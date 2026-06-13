@@ -1,7 +1,7 @@
 import { selfTest } from '../core/transform';
 import { snapshot } from '../core/metrics';
 import { downloadTrace } from '../core/trace';
-import { bus, state } from '../app/state';
+import { bus, state, settings, type Placement } from '../app/state';
 import { OCR_PROVIDER_LABELS } from '../providers/ocr';
 import { INFER_PROVIDER_LABELS } from '../providers/inference';
 
@@ -47,6 +47,35 @@ export function toggleDrawer(force?: boolean): void {
   drawer.hidden = force === undefined ? !drawer.hidden : !force;
 }
 
+/** AI 行为设置：各项独立绑定，改动即写回 settings 并广播 settings:changed。 */
+function initSettings(): void {
+  const $id = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+  const placement = $id<HTMLSelectElement>('set-placement');
+  const reflow = $id<HTMLSelectElement>('set-reflow');
+  const gesture = $id<HTMLInputElement>('set-gesture');
+  const idle = $id<HTMLInputElement>('set-idle');
+  const idleSec = $id<HTMLInputElement>('set-idle-sec');
+
+  // 从 settings 初始化控件
+  placement.value = settings.placement;
+  reflow.value = settings.reflowProvider;
+  gesture.checked = settings.gesture.enabled;
+  idle.checked = settings.idle.enabled;
+  idleSec.value = String(settings.idle.seconds);
+
+  const changed = () => bus.emit('settings:changed');
+  placement.addEventListener('change', () => { settings.placement = placement.value as Placement; changed(); });
+  reflow.addEventListener('change', () => { settings.reflowProvider = reflow.value; changed(); });
+  gesture.addEventListener('change', () => { settings.gesture.enabled = gesture.checked; changed(); });
+  idle.addEventListener('change', () => { settings.idle.enabled = idle.checked; changed(); });
+  idleSec.addEventListener('change', () => {
+    const n = Math.min(30, Math.max(1, Number(idleSec.value) || settings.idle.seconds));
+    settings.idle.seconds = n;
+    idleSec.value = String(n);
+    changed();
+  });
+}
+
 export function initDevDrawer(els: {
   drawer: HTMLElement;
   ocrSelect: HTMLSelectElement;
@@ -62,6 +91,7 @@ export function initDevDrawer(els: {
   metricsBody = els.metricsBody;
   selftestEl = els.selftest;
 
+  initSettings();
   fillSelect(els.ocrSelect, OCR_PROVIDER_LABELS, state.ocrProvider);
   fillSelect(els.inferSelect, INFER_PROVIDER_LABELS, state.inferProvider);
   els.ocrSelect.addEventListener('change', () => { state.ocrProvider = els.ocrSelect.value; });

@@ -104,12 +104,26 @@ main { display: flex; flex: 1; min-height: 0; }
   margin: 0 auto;
   min-width: 480px;
   min-height: 560px;
-  background: var(--page);
-  box-shadow: 0 1px 2px rgba(60, 50, 30, 0.1), 0 10px 32px rgba(60, 50, 30, 0.14);
+  --page-w: 100%; /* renderer 渲染后写入页面像素宽，右侧即留白 */
 }
 #page-layer, #ink-layer { position: absolute; left: 0; top: 0; }
 #ink-layer { touch-action: none; cursor: crosshair; }
 #whisper-layer { position: absolute; inset: 0; pointer-events: none; }
+/* 页面底色/阴影/留白分隔线只在文档加载后出现 —— 空状态下不留任何残框 */
+body.doc-loaded #page-layer {
+  background: var(--page);
+  box-shadow: 0 1px 2px rgba(60, 50, 30, 0.1), 0 10px 32px rgba(60, 50, 30, 0.14);
+}
+/* 页面与留白之间一道很淡的界，提示右侧是 AI 的边注区 */
+body.doc-loaded #stage::after {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: var(--page-w);
+  border-left: 1px solid var(--line);
+  opacity: 0.5;
+  pointer-events: none;
+}
 
 /* ═══ 旁注低语：贴标注旁、无边框、斜体灰字、左侧一道竖线 ═══ */
 .whisper {
@@ -166,6 +180,16 @@ main { display: flex; flex: 1; min-height: 0; }
 .whisper[data-state="edited"] .whisper-text { color: var(--ink); }
 .whisper[data-state="edited"] { border-color: var(--ok); }
 .whisper[data-state="dismissed"] { display: none; }
+
+/* ═══ 右侧留白落点（settings.placement = margin）═══ */
+.whisper.gutter {
+  width: 264px;
+  padding: 4px 0 4px 14px;
+  border-left: 2px solid var(--ai-line);
+  border-right: none;
+  text-align: left;
+}
+/* 停顿综合也走轻样式 —— 不做卡片，跟逐处旁注同一副长相（斜体灰字 + 细竖线） */
 
 /* 空状态 */
 #empty-state {
@@ -332,6 +356,42 @@ main { display: flex; flex: 1; min-height: 0; }
   padding: 6px 8px;
   margin-bottom: 4px;
 }
+/* AI 行为设置：落点选择 + 各行为勾选 */
+.drawer-section .set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 2px 0 10px;
+}
+.set-row > span { font: 12.5px var(--sans); color: #b8b2a8; }
+.drawer-section .set-row select { width: auto; min-width: 124px; margin: 0; }
+.drawer-section label.set-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: 12.5px var(--sans);
+  letter-spacing: 0;
+  color: #d7d2c7;
+  margin: 9px 0 0;
+  cursor: pointer;
+}
+.set-check input[type="checkbox"] {
+  width: 14px; height: 14px;
+  accent-color: #8fc7a6;
+  margin: 0;
+  cursor: pointer;
+}
+.set-check .sec-in {
+  width: 44px;
+  margin: 0 0 0 auto;
+  padding: 2px 5px;
+  font: 12px var(--mono);
+  color: #d7d2c7;
+  background: #2c2925;
+  border: 1px solid #4a463f;
+  border-radius: 4px;
+}
+.set-check .sec-u { color: #989288; }
 #selftest { font: 11.5px var(--mono); }
 #selftest[data-ok="true"] { color: #8fc7a6; }
 #selftest[data-ok="false"] { color: #e08a80; }
@@ -347,6 +407,38 @@ main { display: flex; flex: 1; min-height: 0; }
   background: #1b1916;
   border-radius: 6px;
   padding: 8px 10px;
+}
+
+/* ═══ 重排阅读面（viewMode = reader）═══ */
+#reader {
+  flex: 1;
+  overflow-y: auto;
+  padding: 44px 28px 90px;
+  min-width: 0;
+}
+#reader[hidden] { display: none; }
+#reading.reader #toolbar { display: none; }
+.reader-col {
+  max-width: 680px;
+  margin: 0 auto;
+  font: 16px/1.85 var(--serif);
+  color: var(--ink);
+}
+.reader-h {
+  font: 600 22px/1.4 var(--serif);
+  margin: 1.7em 0 0.5em;
+  letter-spacing: 0.3px;
+}
+.reader-h:first-child { margin-top: 0; }
+.reader-h[data-level="1"] { font-size: 27px; }
+.reader-h[data-level="2"] { font-size: 22px; }
+.reader-h[data-level="3"] { font-size: 19px; }
+.reader-p { margin: 0 0 1.05em; text-align: justify; hyphens: auto; }
+.reader-empty {
+  max-width: 680px;
+  margin: 48px auto;
+  color: var(--hint);
+  font: italic 14px/1.8 var(--serif);
 }
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }

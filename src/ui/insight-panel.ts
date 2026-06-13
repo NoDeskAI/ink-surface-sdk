@@ -47,6 +47,11 @@ export function initInsightPanel(els: { cards: HTMLElement; foot: HTMLElement; c
   footEl = els.foot;
   countEl = els.count;
   bus.on('overlay:add', (o) => add(o as ScreenOverlay));
+  bus.on('overlay:remove', (id) => {
+    const item = cardEls.get(id as string);
+    if (item) { item.remove(); cardEls.delete(id as string); }
+    refreshFoot();
+  });
   bus.on('overlay:state', (o) => {
     const ov = o as ScreenOverlay;
     const item = cardEls.get(ov.overlay_id);

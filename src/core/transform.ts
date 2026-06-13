@@ -5,6 +5,10 @@
 
 export const pageCss = { w: 0, h: 0 };
 
+/** 右侧留白（AI 输出落点）布局常量。stage 宽 = 页宽 + GUTTER_W。 */
+export const GUTTER_W = 300;   // 留白总宽（px）
+export const GUTTER_PAD = 20;  // 留白内容离页面右缘的左边距（px）
+
 export function setPageSize(w: number, h: number): void {
   pageCss.w = w;
   pageCss.h = h;

@@ -22,6 +22,7 @@
       <span class="vsep"></span>
       <label for="file-in" class="ghost import-label">导入 PDF</label>
       <input type="file" id="file-in" accept="application/pdf" hidden />
+      <button id="view-toggle" class="ghost" title="原版 PDF ⇄ 重排阅读">重排</button>
       <button id="insight-toggle" class="ghost" title="本页洞察">洞察</button>
       <button id="dev-toggle" class="ghost" title="开发面板（d）">⋯</button>
     </div>
@@ -42,6 +43,7 @@
           </div>
         </div>
       </div>
+      <div id="reader" hidden></div>
       <nav id="toolbar" aria-label="标注工具"></nav>
     </section>
 
@@ -59,6 +61,32 @@
     <div class="drawer-head">
       <span>开发面板</span>
       <button id="drawer-close" class="ghost">✕</button>
+    </div>
+    <div class="drawer-section">
+      <label>AI 行为（可独立开关、可组合）</label>
+      <div class="set-row">
+        <span>输出落点</span>
+        <select id="set-placement">
+          <option value="margin">右侧留白</option>
+          <option value="inline">贴正文浮动</option>
+        </select>
+      </div>
+      <div class="set-row">
+        <span>重排引擎</span>
+        <select id="set-reflow">
+          <option value="local">仅启发式</option>
+          <option value="hybrid">启发式 + 模型精修</option>
+        </select>
+      </div>
+      <label class="set-check">
+        <input type="checkbox" id="set-gesture" />
+        <span>手势响应（圈=解释·划=重点·圈+问号=提问·写字=批注）</span>
+      </label>
+      <label class="set-check">
+        <input type="checkbox" id="set-idle" />
+        <span>停顿综合</span>
+        <input type="number" id="set-idle-sec" class="sec-in" min="1" max="30" step="1" /><span class="sec-u">秒</span>
+      </label>
     </div>
     <div class="drawer-section">
       <label>OCR provider</label>

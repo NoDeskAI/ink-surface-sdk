@@ -4,7 +4,7 @@ import type { TextItem } from 'pdfjs-dist/types/src/display/api';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { SCHEMA_VERSION } from '../core/contracts';
 import { sha256Hex } from '../core/ids';
-import { setPageSize } from '../core/transform';
+import { setPageSize, GUTTER_W } from '../core/transform';
 import { trace } from '../core/trace';
 import { bus, state } from '../app/state';
 
@@ -59,7 +59,8 @@ export async function renderPage(): Promise<void> {
   const page = await pdf.getPage(state.pageIndex + 1);
   const dpr = window.devicePixelRatio || 1;
   const vp1 = page.getViewport({ scale: 1 });
-  const fitWidth = Math.min(860, Math.max(480, stageWrap.clientWidth - 56));
+  // 预算里扣掉右侧留白，保证「页面 + 留白」不溢出阅读区
+  const fitWidth = Math.min(860, Math.max(480, stageWrap.clientWidth - 56 - GUTTER_W));
   const baseScale = fitWidth / vp1.width;
   const vp = page.getViewport({ scale: baseScale * state.zoom });
   setPageSize(vp.width, vp.height);
@@ -70,8 +71,10 @@ export async function renderPage(): Promise<void> {
     cv.style.width = vp.width + 'px';
     cv.style.height = vp.height + 'px';
   }
-  stage.style.width = vp.width + 'px';
+  // stage 容纳「页面 + 右侧留白」；页面靠左，留白供 AI 输出
+  stage.style.width = vp.width + GUTTER_W + 'px';
   stage.style.height = vp.height + 'px';
+  stage.style.setProperty('--page-w', vp.width + 'px');
 
   // 同一 canvas 不允许并发 render（快速连点缩放/翻页）：先取消未完成任务
   if (renderTask) { try { renderTask.cancel(); } catch { /* noop */ } }

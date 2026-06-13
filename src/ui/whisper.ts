@@ -1,14 +1,15 @@
 import type { ScreenOverlay } from '../core/contracts';
-import { normToPx, pageCss } from '../core/transform';
-import { bus, state } from '../app/state';
+import { normToPx, pageCss, GUTTER_PAD } from '../core/transform';
+import { bus, state, settings } from '../app/state';
 
 /**
- * 旁注低语 —— 贴在标注旁、低打扰的文字注释（非卡片）。
- * 停笔后整段交付，逐句淡入（电子纸不逐字流式）。
- * 单击展开操作（接受/编辑/暂不），不点则只是静静陪着。
+ * AI 输出的屏上呈现。两种落点（settings.placement，可随时切换）：
+ *  - margin：右侧留白。按标注 y 对齐，多条自动下推防重叠（综述/对话的默认落点）。
+ *  - inline：贴正文浮动（原旁注低语行为）。贴标注旁，放不下则翻面/落下。
+ * 停笔后整段交付、逐句淡入（电子纸不逐字流式）；hover 才显操作（接受/编辑/暂不）。
  */
 
-const WHISPER_W = 230; // 估算宽度，用于左右翻转判定
+const GUTTER_GAP_Y = 16; // 留白内卡片纵向间距
 let layer: HTMLElement;
 const els = new Map<string, HTMLElement>();
 
@@ -19,18 +20,14 @@ function splitSentences(text: string): string[] {
     .filter(Boolean);
 }
 
-function place(o: ScreenOverlay, el: HTMLElement): void {
-  if (o.page_id !== state.pageId || o.state === 'dismissed') {
-    el.style.display = 'none';
-    return;
-  }
-  el.style.display = '';
+/** inline：贴标注旁。默认右侧；右放不下翻左；再放不下落到下方。 */
+function placeInline(o: ScreenOverlay, el: HTMLElement): void {
+  el.classList.remove('gutter');
   const [x, y, w, h] = o.geometry.anchor_bbox;
   const topLeft = normToPx(x, y);
   const right = normToPx(x + w, y);
   const bottom = normToPx(x, y + h);
-
-  // 默认贴右侧；右侧放不下则翻到左侧；再放不下落到下方
+  const WHISPER_W = 230;
   if (right.x + 12 + WHISPER_W <= pageCss.w) {
     el.classList.remove('left');
     el.style.left = `${right.x + 12}px`;
@@ -44,6 +41,44 @@ function place(o: ScreenOverlay, el: HTMLElement): void {
     el.classList.remove('left');
     el.style.left = `${topLeft.x}px`;
     el.style.top = `${bottom.y + 8}px`;
+  }
+}
+
+/** margin：留白内，按 anchor y 排序后自上而下堆叠，遇重叠则下推。 */
+function layoutGutter(items: ScreenOverlay[]): void {
+  const x = pageCss.w + GUTTER_PAD;
+  let cursor = 8;
+  for (const o of items) {
+    const el = els.get(o.overlay_id)!;
+    el.classList.add('gutter');
+    el.classList.remove('left');
+    el.style.removeProperty('right');
+    el.style.left = `${x}px`;
+    const anchorY = normToPx(0, o.geometry.anchor_bbox[1]).y;
+    const top = Math.max(anchorY, cursor);
+    el.style.top = `${top}px`;
+    cursor = top + el.offsetHeight + GUTTER_GAP_Y;
+  }
+}
+
+/** 统一重排：先定可见性，再按落点排版。任何位置/状态/页面/设置变化都走这里。 */
+function relayout(): void {
+  const live: ScreenOverlay[] = [];
+  for (const o of state.overlays) {
+    const el = els.get(o.overlay_id);
+    if (!el) continue;
+    if (o.page_id !== state.pageId || o.state === 'dismissed') {
+      el.style.display = 'none';
+    } else {
+      el.style.display = '';
+      live.push(o);
+    }
+  }
+  if (settings.placement === 'margin') {
+    live.sort((a, b) => a.geometry.anchor_bbox[1] - b.geometry.anchor_bbox[1]);
+    layoutGutter(live);
+  } else {
+    for (const o of live) placeInline(o, els.get(o.overlay_id)!);
   }
 }
 
@@ -100,21 +135,27 @@ function add(o: ScreenOverlay): void {
   el.addEventListener('mouseenter', () => bus.emit('whisper:focus', o.overlay_id));
   layer.appendChild(el);
   els.set(o.overlay_id, el);
-  place(o, el);
+  relayout();
+}
+
+function remove(overlayId: string): void {
+  const el = els.get(overlayId);
+  if (el) { el.remove(); els.delete(overlayId); }
+  relayout();
 }
 
 export function initWhisper(whisperLayer: HTMLElement): void {
   layer = whisperLayer;
   bus.on('overlay:add', (o) => add(o as ScreenOverlay));
+  bus.on('overlay:remove', (id) => remove(id as string));
   bus.on('overlay:state', (o) => {
     const ov = o as ScreenOverlay;
     const el = els.get(ov.overlay_id);
-    if (el) { el.dataset.state = ov.state; place(ov, el); }
+    if (el) el.dataset.state = ov.state;
+    relayout();
   });
-  bus.on('page:rendered', () => state.overlays.forEach((o) => {
-    const el = els.get(o.overlay_id);
-    if (el) place(o, el);
-  }));
+  bus.on('page:rendered', relayout);
+  bus.on('settings:changed', relayout);
   bus.on('whisper:reveal', (overlayId) => {
     const el = els.get(overlayId as string);
     if (!el || el.style.display === 'none') return;

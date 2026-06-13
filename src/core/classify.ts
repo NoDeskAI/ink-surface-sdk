@@ -31,3 +31,18 @@ export function classify(points: StrokePoint[], bb: NormBBox): EventType {
   if (hPx < 14 && wPx > 4 * hPx) return 'underline';
   return 'stroke';
 }
+
+/**
+ * 符号对话的「求解意图」启发式占位 —— 一次停笔会话里若有一个圈/点选 + 至少一个附加记号
+ * （形如「圈住某处再写个问号」），就当作用户在发问。
+ *
+ * ⚠️ 这是占位级近似。真正「这个符号在问什么、圈住的到底是什么」属于语义识别，
+ * 是本项目要突破的差异化，最终由 LLM 承载（providers/inference.ts 的 cloud 接缝）。
+ * 前端只负责把候选意图标出来，不替 LLM 下结论。
+ */
+export function detectQueryIntent(types: EventType[]): boolean {
+  if (types.length < 2) return false;
+  const hasEnclose = types.some((t) => t === 'circle' || t === 'tap_region');
+  const hasMark = types.some((t) => t === 'tap_region' || t === 'stroke' || t === 'underline');
+  return hasEnclose && hasMark;
+}

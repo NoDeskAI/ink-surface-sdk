@@ -1,0 +1,169 @@
+/**
+ * 推理网关代理（Node 侧，仅 dev server 内运行）。
+ *
+ * 复用 Nodesign 的 NoDesk AI Gateway：
+ *   POST {LLM_GATEWAY_URL}  (= …/default/passthrough)
+ *   Authorization: Bearer {LLM_GATEWAY_KEY}     ← 网关只认 Bearer，不认 x-api-key
+ *   body: 标准 Anthropic /v1/messages + 顶层注入 channel / channel_url
+ *
+ * channel 按 model 前缀自动路由（跟他们网关一致）：kimi-* → moonshot；其余 → DMXAPI。
+ * 真实回答由此处的 model 产出；source_refs 由服务端从请求装配，**不让模型编造**（PRD 红线）。
+ *
+ * 这是 inference 的 provider 接缝实现之一；annotation 语义/文档解析最终归 B 组，
+ * 这里先用现成网关把链路跑通。
+ */
+
+// 惰性读取：env 由 vite 插件在 configureServer 里注入 process.env，
+// 晚于本模块 import 求值，所以不能在模块顶层捕获。
+function cfg() {
+  return {
+    url: process.env.LLM_GATEWAY_URL || 'https://llm-gateway-api.nodesk.tech/default/passthrough',
+    key: process.env.LLM_GATEWAY_KEY || '',
+    model: process.env.LLM_MODEL || 'kimi-k2.6',
+  };
+}
+
+function route(model: string): { channel: string; channel_url: string } {
+  if (model.startsWith('kimi')) {
+    return { channel: 'kimi', channel_url: 'https://api.moonshot.cn/anthropic/v1/messages' };
+  }
+  return { channel: 'DMX', channel_url: 'https://www.dmxapi.cn/v1/messages' };
+}
+
+async function gateway(system: string, user: string, maxTokens: number): Promise<string> {
+  const { url, key, model } = cfg();
+  if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
+  const { channel, channel_url } = route(model);
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+      channel,
+      channel_url,
+    }),
+  });
+  const data: any = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
+  }
+  return (data.content || [])
+    .filter((b: any) => b?.type === 'text')
+    .map((b: any) => b.text)
+    .join('')
+    .trim();
+}
+
+const SYM: Record<string, string> = {
+  circle: '圈选', underline: '划线', highlight: '高亮', arrow: '箭头',
+  margin_note: '批注', tap_region: '点选', stroke: '标记', eraser: '擦除', unknown: '标记',
+};
+
+function extractJson(text: string): any {
+  if (!text) return {};
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return { content: text };
+  try { return JSON.parse(m[0]); } catch { return { content: text }; }
+}
+
+const rand = () => Math.random().toString(36).slice(2, 10);
+
+/** 把一个 InferenceRequest 跑成 InferenceResult（contract 不变）。 */
+export async function runInference(req: any): Promise<any> {
+  const modes: string[] = req.output_modes || ['inspiration', 'question', 'connection'];
+  const evt = req.annotation_event || {};
+  const enclosed = (req.ocr_blocks || []).map((b: any) => b.text).join('') || '';
+  const nearby = req.nearby_text || '';
+  const et: string = evt.event_type;
+  const isDigest = modes.includes('summary');
+  const isAsk = modes.length === 1 && modes[0] === 'question';
+
+  const system =
+    '你是 InkLoop —— 嵌在 PDF 阅读器里的旁注式 AI 同读者。用户在原文上用符号（圈/划线/批注/点选）标注，' +
+    '你依据符号含义与它圈住的上下文，轻声给一条简短中文旁注。不寒暄、不复述原文、不用 markdown 或列表、不超过 2 句，像页边批注点到为止。';
+
+  let task: string;
+  if (isDigest) {
+    task = `用户停笔了。下面是 ta 在这一页留下的所有标注（每条含符号类型与圈住的文字）：\n${nearby || '（无可提取文字）'}\n请综合这些标注给一条整体性的洞察或提示——帮 ta 想深一层、点出背后的关键、或建议下一步。`;
+  } else if (isAsk) {
+    // 圈+问号 = 提问
+    task = `用户圈了一处并加了记号，像在发问。圈住/附近的内容："${enclosed || nearby || '（未提取到文字）'}"。请针对它直接作答，不要反问。`;
+  } else if (et === 'underline') {
+    // 划线 = 重点
+    task = `用户用划线标了重点："${enclosed || nearby || '（未提取到文字）'}"。请提炼这处的要点、点出它为什么重要——一句话。`;
+  } else if (et === 'margin_note') {
+    // 写字 = 批注（手写内容暂不可读，先用附近正文）
+    task = `用户在页边写了一条批注（手写内容暂不可读）。批注落在这段正文附近："${nearby || enclosed || '（未提取到文字）'}"。请就这段正文给一条呼应 ta 思路的旁注。`;
+  } else {
+    // 圈 = 解释
+    task = `用户圈出了一处："${enclosed || nearby || '（未提取到文字）'}"。请解释它是什么、关键在哪——像同读者在页边轻声点一句。`;
+  }
+  const user = `${task}\n\n只输出一个 JSON 对象：{"result_type":"…","content":"…","confidence":0.x}。result_type 从这些里选最贴切的一个：${modes.join(' / ')}；content 是要显示的旁注文字；confidence 是 0–1 把握度。除该 JSON 外不要输出任何文字。`;
+
+  const raw = await gateway(system, user, isDigest ? 600 : 400);
+  const parsed = extractJson(raw);
+  const result_type = modes.includes(parsed.result_type) ? parsed.result_type : modes[0];
+  const content = String(parsed.content || raw || '此刻没能想清楚，稍后再为你低语。').trim();
+  const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.8;
+
+  const bbox = req.ocr_blocks?.[0]?.bbox || evt.geometry?.bbox || [0, 0, 0, 0];
+  return {
+    result_id: 'res_' + rand(),
+    trace_id: req.trace_id,
+    request_id: req.request_id,
+    result_type,
+    content,
+    source_refs: [{
+      page_id: evt.page_id,
+      bbox,
+      ocr_block_ids: (req.ocr_blocks || []).map((b: any) => b.id),
+      event_id: req.event_id,
+    }],
+    confidence,
+    created_at: new Date().toISOString(),
+    model_name: cfg().model,
+    model_version: 'nodesk-gateway',
+  };
+}
+
+function extractJsonArray(text: string): any[] {
+  if (!text) return [];
+  const m = text.match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  try { const a = JSON.parse(m[0]); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+
+/**
+ * 逐块精修（中间路线）：几何切好的块交模型清断词/纠类型/修阅读顺序，
+ * **同一批 id 各用一次、不许合并拆分** —— 这样每块仍认得原页 bbox（前端按 id 贴回）。
+ */
+export async function runReflow(payload: any): Promise<any[]> {
+  const blocks: any[] = payload?.blocks || [];
+  if (!blocks.length) return [];
+  const list = blocks.map((b, i) => `${i + 1}. [${b.type}] (${b.id}) ${b.text}`).join('\n');
+  const system = '你在精修一页 PDF 的文本块：修断词与多余空格、纠正每块是标题还是正文、按正确阅读顺序排列。只做精修，不改写原意。';
+  const user =
+    `下面是按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n` +
+    `输出一个 JSON 数组，每个元素 {"id":"…","type":"heading"|"para","level":1到3,"text":"…"}：\n` +
+    `- 必须把上面每个 id 各用一次，不许合并、拆分、新增或丢弃；\n` +
+    `- 可以重排顺序以修正（多栏）阅读顺序；\n` +
+    `- text 清掉断词与多余空格；type/level 重新判定（para 的 level 给 0）。\n` +
+    `只输出该 JSON 数组，别的都不要。`;
+  const raw = await gateway(system, user, 2500);
+  const refined = extractJsonArray(raw);
+  // 校验：只保留出现过的 id；模型漏掉的块前端会按原样补回
+  const ids = new Set(blocks.map((b) => b.id));
+  return refined.filter((r) => r && ids.has(r.id)).map((r) => ({
+    id: r.id,
+    type: r.type === 'heading' ? 'heading' : 'para',
+    level: typeof r.level === 'number' ? r.level : 0,
+    text: String(r.text || '').trim(),
+  }));
+}
