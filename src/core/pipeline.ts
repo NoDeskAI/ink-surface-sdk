@@ -7,7 +7,6 @@ import { trace } from './trace';
 import { bus, state, type Stroke } from '../app/state';
 import { ocrProviders } from '../providers/ocr';
 import { inferProviders } from '../providers/inference';
-import type { Gesture } from './gesture';
 
 /** 单笔封装为契约 shape。会话内多笔共享一个 trace_id（决策：停笔会话）。 */
 export function makeEvent(stroke: Stroke, traceId: string): AnnotationEvent | null {
@@ -109,56 +108,6 @@ function buildOverlay(result: InferenceResult, evt: AnnotationEvent): ScreenOver
   };
 }
 
-/**
- * 停笔会话提交：合并几何 → OCR → 推理 → 旁注低语。云端失败降级不崩（A11）。
- * 行为「逐笔即时旁注」用默认 modes；「符号对话」经 commitDialogue 传 ['question']。
- */
-export async function commitSession(
-  events: AnnotationEvent[],
-  penUpAt: number,
-  modes: OutputMode[] = ['inspiration', 'question', 'connection'],
-  eventType?: EventType,
-): Promise<void> {
-  if (!events.length) return;
-  const evt = representative(events);
-  if (eventType) evt.event_type = eventType; // 手势 canonical 类型，服务端据此框定语气
-
-  const tEvent = performance.now();
-  let result: InferenceResult;
-  try {
-    const ocr = await ocrProviders[state.ocrProvider](evt);
-    trace('OCRResult', ocr as unknown as Record<string, unknown>);
-    mark('event_ocr', performance.now() - tEvent);
-
-    const tOcr = performance.now();
-    const req = buildRequest(evt, ocr, modes);
-    trace('InferenceRequest', req as unknown as Record<string, unknown>);
-    result = await inferProviders[state.inferProvider](req);
-    trace('InferenceResult', result as unknown as Record<string, unknown>);
-    mark('ocr_result', performance.now() - tOcr);
-  } catch (err) {
-    result = errorResult(evt, err);
-    trace('InferenceResult(error)', result as unknown as Record<string, unknown>);
-  }
-
-  const tResult = performance.now();
-  const overlay = buildOverlay(result, evt);
-  trace('ScreenOverlay', overlay as unknown as Record<string, unknown>);
-  state.overlays.push(overlay);
-  bus.emit('overlay:add', overlay);
-  mark('result_screen', performance.now() - tResult);
-  mark('total', performance.now() - penUpAt);
-}
-
-/**
- * 手势提交：一次停笔会话按解析出的手势意图作答（圈=解释/划线=重点/圈+问号=提问/写字=批注）。
- * 同一条管线，手势只改 output_modes + canonical eventType；服务端据此框定语气。
- * 真值「这符号在问什么、圈住的到底是什么」由 LLM 细化（B 组），前端只给几何意图。
- */
-export async function commitGesture(events: AnnotationEvent[], penUpAt: number, g: Gesture): Promise<void> {
-  await commitSession(events, penUpAt, g.output_modes, g.eventType);
-}
-
 /** 符号类型 → 中文标签（喂给推理的结构化上下文，也方便人读 trace）。 */
 const SYM_LABEL: Record<EventType, string> = {
   circle: '圈选', underline: '划线', highlight: '高亮', arrow: '箭头',
@@ -166,50 +115,53 @@ const SYM_LABEL: Record<EventType, string> = {
 };
 
 /**
- * 停顿综合：把本页累积的所有标注合成一条 AI 回答，落在右侧留白。
- * 每个标注各取「符号类型 + 圈住的上下文」，结构化进 nearby_text 一并喂推理
- * （守住冻结契约 D4：不改 InferenceRequest 形状，只用既有 nearby_text/output_modes 字段）。
- * 每轮综合替换上一条综述（按页 upsert），始终只留最新一条。
+ * 段落讨论提交：把同一段上的一簇手势（1 个或多个）合成一条回应，落在该段旁的留白。
+ * 每个标注各取「符号类型 + 圈住的上下文」结构化进 nearby_text（守 D4：不改契约形状，
+ * 只用既有 nearby_text / output_modes）。**按 discId upsert** —— 讨论继续就原地刷新
+ * 同一条，不每段各占空间。云端失败降级不崩（A11）。
  */
-export async function commitDigest(events: AnnotationEvent[], penUpAt: number): Promise<void> {
+export async function commitDiscussion(
+  events: AnnotationEvent[],
+  penUpAt: number,
+  discId: string,
+  modes: OutputMode[],
+  eventType?: EventType,
+): Promise<void> {
   if (!events.length) return;
   const evt = representative(events);
-  evt.trace_id = shortId('dgst');
+  evt.trace_id = shortId('disc');
+  if (eventType) evt.event_type = eventType; // 单手势时写 canonical 类型，服务端据此框定语气
 
-  // 逐标注取圈住的上下文（OCR 失败的单条跳过，不连累整体）
-  const ocrs = await Promise.all(
-    events.map((e) => ocrProviders[state.ocrProvider](e).catch(() => null)),
-  );
+  // 逐标注取圈住的上下文（单条 OCR 失败跳过，不连累整体）
+  const ocrs = await Promise.all(events.map((e) => ocrProviders[state.ocrProvider](e).catch(() => null)));
   const parts = events.map((e, i) => {
     const blocks = ocrs[i]?.text_blocks ?? [];
-    const text = (blocks.map((b) => b.text).join('') || ocrs[i]?.nearby_text || '').trim();
-    return { type: e.event_type, text };
+    return { type: e.event_type, text: (blocks.map((b) => b.text).join('') || ocrs[i]?.nearby_text || '').trim() };
   });
-  const structured = parts
-    .map((p) => `〔${SYM_LABEL[p.type]}〕"${(p.text || '此处').slice(0, 40)}"`)
-    .join('  ');
+  const structured = parts.map((p) => `〔${SYM_LABEL[p.type]}〕"${(p.text || '此处').slice(0, 40)}"`).join('  ');
   const allBlocks = ocrs.flatMap((o) => o?.text_blocks ?? []);
 
   let result: InferenceResult;
   try {
-    const req = buildRequest(evt, { text_blocks: allBlocks, nearby_text: structured || null }, ['summary']);
-    trace('InferenceRequest(digest)', req as unknown as Record<string, unknown>);
+    const req = buildRequest(evt, { text_blocks: allBlocks, nearby_text: structured || null }, modes);
+    trace('InferenceRequest(disc)', req as unknown as Record<string, unknown>);
     result = await inferProviders[state.inferProvider](req);
-    trace('InferenceResult(digest)', result as unknown as Record<string, unknown>);
+    trace('InferenceResult(disc)', result as unknown as Record<string, unknown>);
   } catch (err) {
     result = errorResult(evt, err);
     trace('InferenceResult(error)', result as unknown as Record<string, unknown>);
   }
 
-  // upsert：移除本页上一条综述，换成最新一条
-  const prev = state.overlays.find((o) => o.result_type === 'summary' && o.page_id === evt.page_id);
+  // upsert by discId：移除同一讨论的上一条，原地换最新一条
+  const prev = state.overlays.find((o) => o.overlay_id === discId);
   if (prev) {
     state.overlays = state.overlays.filter((o) => o !== prev);
-    bus.emit('overlay:remove', prev.overlay_id);
+    bus.emit('overlay:remove', discId);
   }
   const overlay = buildOverlay(result, evt);
-  overlay.geometry = { anchor_bbox: evt.geometry.bbox }; // 锚到标注簇，留白里按其 y 对齐
-  trace('ScreenOverlay(digest)', overlay as unknown as Record<string, unknown>);
+  overlay.overlay_id = discId;
+  overlay.geometry = { anchor_bbox: evt.geometry.bbox }; // 锚到这簇手势，留白里按其 y 对齐
+  trace('ScreenOverlay(disc)', overlay as unknown as Record<string, unknown>);
   state.overlays.push(overlay);
   bus.emit('overlay:add', overlay);
   mark('total', performance.now() - penUpAt);

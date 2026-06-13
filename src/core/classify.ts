@@ -10,12 +10,22 @@ export function bboxOf(points: StrokePoint[]): NormBBox {
   return [x0, y0, x1 - x0, y1 - y0];
 }
 
-/** 几何启发式分类：tap_region / circle / underline / stroke */
-export function classify(points: StrokePoint[], bb: NormBBox): EventType {
+const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+
+export interface ScoredGesture {
+  type: EventType;
+  score: number; // 0–1：这笔画得有多像该模板（用于"画得像范例才算数"的门槛）
+}
+
+/**
+ * 几何启发式分类 + 置信度。score 表示笔迹与模板的接近度：
+ * 干净的圈/直线/点 → 高分；随手涂、半截笔画 → 低分（自由笔 stroke 基本判不出模板）。
+ */
+export function classifyScored(points: StrokePoint[], bb: NormBBox): ScoredGesture {
   const wPx = bb[2] * pageCss.w;
   const hPx = bb[3] * pageCss.h;
   const diagPx = Math.hypot(wPx, hPx);
-  if (points.length <= 3 || diagPx < 8) return 'tap_region';
+  if (points.length <= 3 || diagPx < 8) return { type: 'tap_region', score: diagPx < 8 ? 0.7 : 0.5 };
 
   const first = points[0];
   const last = points[points.length - 1];
@@ -27,9 +37,21 @@ export function classify(points: StrokePoint[], bb: NormBBox): EventType {
       (points[i].y - points[i - 1].y) * pageCss.h,
     );
   }
-  if (closure < 0.25 * diagPx && len > 1.5 * diagPx) return 'circle';
-  if (hPx < 14 && wPx > 4 * hPx) return 'underline';
-  return 'stroke';
+  // 圈：起止接近（闭合）+ 路径绕得够长
+  const circleScore = clamp01((0.4 - closure / diagPx) / 0.4) * clamp01((len / diagPx - 1.2) / 1.3);
+  // 直划线：扁 + 直（路径≈宽度）
+  const aspect = wPx / Math.max(hPx, 1);
+  const straight = wPx / Math.max(len, 1);
+  const underlineScore = clamp01((aspect - 3) / 4) * clamp01((straight - 0.7) / 0.3);
+
+  if (circleScore >= underlineScore && circleScore > 0.35) return { type: 'circle', score: circleScore };
+  if (underlineScore > 0.35) return { type: 'underline', score: underlineScore };
+  return { type: 'stroke', score: 0.15 + Math.max(circleScore, underlineScore) * 0.3 }; // 自由笔：低分
+}
+
+/** 几何启发式分类：tap_region / circle / underline / stroke */
+export function classify(points: StrokePoint[], bb: NormBBox): EventType {
+  return classifyScored(points, bb).type;
 }
 
 /**
@@ -42,7 +64,7 @@ export function classify(points: StrokePoint[], bb: NormBBox): EventType {
  */
 export function detectQueryIntent(types: EventType[]): boolean {
   if (types.length < 2) return false;
-  const hasEnclose = types.some((t) => t === 'circle' || t === 'tap_region');
-  const hasMark = types.some((t) => t === 'tap_region' || t === 'stroke' || t === 'underline');
-  return hasEnclose && hasMark;
+  const hasCircle = types.includes('circle');                               // 必须真的圈了东西
+  const hasMark = types.some((t) => t === 'tap_region' || t === 'stroke');   // 旁边再加个记号（问号）
+  return hasCircle && hasMark;
 }

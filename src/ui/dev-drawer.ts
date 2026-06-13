@@ -53,25 +53,22 @@ function initSettings(): void {
   const placement = $id<HTMLSelectElement>('set-placement');
   const reflow = $id<HTMLSelectElement>('set-reflow');
   const gesture = $id<HTMLInputElement>('set-gesture');
-  const idle = $id<HTMLInputElement>('set-idle');
-  const idleSec = $id<HTMLInputElement>('set-idle-sec');
+  const pauseSec = $id<HTMLInputElement>('set-pause-sec');
 
   // 从 settings 初始化控件
   placement.value = settings.placement;
   reflow.value = settings.reflowProvider;
   gesture.checked = settings.gesture.enabled;
-  idle.checked = settings.idle.enabled;
-  idleSec.value = String(settings.idle.seconds);
+  pauseSec.value = String(settings.gesture.pauseSeconds);
 
   const changed = () => bus.emit('settings:changed');
   placement.addEventListener('change', () => { settings.placement = placement.value as Placement; changed(); });
   reflow.addEventListener('change', () => { settings.reflowProvider = reflow.value; changed(); });
   gesture.addEventListener('change', () => { settings.gesture.enabled = gesture.checked; changed(); });
-  idle.addEventListener('change', () => { settings.idle.enabled = idle.checked; changed(); });
-  idleSec.addEventListener('change', () => {
-    const n = Math.min(30, Math.max(1, Number(idleSec.value) || settings.idle.seconds));
-    settings.idle.seconds = n;
-    idleSec.value = String(n);
+  pauseSec.addEventListener('change', () => {
+    const n = Math.min(30, Math.max(1, Number(pauseSec.value) || settings.gesture.pauseSeconds));
+    settings.gesture.pauseSeconds = n;
+    pauseSec.value = String(n);
     changed();
   });
 }

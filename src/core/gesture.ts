@@ -8,7 +8,21 @@
  * 服务端据此框定回应语气（output_modes 约束 result_type）。
  */
 import type { AnnotationEvent, EventType, OutputMode } from './contracts';
-import { detectQueryIntent } from './classify';
+import { classifyScored, detectQueryIntent } from './classify';
+
+/** 形状门槛：低于此分的单笔自由涂抹不算手势（不触发 AI），笔迹仍无损留着。 */
+export const GESTURE_MIN_SCORE = 0.4;
+
+/**
+ * 这次停笔到底算不算"刻意的手势"——决定生成与否（看是否画得像范例，而非有没有动作）。
+ * 刻意 = ① 多笔自由书写（手写批注），或 ② 有一笔画得够像模板（圈/划/点）。
+ */
+export function isDeliberate(events: AnnotationEvent[]): boolean {
+  if (!events.length) return false;
+  const freeform = events.filter((e) => e.event_type === 'stroke').length;
+  if (events.length >= 2 && freeform >= 2) return true; // 手写批注
+  return events.some((e) => classifyScored(e.stroke_points, e.geometry.bbox).score >= GESTURE_MIN_SCORE);
+}
 
 export type GestureKind = 'explain' | 'emphasize' | 'ask' | 'note';
 

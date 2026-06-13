@@ -30,10 +30,16 @@ function route(model: string): { channel: string; channel_url: string } {
   return { channel: 'DMX', channel_url: 'https://www.dmxapi.cn/v1/messages' };
 }
 
-async function gateway(system: string, user: string, maxTokens: number): Promise<string> {
+async function gateway(system: string, user: string, maxTokens: number, imageB64?: string): Promise<string> {
   const { url, key, model } = cfg();
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
   const { channel, channel_url } = route(model);
+  const content = imageB64
+    ? [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageB64 } },
+        { type: 'text', text: user },
+      ]
+    : user;
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
@@ -45,7 +51,7 @@ async function gateway(system: string, user: string, maxTokens: number): Promise
       model,
       max_tokens: maxTokens,
       system,
-      messages: [{ role: 'user', content: user }],
+      messages: [{ role: 'user', content }],
       channel,
       channel_url,
     }),
@@ -147,16 +153,18 @@ function extractJsonArray(text: string): any[] {
 export async function runReflow(payload: any): Promise<any[]> {
   const blocks: any[] = payload?.blocks || [];
   if (!blocks.length) return [];
+  const img = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : undefined;
   const list = blocks.map((b, i) => `${i + 1}. [${b.type}] (${b.id}) ${b.text}`).join('\n');
-  const system = '你在精修一页 PDF 的文本块：修断词与多余空格、纠正每块是标题还是正文、按正确阅读顺序排列。只做精修，不改写原意。';
-  const user =
-    `下面是按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n` +
+  const system = '你在精修一页 PDF 的文本块：纠正每块是标题还是正文、按正确阅读顺序排列、修断词与多余空格。只精修，不改写原意。';
+  const rules =
     `输出一个 JSON 数组，每个元素 {"id":"…","type":"heading"|"para","level":1到3,"text":"…"}：\n` +
-    `- 必须把上面每个 id 各用一次，不许合并、拆分、新增或丢弃；\n` +
-    `- 可以重排顺序以修正（多栏）阅读顺序；\n` +
-    `- text 清掉断词与多余空格；type/level 重新判定（para 的 level 给 0）。\n` +
+    `- 必须把每个 id 各用一次，不许合并、拆分、新增或丢弃；\n` +
+    `- 按真实阅读顺序排列（多栏要对）；type/level 重新判定（para 的 level 给 0）；text 清掉断词与多余空格。\n` +
     `只输出该 JSON 数组，别的都不要。`;
-  const raw = await gateway(system, user, 2500);
+  const user = img
+    ? `这是该页的图，以及按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n看着图判断真实版面，${rules}`
+    : `下面是按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n${rules}`;
+  const raw = await gateway(system, user, 2500, img);
   const refined = extractJsonArray(raw);
   // 校验：只保留出现过的 id；模型漏掉的块前端会按原样补回
   const ids = new Set(blocks.map((b) => b.id));

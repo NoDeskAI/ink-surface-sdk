@@ -75,17 +75,17 @@
         <span>重排引擎</span>
         <select id="set-reflow">
           <option value="local">仅启发式</option>
-          <option value="hybrid">启发式 + 模型精修</option>
+          <option value="hybrid">启发式 + 模型精修（文字）</option>
+          <option value="vision">启发式 + 视觉重排（看图）</option>
         </select>
       </div>
       <label class="set-check">
         <input type="checkbox" id="set-gesture" />
-        <span>手势响应（圈=解释·划=重点·圈+问号=提问·写字=批注）</span>
+        <span>手势响应（段落讨论：圈=解释·划=重点·圈+问号=提问·写字=批注）</span>
       </label>
       <label class="set-check">
-        <input type="checkbox" id="set-idle" />
-        <span>停顿综合</span>
-        <input type="number" id="set-idle-sec" class="sec-in" min="1" max="30" step="1" /><span class="sec-u">秒</span>
+        <span>停笔</span>
+        <input type="number" id="set-pause-sec" class="sec-in" min="1" max="30" step="1" /><span class="sec-u">秒后生成（同段原地更新）</span>
       </label>
     </div>
     <div class="drawer-section">

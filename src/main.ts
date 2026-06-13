@@ -1,9 +1,9 @@
 import './styles.css';
-import { recordEvent, commitGesture, commitDigest } from './core/pipeline';
-import { resolveGesture } from './core/gesture';
+import { recordEvent, commitDiscussion } from './core/pipeline';
+import { resolveGesture, isDeliberate, type Gesture } from './core/gesture';
 import { shortId } from './core/ids';
 import { bus, state, settings } from './app/state';
-import type { AnnotationEvent } from './core/contracts';
+import type { AnnotationEvent, EventType, NormBBox, OutputMode } from './core/contracts';
 import { initRenderer, loadFile, gotoPage, setZoom, hasDocument } from './ui/renderer';
 import { initInk } from './ui/ink';
 import { initWhisper } from './ui/whisper';
@@ -14,7 +14,7 @@ import { initDevDrawer, toggleDrawer } from './ui/dev-drawer';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 
-const STOP_WINDOW = 1200; // 手势会话窗：抬笔后静默此窗即算一次手势完成（即时旁注 / 符号对话）
+const SESSION_WINDOW = 1200; // 手势组装窗：抬笔静默此窗即算一次手势完成（多笔合一）
 
 initRenderer({
   pageLayer: $<HTMLCanvasElement>('page-layer'),
@@ -25,21 +25,70 @@ initRenderer({
 
 let sessionTrace: string | null = null;
 let pending: AnnotationEvent[] = [];
-let stopTimer: number | undefined;
-let idleTimer: number | undefined;
+let sessionTimer: number | undefined; // 组装一次手势（多笔合一）
+let pauseTimer: number | undefined;   // 停顿到点 → 聚类已识别手势、每簇一条讨论
 
-// 停顿综合按页累积本页所有标注（不清空：每轮综合都基于"全部标注"，替换上一条综述）
-const digestByPage = new Map<string, AnnotationEvent[]>();
-const pageBucket = (pid: string): AnnotationEvent[] => {
-  if (!digestByPage.has(pid)) digestByPage.set(pid, []);
-  return digestByPage.get(pid)!;
+// 本页"已识别手势会话"（过了形状门槛才进来）
+interface RecGesture { events: AnnotationEvent[]; gesture: Gesture; bbox: NormBBox; }
+const recByPage = new Map<string, RecGesture[]>();
+const recBucket = (pid: string): RecGesture[] => {
+  if (!recByPage.has(pid)) recByPage.set(pid, []);
+  return recByPage.get(pid)!;
 };
+const lastSig = new Map<string, string>(); // discId → 上轮成员签名，避免重复生成
+
+function unionBBox(events: AnnotationEvent[]): NormBBox {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+  for (const e of events) {
+    const [x, y, w, h] = e.geometry.bbox;
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
+  }
+  return [x0, y0, x1 - x0, y1 - y0];
+}
 
 function cancelTimers(): void {
-  window.clearTimeout(stopTimer);
-  window.clearTimeout(idleTimer);
+  window.clearTimeout(sessionTimer);
+  window.clearTimeout(pauseTimer);
   pending = [];
   sessionTrace = null;
+}
+
+/** 按纵向邻近把已识别手势聚成"段落讨论"簇。 */
+function clusterByProximity(recs: RecGesture[]): RecGesture[][] {
+  const sorted = [...recs].sort((a, b) => a.bbox[1] - b.bbox[1]);
+  const clusters: RecGesture[][] = [];
+  const GAP = 0.06; // 纵向间隙阈值（页面归一化）
+  for (const r of sorted) {
+    const cur = clusters[clusters.length - 1];
+    const curBottom = cur ? Math.max(...cur.map((c) => c.bbox[1] + c.bbox[3])) : -1;
+    if (cur && r.bbox[1] - curBottom < GAP) cur.push(r);
+    else clusters.push([r]);
+  }
+  return clusters;
+}
+
+/** 一簇手势 → 生成参数：单手势按其意图，多手势走综合，含提问则作答。 */
+function clusterIntent(cluster: RecGesture[]): { modes: OutputMode[]; eventType?: EventType } {
+  if (cluster.some((c) => c.gesture.kind === 'ask')) return { modes: ['question'], eventType: 'circle' };
+  if (cluster.length === 1) return { modes: cluster[0].gesture.output_modes, eventType: cluster[0].gesture.eventType };
+  return { modes: ['summary'] };
+}
+
+/** 停顿到点：聚类本页已识别手势，每簇一条讨论；成员没变则跳过（不重复生成）。 */
+function runDiscussions(pid: string): void {
+  const recs = recBucket(pid);
+  if (!recs.length) return;
+  for (const cluster of clusterByProximity(recs)) {
+    const events = cluster.flatMap((c) => c.events);
+    const ids = events.map((e) => e.event_id).sort();
+    const discId = 'disc_' + ids[0];
+    const sig = ids.join(',');
+    if (lastSig.get(discId) === sig) continue;
+    lastSig.set(discId, sig);
+    const { modes, eventType } = clusterIntent(cluster);
+    void commitDiscussion(events, performance.now(), discId, modes, eventType);
+  }
 }
 
 initInk($<HTMLCanvasElement>('ink-layer'), (stroke, pointerType, penUpAt) => {
@@ -47,26 +96,23 @@ initInk($<HTMLCanvasElement>('ink-layer'), (stroke, pointerType, penUpAt) => {
   const evt = recordEvent(stroke, sessionTrace, pointerType, penUpAt);
   if (!evt) return;
   pending.push(evt);
-  pageBucket(evt.page_id).push(evt);
 
-  // 会话窗结算：把这次停笔解析成一个手势意图 → 按意图作答（圈/划/问/写）
-  window.clearTimeout(stopTimer);
-  stopTimer = window.setTimeout(() => {
+  // 1.2s：一次手势组装完 → 过形状门槛(画得像范例)才记为"已识别手势"，随手涂忽略
+  window.clearTimeout(sessionTimer);
+  sessionTimer = window.setTimeout(() => {
     const batch = pending;
     pending = [];
     sessionTrace = null;
-    if (settings.gesture.enabled && batch.length) {
-      void commitGesture(batch, performance.now(), resolveGesture(batch));
+    if (batch.length && isDeliberate(batch)) {
+      recBucket(batch[0].page_id).push({ events: batch, gesture: resolveGesture(batch), bbox: unionBBox(batch) });
     }
-  }, STOP_WINDOW);
+  }, SESSION_WINDOW);
 
-  // 停顿综合窗：每次落笔都重置，超时无新标注 → 综合本页所有标注
-  if (settings.idle.enabled) {
+  // 停顿窗：每次落笔重置；停笔 pauseSeconds 后才生成（避免打扰）
+  if (settings.gesture.enabled) {
     const pid = evt.page_id;
-    window.clearTimeout(idleTimer);
-    idleTimer = window.setTimeout(() => {
-      void commitDigest(pageBucket(pid).slice(), performance.now());
-    }, settings.idle.seconds * 1000);
+    window.clearTimeout(pauseTimer);
+    pauseTimer = window.setTimeout(() => runDiscussions(pid), settings.gesture.pauseSeconds * 1000);
   }
 });
 

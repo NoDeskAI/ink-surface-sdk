@@ -45,16 +45,15 @@ export interface Settings {
   placement: Placement;
   viewMode: ViewMode;                            // 阅读面：原版 PDF / 重排
   reflowProvider: string;                        // 重排引擎：local / llm
-  gesture: { enabled: boolean };                 // 手势响应：每次停笔 → 按手势意图作答（圈/划/问/写）
-  idle: { enabled: boolean; seconds: number };   // 停顿综合：超时无新标注 → 综合本页所有标注
+  // 段落讨论：同段上的手势聚成一次讨论，停笔 pauseSeconds 后生成、按 discId 原地更新
+  gesture: { enabled: boolean; pauseSeconds: number };
 }
 
 export const settings: Settings = {
   placement: 'margin',
   viewMode: 'page',
   reflowProvider: 'local',
-  gesture: { enabled: true },
-  idle: { enabled: true, seconds: 5 },
+  gesture: { enabled: true, pauseSeconds: 5 },
 };
 
 export interface Stroke {
