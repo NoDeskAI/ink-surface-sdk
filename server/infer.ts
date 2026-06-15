@@ -313,6 +313,34 @@ export async function runExplainImage(payload: any): Promise<{ text: string }> {
   return { text: text.trim() };
 }
 
+/**
+ * VLM 重写重排：让模型看一张整页 PDF 截图，按真实阅读顺序产出语义块（标题/段/列表）。
+ * 治网页截图、扭曲页、字号统一的 OCR 嵌字 PDF —— 这些把纯几何 reflowLocal 打爆的情况。
+ * 严格转写、不改写原文（PRD 红线）；返回数组里每块带模型估计的归一化 bbox（便于反查）。
+ */
+export async function runReflowVlm(payload: any): Promise<any[]> {
+  const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
+  if (!image) return [];
+  const system =
+    '你在重排一张 PDF 页面截图。按真实阅读顺序输出一个 JSON 数组，每个元素是一个语义块：' +
+    '{"type":"heading"|"para"|"list","level":1到3(heading时；其他=0),' +
+    '"text":"原样转写的文字（para/heading用；list省略）",' +
+    '"items":["项1","项2"](list用；其他省略),"ordered":true|false(list用),' +
+    '"bbox":[x,y,w,h] 归一化0–1，估计该块在页面上的位置}。' +
+    '严格按图中文字转写，不要改写、翻译、添加或省略文字；多栏按真实阅读顺序排（先左栏后右栏）；' +
+    '标题/正文/列表分类清楚。只输出 JSON 数组，别的都不要。';
+  const raw = await gateway(system, '看这张页面图，按上面格式重排：', 3000, image);
+  const arr = extractJsonArray(raw);
+  return arr.filter((b) => b && (b.type === 'heading' || b.type === 'para' || b.type === 'list')).map((b) => ({
+    type: b.type,
+    level: typeof b.level === 'number' ? b.level : 0,
+    text: typeof b.text === 'string' ? b.text.trim() : '',
+    items: Array.isArray(b.items) ? b.items.map((x: unknown) => String(x).trim()).filter(Boolean) : undefined,
+    ordered: typeof b.ordered === 'boolean' ? b.ordered : undefined,
+    bbox: Array.isArray(b.bbox) && b.bbox.length === 4 ? b.bbox.map((n: any) => Number(n) || 0) : [0, 0, 1, 0.05],
+  }));
+}
+
 /** 翻页总结：把一页的标注 + AI 回应压成一句备忘，供跨页综合。 */
 export async function runSummarize(payload: any): Promise<{ summary: string }> {
   const marks: any[] = payload?.marks || [];

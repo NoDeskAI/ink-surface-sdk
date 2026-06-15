@@ -1,13 +1,14 @@
-import type { OcrTextBlock } from '../core/contracts';
-import type { ReflowBlock } from '../core/reflow';
+import type { NormBBox, OcrTextBlock } from '../core/contracts';
+import type { ReflowBlock, ReflowBlockType } from '../core/reflow';
 import { reflowLocal } from '../core/reflow';
 
 /**
  * 重排 provider 接缝（跟 ocr.ts / inference.ts 同构）。
- *  - local ：本地启发式，纯几何、离线、保 bbox。
- *  - hybrid：几何打骨架 + 模型逐块精修（纯文字），保 bbox。
- *  - vision：几何打骨架 + 模型**看页面图**重判角色/阅读顺序，保 bbox（多栏/表格更准）。
- * 三者都只重排/精修同一批 id、不合并拆分，所以每块仍认得原页 bbox。
+ *  - local  ：本地启发式，纯几何、离线、保 bbox。
+ *  - hybrid ：几何打骨架 + 模型逐块精修（纯文字），保 bbox。
+ *  - vision ：几何打骨架 + 模型**看页面图**重判角色/阅读顺序，保 bbox（多栏/表格更准）。
+ *  - rewrite：完全放弃几何，让模型**看图重写**成规范语义块（治网页截图/扭曲页/字号统一）。
+ *           bbox 由模型估计（粗），文字严格按图转写。
  */
 export type ReflowProvider = (blocks: OcrTextBlock[]) => Promise<ReflowBlock[]>;
 
@@ -72,10 +73,48 @@ async function refine(base: ReflowBlock[], image?: string): Promise<ReflowBlock[
 const hybrid: ReflowProvider = async (blocks) => refine(reflowLocal(blocks));
 const vision: ReflowProvider = async (blocks) => refine(reflowLocal(blocks), grabPageImage());
 
-export const reflowProviders: Record<string, ReflowProvider> = { local, hybrid, vision };
+/** 确定性 id：同页 rewrite 出同样的 id → 缩放/重渲后行内注不丢锚。 */
+function rewriteId(text: string, index: number): string {
+  let h = 0;
+  for (let k = 0; k < text.length; k++) h = (h * 31 + text.charCodeAt(k)) | 0;
+  return `vlm_${index}_${(h >>> 0).toString(36)}`;
+}
+
+/** 完全 VLM 重写：看图直出语义块（治网页截图/扭曲页/统一字号）。文字严格转写，bbox 由模型估。 */
+const rewrite: ReflowProvider = async () => {
+  const image = grabPageImage();
+  if (!image) return [];
+  let arr: Array<{ type?: string; level?: number; text?: string; items?: string[]; ordered?: boolean; bbox?: number[] }>;
+  try {
+    const resp = await fetch('/api/reflow-vlm', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image }),
+    });
+    if (!resp.ok) return [];
+    arr = await resp.json();
+    if (!Array.isArray(arr)) return [];
+  } catch { return []; }
+  return arr.map((b, i): ReflowBlock => {
+    const type = (b.type === 'heading' || b.type === 'list' ? b.type : 'para') as ReflowBlockType;
+    const text = type === 'list' ? (b.items ?? []).join('\n') : String(b.text ?? '');
+    const bbox: NormBBox = (b.bbox && b.bbox.length === 4)
+      ? [b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]] as NormBBox
+      : [0, 0, 1, 0.05];
+    return {
+      id: rewriteId(text, i),
+      type,
+      level: type === 'heading' ? (b.level || 1) : 0,
+      text,
+      source: bbox,
+      ...(type === 'list' ? { items: b.items ?? [], ordered: !!b.ordered } : {}),
+    };
+  }).filter((b) => b.text.trim().length > 0 || (b.items?.length ?? 0) > 0);
+};
+
+export const reflowProviders: Record<string, ReflowProvider> = { local, hybrid, vision, rewrite };
 
 export const REFLOW_PROVIDER_LABELS: Record<string, string> = {
   local: '仅启发式（即时·保 bbox）',
   hybrid: '启发式 + 模型精修（文字）',
   vision: '启发式 + 视觉重排（Kimi 看图·保 bbox）',
+  rewrite: 'VLM 看图重写（治网页截图/扭曲页·bbox 估算）',
 };
