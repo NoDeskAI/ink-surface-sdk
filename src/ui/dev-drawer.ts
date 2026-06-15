@@ -133,7 +133,7 @@ function initSettings(): void {
   ppReflow.addEventListener('change', () => { settings.preprocess.reflowPages = clampPp(ppReflow, settings.preprocess.reflowPages); ppReflow.value = String(settings.preprocess.reflowPages); });
   ppDigest.addEventListener('change', () => { settings.preprocess.digestPages = clampPp(ppDigest, settings.preprocess.digestPages); ppDigest.value = String(settings.preprocess.digestPages); });
   gesture.addEventListener('change', () => { settings.gesture.enabled = gesture.checked; changed(); });
-  gestureRouting.addEventListener('change', () => { settings.gesture.routing = (gestureRouting.value === 'vlm' ? 'vlm' : 'geometric'); changed(); });
+  gestureRouting.addEventListener('change', () => { settings.gesture.routing = gestureRouting.value as 'auto' | 'geometric' | 'vlm'; changed(); });
   ctxLines.addEventListener('change', () => {
     const n = Math.min(10, Math.max(0, Number(ctxLines.value) || settings.gesture.contextLines));
     settings.gesture.contextLines = n;
@@ -178,7 +178,7 @@ export function initDevDrawer(els: {
       trace_id?: string; event_id?: string; nearby_text?: string | null; content?: string;
       result_type?: string; source_refs?: Array<{ page_id?: string; ocr_block_ids?: string[] }>; recalled?: number[];
       strokes?: Array<{ type: string; score: number; raw?: { circle: number; underline: number; arrow: number } }>;
-      threshold?: number; deliberate?: boolean; resolved?: string;
+      threshold?: number; deliberate?: boolean; resolved?: string; route?: string; features?: string;
     };
     let txt = `${String(kind).padEnd(22)}${o.trace_id ?? o.event_id ?? ''}`;
     // 手势诊断：每会话原始分类 + 是否过门槛 + 解析出的手势
@@ -188,7 +188,10 @@ export function initDevDrawer(els: {
         const detail = r ? ` (circle=${r.circle.toFixed(2)} underline=${r.underline.toFixed(2)} arrow=${r.arrow.toFixed(2)})` : '';
         return `   笔${i + 1}: ${s.type} · 分${s.score}${detail}`;
       }).join('\n');
-      txt += `\n${lines}\n   门槛=${o.threshold} · 过=${o.deliberate ? '是' : '否'} → ${o.resolved ?? ''}`;
+      const tail = o.route
+        ? `档=${o.route}${o.features ? ' · ' + o.features : ''}`
+        : (o.threshold !== undefined ? `门槛=${o.threshold} · 过=${o.deliberate ? '是' : '否'}` : '');
+      txt += `\n${lines}\n   ${tail}${tail ? ' → ' : ''}${o.resolved ?? ''}`;
     }
     // 请求：AI 看到/引用了哪些内容（圈住的原文）
     if (o.nearby_text) txt += `\n   ⟵引用上下文: ${String(o.nearby_text).replace(/\n/g, ' ').slice(0, 90)}`;

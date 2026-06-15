@@ -33,14 +33,24 @@ export function classifyScored(
   const wPx = bb[2] * dimW;
   const hPx = bb[3] * dimH;
   const diagPx = Math.hypot(wPx, hPx);
-  if (points.length <= 3 || diagPx < 8) return { type: 'tap_region', score: diagPx < 8 ? 0.7 : 0.5 };
 
+  // 总行程（笔走过的总路程）+ 时长 —— 判"点按/误触 vs 刻意手势"的主信号。
   const first = points[0];
   const last = points[points.length - 1];
-  const closure = Math.hypot((last.x - first.x) * dimW, (last.y - first.y) * dimH);
   let len = 0;
   for (let i = 1; i < points.length; i++) {
     len += Math.hypot((points[i].x - points[i - 1].x) * dimW, (points[i].y - points[i - 1].y) * dimH);
+  }
+  const closure = first && last ? Math.hypot((last.x - first.x) * dimW, (last.y - first.y) * dimH) : 0;
+  const dur = last ? last.t : 0;
+
+  // 落点/误触判定（缩放无关：阈值取页面对角线比例）。手抖会把 bbox 撑过几像素，
+  // 但走过的总路程骗不了人——点按再抖也走不远；又短又快的轻触一并归为 tap。
+  // tap_region 会被 isDeliberate 滤掉，不进推理路径（v1 词表无"点选触发"）。
+  const pageDiag = Math.hypot(dimW, dimH) || 1;
+  const travelFloor = pageDiag * 0.018; // ≈ 半个词的尺度，真机再调
+  if (points.length <= 3 || len < travelFloor || (dur < 90 && len < travelFloor * 2)) {
+    return { type: 'tap_region', score: 0.7 };
   }
   // 圈：起止接近（闭合）+ 路径绕得够长
   const circleScore = clamp01((0.5 - closure / diagPx) / 0.5) * clamp01((len / diagPx - 1.0) / 1.3);
@@ -67,10 +77,12 @@ export function classifyScored(
     arrowScore = sharp * nearEnd * shaft;
   }
 
+  // 最小尺寸闸：比这还小的"圈/划"连一个词都框不住，多半是原地小抖 → 降为自由笔（低分）。
+  const tooSmall = diagPx < pageDiag * 0.02;
   const raw = { circle: circleScore, underline: underlineScore, arrow: arrowScore };
-  if (circleScore >= Math.max(underlineScore, arrowScore) && circleScore > 0.22) return { type: 'circle', score: circleScore, raw };
-  if (arrowScore > 0.45 && arrowScore >= underlineScore) return { type: 'arrow', score: arrowScore, raw };
-  if (underlineScore > 0.22) return { type: 'underline', score: underlineScore, raw };
+  if (!tooSmall && circleScore >= Math.max(underlineScore, arrowScore) && circleScore > 0.22) return { type: 'circle', score: circleScore, raw };
+  if (!tooSmall && arrowScore > 0.45 && arrowScore >= underlineScore) return { type: 'arrow', score: arrowScore, raw };
+  if (!tooSmall && underlineScore > 0.22) return { type: 'underline', score: underlineScore, raw };
   return { type: 'stroke', score: 0.15 + Math.max(circleScore, underlineScore, arrowScore) * 0.3, raw }; // 自由笔：低分
 }
 

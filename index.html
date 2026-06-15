@@ -89,8 +89,9 @@
       <div class="set-row">
         <span>手势判定</span>
         <select id="set-gesture-routing">
-          <option value="geometric">几何阈值（本地·0 token）</option>
-          <option value="vlm">VLM 视觉判定（任意符号 / 抽象绘画 · 烧 token）</option>
+          <option value="auto">自动三档（记号→几何·手写→读字·拿不准→VLM 裁决）</option>
+          <option value="geometric">只几何阈值（本地·0 token）</option>
+          <option value="vlm">全程 VLM 视觉判定（任意符号 / 抽象绘画 · 烧 token）</option>
         </select>
       </div>
       <label class="set-check">

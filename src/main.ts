@@ -1,6 +1,6 @@
 import './styles.css';
 import { recordEvent, commitDiscussion, summarizePage } from './core/pipeline';
-import { resolveGesture, isDeliberate, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './core/gesture';
+import { resolveGesture, isDeliberate, routeAssembly, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './core/gesture';
 import { classifyScored } from './core/classify';
 import { grabRegion } from './providers/ocr';
 import { trace } from './core/trace';
@@ -112,6 +112,39 @@ async function resolveAssemblyWindow(): Promise<void> {
   sessionTrace = null;
   if (!batch.length) return;
   const bbox = unionBBox(batch);
+
+  // 三档 auto 门：滤掉点按/误触 → 记号(几何) / 手写(读字) / 拿不准(VLM 裁决，可回 nothing 不打扰)
+  if (settings.gesture.routing === 'auto') {
+    const scoredFull = batch.map((e) => ({ e, s: classifyScored(e.stroke_points, e.geometry.bbox) }));
+    const real = scoredFull.filter((x) => x.s.type !== 'tap_region').map((x) => x.e);
+    const scored = scoredFull.map((x) => ({ type: x.s.type, score: Number(x.s.score.toFixed(2)), raw: x.s.raw }));
+    const pid = batch[0].page_id;
+    if (!real.length) {
+      trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, resolved: '— 全是点按/误触，不触发' });
+      return;
+    }
+    const d = routeAssembly(real);
+    const rbbox = unionBBox(real);
+    const feat = `n=${d.n} medSize=${d.medSize < 0 ? '—' : d.medSize.toFixed(2)} primMax=${d.primMax.toFixed(2)}`;
+    if (d.route === 'vlm') {
+      const r = await resolveByVlm(real);
+      trace('GestureSession', {
+        page_id: pid, routing: 'auto', strokes: scored, route: 'vlm', features: feat,
+        resolved: r ? `VLM → ${r.gesture.label} (${r.gesture.eventType} · ${r.gesture.intent})${r.reading ? ' · 读到「' + r.reading.slice(0, 24) + '」' : ''}` : `${d.reason}；VLM 判 nothing，不触发`,
+      });
+      if (r) recBucket(pid).push({ events: real, gesture: r.gesture, bbox: rbbox, reading: r.reading });
+      return;
+    }
+    if (d.route === 'write') {
+      trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, route: 'write', features: feat, resolved: d.reason });
+      recBucket(pid).push({ events: real, gesture: GESTURES.note, bbox: rbbox });
+      return;
+    }
+    const gesture = resolveGesture(real); // mark：交几何解析挑圈/划/箭头
+    trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, route: 'mark', features: feat, resolved: `${gesture.label} (→ ${gesture.eventType} · ${gesture.intent})` });
+    recBucket(pid).push({ events: real, gesture, bbox: rbbox });
+    return;
+  }
 
   if (settings.gesture.routing === 'vlm') {
     const r = await resolveByVlm(batch);
