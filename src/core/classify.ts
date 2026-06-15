@@ -12,6 +12,10 @@ export function bboxOf(points: StrokePoint[]): NormBBox {
 
 const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
 
+/** CSS px ≈ 1/96 inch → 每物理毫米的 CSS px。用屏幕物理尺度判"点按 vs 刻意手势"，缩放无关
+ *  （借鉴 xournalpp：tap 用 mm 而非页面比例；len/diagPx 已是 CSS px，故可直接换算）。 */
+const PX_PER_MM = 96 / 25.4; // ≈ 3.78
+
 export interface ScoredGesture {
   type: EventType;
   score: number; // 0–1：这笔画得有多像该模板（用于"画得像范例才算数"的门槛）
@@ -44,12 +48,11 @@ export function classifyScored(
   const closure = first && last ? Math.hypot((last.x - first.x) * dimW, (last.y - first.y) * dimH) : 0;
   const dur = last ? last.t : 0;
 
-  // 落点/误触判定（缩放无关：阈值取页面对角线比例）。手抖会把 bbox 撑过几像素，
-  // 但走过的总路程骗不了人——点按再抖也走不远；又短又快的轻触一并归为 tap。
+  // 落点/误触判定（物理屏幕尺度，缩放无关）。手抖会把 bbox 撑过几像素，但走过的总路程骗不了人——
+  // 刻意手势在屏幕上至少走 ~3.5mm；点按/抖动远小于。又短(<140ms)又走不远的轻触一并归为 tap。
   // tap_region 会被 isDeliberate 滤掉，不进推理路径（v1 词表无"点选触发"）。
-  const pageDiag = Math.hypot(dimW, dimH) || 1;
-  const travelFloor = pageDiag * 0.018; // ≈ 半个词的尺度，真机再调
-  if (points.length <= 3 || len < travelFloor || (dur < 90 && len < travelFloor * 2)) {
+  const travelFloor = 3.5 * PX_PER_MM; // ≈ 13 CSS px
+  if (points.length <= 3 || len < travelFloor || (dur < 140 && len < 6 * PX_PER_MM)) {
     return { type: 'tap_region', score: 0.7 };
   }
   // 圈：起止接近（闭合）+ 路径绕得够长
@@ -77,8 +80,8 @@ export function classifyScored(
     arrowScore = sharp * nearEnd * shaft;
   }
 
-  // 最小尺寸闸：比这还小的"圈/划"连一个词都框不住，多半是原地小抖 → 降为自由笔（低分）。
-  const tooSmall = diagPx < pageDiag * 0.02;
+  // 最小尺寸闸：屏幕上小于 ~3mm 的"圈/划"框不住任何词，多半是原地小抖 → 降为自由笔（低分）。
+  const tooSmall = diagPx < 3 * PX_PER_MM;
   const raw = { circle: circleScore, underline: underlineScore, arrow: arrowScore };
   if (!tooSmall && circleScore >= Math.max(underlineScore, arrowScore) && circleScore > 0.22) return { type: 'circle', score: circleScore, raw };
   if (!tooSmall && arrowScore > 0.45 && arrowScore >= underlineScore) return { type: 'arrow', score: arrowScore, raw };

@@ -13,6 +13,10 @@ let cv: HTMLCanvasElement;
 let ctx: CanvasRenderingContext2D;
 let live: { tool: Tool; points: StrokePoint[]; t0: number; pointerType: string } | null = null;
 let nav: { x0: number; y0: number } | null = null;
+/** 死区半径（CSS px）：逐 pointermove 丢掉与上一采样点相距 < 此值的 sub-px 抖动。
+ *  借鉴 xournalpp Deadzone(1.3px)——在抖动发生时即抑制，让点按/手抖稳定落到 tap_region，
+ *  而非事后靠总行程补救。真实笔画相邻点远大于此值，不受影响。 */
+const DEADZONE_PX = 1.3;
 let onStrokeComplete: ((stroke: Stroke, pointerType: string, penUpAt: number) => void) | null = null;
 
 const SWIPE_MIN_PX = 60; // 横滑超过此距离且以横向为主 → 翻页
@@ -139,12 +143,15 @@ export function initInk(
     if (!raw.length) raw = [e];
     for (const ce of raw) {
       const p = evtNorm(ce);
+      const last = live.points[live.points.length - 1];
+      // 死区：与上一点相距 < DEADZONE_PX(CSS px) 的 sub-px 抖动直接丢，稳 tap 判定（页面未渲染时 pageCss=0，跳过死区）
+      if (pageCss.w && pageCss.h && Math.hypot((p.x - last.x) * pageCss.w, (p.y - last.y) * pageCss.h) < DEADZONE_PX) continue;
       const pt: StrokePoint = {
         x: p.x, y: p.y,
         t: Math.round(performance.now() - live.t0),
         pressure: ce.pressure || 0,
       };
-      drawSeg(live.points[live.points.length - 1], pt, live.tool);
+      drawSeg(last, pt, live.tool);
       live.points.push(pt);
     }
   });

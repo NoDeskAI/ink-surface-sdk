@@ -1,6 +1,6 @@
 import './styles.css';
 import { recordEvent, commitDiscussion, summarizePage } from './core/pipeline';
-import { resolveGesture, isDeliberate, routeAssembly, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './core/gesture';
+import { resolveGesture, isDeliberate, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './core/gesture';
 import { classifyScored } from './core/classify';
 import { grabRegion } from './providers/ocr';
 import { trace } from './core/trace';
@@ -113,7 +113,9 @@ async function resolveAssemblyWindow(): Promise<void> {
   if (!batch.length) return;
   const bbox = unionBBox(batch);
 
-  // 三档 auto 门：滤掉点按/误触 → 记号(几何) / 手写(读字) / 拿不准(VLM 裁决，可回 nothing 不打扰)
+  // auto 门（P1/P2 收敛为单闸）：滤掉点按/误触；任何还剩真实笔画的簇 = 刻意 → 交 LLM。
+  // 语义（形状/圈住什么/手写/意图）全由 commitDiscussion 的合成图判，几何只给 tone gesture。
+  // 不再走 resolveByVlm 那条"判 nothing 就丢"——它会把手写整条吞掉（见 ses_d4b627a7：「她是谁」被丢）。
   if (settings.gesture.routing === 'auto') {
     const scoredFull = batch.map((e) => ({ e, s: classifyScored(e.stroke_points, e.geometry.bbox) }));
     const real = scoredFull.filter((x) => x.s.type !== 'tap_region').map((x) => x.e);
@@ -123,26 +125,9 @@ async function resolveAssemblyWindow(): Promise<void> {
       trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, resolved: '— 全是点按/误触，不触发' });
       return;
     }
-    const d = routeAssembly(real);
-    const rbbox = unionBBox(real);
-    const feat = `n=${d.n} medSize=${d.medSize < 0 ? '—' : d.medSize.toFixed(2)} primMax=${d.primMax.toFixed(2)}`;
-    if (d.route === 'vlm') {
-      const r = await resolveByVlm(real);
-      trace('GestureSession', {
-        page_id: pid, routing: 'auto', strokes: scored, route: 'vlm', features: feat,
-        resolved: r ? `VLM → ${r.gesture.label} (${r.gesture.eventType} · ${r.gesture.intent})${r.reading ? ' · 读到「' + r.reading.slice(0, 24) + '」' : ''}` : `${d.reason}；VLM 判 nothing，不触发`,
-      });
-      if (r) recBucket(pid).push({ events: real, gesture: r.gesture, bbox: rbbox, reading: r.reading });
-      return;
-    }
-    if (d.route === 'write') {
-      trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, route: 'write', features: feat, resolved: d.reason });
-      recBucket(pid).push({ events: real, gesture: GESTURES.note, bbox: rbbox });
-      return;
-    }
-    const gesture = resolveGesture(real); // mark：交几何解析挑圈/划/箭头
-    trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, route: 'mark', features: feat, resolved: `${gesture.label} (→ ${gesture.eventType} · ${gesture.intent})` });
-    recBucket(pid).push({ events: real, gesture, bbox: rbbox });
+    const gesture = resolveGesture(real); // 几何只定 tone（圈/划/箭头/写字）；真正语义 LLM 看合成图再判
+    trace('GestureSession', { page_id: pid, routing: 'auto', strokes: scored, route: 'llm', resolved: `${gesture.label} (→ ${gesture.eventType} · ${gesture.intent}) · 交 LLM` });
+    recBucket(pid).push({ events: real, gesture, bbox: unionBBox(real) });
     return;
   }
 
