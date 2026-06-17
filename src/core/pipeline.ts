@@ -17,7 +17,8 @@ import { openBook, bookMessages } from '../chat/buffer';
 /** 旁注人格（网页对话式·替代退役 session 的伴读 persona）。buffer 给跨标注连贯，需要时呼应本书前文。 */
 const CHAT_SYSTEM =
   '你是 InkLoop —— 嵌在阅读器里的旁注式 AI 同读者。读者在原文上用符号（圈/划/批注/点选）标注，' +
-  '你依据标注与上下文，轻声给一条简短中文旁注。不寒暄、不复述原文、不用 markdown 或列表、不超过 2 句，像页边批注点到为止。' +
+  '你**只就被标注的那一处**轻声给一条简短中文旁注：**紧扣所标的具体文字**，绝不脱开它去谈整页大主题或泛泛而论；' +
+  '不寒暄、不复述原文、不用 markdown 或列表、不超过 2 句，像页边批注点到为止。' +
   '上文里有读者在这本书前面留下的标注与你的回应——需要时自然呼应，但别强行联系。';
 const GVERB: Record<string, string> = {
   circle: '圈选', underline: '划线', highlight: '高亮', arrow: '画箭头标', margin_note: '手写批注', tap_region: '点选', stroke: '标记',
@@ -302,8 +303,10 @@ export async function commitDiscussion(
     const ask = finalIntent === 'question' ? '读者像在发问：针对所标处直接作答，不要反问。'
       : finalIntent === 'command' ? '读者写的是一条指令（如总结/翻译/改写）：直接作用在所标处、给结果而非评论。'
       : finalModes.includes('summary') ? '读者在这一处留了多个标注：综合它们给一条整体性的洞察或提示。'
-      : '就所标处给一条点到为止的旁注。';
-    const userContent = `这一页的全文（供你理解语境）：\n${pgText.slice(0, 1600)}\n\n读者在原文上${verb}了「${marked}」。${ask}`;
+      : '解释所标处是什么、关键在哪，或顺着它点一句——但始终扣住所标这几个字。';
+    // 先把"所标处"摆在最前、最重；整页文字仅作消歧上下文放在后面、压短，免得模型跑题到整页主题。
+    const ctx = pgText ? `\n\n（仅供消歧的本页上下文，别据此跑题到整页主题）：${pgText.slice(0, 700)}` : '';
+    const userContent = `读者在原文上${verb}了这一处：「${marked}」。${ask}${ctx}`;
     const anchorRefs = hmp?.target_object_refs ?? [];
     trace('InferenceRequest(disc)', { mode: 'chat-buffer', page_id: evt.page_id, gesture: evt.event_type, intent: finalIntent, marked: marked.slice(0, 60), buffer_turns: bookMessages(bookId).length } as unknown as Record<string, unknown>);
     const full = await chatTurn(bookId, userContent, {
