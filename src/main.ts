@@ -16,6 +16,7 @@ import { initInk, persistInk } from './capture/ink';
 import { initWhisper } from './surface/whisper';
 import { initReader } from './surface/reader';
 import { initAnchorLayer } from './surface/anchor-layer';
+import { openBook } from './chat/buffer';
 import { initInsightPanel } from './surface/insight-panel';
 import { initToolbar } from './surface/toolbar';
 import { initDevDrawer, toggleDrawer } from './dev/dev-drawer';
@@ -282,7 +283,7 @@ bus.on('document:loaded', () => {
   document.body.classList.add('doc-loaded');
   $('empty-state').style.display = 'none';
   $('doc-name').textContent = state.fileName;
-  // （会话引擎/开书预热已退役 P2；chat/ 面板将在开书时非阻塞预热每本书 buffer。）
+  if (state.documentId) openBook(state.documentId); // 开书非阻塞预热每本书对话 buffer（≈0ms，纯建数组）
   // 从持久化恢复：两段记忆、原始笔迹、AI 卡片（重排/图解缓存由 reader 按需读 store）
   const doc = storedDoc();
   if (!doc || !state.documentId) return;

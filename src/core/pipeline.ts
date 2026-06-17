@@ -8,10 +8,20 @@ import { trace } from './trace';
 import { bus, settings, state, type Stroke } from '../app/state';
 import { grabLayers, grabRegion } from '../evidence/ocr';
 import { pageText } from '../evidence/focus';
-import { inferProviders } from '../local/model-client';
-import { getMemory, memorySnapshot, pageMarks, recordMark, setSummary } from '../local/memory';
+import { getMemory, pageMarks, recordMark, setSummary } from '../local/memory';
 import { putMemory } from '../local/store';
 import { pushInspect } from './inspect';
+import { chatTurn } from '../chat/stream-client';
+import { openBook, bookMessages } from '../chat/buffer';
+
+/** 旁注人格（网页对话式·替代退役 session 的伴读 persona）。buffer 给跨标注连贯，需要时呼应本书前文。 */
+const CHAT_SYSTEM =
+  '你是 InkLoop —— 嵌在阅读器里的旁注式 AI 同读者。读者在原文上用符号（圈/划/批注/点选）标注，' +
+  '你依据标注与上下文，轻声给一条简短中文旁注。不寒暄、不复述原文、不用 markdown 或列表、不超过 2 句，像页边批注点到为止。' +
+  '上文里有读者在这本书前面留下的标注与你的回应——需要时自然呼应，但别强行联系。';
+const GVERB: Record<string, string> = {
+  circle: '圈选', underline: '划线', highlight: '高亮', arrow: '画箭头标', margin_note: '手写批注', tap_region: '点选', stroke: '标记',
+};
 
 /** 单笔封装为契约 shape。会话内多笔共享一个 trace_id（决策：停笔会话）。 */
 export function makeEvent(stroke: Stroke, traceId: string): AnnotationEvent | null {
@@ -282,21 +292,37 @@ export async function commitDiscussion(
   let result: InferenceResult;
   let memoryPages = 0;
   let hasImage = false;
+  const bookId = state.documentId ?? 'book';
   try {
-    // 单线无状态推理:每标注一次 /api/infer。page_text/focus/image 为 proxy 级 wire 附加(不动冻结契约 D4)。
-    // （会话引擎/Agent SDK 已退役 P2；跨标注连贯将由 chat/ 面板的每本书 buffer 承接。）
-    const req = buildRequest(evt, { text_blocks: [], nearby_text: focusStr || null }, finalModes) as InferenceRequest & { memory?: unknown; image?: string; images?: Array<{ role: string; data: string }>; page_text?: string; focus?: string; model?: string; intent?: string };
-    req.page_text = pgText;
-    req.focus = focusStr;
-    req.intent = finalIntent;
-    req.model = settings.inferModel;
-    req.memory = memorySnapshot(evt.page_id);
-    memoryPages = Array.isArray(req.memory) ? req.memory.length : 0;
-    trace('InferenceRequest(disc)', req as unknown as Record<string, unknown>); // 此时尚未挂 image，trace 不被 base64 撑大
-    if (images.length) { req.images = images; req.image = composite; hasImage = true; }
-    result = await inferProviders[state.inferProvider](req);
+    // v3 合龙①②：理解走每本书有状态 chat buffer（流式），回应实时落 anchor-layer（页内按 HMP 锚点）。
+    // 收尾清掉流式预览，交给持久 overlay（whisper 页 / reader 重排 / insight 卡片 / 记忆）。
+    openBook(bookId);
+    const marked = (hmp?.text_hint || focusStr || '').trim() || '（未提取到文字）';
+    const verb = GVERB[evt.event_type] ?? '标注';
+    const ask = finalIntent === 'question' ? '读者像在发问：针对所标处直接作答，不要反问。'
+      : finalIntent === 'command' ? '读者写的是一条指令（如总结/翻译/改写）：直接作用在所标处、给结果而非评论。'
+      : finalModes.includes('summary') ? '读者在这一处留了多个标注：综合它们给一条整体性的洞察或提示。'
+      : '就所标处给一条点到为止的旁注。';
+    const userContent = `这一页的全文（供你理解语境）：\n${pgText.slice(0, 1600)}\n\n读者在原文上${verb}了「${marked}」。${ask}`;
+    const anchorRefs = hmp?.target_object_refs ?? [];
+    trace('InferenceRequest(disc)', { mode: 'chat-buffer', page_id: evt.page_id, gesture: evt.event_type, intent: finalIntent, marked: marked.slice(0, 60), buffer_turns: bookMessages(bookId).length } as unknown as Record<string, unknown>);
+    const full = await chatTurn(bookId, userContent, {
+      system: CHAT_SYSTEM, model: settings.inferModel,
+      onDelta: (t) => bus.emit('anchor:place', { id: discId, pageId: evt.page_id, anchorRefs, bbox: evt.geometry.bbox, text: t, kind: 'note' }),
+    });
+    bus.emit('anchor:clear', discId); // 流式预览结束 → 持久 overlay 接手
+    memoryPages = bookMessages(bookId).length;
+    result = {
+      result_id: shortId('res'), trace_id: evt.trace_id, request_id: 'chat',
+      result_type: finalModes[0] as InferenceResult['result_type'],
+      content: full || '此刻没能想清楚，稍后再为你低语。',
+      source_refs: [{ page_id: evt.page_id, bbox: evt.geometry.bbox, ocr_block_ids: [], event_id: evt.event_id }],
+      confidence: 0.8, created_at: new Date().toISOString(), model_name: settings.inferModel, model_version: 'chat-buffer',
+    };
+    (result as unknown as { _debug?: unknown })._debug = { mode: 'chat-buffer', focus: focusStr, page_text_len: pgText.length, has_image: false, buffer_turns: memoryPages };
     trace('InferenceResult(disc)', result as unknown as Record<string, unknown>);
   } catch (err) {
+    bus.emit('anchor:clear', discId);
     result = errorResult(evt, err);
     trace('InferenceResult(error)', result as unknown as Record<string, unknown>);
   }
