@@ -15,6 +15,7 @@ import { renderChatSurface } from './surface/chat-surface';
 import { initInk, persistInk } from './capture/ink';
 import { initWhisper } from './surface/whisper';
 import { initReader } from './surface/reader';
+import { initAnchorLayer } from './surface/anchor-layer';
 import { initInsightPanel } from './surface/insight-panel';
 import { initToolbar } from './surface/toolbar';
 import { initDevDrawer, toggleDrawer } from './dev/dev-drawer';
@@ -221,6 +222,7 @@ bus.on('overlay:remove', (id) => {
 });
 
 initWhisper($('whisper-layer'));
+initAnchorLayer($('stage'));
 initReader($('reader'));
 initToolbar($('toolbar'));
 initInsightPanel({

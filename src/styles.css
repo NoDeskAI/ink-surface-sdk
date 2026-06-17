@@ -607,3 +607,14 @@ body.dev-on > main { display: none; }   /* 开发页激活时隐藏阅读视图�
 .ins-shots { display: flex; flex-wrap: wrap; gap: 6px; }
 .ins-shots .ins-shotwrap { position: relative; display: inline-block; }
 .ins-shotcap { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; font-size: 10px; line-height: 1.5; background: rgba(0,0,0,.6); color: #fff; border-radius: 3px; pointer-events: none; }
+
+/* 锚点落位层（v3 anchor-layer）：AI 输出按 HMP 锚点贴回原页，点击溯源回原文 */
+#anchor-layer .anchor-note {
+  font: 13px/1.5 -apple-system, "Noto Sans CJK SC", sans-serif;
+  color: #1d1b18; background: #fffdf9; border: 1px solid #d6e7e8;
+  border-left: 3px solid #2f6b73; border-radius: 7px; padding: 8px 11px;
+  box-shadow: 0 2px 10px rgba(20,30,30,.08); cursor: pointer; max-width: 230px;
+}
+#anchor-layer .anchor-note[data-kind="margin"] { border-left-color: #b86b3c; }
+#anchor-layer .anchor-note[data-kind="link"] { border-left-color: #607780; font-style: italic; }
+#anchor-layer .anchor-note:hover { box-shadow: 0 3px 14px rgba(20,30,30,.16); }
