@@ -31,11 +31,14 @@ function route(model: string): { channel: string; channel_url: string } {
 }
 
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
-async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[] }): Promise<any> {
-  const { url, key, model } = cfg();
+async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string }): Promise<any> {
+  const { url, key } = cfg();
+  const model = opts.model || cfg().model; // 模型可由调用方覆盖(dev 面板选的)，route() 按前缀分渠道
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
   const { channel, channel_url } = route(model);
-  const body: any = { model, max_tokens: opts.maxTokens, system: opts.system, messages: opts.messages, channel, channel_url };
+  // gemini 适配：Gemini 2.5/3 flash 默认开思考、思考 token 计入 max_tokens，低预算→空响应。给足余量。
+  const max_tokens = model.startsWith('gemini') ? Math.max(opts.maxTokens, 2048) : opts.maxTokens;
+  const body: any = { model, max_tokens, system: opts.system, messages: opts.messages, channel, channel_url };
   if (opts.tools) body.tools = opts.tools;
   const resp = await fetch(url, {
     method: 'POST',
@@ -50,11 +53,38 @@ async function callGateway(opts: { system: string; messages: any[]; maxTokens: n
 const textOf = (data: any): string =>
   (data?.content || []).filter((b: any) => b?.type === 'text').map((b: any) => b.text).join('').trim();
 
-async function gateway(system: string, user: string, maxTokens: number, imageB64?: string): Promise<string> {
-  const content = imageB64
-    ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageB64 } }, { type: 'text', text: user }]
-    : user;
-  return textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens }));
+type ImgIn = { role?: string; data: string };
+
+// 多图角色标签：每张图前插一段文字说明它是什么，按名（笔迹图/合成图）引用，不依赖张数/编号。
+const ROLE_LABEL: Record<string, string> = {
+  ink: '【笔迹图·用户手写已从原文单独抽出、铺白底，识别手写就看这张】',
+  composite: '【合成图·墨迹叠在原文上，判断画在哪、圈/划住了什么就看这张】',
+  // page(原文层)已弃用——原文以整页文字 page_text 为准，不再单独发图
+};
+
+/** 把图列表（带可选角色）转成 content 块：每张前插一段角色标签文字，再插图。 */
+function imageBlocks(images: ImgIn[]): any[] {
+  const out: any[] = [];
+  for (const im of images) {
+    const raw = String(im?.data || '');
+    const data = raw.replace(/^data:image\/[a-z]+;base64,/, '');
+    if (!data) continue;
+    const mt = /^data:(image\/[a-z]+);base64,/.exec(raw);
+    const media_type = mt ? mt[1] : 'image/png'; // 透传 jpeg/png（grabLayers 原文/合成发 jpeg 省体积）
+    const label = im.role ? ROLE_LABEL[im.role] : '';
+    if (label) out.push({ type: 'text', text: label });
+    out.push({ type: 'image', source: { type: 'base64', media_type, data } });
+  }
+  return out;
+}
+
+/** 单发：images 可为多图(带角色)数组，或单张已 strip 的 b64 字符串(旧调用方)。图在前、文字在后。 */
+async function gateway(system: string, user: string, maxTokens: number, image?: string | ImgIn[], model?: string): Promise<string> {
+  const blocks = Array.isArray(image)
+    ? imageBlocks(image)
+    : (image ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } }] : []);
+  const content = blocks.length ? [...blocks, { type: 'text', text: user }] : user;
+  return textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model }));
 }
 
 type MemSnap = Array<{ index: number; content?: string | null; summary: string | null; marks: Array<{ text: string; note: string }> }>;
@@ -63,7 +93,7 @@ type MemSnap = Array<{ index: number; content?: string | null; summary: string |
  * Tier2 按需 recall：给模型 recall_page 工具 + 前页索引，让它自己决定回看哪页综合作答。
  * 返回 { text, recalled }（recalled 供开发面板监控"AI 回看了哪些页"）。
  */
-async function agentLoop(system: string, task: string, jsonRule: string, memory: MemSnap, imageB64?: string): Promise<{ text: string; recalled: number[] }> {
+async function agentLoop(system: string, task: string, jsonRule: string, memory: MemSnap, images?: ImgIn[], model?: string): Promise<{ text: string; recalled: number[] }> {
   const tools = [{
     name: 'recall_page',
     description: '回看某一页的标注与摘要，用于跨页综合',
@@ -72,15 +102,14 @@ async function agentLoop(system: string, task: string, jsonRule: string, memory:
   // 优先用内容解读（记忆A，预处理产出），其次行为摘要（记忆B）
   const idx = memory.map((m) => `第${m.index + 1}页${m.content ? '：' + m.content : m.summary ? '：' + m.summary : `（${m.marks.length}处标注）`}`).join('；');
   const firstText = `${task}\n\n可回看的前页：${idx}。若与当前内容相关，用 recall_page(页码) 取该页详情来综合；不需要就直接给最终答案。\n\n${jsonRule}`;
+  const firstBlocks = images && images.length ? imageBlocks(images) : [];
   const messages: any[] = [{
     role: 'user',
-    content: imageB64
-      ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageB64 } }, { type: 'text', text: firstText }]
-      : firstText,
+    content: firstBlocks.length ? [...firstBlocks, { type: 'text', text: firstText }] : firstText,
   }];
   const recalled: number[] = [];
   for (let turn = 0; turn < 3; turn++) {
-    const data = await callGateway({ system, messages, maxTokens: 1024, tools });
+    const data = await callGateway({ system, messages, maxTokens: 1024, tools, model });
     const blocks = data.content || [];
     const toolUses = blocks.filter((b: any) => b.type === 'tool_use');
     if (!toolUses.length) return { text: textOf(data), recalled };
@@ -98,7 +127,7 @@ async function agentLoop(system: string, task: string, jsonRule: string, memory:
       }),
     });
   }
-  const data = await callGateway({ system, messages: [...messages, { role: 'user', content: `直接给最终 JSON，不要再调用工具。${jsonRule}` }], maxTokens: 600 });
+  const data = await callGateway({ system, messages: [...messages, { role: 'user', content: `直接给最终 JSON，不要再调用工具。${jsonRule}` }], maxTokens: 600, model });
   return { text: textOf(data), recalled };
 }
 
@@ -107,11 +136,32 @@ const SYM: Record<string, string> = {
   margin_note: '批注', tap_region: '点选', stroke: '标记', eraser: '擦除', unknown: '标记',
 };
 
+// 回应语气：由「为什么画」(intent) 主导，几何形状(event_type)兜底——提问/指令/综合不被当普通解释。
+const TONE_BY_TYPE: Record<string, string> = {
+  circle: '这是圈选：解释被圈的是什么、关键在哪。',
+  underline: '这是划线/重点：提炼要点、点出它为何重要。',
+  highlight: '这是高亮/重点：提炼这处的要点、点出它为何重要。',
+  arrow: '这是箭头/关联：点出它指向什么、和什么相关。',
+  margin_note: '这是手写批注：先读出 ta 写了什么，再就 ta 写的内容与所标段落给呼应。',
+};
+function toneFor(eventType: string, intent: string, modes: string[]): string {
+  if (intent === 'question') return '用户像在发问：针对所标处直接作答，不要反问。';
+  if (intent === 'command') return '用户写的是一条指令（如总结/翻译/改写）：直接执行 ta 的要求、作用在所标段落上，给结果而非评论。';
+  if (intent === 'summary' || (Array.isArray(modes) && modes.includes('summary'))) return '用户在这一处留了多个标注：综合它们给一条整体性的洞察或提示，帮 ta 想深一层。';
+  return TONE_BY_TYPE[eventType] || '就用户标注处给一条旁注。';
+}
+
 function extractJson(text: string): any {
   if (!text) return {};
   const m = text.match(/\{[\s\S]*\}/);
   if (!m) return { content: text };
-  try { return JSON.parse(m[0]); } catch { return { content: text }; }
+  try { return JSON.parse(m[0]); } catch { /* 内部半角引号破坏 JSON（Claude 常见）→ 正则抽字段兜底 */ }
+  const b = m[0];
+  const rt = b.match(/"result_type"\s*:\s*"([^"]*)"/);
+  const cf = b.match(/"confidence"\s*:\s*([0-9.]+)/);
+  const cm = b.match(/"content"\s*:\s*"([\s\S]*?)"\s*(?:,\s*"confidence"|\}\s*$)/);
+  if (!cm && !rt) return { content: text };
+  return { result_type: rt ? rt[1] : undefined, content: cm ? cm[1] : text, confidence: cf ? Number(cf[1]) : undefined };
 }
 
 const rand = () => Math.random().toString(36).slice(2, 10);
@@ -123,6 +173,7 @@ export async function runInference(req: any): Promise<any> {
   const enclosed = (req.ocr_blocks || []).map((b: any) => b.text).join('') || '';
   const nearby = req.nearby_text || '';
   const et: string = evt.event_type;
+  const intent = String(req.intent || ''); // 「为什么画」——主导回应语气（提问/指令/综合/解释）
   const isDigest = modes.includes('summary');
   const isAsk = modes.length === 1 && modes[0] === 'question';
 
@@ -130,27 +181,33 @@ export async function runInference(req: any): Promise<any> {
     '你是 InkLoop —— 嵌在 PDF 阅读器里的旁注式 AI 同读者。用户在原文上用符号（圈/划线/批注/点选）标注，' +
     '你依据符号含义与它圈住的上下文，轻声给一条简短中文旁注。不寒暄、不复述原文、不用 markdown 或列表、不超过 2 句，像页边批注点到为止。';
 
-  // 推理底图：合成图(墨迹叠原文) / 局部截图随请求带来时，让模型看着现场作答
-  const img = req.image ? String(req.image).replace(/^data:image\/[a-z]+;base64,/, '') : undefined;
+  // 推理底图：多图(笔迹/原文/合成，同取景)优先；兼容旧的单图 req.image。让模型看着现场作答。
+  const imagesIn: ImgIn[] = Array.isArray(req.images)
+    ? req.images.filter((i: any) => i && i.data)
+    : (req.image ? [{ role: 'composite', data: String(req.image) }] : []);
+  const hasImg = imagesIn.length > 0;
+  const model = req.model || cfg().model; // dev 面板选的模型(kimi/claude/gemini)，route() 按前缀分渠道
   const pageTextIn = String(req.page_text || '').slice(0, 4000); // P1：整页文字作恒定上下文
   const focus = String(req.focus || nearby || '').trim();        // P1：几何焦点提示
 
   let task: string;
-  if (img && pageTextIn) {
+  if (hasImg && pageTextIn) {
     // P1 统一视觉路径：整页文字作上下文 + 合成图(墨迹叠原文) + 焦点提示，一次看图判完。
     // 形状 / 圈中什么 / 手写读出 / 意图 全交模型，不再靠前端 bbox-文本匹配（治"答非所问"）。
-    const toneMap: Record<string, string> = {
-      underline: '这是划线/重点：提炼要点、点出它为何重要。',
-      arrow: '这是箭头/关联：点出它指向什么、和什么相关。',
-      margin_note: '这是手写批注：先读出 ta 写了什么，再就 ta 写的内容与所标段落给呼应。',
-      circle: '这是圈选：解释被圈的是什么、关键在哪。',
-    };
-    const tone = isAsk ? '用户像在发问：针对所标处直接作答，不要反问。' : (toneMap[et] || '就用户标注处给一条旁注。');
+    const tone = toneFor(et, intent, modes);
+    const hasInk = imagesIn.some((i) => i.role === 'ink');
+    // 话术随实际附图自适应：手写发笔迹图+合成图，非手写只发合成图（省 vision token / 延迟）。
+    const imgDesc = hasInk
+      ? `上面附了笔迹图（用户手写已从原文抽出、铺白底）与合成图（墨迹叠在原文上）。原文以上面整页文字为准。`
+      : `上面附了一张合成图（墨迹叠在原文上，看画在哪、圈住了什么）。原文以上面整页文字为准。`;
+    const step1 = hasInk
+      ? `请：① 先看笔迹图把手写文字逐字读出来；再看合成图确认标注形状、以及圈/划/指向落在全文哪一处（对照上面整页文字）；`
+      : `请：① 看合成图确认标注形状、以及圈/划/指向落在全文哪一处（对照上面整页文字）；`;
     task =
       `这一页的全文（供你理解语境）：\n${pageTextIn}\n\n` +
-      `附图是用户在这一页原文上画的标注截图——墨迹（圈/线/箭头/手写）已叠在原文上。` +
+      `${imgDesc}` +
       `几何粗判焦点约在：「${focus || '（未定位）'}」（仅供参考，以图为准）。\n` +
-      `请：① 看图确认 ta 标注的形状、以及圈/划/指向/写了哪些字（手写就读出来）落在全文哪一处；` +
+      `${step1}` +
       `② ${tone} 一句中文旁注，点到为止。`;
   } else if (isDigest) {
     task = `用户停笔了。下面是 ta 在这一页留下的所有标注（每条含符号类型与圈住的文字）：\n${nearby || '（无可提取文字）'}\n请综合这些标注给一条整体性的洞察或提示——帮 ta 想深一层、点出背后的关键、或建议下一步。`;
@@ -170,18 +227,18 @@ export async function runInference(req: any): Promise<any> {
     // 圈 = 解释
     task = `用户圈出了一处："${enclosed || nearby || '（未提取到文字）'}"。请解释它是什么、关键在哪——像同读者在页边轻声点一句。`;
   }
-  const jsonRule = `最终只输出一个 JSON 对象：{"result_type":"…","content":"…","confidence":0.x}。result_type 从这些里选最贴切的一个：${modes.join(' / ')}；content 是要显示的旁注文字；confidence 是 0–1 把握度。除该 JSON 外不要输出任何文字。`;
+  const jsonRule = `最终只输出一个 JSON 对象：{"result_type":"…","content":"…","confidence":0.x}。result_type 从这些里选最贴切的一个：${modes.join(' / ')}；content 是要显示的旁注文字（内部若引用原文用「」括，勿用半角双引号，否则破坏 JSON）；confidence 是 0–1 把握度。除该 JSON 外不要输出任何文字。`;
 
   // Tier2：附带前页记忆快照时，走 recall 工具循环；否则单发
   const memory: MemSnap = Array.isArray(req.memory) ? req.memory : [];
   let raw: string;
   let recalled: number[] = [];
   if (memory.length) {
-    const r = await agentLoop(system, task, jsonRule, memory, img);
+    const r = await agentLoop(system, task, jsonRule, memory, imagesIn, model);
     raw = r.text;
     recalled = r.recalled;
   } else {
-    raw = await gateway(system, `${task}\n\n${jsonRule}`, isDigest ? 600 : 400, img);
+    raw = await gateway(system, `${task}\n\n${jsonRule}`, isDigest ? 600 : 400, imagesIn, model);
   }
   const parsed = extractJson(raw);
   const result_type = modes.includes(parsed.result_type) ? parsed.result_type : modes[0];
@@ -203,12 +260,12 @@ export async function runInference(req: any): Promise<any> {
     }],
     confidence,
     created_at: new Date().toISOString(),
-    model_name: cfg().model,
+    model_name: model,
     model_version: 'nodesk-gateway',
     recalled, // 服务端额外字段：本次回看了哪些页（开发面板监控用）
     // 上下文监控（proxy 级附加，不动冻结契约）：暴露模型真正看到的 system + 任务 + 上下文
     _debug: {
-      model: cfg().model,
+      model,
       system,
       task,
       enclosed,
@@ -216,8 +273,9 @@ export async function runInference(req: any): Promise<any> {
       focus,
       page_text_len: pageTextIn.length,
       ocr_block_count: (req.ocr_blocks || []).length,
-      has_image: !!img,
-      mode: (img && pageTextIn) ? 'p1-vision' : 'legacy',
+      has_image: hasImg,
+      image_roles: imagesIn.map((i) => i.role || 'image'),
+      mode: (hasImg && pageTextIn) ? 'p1-vision' : 'legacy',
       tier: memory.length ? 'tier2-recall' : 'single',
       memory_pages: memory.map((m) => ({ index: m.index, content: m.content ?? null, summary: m.summary, marks: m.marks.length })),
     },
@@ -316,6 +374,34 @@ export async function runReflow(payload: any): Promise<any[]> {
     level: typeof r.level === 'number' ? r.level : 0,
     text: String(r.text || '').trim(),
   }));
+}
+
+/**
+ * AI 结构重建：给"行"（id+相对字号+文字）让模型分组成 标题/段落/列表。
+ * 模型只输出分组 lineIds、不改写文字——前端按 lineIds 把文字与原页 bbox 拼回（重排块可追溯）。
+ * 关键治"多段并一块"：标题靠字号+独立成行，连续正文按语义切多段，绝不因行距均匀而合并。
+ */
+export async function runReflowAi(payload: any): Promise<any[]> {
+  const lines: any[] = payload?.lines || [];
+  if (lines.length < 2) return [];
+  const list = lines.map((l) => `${l.id}\t[${l.sizeRatio ?? 1}x] ${String(l.text || '').slice(0, 200)}`).join('\n');
+  const system = '你在重建一页 PDF 的文档结构。下面是按阅读顺序的"行"，每行有 id、相对字号(1=正文)、文字。把这些行分组成干净的语义块：heading(标题,带 level)、para(正文段落)、list(列表)。靠内容与字号判断——标题通常字号偏大且独立成行；连续正文要按语义切成多个 para，**绝不能因为行距均匀就把多段并成一段**；项目符号/编号行归 list。';
+  const rules =
+    `输出一个 JSON 数组，每个元素 {"type":"heading"|"para"|"list","level":1到3(仅heading需要),"lineIds":["ln_x",...]}：\n` +
+    `- 每个行 id 必须恰好出现一次，不丢、不重、不新增；整体按阅读顺序；\n` +
+    `- 不要改写、翻译或新增任何文字——你只做分组与分类；\n` +
+    `只输出该 JSON 数组，别的都不要。`;
+  const raw = await gateway(system, `${list}\n\n${rules}`, 3500);
+  const arr = extractJsonArray(raw);
+  const valid = new Set(lines.map((l) => l.id));
+  return arr
+    .filter((g) => g && Array.isArray(g.lineIds))
+    .map((g) => ({
+      type: g.type === 'heading' ? 'heading' : g.type === 'list' ? 'list' : 'para',
+      level: typeof g.level === 'number' ? g.level : 1,
+      lineIds: g.lineIds.filter((id: unknown) => valid.has(id)),
+    }))
+    .filter((g) => g.lineIds.length);
 }
 
 /**

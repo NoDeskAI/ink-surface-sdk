@@ -1,6 +1,6 @@
 import type { NormBBox, OcrTextBlock } from '../core/contracts';
 import type { ReflowBlock, ReflowBlockType } from '../core/reflow';
-import { reflowLocal } from '../core/reflow';
+import { reflowLocal, groupLines, blockId, type ReflowLine } from '../core/reflow';
 
 /**
  * 重排 provider 接缝（跟 ocr.ts / inference.ts 同构）。
@@ -110,9 +110,58 @@ const rewrite: ReflowProvider = async () => {
   }).filter((b) => b.text.trim().length > 0 || (b.items?.length ?? 0) > 0);
 };
 
-export const reflowProviders: Record<string, ReflowProvider> = { local, hybrid, vision, rewrite };
+function unionLines(lines: ReflowLine[]): NormBBox {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+  for (const l of lines) { const [x, y, w, h] = l.bbox; x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h); }
+  return [x0, y0, x1 - x0, y1 - y0];
+}
+
+/**
+ * AI 结构重建（文本驱动·主线升级）：把"行"(id+相对字号+文字)交模型分组成 标题/段落/列表，
+ * 靠内容+字号判段落边界与标题层级——治本地 gap 启发式把多段并成一块。模型只输出分组(lineIds)，
+ * 文字与 source bbox 由前端按 lineIds 从原行拼回，**重排块照样映射回原页**（圈画可追溯）。
+ */
+const ai: ReflowProvider = async (blocks) => {
+  const lines = groupLines(blocks);
+  if (lines.length < 3) return reflowLocal(blocks);
+  const sizes = lines.map((l) => l.size).sort((a, b) => a - b);
+  const bodyFont = sizes[sizes.length >> 1] || 0.012;
+  let groups: Array<{ type?: string; level?: number; lineIds?: string[] }>;
+  try {
+    const resp = await fetch('/api/reflow-ai', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lines: lines.map((l) => ({ id: l.id, sizeRatio: +(l.size / bodyFont).toFixed(2), text: l.text })) }),
+    });
+    if (!resp.ok) return reflowLocal(blocks);
+    groups = await resp.json();
+    if (!Array.isArray(groups)) return reflowLocal(blocks);
+  } catch { return reflowLocal(blocks); }
+
+  const byId = new Map(lines.map((l) => [l.id, l]));
+  const used = new Set<string>();
+  const out: ReflowBlock[] = [];
+  for (const g of groups) {
+    const gls = (g.lineIds ?? []).map((id) => byId.get(id)).filter((l): l is ReflowLine => !!l);
+    if (!gls.length) continue;
+    gls.forEach((l) => used.add(l.id));
+    const type: ReflowBlockType = g.type === 'heading' ? 'heading' : g.type === 'list' ? 'list' : 'para';
+    const text = gls.map((l) => l.text).join(type === 'list' ? '\n' : ' ');
+    out.push({
+      id: blockId(text, out.length), type,
+      level: type === 'heading' ? (g.level || 1) : 0,
+      text, source: unionLines(gls),
+      ...(type === 'list' ? { items: gls.map((l) => l.text), ordered: false } : {}),
+    });
+  }
+  for (const l of lines) if (!used.has(l.id)) out.push({ id: blockId(l.text, out.length + 1000), type: 'para', level: 0, text: l.text, source: l.bbox }); // 漏掉的行补回，别丢字
+  out.sort((a, b) => a.source[1] - b.source[1]);
+  return out.length ? out : reflowLocal(blocks);
+};
+
+export const reflowProviders: Record<string, ReflowProvider> = { local, hybrid, vision, rewrite, ai };
 
 export const REFLOW_PROVIDER_LABELS: Record<string, string> = {
+  ai: 'AI 结构重建（文本驱动·主线·保 bbox）',
   local: '仅启发式（即时·保 bbox）',
   hybrid: '启发式 + 模型精修（文字）',
   vision: '启发式 + 视觉重排（Kimi 看图·保 bbox）',

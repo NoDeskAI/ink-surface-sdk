@@ -1,4 +1,4 @@
-import type { NormBBox, OcrTextBlock, PDFPageRecord, ScreenOverlay, StrokePoint } from '../core/contracts';
+import type { HMP, NormBBox, OcrTextBlock, PDFPageRecord, ScreenOverlay, StrokePoint, SurfaceIndex } from '../core/contracts';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -58,20 +58,45 @@ export interface Settings {
   //            geometric=只几何阈值（本地·0 token）；vlm=每次抬笔都截图给 VLM 判定
   //   contextLines: 手写批注的"最近正文"行数（按笔迹 y 距离取最近 N 行）
   gesture: { enabled: boolean; pauseSeconds: number; routing: 'auto' | 'geometric' | 'vlm'; contextLines: number };
-  // 推理引擎：stateless=每标注一次无状态 /api/infer（快 ~1-2s，无跨标注记忆）；
-  //          session=一本书一个长驻 Agent SDK 会话（跨标注连贯，但热轮 ~5s/冷启 ~14s）。默认 stateless。
+  // 推理引擎：session=一本书一个长驻 Agent SDK 会话（跨标注连贯·记得本书前文，热轮 ~5s/冷启 ~14s）=主线；
+  //          stateless=每标注一次无状态 /api/infer（快 ~1-2s，无跨标注记忆）=快速档。默认 session（2026-06-16 用户定）。
   inferEngine: 'stateless' | 'session';
+  // 推理模型：按前缀路由渠道——kimi*→moonshot；claude/gpt/gemini*→DMX。默认 kimi（中文笔迹稳，用户保留）。
+  inferModel: string;
+  // 思考链开关（仅 session 路径）：on→代理 thinking enabled(预算 env AGENT_THINK_BUDGET 或 1024)；off→删 thinking。
+  // 注：kimi 远端仍会思考(只是不回传推理链)；Claude 才是真开关。默认 off（更快）。
+  thinking: boolean;
+  // 是否把合成图(墨迹叠原文)送给理解模型。**合成图非徐智强方案**——他的路线靠 HMP 取证事实
+  //（命中原文 + text_hint）让 AI 理解，不靠截图。默认 false=纯徐路线验证；dev 控制台可临时 true 做 A/B。
+  sendMarkImage: boolean;
+  // dev 可视化叠层：在页面上画 SurfaceIndex 对象 bbox + 命中高亮 + 右上角 HMP 浮窗（精度/粒度诊断）。默认关。
+  devOverlay: boolean;
 }
 
 export const settings: Settings = {
   placement: 'margin',
   viewMode: 'page',
-  reflowProvider: 'local',
+  reflowProvider: 'ai', // 主线：AI 结构重建（文本驱动·保 bbox）
   ocr: { textlayer: true, image: 'off' },
   preprocess: { reflowEnabled: false, digestEnabled: false, reflowPages: 5, digestPages: 10 },
   gesture: { enabled: true, pauseSeconds: 5, routing: 'auto', contextLines: 3 },
-  inferEngine: 'stateless',
+  inferEngine: 'session', // 主线：长驻会话+跨标注记忆（多图两路径都支持）。切快速档在 dev 面板。
+  inferModel: 'kimi-k2.6', // 默认 kimi（中文笔迹稳）；dev 面板可切 claude-opus-4-7/4-8 · sonnet-4-6 · gemini-3.5-flash/3.1-flash-lite。
+  thinking: false, // 思考链默认关（更快）；dev 面板可开。kimi 远端仍思考、仅 Claude 真关。
+  sendMarkImage: false, // 默认不送合成图：纯验证徐智强的取证路线（AI 只吃 HMP 事实+整页上下文）。
+  devOverlay: false,    // dev bbox 叠层默认关。
 };
+
+/** 持久化 dev 旋钮：刷新不丢（免每次手动重设）。模块加载即回填，故所有消费方从一开始就拿到持久值。 */
+const PREFS_KEY = 'inkloop.settings.v1';
+try {
+  const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
+  if (saved && typeof saved === 'object') Object.assign(settings, saved); // 缺字段保留默认；多余字段无害
+} catch { /* localStorage 不可用/损坏：用默认值 */ }
+
+export function saveSettings(): void {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(settings)); } catch { /* 忽略 */ }
+}
 
 export interface Stroke {
   tool: Tool;
@@ -88,8 +113,16 @@ export const state = {
   pageIndex: 0,
   pageId: null as string | null,
   pageRecord: null as PDFPageRecord | null,
+  // PDF 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录(章节树)。喂重排/AI 排版。
+  docMeta: null as Record<string, unknown> | null,
+  outline: null as unknown[] | null,
   textBlocks: [] as OcrTextBlock[],
   imageRegions: [] as NormBBox[],   // 本页原 PDF 中的图像区域（归一化 bbox），重排时保留
+
+  // 徐智强「序列语义方案」：显式 SurfaceIndex（step①）+ HMP 取证记录（step④）
+  surfaceIndex: null as SurfaceIndex | null, // 当前 surface 的轻量对象表（PDF 路径由 textBlocks/imageRegions 构建）
+  lastHmps: [] as HMP[],                       // 最近 ~10 条 HMP 取证记录（dev-drawer 可读）
+  surfaceType: 'pdf' as 'pdf' | 'chat',        // 当前 surface 类型（决定 PDF 渲染 vs 合成聊天）
 
   strokesByPage: new Map<string, Stroke[]>(),
   overlays: [] as ScreenOverlay[],

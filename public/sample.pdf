@@ -1,0 +1,42 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 612 >>
+stream
+BT /F1 24 Tf 72 720 Td (Hello SurfaceIndex Title) Tj ET
+BT /F1 13 Tf 72 680 Td (The first paragraph talks about a quiet morning routine.) Tj ET
+BT /F1 13 Tf 72 658 Td (It mentions coffee, soft sunlight, and a tidy desk before work.) Tj ET
+BT /F1 13 Tf 72 636 Td (A second, unrelated paragraph shifts entirely to the weather.) Tj ET
+BT /F1 13 Tf 72 614 Td (Rain had been falling since midnight and the streets were grey.) Tj ET
+BT /F1 13 Tf 72 592 Td (The third paragraph is about writing code late at night.) Tj ET
+BT /F1 13 Tf 72 570 Td (Bugs hide in tall paragraphs, and clean structure helps find them.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Title (Hello SurfaceIndex Title) /Author (InkLoop Demo) /Subject (HMP char-level fixture) /Creator (make-sample-pdf.mjs) /Producer (InkLoop) /CreationDate (D:20260617120000Z) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000904 00000 n 
+0000000974 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R >>
+startxref
+1171
+%%EOF

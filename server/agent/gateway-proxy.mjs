@@ -17,20 +17,26 @@ import https from 'node:https';
 let _instance = null;
 const PREFIX_RE = /^\/__nd\/([^/]+)(\/.*)$/;
 
+/** 按模型前缀路由渠道（与 server/infer.ts route() 一致）：kimi→moonshot；其余(claude/gpt/gemini…)→DMX。 */
+function routeModel(model) {
+  if (String(model || '').startsWith('kimi')) return { channel: 'kimi', base: 'https://api.moonshot.cn/anthropic' };
+  return { channel: 'DMX', base: 'https://www.dmxapi.cn' };
+}
+
 /**
  * 启动代理(幂等)。
  * @param {{gatewayUrl:string, realModel:string, channel?:string, channelUrlBase?:string}} opts
  *   gatewayUrl 已含 /default/passthrough(我们的 LLM_GATEWAY_URL 即是)。
  */
 export async function getOrStartProxy(opts) {
-  if (_instance) return _instance;
-  const { gatewayUrl, realModel, channel = 'kimi', channelUrlBase = 'https://api.moonshot.cn/anthropic' } = opts || {};
+  const { gatewayUrl, realModel, thinkBudget } = opts || {};
+  if (_instance) { if (realModel) _instance.realModel = realModel; if (thinkBudget !== undefined) _instance.thinkBudget = thinkBudget; return _instance; } // 复用代理，更新模型+思考预算
   if (!gatewayUrl) throw new Error('gateway-proxy: gatewayUrl required');
   const target = new URL(gatewayUrl);
   const useHttps = target.protocol === 'https:';
   const targetPort = target.port || (useHttps ? 443 : 80);
   const reqLib = useHttps ? https : http;
-  const base = channelUrlBase.replace(/\/$/, '');
+  const inst = { realModel: realModel || process.env.LLM_MODEL || 'kimi-k2.6', thinkBudget: thinkBudget !== undefined ? thinkBudget : (Number(process.env.AGENT_THINK_BUDGET) || 0) }; // 模型+思考预算，可被后续调用更新
 
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -51,7 +57,9 @@ export async function getOrStartProxy(opts) {
           res.end(rb); return;
         }
 
-        body = fixupBody(body, { realModel, channel, channelUrl: base + origPath });
+        const rm = inst.realModel;
+        const { channel, base } = routeModel(rm); // 按当前模型动态路由（支持运行时切 kimi/claude/gemini）
+        body = fixupBody(body, { realModel: rm, channel, channelUrl: base + origPath, thinkBudget: inst.thinkBudget });
 
         const headers = { ...req.headers, host: target.hostname };
         const key = headers['x-api-key'] || headers['X-Api-Key'];
@@ -81,26 +89,31 @@ export async function getOrStartProxy(opts) {
   });
 
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-  const baseUrl = `http://127.0.0.1:${server.address().port}`;
-  console.log(`[gateway-proxy] ${baseUrl} → ${gatewayUrl} (channel=${channel}, model→${realModel})`);
-  _instance = { baseUrl, close: () => new Promise((r) => server.close(() => r())), server };
+  inst.baseUrl = `http://127.0.0.1:${server.address().port}`;
+  inst.close = () => new Promise((r) => server.close(() => r()));
+  inst.server = server;
+  console.log(`[gateway-proxy] ${inst.baseUrl} → ${gatewayUrl} (model→${inst.realModel}, channel 按前缀)`);
+  _instance = inst;
   return _instance;
 }
 
 export async function stopProxy() { if (_instance) { await _instance.close(); _instance = null; } }
 
 /** 出口改写:强制真模型(单一 kimi 网关)、thinking 修复、lift 图、注 channel。 */
-function fixupBody(body, { realModel, channel, channelUrl }) {
+function fixupBody(body, { realModel, channel, channelUrl, thinkBudget }) {
   let p;
   try { p = JSON.parse(body.toString('utf8')); } catch { return body; }
   if (!p || typeof p !== 'object') return body;
-  if (realModel) p.model = realModel; // 我们只有 kimi 网关,任何模型(spoof alias / SDK 内部 helper)一律改成真模型
-  // SDK 对非白名单模型强转 thinking 'adaptive'(Kimi 不支持→0 思考块);改回 enabled。
-  // 但旁注是"一两句"的轻任务,8192 预算会让 Kimi 过度推理→编造事实(如凭空"八五年")+慢。
-  // 降到低预算:够产出思考块(SDK 需要),又不过度发散。env 可调。
+  if (realModel) p.model = realModel; // 任何模型(spoof alias / SDK 内部 helper)一律改成真模型
+  // SDK 对非白名单模型强转 thinking 'adaptive'。思考开关由 dev 面板控（thinkBudget，每轮刷新）：
+  // >0 → enabled(该预算)；否则删 thinking（默认 off，更快）。注：kimi 远端仍思考、只是不回传链；Claude 才真关。
   if (p.thinking && p.thinking.type === 'adaptive') {
-    p.thinking = { type: 'enabled', budget_tokens: Number(process.env.AGENT_THINK_BUDGET) || 1024 };
+    const budget = Number(thinkBudget) || 0;
+    if (budget > 0) p.thinking = { type: 'enabled', budget_tokens: budget };
+    else delete p.thinking;
   }
+  // gemini 适配：Gemini 2.5/3 flash 默认开思考、思考 token 计入 max_tokens，预算太低→空响应；夹到 2048–8192。
+  if (String(realModel || '').startsWith('gemini')) p.max_tokens = Math.min(Math.max(Number(p.max_tokens) || 0, 2048), 8192);
   if (Array.isArray(p.messages)) liftImagesFromToolResult(p.messages);
   p.channel = channel;
   p.channel_url = channelUrl;

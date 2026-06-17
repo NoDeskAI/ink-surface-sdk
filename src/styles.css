@@ -524,6 +524,43 @@ body.dev-on > main { display: none; }   /* 开发页激活时隐藏阅读视图�
 }
 #inspect-log::-webkit-scrollbar { width: 8px; }
 #inspect-log::-webkit-scrollbar-thumb { background: #4a463f; border-radius: 4px; }
+/* HMP 取证面板：复用 .ins-card 卡片风格，作为监控列上方次要区，限高独立滚动 */
+#hmp-log {
+  max-height: 26vh;
+  min-height: 64px;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid #3a3733;
+  border-radius: 6px;
+  padding: 8px;
+}
+#hmp-log::-webkit-scrollbar { width: 8px; }
+#hmp-log::-webkit-scrollbar-thumb { background: #4a463f; border-radius: 4px; }
+.surface-summary { color: var(--hint); font: 11px/1.5 var(--mono); margin: 2px 0 6px; }
+.so-tbl { width: 100%; border-collapse: collapse; font: 10.5px/1.4 var(--mono); margin: 4px 0; }
+.so-tbl th, .so-tbl td { border: 1px solid var(--line); padding: 2px 5px; text-align: left; vertical-align: top; word-break: break-word; }
+.so-tbl th { color: var(--hint); font-weight: 600; }
+
+/* dev bbox 叠层（精度诊断）：覆在页面上，pointer-events:none 不挡笔 */
+#bbox-overlay { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 6; }
+.bbox-rect { position: absolute; border: 1px dashed rgba(110,130,170,0.55); box-sizing: border-box; }
+.bbox-rect.t-image { border-color: rgba(190,120,70,0.6); }
+.bbox-rect.t-blank_region { border-color: rgba(150,150,150,0.3); }
+.bbox-rect.t-title { border-color: rgba(120,90,180,0.6); }
+.bbox-rect.hit { border: 2px solid #22c55e; background: rgba(34,197,94,0.14); }
+.bbox-rect .bbox-tag { position: absolute; top: 0; left: 0; font: 9px/1.2 var(--mono); color: rgba(80,100,140,0.95); background: rgba(255,255,255,0.7); padding: 0 2px; display: none; white-space: nowrap; }
+.bbox-rect:hover .bbox-tag, .bbox-rect.hit .bbox-tag { display: block; }
+.bbox-mark { position: absolute; border: 2px dashed #e0457b; box-sizing: border-box; pointer-events: none; }
+
+/* 右上角 HMP 浮窗 */
+#hmp-float { position: fixed; top: 54px; right: 14px; width: 308px; z-index: 9999; display: none;
+  background: rgba(22,22,24,0.93); color: #ececec; border-radius: 8px; padding: 8px 10px;
+  font: 11px/1.55 var(--mono); box-shadow: 0 6px 20px rgba(0,0,0,0.35); }
+#hmp-float .hf-head { font-size: 12px; border-bottom: 1px solid #4a4a4a; padding-bottom: 4px; margin-bottom: 5px; }
+#hmp-float .hf-row { display: flex; gap: 8px; align-items: baseline; }
+#hmp-float .hf-row > span { color: #9a9a9a; min-width: 78px; flex: 0 0 auto; }
+#hmp-float .hf-row > b { word-break: break-all; font-weight: 600; }
+#hmp-float .hf-empty { color: #9a9a9a; }
 /* trace 区也同步：内部独立滚动，超出可看 */
 #trace-log {
   max-height: 22vh;             /* 降为底部小条：raw 日志次要 */
@@ -557,3 +594,16 @@ body.dev-on > main { display: none; }   /* 开发页激活时隐藏阅读视图�
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
 #dev-drawer ::-webkit-scrollbar-thumb { background: #4a463f; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 旧/实验路线折叠：dev 面板里弱化显示，标记"已不在主路径" */
+.legacy-fold { margin: 2px 0 6px; opacity: .72; }
+.legacy-fold[open] { opacity: .9; }
+.legacy-fold > summary { cursor: pointer; font-size: 12px; color: #9a948a; list-style: none; user-select: none; }
+.legacy-fold > summary::-webkit-details-marker { display: none; }
+.legacy-fold > summary::before { content: '▸ '; }
+.legacy-fold[open] > summary::before { content: '▾ '; }
+
+/* 多图监控：三张（笔迹/原文/合成）并排 + 角色小标 */
+.ins-shots { display: flex; flex-wrap: wrap; gap: 6px; }
+.ins-shots .ins-shotwrap { position: relative; display: inline-block; }
+.ins-shotcap { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; font-size: 10px; line-height: 1.5; background: rgba(0,0,0,.6); color: #fff; border-radius: 3px; pointer-events: none; }

@@ -11,7 +11,7 @@
 import type { NormBBox, OcrTextBlock } from './contracts';
 
 /** 确定性块 id：同页同引擎重排出同样的 id → 缩放/重渲后行内注不丢锚。 */
-function blockId(text: string, index: number): string {
+export function blockId(text: string, index: number): string {
   let h = 0;
   for (let k = 0; k < text.length; k++) h = (h * 31 + text.charCodeAt(k)) | 0;
   return `rfl_${index}_${(h >>> 0).toString(36)}`;
@@ -69,6 +69,36 @@ function unionBBox(runs: OcrTextBlock[]): NormBBox {
     x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
   }
   return [x0, y0, x1 - x0, y1 - y0];
+}
+
+/** 一"行"：聚合后的 run 行（保 bbox），供 AI 结构重建按行分组、再用 bbox 映射回原页。 */
+export interface ReflowLine { id: string; text: string; size: number; bbox: NormBBox; }
+
+/**
+ * 把 run 聚成行（剥页眉页脚、按 y 聚行、行内按 x 排）。
+ * 只到"行"为止——段落边界/标题层级交给 AI（结构重建），避免本地 gap 启发式把多段并成一块。
+ */
+export function groupLines(blocks: OcrTextBlock[]): ReflowLine[] {
+  const runs = blocks.filter((b) => b.text && b.text.trim());
+  if (!runs.length) return [];
+  const medH = median(runs.map((r) => r.bbox[3])) || 0.012;
+  const body = runs.filter((r) => {
+    const yc = r.bbox[1] + r.bbox[3] / 2;
+    return !((yc < 0.06 || yc > 0.94) && r.text.trim().length <= 6);
+  });
+  body.sort((a, b) => (a.bbox[1] - b.bbox[1]) || (a.bbox[0] - b.bbox[0]));
+  const lineGap = 0.6 * medH;
+  const groups: OcrTextBlock[][] = [];
+  let curY = -1;
+  for (const r of body) {
+    const yc = r.bbox[1] + r.bbox[3] / 2;
+    if (groups.length && Math.abs(yc - curY) <= lineGap) groups[groups.length - 1].push(r);
+    else { groups.push([r]); curY = yc; }
+  }
+  return groups.map((g, i) => {
+    g.sort((a, b) => a.bbox[0] - b.bbox[0]);
+    return { id: 'ln_' + i, text: joinRuns(g.map((r) => r.text)), size: median(g.map((r) => r.bbox[3])), bbox: unionBBox(g) };
+  });
 }
 
 export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {

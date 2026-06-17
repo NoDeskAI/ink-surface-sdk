@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite';
 import type { Plugin } from 'vite';
-import { runInference, runReflow, runSummarize, runOcrVlm, runExplainImage, runDigest, runInterpret, runInterpretGesture, runReflowVlm } from './server/infer';
+import { runInference, runReflow, runReflowAi, runSummarize, runOcrVlm, runExplainImage, runDigest, runInterpret, runInterpretGesture, runReflowVlm } from './server/infer';
+import { debugEvent, debugSnapshot } from './server/debug.mjs';
 
 /** dev-only 推理代理：浏览器 POST /api/infer → 网关 → InferenceResult。Key 留服务端。 */
 function inferenceProxy(env: Record<string, string>): Plugin {
@@ -25,8 +26,20 @@ function inferenceProxy(env: Record<string, string>): Plugin {
             }
           });
         });
+      // dev-only 调试通道：客户端镜像 inspect → JSONL + 内存环；GET 快照供外部读。
+      post('/api/__debug/event', async (b) => debugEvent(b));
+      server.middlewares.use('/api/__debug/snapshot', (req, res) => {
+        if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+        res.setHeader('content-type', 'application/json');
+        try {
+          const n = new URL(req.url || '/', 'http://localhost').searchParams.get('n');
+          res.end(JSON.stringify(debugSnapshot(n ? Number(n) : 20)));
+        } catch (e) { res.statusCode = 500; res.end(JSON.stringify({ error: String((e as Error)?.message || e) })); }
+      });
+
       post('/api/infer', runInference);
       post('/api/reflow', runReflow);
+      post('/api/reflow-ai', runReflowAi);
       post('/api/summarize', runSummarize);
       post('/api/ocr-vlm', runOcrVlm);
       post('/api/explain-image', runExplainImage);

@@ -1,4 +1,4 @@
-import type { EventType, NormBBox, StrokePoint } from './contracts';
+import type { EventType, MarkShape, NormBBox, StrokePoint } from './contracts';
 import { pageCss } from './transform';
 
 export function bboxOf(points: StrokePoint[]): NormBBox {
@@ -92,6 +92,23 @@ export function classifyScored(
 /** 几何启发式分类：tap_region / circle / underline / stroke */
 export function classify(points: StrokePoint[], bb: NormBBox): EventType {
   return classifyScored(points, bb).type;
+}
+
+/**
+ * EventType → 徐智强 MarkShape 词汇映射（step③→step④ 桥接）。
+ * 不改冻结的 EventType 词表（trace/持久化都记了它）；只在产出 HMP 时翻译成徐智强的动作词汇。
+ * cross/sketch 当前分类器未产出，留位待真机手势补全。
+ */
+export function markShapeOf(type: EventType, score = 1): MarkShape {
+  switch (type) {
+    case 'circle': return 'enclosure';
+    case 'underline': return 'underline';
+    case 'arrow': return 'arrow';
+    case 'highlight': return 'highlight';
+    case 'margin_note': return 'handwriting';
+    case 'stroke': return score >= 0.3 ? 'handwriting' : 'unknown';
+    default: return 'unknown'; // tap_region / eraser / unknown
+  }
 }
 
 /**

@@ -1,7 +1,7 @@
 import { selfTest } from '../core/transform';
 import { snapshot } from '../core/metrics';
 import { downloadTrace } from '../core/trace';
-import { bus, state, settings, type Placement, type OcrImageMode } from '../app/state';
+import { bus, state, settings, saveSettings, type Placement, type OcrImageMode } from '../app/state';
 import { INFER_PROVIDER_LABELS } from '../providers/inference';
 import { inspectLog } from '../core/inspect';
 
@@ -47,10 +47,13 @@ function renderInspect(): void {
     const mode = d.mode ? `${esc(String(d.mode))} · ` : '';
     const flags = [r.recalled.length ? `回看[${r.recalled.join(',')}]` : '', String(d.tier ?? '')].filter(Boolean).join(' · ');
     const bb = r.bbox ? r.bbox.map((n) => n.toFixed(2)).join(',') : '';
-    // 合成图(模型实际看到的图)直接显示在卡片里——核对"是模型问题还是没截到"
-    const shot = r.composite
-      ? `<a class="ins-shotwrap" href="${r.composite}" target="_blank" title="模型看到的合成图 · bbox[${bb}] · 点击放大"><img class="ins-shot" src="${r.composite}" alt="composite" /></a>`
-      : `<div class="ins-noshot">无合成图</div>`;
+    // 模型实际看到的图直接显示在卡片里——核对"是模型问题还是没截到/没识别"。
+    // 多图(笔迹/原文/合成)逐张并排显示并标注角色；兼容旧的单张合成图。
+    const ROLE_CN: Record<string, string> = { ink: '笔迹', page: '原文', composite: '合成' };
+    const imgs = (r.images && r.images.length) ? r.images : (r.composite ? [{ role: 'composite', data: r.composite }] : []);
+    const shot = imgs.length
+      ? `<div class="ins-shots">${imgs.map((im) => `<a class="ins-shotwrap" href="${im.data}" target="_blank" title="模型看到的「${ROLE_CN[im.role] ?? im.role}」· bbox[${bb}] · 点击放大"><img class="ins-shot" src="${im.data}" alt="${esc(im.role)}" /><span class="ins-shotcap">${ROLE_CN[im.role] ?? esc(im.role)}</span></a>`).join('')}</div>`
+      : `<div class="ins-noshot">无图</div>`;
     return `<div class="ins-card">`
       + `<div class="ins-head"><span class="ins-tag">${esc(tag)}</span><span class="ins-meta">第${r.pageIndex + 1}页 · ${mode}${ms}${esc(r.model)}${flags ? ' · ' + esc(flags) : ''}</span></div>`
       + `<div class="ins-main">${shot}<div class="ins-cols">`
@@ -64,6 +67,72 @@ function renderInspect(): void {
       + `<div class="ins-k">前页记忆（${r.memoryPages}）</div><div class="ins-v">${esc(memLine)}</div>`
       + `</div></details></div>`;
   }).join('');
+}
+
+const MODE_COLOR: Record<string, string> = {
+  anchored: '#22c55e', self_content: '#f59e0b', mixed: '#3b82f6', unknown: '#ef4444',
+};
+const ACTION_CN: Record<string, string> = {
+  enclosure: '圈', underline: '划线', cross: '叉', arrow: '箭头',
+  handwriting: '手写', sketch: '草图', highlight: '高亮', unknown: '未知',
+};
+const OBJHINT_CN: Record<string, string> = {
+  text: '文字', image_region: '图区', ui_region: 'UI', blank: '空白', diagram: '图表', unknown: '未知',
+};
+
+/** HMP 取证面板：最近若干条 HMP 的**全字段**，肉眼核对采集完整性/准确性（命中→原文、region bbox、text_hint、provenance、version）。 */
+function renderHmpLog(): void {
+  const box = document.getElementById('hmp-log');
+  if (!box) return;
+  const hmps = state.lastHmps;
+  if (!hmps.length) { box.innerHTML = '<p class="ins-empty">还没有标注。圈/划/写一处、停笔，HMP 会出现在这里。</p>'; return; }
+  const objs = state.surfaceIndex?.objects ?? [];
+  box.innerHTML = hmps.map((h) => {
+    const color = MODE_COLOR[h.mode] ?? '#888';
+    const targets = h.target_object_refs.map((id) => {
+      const o = objs.find((x) => x.id === id);
+      return o ? `${esc(o.id)}「${esc((o.text || '·' + o.type).slice(0, 24))}」` : `${esc(id)}<span style="color:#ef4444">(缺)</span>`;
+    });
+    const refs = targets.length ? targets.join('　') : '<span style="color:#ef4444">空（未命中）</span>';
+    const ocr = h.text_hint ? esc(h.text_hint) : '—';
+    const reg = h.target_region.map((n) => n.toFixed(3)).join(', ');
+    const crop = h.crop_ref ? `<a class="ins-shotwrap" href="${h.crop_ref}" target="_blank" title="局部 crop"><img class="ins-shot" src="${h.crop_ref}" alt="crop" /><span class="ins-shotcap">crop</span></a>` : '';
+    const ink = h.vector_ref ? `<a class="ins-shotwrap" href="${h.vector_ref}" target="_blank" title="笔迹白底"><img class="ins-shot" src="${h.vector_ref}" alt="ink" /><span class="ins-shotcap">笔迹</span></a>` : '';
+    const shots = (crop || ink) ? `<div class="ins-shots">${crop}${ink}</div>` : '<div class="ins-noshot">无图</div>';
+    return `<div class="ins-card">`
+      + `<div class="ins-head"><span class="ins-tag" style="color:${color}">[${esc(h.mode)}] ${ACTION_CN[h.action] ?? esc(h.action)}</span>`
+      + `<span class="ins-meta">${OBJHINT_CN[h.object_hint] ?? esc(h.object_hint)} · 命中${h.target_object_refs.length} · 信心${h.confidence.toFixed(2)} · v${esc(h.version)}</span></div>`
+      + `<div class="ins-main">${shots}<div class="ins-cols">`
+      + `<div class="ins-line"><span class="ins-k">target</span><span class="ins-v">${refs}</span></div>`
+      + `<div class="ins-line"><span class="ins-k">text_hint</span><span class="ins-v">${ocr}</span></div>`
+      + `<div class="ins-line"><span class="ins-k">region</span><span class="ins-v">[${reg}]</span></div>`
+      + `</div></div></div>`;
+  }).join('');
+}
+
+/** SurfaceIndex 对象表（step① 源头）：逐对象 id/type/role/bbox/text/source，核对采集源本身对不对。 */
+function renderSurfaceObjects(): void {
+  const box = document.getElementById('surface-objects');
+  if (!box) return;
+  const si = state.surfaceIndex;
+  if (!si || !si.objects.length) { box.innerHTML = '<p class="ins-empty">无对象。</p>'; return; }
+  const CAP = 80; // 字母级下对象可达数百，截断防表格爆炸
+  const shown = si.objects.slice(0, CAP);
+  box.innerHTML = '<table class="so-tbl"><thead><tr><th>id</th><th>type</th><th>role</th><th>bbox</th><th>text</th><th>src</th></tr></thead><tbody>'
+    + shown.map((o) => `<tr><td>${esc(o.id)}</td><td>${esc(o.type)}</td><td>${esc(o.role || '—')}</td><td>${o.bbox.map((n) => n.toFixed(3)).join(',')}</td><td>${esc((o.text || '').slice(0, 40) || '—')}</td><td>${esc(o.source)}</td></tr>`).join('')
+    + '</tbody></table>'
+    + (si.objects.length > CAP ? `<p class="ins-empty">…共 ${si.objects.length} 个对象，仅显示前 ${CAP}</p>` : '');
+}
+
+/** SurfaceIndex 概览：surface 类型 + 对象数 + type 分布（核对 step① 原生吐的对象表）。 */
+function renderSurfaceSummary(): void {
+  const el = document.getElementById('surface-summary');
+  if (!el) return;
+  const si = state.surfaceIndex;
+  if (!si) { el.textContent = 'surface：未初始化'; return; }
+  const dist = si.objects.reduce((acc, o) => { acc[o.type] = (acc[o.type] || 0) + 1; return acc; }, {} as Record<string, number>);
+  const distStr = Object.entries(dist).map(([t, n]) => `${t}×${n}`).join(' · ') || '空';
+  el.textContent = `surface：${si.surface_type} · ${si.objects.length} 个对象 · ${distStr}`;
 }
 
 function renderMetrics(): void {
@@ -118,6 +187,10 @@ function initSettings(): void {
   const ctxLines = $id<HTMLInputElement>('set-ctx-lines');
   const pauseSec = $id<HTMLInputElement>('set-pause-sec');
   const inferEngine = $id<HTMLSelectElement>('set-infer-engine');
+  const inferModel = $id<HTMLSelectElement>('set-infer-model');
+  const thinking = $id<HTMLInputElement>('set-thinking');
+  const sendImage = $id<HTMLInputElement>('set-send-image');
+  const devOverlay = $id<HTMLInputElement>('set-dev-overlay');
 
   // 从 settings 初始化控件
   placement.value = settings.placement;
@@ -133,25 +206,43 @@ function initSettings(): void {
   ctxLines.value = String(settings.gesture.contextLines);
   pauseSec.value = String(settings.gesture.pauseSeconds);
   inferEngine.value = settings.inferEngine;
+  inferModel.value = settings.inferModel;
+  thinking.checked = settings.thinking;
+  sendImage.checked = settings.sendMarkImage;
+  devOverlay.checked = settings.devOverlay;
 
-  const changed = () => bus.emit('settings:changed');
+  const changed = () => { bus.emit('settings:changed'); saveSettings(); };
   const clampPp = (el: HTMLInputElement, cur: number) => Math.min(100, Math.max(0, Number(el.value) || cur));
   placement.addEventListener('change', () => { settings.placement = placement.value as Placement; changed(); });
   reflow.addEventListener('change', () => { settings.reflowProvider = reflow.value; changed(); });
   textlayer.addEventListener('change', () => { settings.ocr.textlayer = textlayer.checked; changed(); });
   ocrImage.addEventListener('change', () => { settings.ocr.image = ocrImage.value as OcrImageMode; changed(); });
-  ppReflowOn.addEventListener('change', () => { settings.preprocess.reflowEnabled = ppReflowOn.checked; });
-  ppDigestOn.addEventListener('change', () => { settings.preprocess.digestEnabled = ppDigestOn.checked; });
-  ppReflow.addEventListener('change', () => { settings.preprocess.reflowPages = clampPp(ppReflow, settings.preprocess.reflowPages); ppReflow.value = String(settings.preprocess.reflowPages); });
-  ppDigest.addEventListener('change', () => { settings.preprocess.digestPages = clampPp(ppDigest, settings.preprocess.digestPages); ppDigest.value = String(settings.preprocess.digestPages); });
+  sendImage.addEventListener('change', () => { settings.sendMarkImage = sendImage.checked; changed(); });
+  devOverlay.addEventListener('change', () => { settings.devOverlay = devOverlay.checked; changed(); });
+  ppReflowOn.addEventListener('change', () => { settings.preprocess.reflowEnabled = ppReflowOn.checked; saveSettings(); });
+  ppDigestOn.addEventListener('change', () => { settings.preprocess.digestEnabled = ppDigestOn.checked; saveSettings(); });
+  ppReflow.addEventListener('change', () => { settings.preprocess.reflowPages = clampPp(ppReflow, settings.preprocess.reflowPages); ppReflow.value = String(settings.preprocess.reflowPages); saveSettings(); });
+  ppDigest.addEventListener('change', () => { settings.preprocess.digestPages = clampPp(ppDigest, settings.preprocess.digestPages); ppDigest.value = String(settings.preprocess.digestPages); saveSettings(); });
   gesture.addEventListener('change', () => { settings.gesture.enabled = gesture.checked; changed(); });
   gestureRouting.addEventListener('change', () => { settings.gesture.routing = gestureRouting.value as 'auto' | 'geometric' | 'vlm'; changed(); });
   inferEngine.addEventListener('change', () => {
     settings.inferEngine = inferEngine.value === 'session' ? 'session' : 'stateless';
     // 切到会话且已开书 → 预热(起会话+spawn,消首笔冷启)
     if (settings.inferEngine === 'session' && state.documentId) {
-      fetch('/api/agent/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bookId: state.documentId }) }).catch(() => { /* 预热失败不影响 */ });
+      fetch('/api/agent/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bookId: state.documentId, model: settings.inferModel }) }).catch(() => { /* 预热失败不影响 */ });
     }
+    changed();
+  });
+  inferModel.addEventListener('change', () => {
+    settings.inferModel = inferModel.value;
+    // 会话引擎下换模型 = 重起会话(代理按新模型前缀路由 kimi/DMX) → 用新模型预热消冷启
+    if (settings.inferEngine === 'session' && state.documentId) {
+      fetch('/api/agent/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bookId: state.documentId, model: settings.inferModel, thinking: settings.thinking }) }).catch(() => { /* 预热失败不影响 */ });
+    }
+    changed();
+  });
+  thinking.addEventListener('change', () => {
+    settings.thinking = thinking.checked; // 仅 session 生效；代理每轮刷新思考预算，下一条标注即生效（无需重起会话）
     changed();
   });
   ctxLines.addEventListener('change', () => {
@@ -190,6 +281,8 @@ export function initDevDrawer(els: {
 
   bus.on('metrics', renderMetrics);
   bus.on('inspect', renderInspect);
+  bus.on('hmp:updated', renderHmpLog);
+  bus.on('surface:indexed', () => { renderSurfaceSummary(); renderSurfaceObjects(); });
   bus.on('preprocess:progress', (i, n) => { const el = document.getElementById('pp-progress'); if (el) el.textContent = `预处理中 ${i as number}/${n as number} 页…`; });
   bus.on('preprocess:done', () => { const el = document.getElementById('pp-progress'); if (el) el.textContent = '预处理完成'; });
   bus.on('page:rendered', runSelfTest);
@@ -242,5 +335,8 @@ export function initDevDrawer(els: {
   syncDevRoute();
   renderMetrics();
   renderInspect();
+  renderHmpLog();
+  renderSurfaceSummary();
+  renderSurfaceObjects();
   runSelfTest();
 }

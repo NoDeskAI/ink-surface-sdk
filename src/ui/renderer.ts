@@ -8,6 +8,7 @@ import { sha256Hex } from '../core/ids';
 import { setPageSize, GUTTER_W } from '../core/transform';
 import { trace } from '../core/trace';
 import { reflowLocal } from '../core/reflow';
+import { wrapSurfaceIndex } from '../core/target';
 import { setContent } from '../core/memory';
 import { bus, settings, state } from '../app/state';
 import { getContent, getReflow, openDoc, putContent, putReflow } from '../app/store';
@@ -88,6 +89,7 @@ export async function loadFile(file: File): Promise<void> {
   state.fileHash = await sha256Hex(buf);
   state.documentId = 'doc_' + state.fileHash.slice(0, 12); // hash 派生，重复导入 id 稳定
   state.fileName = file.name;
+  state.surfaceType = 'pdf';
   // cMapUrl/standardFontDataUrl：救老中文 PDF —— 非嵌入 CID 字体 + 预定义 CJK CMap（如 GBK-EUC-H）
   // 需要 CMap 表才能把字符码映射成字形，否则中文画布渲染与 getTextContent 都出空白/乱码。
   // 资产在 public/（cp 自 pdfjs-dist），dev 与 build 均自动服务于根路径。
@@ -100,6 +102,9 @@ export async function loadFile(file: File): Promise<void> {
   state.pageCount = pdf.numPages;
   state.pageIndex = 0;
   state.strokesByPage.clear();
+  // 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录。真书常有，喂重排/AI 排版。
+  try { const m = await pdf.getMetadata(); state.docMeta = (m && m.info) ? m.info as Record<string, unknown> : null; } catch { state.docMeta = null; }
+  try { state.outline = await pdf.getOutline(); } catch { state.outline = null; }
   // 载入本地已存的语义蒸馏（重排/记忆/图解缓存）；没有则新建。重开同一文档即恢复。
   await openDoc({ document_id: state.documentId, file_hash: state.fileHash, filename: file.name, page_count: state.pageCount });
   trace('PDFDocument', {
@@ -247,6 +252,11 @@ export async function renderPage(): Promise<void> {
     version: SCHEMA_VERSION,
   };
   trace('PDFPage', state.pageRecord as unknown as Record<string, unknown>);
+
+  // 徐智强 step①：把本页结构（文本层 + 图像区）包成显式 SurfaceIndex（复用 reflowLocal 分 title/text_block）。
+  state.surfaceIndex = wrapSurfaceIndex(state.pageId!, state.pageIndex, state.textBlocks, state.imageRegions);
+  bus.emit('surface:indexed', state.surfaceIndex);
+
   bus.emit('page:rendered');
 }
 

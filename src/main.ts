@@ -11,12 +11,14 @@ import { restorePage } from './core/memory';
 import type { ScreenOverlay } from './core/contracts';
 import type { AnnotationEvent, EventType, NormBBox, OutputMode } from './core/contracts';
 import { initRenderer, loadFile, gotoPage, setZoom, hasDocument } from './ui/renderer';
+import { renderChatSurface } from './surfaces/chat-surface';
 import { initInk, persistInk } from './ui/ink';
 import { initWhisper } from './ui/whisper';
 import { initReader } from './ui/reader';
 import { initInsightPanel } from './ui/insight-panel';
 import { initToolbar } from './ui/toolbar';
 import { initDevDrawer, toggleDrawer } from './ui/dev-drawer';
+import { initDevOverlay } from './ui/dev-overlay';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -235,12 +237,16 @@ initDevDrawer({
   downloadBtn: $('dl-trace'),
   closeBtn: $('drawer-close'),
 });
+initDevOverlay();
 
 const fileIn = $<HTMLInputElement>('file-in');
 fileIn.addEventListener('change', () => {
   const file = fileIn.files?.[0];
   if (file) void loadFile(file);
 });
+
+// 载入合成聊天 surface（徐智强 step① App-agnostic 验证：原生吐 SurfaceIndex）
+$('load-chat').addEventListener('click', () => renderChatSurface());
 
 // 拖拽上传：拖到整个阅读区任意位置即可
 const reading = $('reading');

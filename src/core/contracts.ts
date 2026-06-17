@@ -148,3 +148,72 @@ export const RESULT_TO_OVERLAY: Record<ResultType, OverlayType> = {
   action: 'suggestion_card',
   error: 'suggestion_card',
 };
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 徐智强「序列语义方案」契约 v1（端侧取证协议：App结构 > 几何命中 > 局部OCR > crop > 后置AI）
+ * 这些是**新增**契约，不修改上面冻结的 v0 typed 契约（SCHEMA_VERSION 仍 '0'，不动）。
+ * 等徐智强真机契约落地时再对齐字段并一起 bump。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export const HMP_SCHEMA_VERSION = '1';
+
+/** SurfaceObject 类型（徐智强 step①：App 渲染时提交的轻量对象表的成员）。 */
+export type SurfaceObjectType =
+  | 'title'          // reflowLocal 的 heading
+  | 'text_block'     // reflowLocal 的 para/list，或裸 text run
+  | 'image'          // 图像区域（embedded_image / 图表）
+  | 'chat_message'   // 聊天气泡
+  | 'blank_region';  // 空白背景（self_content 锚点）
+
+/** 对象来源（provenance）：标清是谁产出的，防云端视觉同时顶替结构层和 OCR 层导致混淆。 */
+export type SurfaceObjectSource = 'structure' | 'reflow' | 'ocr' | 'vlm';
+
+/** 页面/界面类型，决定 target 查找策略。 */
+export type SurfaceType = 'article' | 'chat' | 'whiteboard';
+
+export interface SurfaceObject {
+  id: string;
+  type: SurfaceObjectType;
+  bbox: NormBBox;               // 归一化 [x,y,w,h]，与 OcrTextBlock.bbox 同制（D1）
+  text?: string;               // image / blank_region 可空
+  role?: 'user' | 'agent' | 'embedded_image' | 'diagram' | 'decorative';
+  source: SurfaceObjectSource;
+}
+
+/** SurfaceIndex：一页/一屏的轻量对象表（徐智强 step① 产物）。 */
+export interface SurfaceIndex {
+  surface_id: string;          // = state.pageId
+  surface_type: SurfaceType;
+  page_index: number;
+  objects: SurfaceObject[];
+}
+
+/** 几何分类后的标注动作（徐智强词汇）。由 markShapeOf() 从 EventType 映射；cross/sketch 当前分类器未产出，留位。 */
+export type MarkShape =
+  | 'enclosure' | 'underline' | 'cross' | 'arrow' | 'handwriting' | 'sketch' | 'highlight' | 'unknown';
+
+/** 标注语境（徐智强 step④/⑥）。 */
+export type HmpMode = 'anchored' | 'self_content' | 'mixed' | 'unknown';
+
+/** 命中对象的类型提示（面向理解层语义，从 SurfaceObject.type 派生）。 */
+export type HmpObjectHint = 'text' | 'image_region' | 'ui_region' | 'blank' | 'diagram' | 'unknown';
+
+/**
+ * HMP（Hand-Mark Protocol）—— 一次笔迹手势的取证记录（徐智强序列语义方案 step④ 产物）。
+ * 只放"在哪、对什么、做了什么手势 + 取证线索"，不放 AI 推断结果（那是 InferenceResult 的职责）。
+ * 由 src/core/target.ts:buildHmp 同步产出；step⑤OCR / step⑥手写识别异步补填 text_hint/crop_ref/vector_ref。
+ */
+export interface HMP {
+  hmp_id: string;
+  surface_id: string;
+  mode: HmpMode;
+  action: MarkShape;
+  target_region: NormBBox;       // 多笔 union bbox
+  target_object_refs: string[];  // 命中的 SurfaceObject.id（空 = 未命中）
+  object_hint: HmpObjectHint;
+  text_hint?: string;            // step⑤局部OCR / step⑥手写识别读出的文字
+  crop_ref?: string;             // demo：区域/合成 crop 的 dataURL（将来换不透明 store key）
+  vector_ref?: string;           // demo：白底纯笔迹图 dataURL（徐智强 evidence=vector_ref）
+  confidence: number;
+  version: string;
+}
