@@ -11,10 +11,10 @@
 import type {
   AnnotationEvent, HMP, HmpMode, HmpObjectHint, MarkShape, NormBBox,
   OcrTextBlock, SurfaceIndex, SurfaceObject, SurfaceObjectType,
-} from './contracts';
-import { HMP_SCHEMA_VERSION } from './contracts';
+} from '../core/contracts';
+import { HMP_SCHEMA_VERSION } from '../core/contracts';
 import { pointInPolygon } from './focus';
-import { shortId } from './ids';
+import { shortId } from '../core/ids';
 
 const byReadingOrder = (a: SurfaceObject, b: SurfaceObject): number =>
   (a.bbox[1] - b.bbox[1]) || (a.bbox[0] - b.bbox[0]);

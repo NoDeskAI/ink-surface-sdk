@@ -7,8 +7,8 @@
  * solo 阶段先做，格式按 contract 设计，团队并行时交还/对齐。
  */
 import type { NormBBox, ScreenOverlay, StrokePoint } from './contracts';
-import type { ReflowBlock } from './reflow';
-import type { PageMark } from './memory';
+import type { ReflowBlock } from '../surface/reflow';
+import type { PageMark } from '../local/memory';
 
 export const STORE_VERSION = '0';
 

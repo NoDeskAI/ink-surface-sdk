@@ -1,16 +1,16 @@
 import type { AnnotationEvent, EventType, NormBBox, OutputMode, ScreenOverlay, StrokePoint } from '../core/contracts';
 import { SCHEMA_VERSION } from '../core/contracts';
-import type { ReflowBlock } from '../core/reflow';
+import type { ReflowBlock } from './reflow';
 import { bus, settings, state } from '../app/state';
-import { reflowProviders, reflowAiStream } from '../providers/reflow';
-import { reflowLocal } from '../core/reflow';
+import { reflowProviders, reflowAiStream } from './reflow-provider';
+import { reflowLocal } from './reflow';
 import { extractPageBlocks } from './renderer';
-import { grabRegion } from '../providers/ocr';
-import { getImageExplain, getReflow, putImageExplain, putReflow } from '../app/store';
-import { bboxOf, classifyScored } from '../core/classify';
-import { resolveGesture } from '../core/gesture';
+import { grabRegion } from '../evidence/ocr';
+import { getImageExplain, getReflow, putImageExplain, putReflow } from '../local/store';
+import { bboxOf, classifyScored } from '../capture/classify';
+import { resolveGesture } from '../capture/gesture';
 import { commitDiscussion } from '../core/pipeline';
-import { memorySnapshot } from '../core/memory';
+import { memorySnapshot } from '../local/memory';
 import { DEVICE_ID, SESSION_ID, shortId } from '../core/ids';
 
 /** 重排阅读流里的一项：重排出的文本块，或保留的原页图像（带 AI 解读）。 */

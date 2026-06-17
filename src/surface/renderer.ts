@@ -7,11 +7,11 @@ import { SCHEMA_VERSION } from '../core/contracts';
 import { sha256Hex } from '../core/ids';
 import { setPageSize, GUTTER_W } from '../core/transform';
 import { trace } from '../core/trace';
-import { reflowLocal } from '../core/reflow';
-import { wrapSurfaceIndex } from '../core/target';
-import { setContent } from '../core/memory';
+import { reflowLocal } from './reflow';
+import { wrapSurfaceIndex } from '../evidence/target';
+import { setContent } from '../local/memory';
 import { bus, settings, state } from '../app/state';
-import { getContent, getReflow, openDoc, putContent, putReflow } from '../app/store';
+import { getContent, getReflow, openDoc, putContent, putReflow } from '../local/store';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 

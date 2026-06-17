@@ -5,7 +5,7 @@
  * 全程 try/catch：IDB 不可用（隐私模式等）则退化为「仅内存」，不影响主流程。
  */
 import type { NormBBox, ScreenOverlay } from '../core/contracts';
-import type { ReflowBlock } from '../core/reflow';
+import type { ReflowBlock } from '../surface/reflow';
 import type { PersistedDoc, PersistedMemory, PersistedPage, PersistedStroke } from '../core/store-format';
 import { STORE_VERSION } from '../core/store-format';
 

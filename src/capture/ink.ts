@@ -2,7 +2,7 @@ import type { StrokePoint } from '../core/contracts';
 import { normToPx, pxToNorm, pageCss } from '../core/transform';
 import { trace } from '../core/trace';
 import { bus, currentStrokes, state, type Stroke, type Tool } from '../app/state';
-import { putStrokes } from '../app/store';
+import { putStrokes } from '../local/store';
 
 /** 把当前页笔迹落盘（每次抬笔/擦除/撤销都调一次，去抖在 store 内部）。 */
 export function persistInk(): void {

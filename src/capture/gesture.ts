@@ -7,7 +7,7 @@
  * 一次停笔会话 → 一个手势意图。canonical eventType 写进 representative event，
  * 服务端据此框定回应语气（output_modes 约束 result_type）。
  */
-import type { AnnotationEvent, EventType, OutputMode } from './contracts';
+import type { AnnotationEvent, EventType, OutputMode } from '../core/contracts';
 import { classifyScored, detectQueryIntent } from './classify';
 
 /** 形状门槛：低于此分的单笔自由涂抹不算手势（不触发 AI），笔迹仍无损留着。 */

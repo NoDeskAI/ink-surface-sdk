@@ -1,6 +1,6 @@
 import type { NormBBox, OcrTextBlock } from '../core/contracts';
-import type { ReflowBlock, ReflowBlockType } from '../core/reflow';
-import { reflowLocal, groupLines, blockId, type ReflowLine } from '../core/reflow';
+import type { ReflowBlock, ReflowBlockType } from './reflow';
+import { reflowLocal, groupLines, blockId, type ReflowLine } from './reflow';
 import { settings } from '../app/state';
 
 /**

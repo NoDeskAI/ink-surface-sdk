@@ -2,7 +2,7 @@ import { selfTest } from '../core/transform';
 import { snapshot } from '../core/metrics';
 import { downloadTrace } from '../core/trace';
 import { bus, state, settings, saveSettings, type Placement, type OcrImageMode } from '../app/state';
-import { INFER_PROVIDER_LABELS } from '../providers/inference';
+import { INFER_PROVIDER_LABELS } from '../local/model-client';
 import { inspectLog } from '../core/inspect';
 
 const esc = (s: string): string => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] ?? c));

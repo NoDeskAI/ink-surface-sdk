@@ -1,24 +1,24 @@
 import './styles.css';
 import { recordEvent, commitDiscussion, summarizePage } from './core/pipeline';
-import { resolveGesture, isDeliberate, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './core/gesture';
-import { classifyScored } from './core/classify';
-import { grabRegion } from './providers/ocr';
+import { resolveGesture, isDeliberate, GESTURE_MIN_SCORE, GESTURES, INTENT_MODES, type Gesture } from './capture/gesture';
+import { classifyScored } from './capture/classify';
+import { grabRegion } from './evidence/ocr';
 import { trace } from './core/trace';
 import { shortId } from './core/ids';
 import { bus, state, settings } from './app/state';
-import { getOverlays, getStrokes, removeOverlay, storedDoc, upsertOverlay } from './app/store';
-import { restorePage } from './core/memory';
+import { getOverlays, getStrokes, removeOverlay, storedDoc, upsertOverlay } from './local/store';
+import { restorePage } from './local/memory';
 import type { ScreenOverlay } from './core/contracts';
 import type { AnnotationEvent, EventType, NormBBox, OutputMode } from './core/contracts';
-import { initRenderer, loadFile, gotoPage, setZoom, hasDocument } from './ui/renderer';
-import { renderChatSurface } from './surfaces/chat-surface';
-import { initInk, persistInk } from './ui/ink';
-import { initWhisper } from './ui/whisper';
-import { initReader } from './ui/reader';
-import { initInsightPanel } from './ui/insight-panel';
-import { initToolbar } from './ui/toolbar';
-import { initDevDrawer, toggleDrawer } from './ui/dev-drawer';
-import { initDevOverlay } from './ui/dev-overlay';
+import { initRenderer, loadFile, gotoPage, setZoom, hasDocument } from './surface/renderer';
+import { renderChatSurface } from './surface/chat-surface';
+import { initInk, persistInk } from './capture/ink';
+import { initWhisper } from './surface/whisper';
+import { initReader } from './surface/reader';
+import { initInsightPanel } from './surface/insight-panel';
+import { initToolbar } from './surface/toolbar';
+import { initDevDrawer, toggleDrawer } from './dev/dev-drawer';
+import { initDevOverlay } from './dev/dev-overlay';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 

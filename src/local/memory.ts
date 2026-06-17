@@ -1,4 +1,4 @@
-import type { EventType } from './contracts';
+import type { EventType } from '../core/contracts';
 
 /**
  * 阅读会话记忆（逐页）。每页攒下读者的标注记忆 + 翻页时生成的摘要；

@@ -1,16 +1,16 @@
 import type { AnnotationEvent, EventType, HMP, InferenceRequest, InferenceResult, NormBBox, OCRResult, OutputMode, ScreenOverlay, SurfaceIndex, SurfaceObject } from './contracts';
 import { RESULT_TO_OVERLAY, SCHEMA_VERSION } from './contracts';
 import { DEVICE_ID, SESSION_ID, shortId } from './ids';
-import { bboxOf, classify, markShapeOf } from './classify';
-import { resolveTarget, buildHmp } from './target';
+import { bboxOf, classify, markShapeOf } from '../capture/classify';
+import { resolveTarget, buildHmp } from '../evidence/target';
 import { mark } from './metrics';
 import { trace } from './trace';
 import { bus, settings, state, type Stroke } from '../app/state';
-import { grabLayers, grabRegion } from '../providers/ocr';
-import { pageText } from './focus';
-import { inferProviders } from '../providers/inference';
-import { getMemory, memorySnapshot, pageMarks, recordMark, setSummary } from './memory';
-import { putMemory } from '../app/store';
+import { grabLayers, grabRegion } from '../evidence/ocr';
+import { pageText } from '../evidence/focus';
+import { inferProviders } from '../local/model-client';
+import { getMemory, memorySnapshot, pageMarks, recordMark, setSummary } from '../local/memory';
+import { putMemory } from '../local/store';
 import { pushInspect } from './inspect';
 
 /** 单笔封装为契约 shape。会话内多笔共享一个 trace_id（决策：停笔会话）。 */

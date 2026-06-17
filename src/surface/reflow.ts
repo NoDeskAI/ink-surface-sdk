@@ -8,7 +8,7 @@
  * 处理得了：单栏正文的 行→段→标题，剥页眉页脚页码。
  * 处理不好（留给模型版/B 组 VLM 文档解析）：多栏、表格、图片、公式。
  */
-import type { NormBBox, OcrTextBlock } from './contracts';
+import type { NormBBox, OcrTextBlock } from '../core/contracts';
 
 /** 确定性块 id：同页同引擎重排出同样的 id → 缩放/重渲后行内注不丢锚。 */
 export function blockId(text: string, index: number): string {

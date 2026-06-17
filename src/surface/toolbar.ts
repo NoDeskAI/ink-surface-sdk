@@ -1,5 +1,5 @@
 import { setTool, state, type Tool } from '../app/state';
-import { undoStroke } from './ink';
+import { undoStroke } from '../capture/ink';
 
 const ICONS: Record<string, string> = {
   pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l.8-3.2L16.2 5.4a2 2 0 0 1 2.8 0l-.4-.4a2 2 0 0 1 0 2.8L7.2 19.2 4 20z"/></svg>',

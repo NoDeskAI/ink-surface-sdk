@@ -1,5 +1,5 @@
-import type { EventType, MarkShape, NormBBox, StrokePoint } from './contracts';
-import { pageCss } from './transform';
+import type { EventType, MarkShape, NormBBox, StrokePoint } from '../core/contracts';
+import { pageCss } from '../core/transform';
 
 export function bboxOf(points: StrokePoint[]): NormBBox {
   let x0 = 1, y0 = 1, x1 = 0, y1 = 0;

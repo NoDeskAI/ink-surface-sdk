@@ -4,7 +4,7 @@
  *   pointInPolygon() —— 射线法"点在多边形内"；target.ts 的"圈住了什么"复用它。
  * 注：旧的 focusHint/enclosedBlocks（几何猜"圈住了什么"）已被 HMP 取证线取代、移除。
  */
-import type { StrokePoint } from './contracts';
+import type { StrokePoint } from '../core/contracts';
 import { state } from '../app/state';
 
 /** 射线投射 even-odd：点是否在闭合笔迹多边形内（归一化坐标；内/外是拓扑判定，与轴尺度无关）。 */
