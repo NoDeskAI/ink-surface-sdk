@@ -199,7 +199,10 @@ function unreliableWarn(): string {
 function renderFinal(blocks: ReflowBlock[], provisional = false): void {
   const figures: FigureItem[] = state.imageRegions.map((bb, i) => ({ kind: 'figure', id: `fig_${state.pageIndex}_${i}`, source: bb }));
   const items: RenderItem[] = [...blocks, ...figures].sort((a, b) => a.source[1] - b.source[1]);
-  render(items, provisional ? '' : unreliableWarn());
+  // VLM 看图重写：bbox 系模型估算、无源 run（anchorUnsafe）→ 跨视图标注只能按就近兜底（不精确），显式告知
+  const warn = provisional ? ''
+    : (blocks.length && blocks.every((b) => b.anchorUnsafe) ? 'VLM 看图重写：bbox 为估算，标注跨视图映射按就近兜底（不精确），需精确请用「AI 结构重建」。' : unreliableWarn());
+  render(items, warn);
   buildIndex(blocks); // 重建 字符对象→块 映射（跨视图锚）
   void highlightMarks(); // 高亮被标注过的块
   state.overlays.filter((o) => o.page_id === state.pageId).forEach(renderNote); // 本页所有旁注按 ref 贴回（在 buildIndex 之后）

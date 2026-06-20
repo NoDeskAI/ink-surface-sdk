@@ -235,5 +235,5 @@ export const REFLOW_PROVIDER_LABELS: Record<string, string> = {
   local: '仅启发式（即时·保 bbox）',
   hybrid: '启发式 + 模型精修（文字）',
   vision: '启发式 + 视觉重排（Kimi 看图·保 bbox）',
-  rewrite: 'VLM 看图重写（治网页截图/扭曲页·bbox 估算）',
+  rewrite: 'VLM 看图重写（治网页截图/扭曲页·bbox 估算·⚠跨视图锚不精确）',
 };
