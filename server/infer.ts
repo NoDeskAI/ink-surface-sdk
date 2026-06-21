@@ -387,23 +387,26 @@ export async function runInterpretGesture(payload: any): Promise<{ kind: string;
  * 意图理解：读用户在页边的手写批注截图 —— ①转写手写文字 ②判断「为什么写」。
  * 几何手势（圈/划/箭头）的意图已知；手写靠这条 VLM 解读补上（Phase C）。
  */
-export async function runInterpret(payload: any): Promise<{ reading: string; kind: string }> {
+export async function runInterpret(payload: any): Promise<{ reading: string; kind: string; description: string }> {
   const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
-  if (!image) return { reading: '', kind: 'none' };
+  if (!image) return { reading: '', kind: 'none', description: '' };
   // 类型分类器 + 转写器（v3：markup 由几何判，"手写 vs 画"这条无几何模板的轴交给识别——
   // 它读这团墨是不是文字。**context-free**：只看墨图，不需要对话上下文。英文优先、中文兜底，逐字转写不翻译。
+  // 画（sketch/mixed）另给一句"大概像什么"的粗描述（笑脸/箭头/方框…）——只描述长相，不揣测意图（意图交推理模型）。
   const system =
-    'This is a crop of ink the reader drew (white background, dark strokes). Judge the KIND of ink and transcribe any text. ' +
+    'This is a crop of ink the reader drew (white background, dark strokes). Judge the KIND of ink, transcribe any text, and roughly describe any drawing. ' +
     'kind: "handwriting" = legible letters / words / characters; "sketch" = a drawing / diagram / doodle / arrow / lone line, not text; ' +
     '"mixed" = both text and a drawing; "none" = a stray dot or scribble with no content. ' +
     'reading: if it contains text, transcribe it verbatim in its original language (the reader writes primarily English; Chinese also possible); otherwise empty. ' +
-    'Do not translate, summarize, or correct. Output only one JSON: {"kind":"handwriting|sketch|mixed|none","reading":"<text or empty>"}. No other text.';
-  const raw = await gateway(system, 'Classify and transcribe this ink:', 300, image, payload?.model);
+    'description: ONLY if kind is "sketch" or "mixed", give a SHORT 3-8 character Chinese phrase for what the drawing LOOKS LIKE (e.g. 一张笑脸 / 一个箭头 / 一个方框 / 一团乱线 / 一颗星). Describe appearance only — do NOT guess why it was drawn or what it means. Empty for handwriting/none. ' +
+    'Do not translate, summarize, or correct text. Output only one JSON: {"kind":"handwriting|sketch|mixed|none","reading":"<text or empty>","description":"<short zh or empty>"}. No other text.';
+  const raw = await gateway(system, 'Classify, transcribe and describe this ink:', 300, image, payload?.model);
   const j = extractJson(raw);
   const reading = String(j.reading || '').trim();
   const KINDS = ['handwriting', 'sketch', 'mixed', 'none'];
   const kind = KINDS.includes(j.kind) ? j.kind : (reading ? 'handwriting' : 'none'); // 缺 kind 时按有无文字兜底
-  return { reading, kind };
+  const description = (kind === 'sketch' || kind === 'mixed') ? String(j.description || '').trim() : '';
+  return { reading, kind, description };
 }
 
 /**

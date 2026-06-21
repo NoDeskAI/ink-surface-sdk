@@ -23,11 +23,18 @@ function nodeText(node: MarkNode): string {
   return (node.text || '').trim();
 }
 
+/** 画（自由笔·非文字）：feature_type=drawing 或 shape=sketch。text 此时是"像什么"的粗描述、非转写。 */
+function isDrawing(node: MarkNode): boolean {
+  return node.feature_type === 'drawing' || node.shape === 'sketch';
+}
+
 function isWriting(node: MarkNode): boolean {
   return node.feature_type === 'handwriting' || node.mode === 'self_content' || node.shape === 'handwriting';
 }
 
 function phraseFor(node: MarkNode, text: string): string {
+  // 画优先于写：画也是 self_content，但它是"画"不是"写"——text 是粗描述（一张笑脸…），让模型知道这是图。
+  if (isDrawing(node)) return text ? `画「${text}」` : '画了一处';
   if (isWriting(node)) return text ? `写下「${text}」` : '写了一段';
   const verb = VERB[node.shape] ?? '标注';
   return text ? `${verb}「${text}」` : `${verb}了一处`;
@@ -36,6 +43,7 @@ function phraseFor(node: MarkNode, text: string): string {
 /** 空间子句里对一个 mark 的简短指代：有字用「字」，无字退回动词短语。 */
 function refOf(node: MarkNode, text: string): string {
   if (text) return `「${text}」`;
+  if (isDrawing(node)) return '画的那处';
   if (isWriting(node)) return '手写那段';
   return `${VERB[node.shape] ?? '标注'}的那处`;
 }

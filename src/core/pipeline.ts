@@ -487,14 +487,14 @@ function resolveMarkedText(hmp: HMP, index: SurfaceIndex): string {
   return targetText || hint;
 }
 
-/** 云端识别当类型分类器（context-free）：读这团墨是不是文字 → kind + 转写。失败默认 none。 */
-async function recognizeInk(inkData: string): Promise<{ kind: string; reading: string }> {
+/** 云端识别当类型分类器（context-free）：读这团墨是不是文字 → kind + 转写 + 画的粗描述。失败默认 none。 */
+async function recognizeInk(inkData: string): Promise<{ kind: string; reading: string; description: string }> {
   try {
     const r = await fetch('/api/interpret', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: inkData, model: settings.inferModel }) });
-    if (!r.ok) return { kind: 'none', reading: '' };
-    const j = await r.json() as { kind?: string; reading?: string };
-    return { kind: String(j.kind || 'none'), reading: String(j.reading || '').trim() };
-  } catch { return { kind: 'none', reading: '' }; }
+    if (!r.ok) return { kind: 'none', reading: '', description: '' };
+    const j = await r.json() as { kind?: string; reading?: string; description?: string };
+    return { kind: String(j.kind || 'none'), reading: String(j.reading || '').trim(), description: String(j.description || '').trim() };
+  } catch { return { kind: 'none', reading: '', description: '' }; }
 }
 
 /**
@@ -522,14 +522,16 @@ export async function captureMark(
       const r = await recognizeInk(layers.ink);
       const isText = r.kind === 'handwriting' || r.kind === 'mixed';
       resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: r.kind === 'none' ? 0.3 : 0.85 };
-      textHint = r.reading || undefined;
+      // 文字→转写；画→粗描述（让画也带"内容"进 markedText/叙事/召回；意图仍交推理模型）。
+      textHint = (isText ? r.reading : r.description) || undefined;
       if (DEV) pl.push({
         stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'ran',
-        note: '自由笔且过几何门(ocrWorthy)：判「手写 vs 画」并转写（context-free，不看上下文）',
+        note: '自由笔且过几何门(ocrWorthy)：判「手写 vs 画」、转写文字、给画一句粗描述（context-free，不看上下文、不揣测意图）',
         input: [{ k: '模型', v: settings.inferModel }, { k: '输入', v: '白底笔迹图 ink' }],
         output: [
           { k: '判定 kind', v: r.kind },
           { k: '转写 reading', v: r.reading || '（无）' },
+          { k: '画的描述 description', v: r.description || '（非画/无）' },
           { k: '定型', v: `${resolved.type} · conf ${resolved.confidence}` },
         ],
         images: [{ role: 'ink（识别输入）', thumb: await thumb(layers.ink) }].filter((x) => x.thumb),
@@ -635,6 +637,12 @@ export async function commitSessionDiscussion(
   if (settings.sendMarkImage || (!anchorMark.markedText.trim() && ah && (ah.object_hint === 'image_region' || ah.mode === 'self_content'))) {
     if (ah?.mode === 'self_content' && ah.vector_ref) crop = { role: 'ink', data: ah.vector_ref };
     else if (ah?.crop_ref) crop = { role: 'composite', data: ah.crop_ref };
+  }
+  // 原图送达：上面没选出图、但本段里有"画"（self_content 带笔迹图）→ 选最近一张画的原图送进推理模型。
+  // 让"画不是最后一笔"（如画完又写了句问题）时，画的原图仍到模型手里，由模型在上下文里解读其含义。
+  if (!crop) {
+    const draw = [...marks].reverse().find((m) => m.feature.type === 'drawing' && m.hmp?.mode === 'self_content' && !!m.hmp?.vector_ref);
+    if (draw?.hmp?.vector_ref) crop = { role: 'ink', data: draw.hmp.vector_ref };
   }
 
   // 空间召回（治本·根因 A）与滑窗上下文并发取，省 commit 路径串行延迟

@@ -172,10 +172,13 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
 async function commitSession(bookId: string, reason: 'idle' | 'handwriting', triggerMark?: Mark): Promise<void> {
   const session = peekSession(bookId);
   if (!session) return;
-  // idle 综合要有实质：至少一笔手写、或锚到真实正文的标记。纯散笔/涂画（无锚内容）不触发，避免无关回复。
+  // idle 综合要有实质：至少一笔手写、锚到真实正文的标记、或被识别成某物的画（带描述）。
+  // 纯散笔/乱涂（none、无描述）不触发，避免无关回复——但识别出的草图（笑脸/箭头…）= 用户有意为之，停笔后交模型解读。
   if (reason === 'idle') {
     const substantial = session.marks.some((m) =>
-      m.feature.type === 'handwriting' || ((m.hmp?.mode === 'anchored' || m.hmp?.mode === 'mixed') && !!m.markedText.trim()));
+      m.feature.type === 'handwriting'
+      || ((m.hmp?.mode === 'anchored' || m.hmp?.mode === 'mixed') && !!m.markedText.trim())
+      || (m.feature.type === 'drawing' && !!m.hmp?.text_hint?.trim()));
     if (!substantial) { clearSession(bookId); lastSig.delete('sess_' + bookId); return; }
   }
   const sig = session.marks.map((m) => m.id).join(',') + ':' + reason + ':' + (triggerMark?.id ?? '');
