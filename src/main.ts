@@ -25,7 +25,7 @@ import { initInsightPanel } from './surface/insight-panel';
 import { initToolbar } from './surface/toolbar';
 import { initDevDrawer, toggleDrawer } from './dev/dev-drawer';
 import { initDevOverlay } from './dev/dev-overlay';
-import { initConsole } from './dev/console';
+import { initNavShell } from './dev/console';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -148,6 +148,7 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
   const cap = await captureMark(repr, geom, markScored.score); // 识别定型 → cap.feature 是最终类型
   const feature = cap.feature;
   const mark = makeMark(repr, feature, markScored, cap.hmp, cap.markedText);
+  mark.trace = cap.trace; // 落笔当时这笔经手的组件阶段（识别/OCR兜底/取证）→ 提交时拼进整轮流水线
   addMark(bookId, mark);
   // 落账本（页账本 mark 条目）+ 建 笔→mark 映射（擦/撤时给整 mark 落 tombstone）
   for (const s of realStrokes) strokeMarkIds.set(s, mark.id);
@@ -269,7 +270,7 @@ initDevDrawer({
   closeBtn: $('drawer-close'),
 });
 initDevOverlay();
-initConsole();
+initNavShell();
 
 const fileIn = $<HTMLInputElement>('file-in');
 fileIn.addEventListener('change', () => {

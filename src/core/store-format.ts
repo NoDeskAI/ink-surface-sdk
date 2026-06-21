@@ -11,7 +11,7 @@
  * 页保持纯净：marks 只装用户笔迹+取证，AI 文本全在 ai_turns（显示靠 anchor refs 挂回页）。
  * 文字级、几 KB/页，墨水屏轻松装下；浏览器用 IndexedDB，映射到设备 SQLite。
  */
-import type { HMP, InferenceView, MarkFeatureType, NormBBox, OverlayState, ScreenOverlay, StrokePoint } from './contracts';
+import type { HMP, InferenceView, MarkFeatureType, NormBBox, OverlayState, PipelineStage, ScreenOverlay, StrokePoint } from './contracts';
 import type { ReflowBlock } from '../surface/reflow';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
@@ -99,6 +99,12 @@ export interface PersistedAiTurn extends BaseEntry {
   overlay_state: OverlayState;     // shown / accepted / edited / dismissed
   user_edited_text: string | null; // edited 时用户改写文本
   ai_reply: string;
+  thinking?: string;               // 模型思考过程（仅 Claude 返回；调试/复盘用，不进对话上下文）
+  diag?: {                         // 全流程诊断（会话页用户内容块"分类展示"用）
+    classify?: { respond: boolean; reason: string } | null; // 上下文分类器判定（仅手写轮；idle 轮为 null）
+    sent_image?: boolean;          // 本轮是否随发了合成图/笔迹图
+  };
+  pipeline?: PipelineStage[];      // 处理流水线（逐组件收到/产出，含缩略图；仅 DEV 落、调试页逐步复盘用）
   anchor: { surface_id: string; mark_ids: string[]; object_refs: string[] }; // 指回页/笔/对象
   inference_view: InferenceView;   // 喂模型的精简载荷快照（crop 已剥），审计/复现
   prompt_snapshot: string;         // 渲染出的用户轮文本（renderUserTurn 结果）

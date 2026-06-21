@@ -1,4 +1,4 @@
-import type { AnnotationEvent, EventType, HMP, InferenceRequest, InferenceResult, InferenceView, MarkFeatureType, MarkShape, NormBBox, OCRResult, OutputMode, ScreenOverlay, SurfaceIndex, SurfaceObject } from './contracts';
+import type { AnnotationEvent, EventType, HMP, InferenceRequest, InferenceResult, InferenceView, MarkFeatureType, MarkShape, NormBBox, OCRResult, OutputMode, PipelineStage, ScreenOverlay, SurfaceIndex, SurfaceObject } from './contracts';
 import { RESULT_TO_OVERLAY, SCHEMA_VERSION, INFERVIEW_SCHEMA_VERSION } from './contracts';
 import { DEVICE_ID, SESSION_ID, shortId, sha256Hex } from './ids';
 import { appendAiTurnEntry, getReflow, setSynthesisWatermark } from '../local/store';
@@ -29,6 +29,39 @@ const CHAT_SYSTEM =
 const GVERB: Record<string, string> = {
   circle: '圈选', underline: '划线', highlight: '高亮', arrow: '画箭头标', margin_note: '手写批注', tap_region: '点选', stroke: '标记',
 };
+
+/* ── 处理流水线（调试）：逐组件「收到什么 → 产出什么」，含缩略图，串成一轮链路 ─────────
+ * 仅 DEV 落库（gate 同 mirror*）；图压成 ~220px 缩略图控 IndexedDB 体积。供 AI 会话调试页复盘。 */
+const DEV = !!(import.meta as { env?: { DEV?: boolean } }).env?.DEV;
+
+/** 缩略图：把 dataURL 压到长边 ≤max → JPEG（控存储体积）。失败/无图返回空串。 */
+function thumb(dataUrl: string | undefined | null, max = 220): Promise<string> {
+  if (!dataUrl) return Promise.resolve('');
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const scale = Math.min(1, max / Math.max(img.width, img.height));
+          const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
+          const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+          cv.getContext('2d')!.drawImage(img, 0, 0, w, h);
+          resolve(cv.toDataURL('image/jpeg', 0.6));
+        } catch { resolve(''); }
+      };
+      img.onerror = () => resolve('');
+      img.src = dataUrl;
+    } catch { resolve(''); }
+  });
+}
+
+/** 一笔在流水线里的短标签（手写「…」/ 画「…」/ 标记「…」），逐 mark 阶段挂它。 */
+function markTraceLabel(feature: MarkFeatureType, markedText: string): string {
+  const t = (markedText || '').replace(/\s+/g, ' ').slice(0, 16);
+  if (feature === 'handwriting') return `手写「${t || '…'}」`;
+  if (feature === 'drawing') return `画${t ? `「${t}」` : '（无字）'}`;
+  return `标记「${t || '—'}」`;
+}
 
 /** CHAT_SYSTEM 指纹（ai_turn 存 system_prompt_hash，便于日后 prompt 变更后审计/复现）。模块加载即算。 */
 const SYS_HASH_P: Promise<string> = sha256Hex(new TextEncoder().encode(CHAT_SYSTEM).buffer as ArrayBuffer)
@@ -140,7 +173,7 @@ function buildOverlay(result: InferenceResult, evt: AnnotationEvent): ScreenOver
  *  · step⑥ self_content：空白手写 → 白底笔迹图 → /api/interpret（Kimi 读手写）。
  * 失败一律静默，不连累主推理闭环。
  */
-async function enrichHmp(hmp: HMP, evt: AnnotationEvent, targets: SurfaceObject[]): Promise<void> {
+async function enrichHmp(hmp: HMP, evt: AnnotationEvent, targets: SurfaceObject[], pl?: PipelineStage[]): Promise<void> {
   // step⑤：命中图区或无文字的内容对象（如 embedded_image），结构里拿不到字 → 局部 OCR 兜底。
   // （freeform 的"手写 vs 画 + 转写"已在 captureMark 由识别裁判，不在此处理。）
   const needsOcr = hmp.mode !== 'self_content'
@@ -151,8 +184,10 @@ async function enrichHmp(hmp: HMP, evt: AnnotationEvent, targets: SurfaceObject[
   hmp.crop_ref = crop;
   try {
     const r = await fetch('/api/ocr-vlm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ image: crop, model: settings.inferModel }) });
+    let readOut = '';
     if (r.ok) {
       const t = String((await r.json())?.text || '').trim();
+      readOut = t;
       if (t) {
         hmp.text_hint = t; // 识别只补内容，不改 mode/类型
         hmp.confidence = Math.max(hmp.confidence, 0.7);
@@ -160,6 +195,13 @@ async function enrichHmp(hmp: HMP, evt: AnnotationEvent, targets: SurfaceObject[
         bus.emit('hmp:updated', hmp);
       }
     }
+    if (pl && DEV) pl.push({
+      stage: 'ocr_fallback', label: '图区 OCR 兜底 · /api/ocr-vlm', status: 'ran',
+      note: '命中图区/无文字对象，结构层拿不到字 → 裁 crop 交云端视觉转写',
+      input: [{ k: '模型', v: settings.inferModel }, { k: '输入', v: '标注区 crop 图' }],
+      output: [{ k: '读出文字', v: readOut || '（未读出）' }],
+      images: [{ role: 'crop（OCR 输入）', thumb: await thumb(crop) }].filter((x) => x.thumb),
+    });
   } catch { /* 兜底失败不连累闭环 */ }
 }
 
@@ -301,7 +343,7 @@ export async function commitDiscussion(
     userContent = `读者在原文上${verb}了这一处：「${marked}」。${ask}${ctx}`;
     anchorRefs = hmp?.target_object_refs ?? [];
     trace('InferenceRequest(disc)', { mode: 'chat-buffer', page_id: evt.page_id, gesture: evt.event_type, intent: finalIntent, marked: marked.slice(0, 60), buffer_turns: bookMessages(bookId).length } as unknown as Record<string, unknown>);
-    const full = await chatTurn(bookId, userContent, {
+    const { text: full } = await chatTurn(bookId, userContent, {
       system: CHAT_SYSTEM, model: settings.inferModel,
       onDelta: (t) => bus.emit('anchor:place', { id: discId, pageId: evt.page_id, anchorRefs, bbox: evt.geometry.bbox, text: t, kind: 'note' }),
     });
@@ -359,6 +401,30 @@ export async function commitDiscussion(
   state.overlays.push(overlay);
   bus.emit('overlay:add', overlay);
 
+  // 处理流水线（DEV·段落讨论路）：取证 → 主模型两段，逐组件「收到什么 → 产出什么」
+  let pipeline: PipelineStage[] | undefined;
+  if (DEV) {
+    const pl: PipelineStage[] = [];
+    if (hmp) pl.push({
+      stage: 'hmp', label: 'HMP 取证（段落讨论）', status: 'ran',
+      note: `mode=${hmp.mode} · 命中类型=${hmp.object_hint}`,
+      input: [{ k: '标注框 bbox', v: evt.geometry.bbox.map((n) => +n.toFixed(3)).join(', ') }],
+      output: [{ k: '所标内容', v: focusStr || '（未提取到文字）' }],
+      images: composite ? [{ role: 'composite（笔迹叠原文）', thumb: await thumb(composite) }].filter((x) => x.thumb) : [],
+    });
+    pl.push({
+      stage: 'model', label: '主模型 · /api/chat（段落讨论）', status: 'ran',
+      note: `滑窗 buffer ${memoryPages} 轮`,
+      input: [
+        { k: '模型', v: settings.inferModel },
+        { k: '随发图', v: '无（段落讨论路当前未将图送入主模型）' },
+        { k: '完整 prompt', v: userContent },
+      ],
+      output: [{ k: '回复', v: result.content }],
+    });
+    pipeline = pl;
+  }
+
   // 落账本：reader/段落讨论的回复也进书日志（此前只有 PDF 主路落账）→ reader 旁注持久 + 跨视图
   void appendAiTurnEntry({
     document_id: bookId, page_id: evt.page_id, page_index: state.pageIndex,
@@ -370,6 +436,7 @@ export async function commitDiscussion(
     system_prompt_hash: await SYS_HASH_P,
     settings_snapshot: { inferModel: settings.inferModel, reflowProvider: settings.reflowProvider },
     trigger: 'discussion', model: result.model_name, supersedes: null,
+    pipeline,
   });
   mark('total', performance.now() - penUpAt);
 }
@@ -438,21 +505,41 @@ async function recognizeInk(inkData: string): Promise<{ kind: string; reading: s
  */
 export async function captureMark(
   event: AnnotationEvent, feature: StrokeFeature, score: number,
-): Promise<{ hmp: HMP | null; markedText: string; feature: StrokeFeature }> {
+): Promise<{ hmp: HMP | null; markedText: string; feature: StrokeFeature; trace?: PipelineStage[] }> {
   const index = state.surfaceIndex;
   if (!index || event.page_id !== index.surface_id) return { hmp: null, markedText: '', feature };
   const targets = resolveTarget([event], event.geometry.bbox, index);
   const layers = grabLayers(event.geometry.bbox, 0.04);
+  const pl: PipelineStage[] = []; // 这笔经手的组件阶段（识别/OCR兜底/取证），提交时拼进整轮流水线
 
   // freeform 且几何门判 ocrWorthy（非散笔/线条）→ 识别定型（handwriting/drawing）+ 读出文字。
   // 不值得（单笔近直线/太小）→ 跳过识别、留 drawing，省调用、也避免把线条误转写成字。
   let resolved = feature;
   let textHint: string | undefined;
-  if (feature.type !== 'markup' && feature.raw.ocrWorthy && layers.ink) {
-    const r = await recognizeInk(layers.ink);
-    const isText = r.kind === 'handwriting' || r.kind === 'mixed';
-    resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: r.kind === 'none' ? 0.3 : 0.85 };
-    textHint = r.reading || undefined;
+  if (feature.type !== 'markup') {
+    if (feature.raw.ocrWorthy && layers.ink) {
+      const r = await recognizeInk(layers.ink);
+      const isText = r.kind === 'handwriting' || r.kind === 'mixed';
+      resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: r.kind === 'none' ? 0.3 : 0.85 };
+      textHint = r.reading || undefined;
+      if (DEV) pl.push({
+        stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'ran',
+        note: '自由笔且过几何门(ocrWorthy)：判「手写 vs 画」并转写（context-free，不看上下文）',
+        input: [{ k: '模型', v: settings.inferModel }, { k: '输入', v: '白底笔迹图 ink' }],
+        output: [
+          { k: '判定 kind', v: r.kind },
+          { k: '转写 reading', v: r.reading || '（无）' },
+          { k: '定型', v: `${resolved.type} · conf ${resolved.confidence}` },
+        ],
+        images: [{ role: 'ink（识别输入）', thumb: await thumb(layers.ink) }].filter((x) => x.thumb),
+      });
+    } else if (DEV) {
+      pl.push({
+        stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'skipped',
+        note: layers.ink ? '几何门判不值得识别（单笔近直线/太小）→ 跳过、留 drawing' : '无白底笔迹图可识别',
+        output: [{ k: '定型', v: `${feature.type}（未经识别）` }],
+      });
+    }
   }
   const action = markActionOf(resolved.type, event.event_type, score);
   // markup 锚它所标的内容；freeform（手写/画）属 self_content——它本身就是内容，不锚到 bbox 碰巧蹭到的正文
@@ -468,9 +555,23 @@ export async function captureMark(
   if (state.lastHmps.length > 10) state.lastHmps.length = 10;
   trace('HMP', hmp as unknown as Record<string, unknown>);
   bus.emit('hmp:updated', hmp);
-  await enrichHmp(hmp, event, targets); // 仅图区 OCR 兜底（freeform 转写已在上面完成）
+  await enrichHmp(hmp, event, targets, pl); // 仅图区 OCR 兜底（freeform 转写已在上面完成）
   mirrorHmp(hmp);
-  return { hmp, markedText: resolveMarkedText(hmp, index), feature: resolved };
+  const markedText = resolveMarkedText(hmp, index);
+  if (DEV) pl.push({
+    stage: 'hmp', label: 'HMP 取证（落笔当时）', status: 'ran',
+    note: `mode=${hmp.mode} · action=${hmp.action} · 命中类型=${hmp.object_hint}`,
+    input: [
+      { k: '标注框 bbox', v: event.geometry.bbox.map((n) => +n.toFixed(3)).join(', ') },
+      { k: '命中对象', v: targets.map((o) => `${o.type}「${(o.text || '').slice(0, 12)}」`).join(' / ') || '（无）' },
+    ],
+    output: [
+      { k: '所标内容 markedText', v: markedText || '（未提取到文字）' },
+      { k: '归类', v: hmp.mode === 'self_content' ? '自身内容（手写/画）' : `锚定原文（${hmp.target_object_refs.length} 对象）` },
+    ],
+    images: [{ role: 'composite（笔迹叠原文）', thumb: await thumb(layers.composite) }].filter((x) => x.thumb),
+  });
+  return { hmp, markedText, feature: resolved, trace: DEV ? pl : undefined };
 }
 
 /** 把 inference-view 渲染成喂模型的 user turn：idle=整段综合 / handwriting=定向答问。 */
@@ -547,8 +648,12 @@ export async function commitSessionDiscussion(
   const bookId = session.bookId;
   // handwriting 路：上下文分类器判 respond/fold（带同源 inference-view + 对话历史）。
   // fold = 写给自己的笔记 → 静默、不落 overlay、mark 留 session（计入下次综合）。
+  let classifyDiag: { respond: boolean; reason: string } | null = null; // 存进账本 diag，供会话页"分类展示"
+  let classifyConvoLen = 0; // 分类器看到的对话历史条数（流水线展示用）
   if (reason === 'handwriting') {
+    classifyConvoLen = bookMessages(bookId).length;
     const decision = await classifyContext(view, bookMessages(bookId));
+    classifyDiag = { respond: decision.respond, reason: decision.reason };
     trace('ClassifyContext', { respond: decision.respond, reason: decision.reason, question: view.question ?? '' });
     mirrorClassify({ respond: decision.respond, reason: decision.reason, question: view.question ?? '', discId });
     if (!decision.respond) return false;
@@ -559,13 +664,16 @@ export async function commitSessionDiscussion(
   const anchorRefs = view.anchor_refs;
 
   let result: InferenceResult;
+  let thinking = '';
+  const bufBefore = bookMessages(bookId).length; // 主模型这轮看到的滑窗上下文条数（发送前）
   try {
-    const full = await chatTurn(bookId, userContent, {
+    const { text: full, thinking: tk } = await chatTurn(bookId, userContent, {
       system: CHAT_SYSTEM, model: settings.inferModel,
       maxTokens: reason === 'idle' ? 600 : 400,
       images: view.crop ? [{ data: view.crop.data }] : [], // 被判需图片识别的内容：把合成图/笔迹图送进主推理
       onDelta: (t) => bus.emit('anchor:place', { id: discId, pageId, anchorRefs, bbox: view.anchor_bbox, text: t, kind: 'note' }),
     });
+    thinking = tk; // 思考过程不进 buffer，只随账本存、供调试页展示
     bus.emit('anchor:clear', discId);
     result = {
       result_id: shortId('res'), trace_id: shortId('disc'), request_id: 'chat',
@@ -600,6 +708,83 @@ export async function commitSessionDiscussion(
   state.overlays.push(overlay);
   bus.emit('overlay:add', overlay);
 
+  // 处理流水线（DEV）：把这一轮经手的每个组件「收到什么 → 产出什么」按执行顺序串起来，供会话页逐步复盘。
+  let pipeline: PipelineStage[] | undefined;
+  if (DEV) {
+    const pl: PipelineStage[] = [];
+    // ① 逐 mark 的落笔取证阶段（识别 / OCR 兜底 / HMP）——落笔当时已记，这里拼起并标注是第几笔
+    marks.forEach((m, i) => {
+      const lbl = markTraceLabel(m.feature.type, m.markedText);
+      (m.trace ?? []).forEach((st) => pl.push({ ...st, mark_ord: i + 1, mark_label: lbl }));
+    });
+    // ② mark-graph 关联（时空四象限）
+    const edgeKinds: Record<string, number> = {};
+    for (const e of graph.edges) edgeKinds[e.kind] = (edgeKinds[e.kind] ?? 0) + 1;
+    const quads = graph.edges.filter((e) => e.kind === 'temporal' && e.quadrant).map((e) => e.quadrant);
+    pl.push({
+      stage: 'graph', label: 'mark-graph 关联（时空四象限）', status: 'ran',
+      note: '把这段 mark 连成图：相邻时间边落四象限、空间近邻连边（纯确定性）',
+      input: [{ k: '输入 mark', v: `${marks.length} 笔` }],
+      output: [
+        { k: '节点', v: `${graph.nodes.length}` },
+        { k: '边', v: Object.entries(edgeKinds).map(([k, n]) => `${k}:${n}`).join(' / ') || '无' },
+        ...(quads.length ? [{ k: '时间四象限', v: quads.join(' · ') }] : []),
+      ],
+    });
+    // ③ inference-view 蒸馏（确定性·无模型）
+    const cropThumb = view.crop ? await thumb(view.crop.data) : '';
+    pl.push({
+      stage: 'inferview', label: 'inference-view 蒸馏（确定性·无模型）', status: 'ran',
+      note: '丢坐标/分数/置信，产「关系叙事 + 所标内容 + 滑窗上下文」——主模型与分类器都只吃它',
+      input: [
+        { k: '触发', v: reason === 'idle' ? '长停顿综合' : '手写定向' },
+        { k: '图', v: `${graph.nodes.length} 节点 / ${graph.edges.length} 边` },
+      ],
+      output: [
+        { k: '关系叙事 narrative', v: view.narrative || '—' },
+        { k: '所标内容 marked', v: view.marked || '（未提取到文字）' },
+        ...(view.question ? [{ k: '手写问 question', v: view.question }] : []),
+        { k: '滑窗上下文', v: `${view.page_context?.length ?? 0} 字` },
+        { k: '锚点', v: `${view.anchor_refs.length} 对象` },
+        { k: '随图 crop', v: view.crop ? `有（${view.crop.role}）` : '无' },
+      ],
+      images: cropThumb ? [{ role: `${view.crop!.role}（蒸馏挑出的图）`, thumb: cropThumb }] : [],
+    });
+    // ④ 上下文分类器（仅手写轮；fold 会提前 return、走不到这里）
+    if (reason === 'handwriting' && classifyDiag) pl.push({
+      stage: 'classify', label: '上下文分类器 · /api/classify-context', status: 'ran',
+      note: '判这条手写是「问我」还是「写给自己」(respond/fold)；与主模型独立的第二次调用',
+      input: [
+        { k: '问题', v: (view.question || view.marked) || '—' },
+        { k: 'view_narrative', v: view.narrative || '—' },
+        { k: 'marked', v: view.marked || '—' },
+        { k: '对话历史', v: `${classifyConvoLen} 条` },
+        { k: '模型', v: settings.inferModel },
+      ],
+      output: [
+        { k: '判定', v: classifyDiag.respond ? '回应 respond ✓' : '折叠 fold ✗' },
+        { k: '理由', v: classifyDiag.reason || '—' },
+      ],
+    });
+    // ⑤ 主模型（流式）——产出即下方那条回复气泡 + 思考过程
+    pl.push({
+      stage: 'model', label: '主模型 · /api/chat（流式）', status: result.model_version === 'chat-session' ? 'ran' : 'error',
+      note: `系统人格 hash ${await SYS_HASH_P} · 滑窗 buffer ${bufBefore} 轮（发送前）`,
+      input: [
+        { k: '模型', v: settings.inferModel },
+        { k: 'maxTokens', v: String(reason === 'idle' ? 600 : 400) },
+        { k: '随发图', v: view.crop ? `有（${view.crop.role}）` : '无' },
+        { k: '完整 prompt', v: userContent },
+      ],
+      output: [
+        { k: '回复', v: result.content },
+        { k: '思考过程', v: thinking ? `${thinking.length} 字（见下方气泡）` : '（当前模型未回传）' },
+      ],
+      images: cropThumb ? [{ role: `${view.crop!.role}（送入主模型）`, thumb: cropThumb }] : [],
+    });
+    pipeline = pl;
+  }
+
   // 落账本：ai_turn 进书日志（显示快照 + 锚点 + view 快照[crop 剥] + provenance）；并推综合水位线
   await appendAiTurnEntry({
     document_id: bookId, page_id: pageId, page_index: state.pageIndex,
@@ -610,8 +795,11 @@ export async function commitSessionDiscussion(
     prompt_snapshot: userContent,
     system_prompt_hash: await SYS_HASH_P,
     settings_snapshot: { inferModel: settings.inferModel, reflowProvider: settings.reflowProvider },
-    trigger: reason, model: result.model_name, supersedes: null,
+    trigger: reason, model: result.model_name, supersedes: null, thinking,
+    diag: { classify: classifyDiag, sent_image: !!view.crop },
+    pipeline,
   });
   setSynthesisWatermark(); // 此前所有 mark 记为已综合；之后的新 mark = pending
+  bus.emit('aiturn:appended', bookId); // 账本已落 → 通知会话页刷新（overlay:add 早于本 await，单靠它读账本会漏最新一轮）
   return true;
 }

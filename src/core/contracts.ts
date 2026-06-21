@@ -286,3 +286,25 @@ export interface InferenceView {
   page_id: string;
   version: string;
 }
+
+/**
+ * 「处理流水线」一节（调试用）：一轮 AI 回应里，每个组件/分类器实际**收到了什么**、**产出了什么**。
+ * 按执行顺序串起整条链路（逐 mark 识别/取证 → mark-graph → inference-view 蒸馏 → 上下文分类器 → 主模型），
+ * 让"原始信息如何被一步步加工成最终产出物"可逐字段、连同图一起复盘。
+ * 仅供 AI 会话调试页消费——不进对话上下文、不参与推理；图为缩略图(dataURL，已压到 ~220px 控体积)。
+ */
+export interface PipelineStageIO {
+  k: string; // 字段名（如「输入图」「转写」「命中对象」）
+  v: string; // 值（文字）
+}
+export interface PipelineStage {
+  stage: string;                 // 机器名：recognize/ocr_fallback/hmp/graph/inferview/classify/model
+  label: string;                 // 中文展示名（含端点）
+  status?: 'ran' | 'skipped' | 'error'; // 跳过/出错也如实记
+  note?: string;                 // 一行小结（如几何门控原因）
+  mark_ord?: number;             // 逐 mark 阶段：这是第几个 mark（1 起）
+  mark_label?: string;           // 逐 mark 阶段：该 mark 的识别标签
+  input?: PipelineStageIO[];     // 收到的上下文
+  output?: PipelineStageIO[];    // 产出
+  images?: Array<{ role: string; thumb: string }>; // 该阶段经手的图（缩略 dataURL）
+}

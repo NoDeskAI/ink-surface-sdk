@@ -55,13 +55,25 @@ async function callGateway(opts: { system: string; messages: any[]; maxTokens: n
  * 网关若不支持流式(返回 application/json) → 退化为一次性读出全文再 yield 一次，
  * 调用方逻辑不变(只是不再是增量)。供 reflowAiStream 做"按段流式重排"。
  */
-async function* gatewayTextStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string }): AsyncGenerator<string> {
+type GwEvent = { type: 'text' | 'thinking'; delta: string };
+
+/**
+ * 流式网关调用（事件级）：逐段 yield {type:'text'|'thinking', delta}。
+ *  · thinking 仅对 Claude 请求并回传——gemini 原生思考不经 anthropic thinking 字段回链、kimi 远端思考不回传，
+ *    对它们请求 thinking 无益（甚至吃 max_tokens），故 wantThink 只在 model 以 claude 开头时成立。
+ *  · 网关不支持 SSE 时退化为一次性读出 content 块（text + 可能的 thinking 块）。
+ */
+async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
   const { url, key } = cfg();
   const model = opts.model || cfg().model;
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
   const { channel, channel_url } = route(model);
-  const max_tokens = model.startsWith('gemini') ? Math.max(opts.maxTokens, 2048) : opts.maxTokens;
+  const wantThink = !!opts.thinking && model.startsWith('claude'); // 只有 Claude 经网关真返回思考块
+  const budget = 1024;
+  let max_tokens = model.startsWith('gemini') ? Math.max(opts.maxTokens, 2048) : opts.maxTokens;
+  if (wantThink) max_tokens = Math.max(max_tokens, budget + 256); // anthropic 约束：max_tokens 必须 > thinking.budget_tokens
   const body: any = { model, max_tokens, system: opts.system, messages: opts.messages, channel, channel_url, stream: true };
+  if (wantThink) body.thinking = { type: 'enabled', budget_tokens: budget };
   const resp = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', 'anthropic-version': '2023-06-01', accept: 'text/event-stream' },
@@ -69,10 +81,13 @@ async function* gatewayTextStream(opts: { system: string; messages: any[]; maxTo
   });
   const ct = resp.headers.get('content-type') || '';
   if (!resp.ok || !resp.body || !ct.includes('event-stream')) {
-    // 网关没给 SSE（不支持流式/报错）→ 一次性读出，yield 一次（仍正确，只是不增量）
+    // 网关没给 SSE（不支持流式/报错）→ 一次性读出 content 块（思考块 + 文本块）
     const data: any = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
-    yield textOf(data);
+    for (const b of (data?.content || [])) {
+      if (b?.type === 'thinking' && b.thinking) yield { type: 'thinking', delta: String(b.thinking) };
+      else if (b?.type === 'text' && b.text) yield { type: 'text', delta: String(b.text) };
+    }
     return;
   }
   const reader = (resp.body as any).getReader();
@@ -91,11 +106,20 @@ async function* gatewayTextStream(opts: { system: string; messages: any[]; maxTo
       if (payload === '[DONE]') return;
       try {
         const ev = JSON.parse(payload);
-        const t = ev?.delta?.text ?? (ev?.delta?.type === 'text_delta' ? ev.delta.text : undefined);
-        if (typeof t === 'string' && t) yield t;
+        const d = ev?.delta;
+        if (d?.type === 'thinking_delta' && typeof d.thinking === 'string' && d.thinking) yield { type: 'thinking', delta: d.thinking };
+        else {
+          const t = d?.text ?? (d?.type === 'text_delta' ? d.text : undefined);
+          if (typeof t === 'string' && t) yield { type: 'text', delta: t };
+        }
       } catch { /* 非 JSON 的 SSE 行（注释/心跳）跳过 */ }
     }
   }
+}
+
+/** 流式文字（兼容旧调用：只要正文，不请求思考）。供 reflowAiStream 等。 */
+async function* gatewayTextStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string }): AsyncGenerator<string> {
+  for await (const e of gatewayEventStream(opts)) if (e.type === 'text') yield e.delta;
 }
 
 const textOf = (data: any): string =>
@@ -632,7 +656,10 @@ export async function* chatStream(payload: any): AsyncGenerator<string> {
   const system = String(payload?.system || '');
   const model = payload?.model || cfg().model;
   const maxTokens = typeof payload?.maxTokens === 'number' ? payload.maxTokens : 800;
-  for await (const delta of gatewayTextStream({ system, messages, maxTokens, model })) yield delta;
+  // NDJSON 帧：每行 {"k":"t"|"r","d":"<增量>"}——t=回复正文、r=思考过程（reasoning）。客户端 chatTurn 分流。
+  for await (const e of gatewayEventStream({ system, messages, maxTokens, model, thinking: true })) {
+    yield JSON.stringify({ k: e.type === 'thinking' ? 'r' : 't', d: e.delta }) + '\n';
+  }
 }
 
 /** 翻页总结：把一页的标注 + AI 回应压成一句备忘，供跨页综合。 */
