@@ -10,11 +10,13 @@
  *   · 采集取证（感知层）：一页两段、深度联动——「HMP 取证（全书逐笔）」+「SurfaceIndex 对象（本页对象表）」；
  *     二者是同一批对象 id 的消费者/生产者（HMP.target_object_refs 指进对象表），命中 ref ↔ 对象行互跳。
  *     看"感知对不对"，是 AI 会话的姊妹镜。【已实现】
- *   · 设置：迁移中，暂跳旧 dev 页(#dev)，逐步搬进来后退役它。
+ *   · 设置：迁出旧 dev 抽屉的全部设置控件；按代码审计**诚实标注每项可用性**（生效/调试叠层/弱效/失效）。【已实现】
+ *
+ * 至此除「阅读」外的页全部搬进导航壳，`#dev` 仅余作旧抽屉直达（取证浮窗等），可后续退役。
  *
  * 非「阅读」的页面渲染进 #app-pages（覆盖正文区、不挡侧栏）。侧栏可折叠（键 m / 折叠钮），折叠时正文占满。
  */
-import { bus, state } from '../app/state';
+import { bus, state, settings, saveSettings, type Placement, type OcrImageMode } from '../app/state';
 import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks } from '../local/store';
 import type { PersistedAiTurn, PersistedMark } from '../core/store-format';
@@ -27,7 +29,7 @@ const PAGES: Array<{ id: PageId; icon: string; label: string; ready: boolean }> 
   { id: 'reader', icon: '📖', label: '阅读', ready: true },
   { id: 'chat', icon: '💬', label: 'AI 会话', ready: true }, // 含逐组件处理流水线，已取代旧「上下文监控」
   { id: 'hmp', icon: '🔬', label: '采集取证', ready: true }, // 合并 HMP 取证 + SurfaceIndex 对象，深度联动
-  { id: 'settings', icon: '⚙', label: '设置', ready: false },
+  { id: 'settings', icon: '⚙', label: '设置', ready: true }, // 全部设置 + 逐项可用性标注
 ];
 
 let activePage: PageId = 'reader';
@@ -207,6 +209,33 @@ function injectStyle(): void {
   .hmp-card.cap-flash { animation: capflashcard 1.4s ease; }
   @keyframes capflashbg { 0%, 28% { background: #fde68a; } 100% { background: transparent; } }
   @keyframes capflashcard { 0%, 28% { background: #fde68a; } 100% { background: var(--page); } }
+
+  /* 设置页：分组 + 逐项可用性徽标 */
+  .cset-wrap { max-width: 740px; margin: 0 auto; padding: 6px 24px 48px; }
+  .cset-sec { margin-top: 24px; }
+  .cset-sec-h { font-size: 12px; font-weight: 700; color: var(--mut); letter-spacing: .04em; margin: 0 0 5px; }
+  .cset-sec-note { font-size: 11.5px; color: var(--hint); margin: 0 0 8px; line-height: 1.5; }
+  .cset-row { display: flex; align-items: flex-start; gap: 14px; padding: 11px 2px; border-bottom: 1px solid var(--line); }
+  .cset-text { flex: 1; min-width: 0; }
+  .cset-l { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cset-label { font-size: 13px; color: var(--ink); }
+  .cset-hint { font-size: 11px; color: var(--hint); margin-top: 3px; line-height: 1.5; }
+  .cset-control { flex-shrink: 0; display: flex; align-items: center; gap: 5px; padding-top: 1px; }
+  .cset-control select, .cset-control input[type="number"] { font: 12.5px var(--sans); padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--page); color: var(--ink); }
+  .cset-control input[type="number"] { width: 62px; text-align: right; }
+  .cset-control input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+  .cset-unit { font-size: 11px; color: var(--hint); }
+  .set-badge { font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 20px; white-space: nowrap; }
+  .set-badge.live { background: #dcf2e6; color: #1f6b46; }
+  .set-badge.dev { background: #e4ecf7; color: #355a86; }
+  .set-badge.weak { background: #f8eecf; color: #836315; }
+  .set-badge.dead { background: var(--hl); color: var(--hint); }
+  details.cset-fold > summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--mut); letter-spacing: .04em; padding: 4px 2px; list-style: none; }
+  details.cset-fold > summary::-webkit-details-marker { display: none; }
+  details.cset-fold > summary::before { content: '▸ '; color: var(--hint); }
+  details.cset-fold[open] > summary::before { content: '▾ '; }
+  .cset-actions { margin-top: 24px; }
+  .cset-danger { color: var(--bad); border-color: var(--bad); }
   `;
   document.head.appendChild(s);
 }
@@ -287,6 +316,7 @@ function showPage(id: PageId): void {
 function renderPage(id: PageId, content: HTMLDivElement): void {
   if (id === 'chat') { renderChat(content); return; }
   if (id === 'hmp') { renderCapture(content); return; }
+  if (id === 'settings') { renderSettings(content); return; }
   const label = PAGES.find((p) => p.id === id)?.label ?? '';
   content.innerHTML = `<div class="cns-placeholder"><div style="font-size:15px">「${esc(label)}」迁移中</div>`
     + `<div style="font-size:12.5px;margin-top:6px">暂时还在旧 dev 页，稍后搬进来。</div>`
@@ -623,6 +653,108 @@ function renderCapture(c: HTMLDivElement): void {
   c.querySelectorAll<HTMLButtonElement>('#cap-seg .cap-segbtn').forEach((b) => b.addEventListener('click', () => setSeg(b.dataset.seg as 'hmp' | 'objects')));
   setSeg(captureSeg);
   void fillBookSelect('cap-book-sel').then(() => renderCaptureContent());
+}
+
+/* ── 设置页（迁出旧 #dev 抽屉；按代码审计诚实标注每项是否真生效）─────────────────────
+ * settings 落 localStorage('inkloop.settings.v1')；多数项改完 effect='changed'（emit settings:changed
+ * → main 取消在途计时 + 清当前 session），少数仅 saveSettings()。可用性徽标来自本会话审计：
+ * 生效=v3 主路真读；调试叠层=只影响可视化；弱效=读它的 runOcr/预处理当前主路不走或仅导入时生效；
+ * 失效=定义了但无人按它分流（gesture.routing / pauseSeconds / 解读预处理已撤）。 */
+
+type SetBadge = { t: string; c: 'live' | 'dev' | 'weak' | 'dead' };
+const B_LIVE: SetBadge = { t: '生效', c: 'live' };
+const B_DEV: SetBadge = { t: '调试叠层', c: 'dev' };
+const B_WEAK: SetBadge = { t: '弱效', c: 'weak' };
+const B_DEAD: SetBadge = { t: '失效', c: 'dead' };
+
+type SetRow =
+  | { kind: 'check'; label: string; badge: SetBadge; hint?: string; get: () => boolean; set: (v: boolean) => void; effect: 'changed' | 'save' }
+  | { kind: 'select'; label: string; badge: SetBadge; hint?: string; opts: Array<[string, string]>; get: () => string; set: (v: string) => void; effect: 'changed' | 'save' }
+  | { kind: 'number'; label: string; badge: SetBadge; hint?: string; min: number; max: number; unit: string; get: () => number; set: (v: number) => void; effect: 'changed' | 'save' };
+interface SetSection { title: string; note?: string; fold?: boolean; rows: SetRow[] }
+
+function setSections(): SetSection[] {
+  const g = settings.gesture, o = settings.ocr, p = settings.preprocess;
+  return [
+    { title: '核心 · 影响真实行为', rows: [
+      { kind: 'select', label: '推理模型（每次标注答问/识别用）', badge: B_LIVE, opts: [['kimi-k2.6', 'kimi-k2.6（中文笔迹稳）'], ['claude-opus-4-8', 'claude-opus-4-8（最新·慢）'], ['claude-opus-4-7', 'claude-opus-4-7（质量·慢）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（快·能回思考）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（快）']], get: () => settings.inferModel, set: (v) => { settings.inferModel = v; }, effect: 'changed' },
+      { kind: 'check', label: '送合成图给模型', hint: '强制把合成图/笔迹图也送进主模型；默认关＝纯文字取证路线（徐方案）', badge: B_LIVE, get: () => settings.sendMarkImage, set: (v) => { settings.sendMarkImage = v; }, effect: 'changed' },
+      { kind: 'select', label: '输出落点', badge: B_LIVE, opts: [['margin', '右侧留白'], ['inline', '贴正文浮动']], get: () => settings.placement, set: (v) => { settings.placement = v as Placement; }, effect: 'changed' },
+      { kind: 'check', label: '手势响应（总开关）', hint: '关掉后停笔不再生成 HMP+旁注、不触发综合', badge: B_LIVE, get: () => g.enabled, set: (v) => { g.enabled = v; }, effect: 'changed' },
+      { kind: 'number', label: '长停顿综合阈值', unit: '秒', min: 10, max: 600, hint: '停笔多少秒触发整段 session 综合（v3 主线，默认 90）；调小可冒烟测', badge: B_LIVE, get: () => g.idleSeconds ?? 90, set: (v) => { g.idleSeconds = v; }, effect: 'changed' },
+      { kind: 'select', label: '重排引擎', badge: B_LIVE, opts: [['ai', 'AI 结构重建（主线·保 bbox）'], ['local', '仅启发式'], ['hybrid', '启发式+模型精修'], ['vision', '启发式+视觉重排'], ['rewrite', 'VLM 看图重写']], get: () => settings.reflowProvider, set: (v) => { settings.reflowProvider = v; }, effect: 'changed' },
+      { kind: 'select', label: '重排模型', badge: B_LIVE, opts: [['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（默认·快）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['kimi-k2.6', 'kimi-k2.6（慢·对照）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（准·对照）']], get: () => settings.reflowModel, set: (v) => { settings.reflowModel = v; }, effect: 'changed' },
+      { kind: 'check', label: '重排前置（渲染即后台急算）', hint: '每次翻页后台预排当前页·烧 token；默认关', badge: B_LIVE, get: () => settings.reflowEager, set: (v) => { settings.reflowEager = v; }, effect: 'save' },
+    ] },
+    { title: '调试叠层 · 只影响可视化、不碰推理', rows: [
+      { kind: 'check', label: '显示 bbox 叠层（对象框+命中高亮+HMP 浮窗）', badge: B_DEV, get: () => settings.devOverlay, set: (v) => { settings.devOverlay = v; }, effect: 'changed' },
+      { kind: 'check', label: '显示组装区域（手写实时框）', badge: B_DEV, get: () => settings.showRegion, set: (v) => { settings.showRegion = v; }, effect: 'changed' },
+      { kind: 'check', label: '显示关联框（综合后紫色虚框）', badge: B_DEV, get: () => settings.showRelations, set: (v) => { settings.showRelations = v; }, effect: 'changed' },
+    ] },
+    { title: '历史 / 弱效 · 已知不全生效（按代码审计标注）', note: '保留可调，但当前 v3 主路要么不读、要么仅特定时机生效。', fold: true, rows: [
+      { kind: 'number', label: '停笔秒数（段落讨论计时）', unit: '秒', min: 1, max: 30, hint: 'v3 主路不读它（只剩 dev 快照引用）；区域收口用固定 6s', badge: B_DEAD, get: () => g.pauseSeconds, set: (v) => { g.pauseSeconds = v; }, effect: 'changed' },
+      { kind: 'select', label: '手势判定路由', badge: B_DEAD, hint: '客户端未按它分流——识别恒走 recognizeInk；此项当前无效', opts: [['auto', '自动三档'], ['geometric', '只几何阈值'], ['vlm', '全程 VLM·烧 token']], get: () => g.routing, set: (v) => { g.routing = v as 'auto' | 'geometric' | 'vlm'; }, effect: 'changed' },
+      { kind: 'number', label: '批注上下文行数', unit: '行', min: 0, max: 10, hint: '喂给 runOcr 的最近 N 行；runOcr 当前不在 v3 主路', badge: B_WEAK, get: () => g.contextLines, set: (v) => { g.contextLines = v; }, effect: 'changed' },
+      { kind: 'check', label: 'PDF 文本层 OCR', hint: 'SurfaceIndex 已直接吃文本层；runOcr 主路不走', badge: B_WEAK, get: () => o.textlayer, set: (v) => { o.textlayer = v; }, effect: 'changed' },
+      { kind: 'select', label: '图像 OCR', badge: B_WEAK, hint: '图像 OCR 兜底现走 enrichHmp，不读此项', opts: [['off', '关闭'], ['region', '局部图'], ['page', '整页图']], get: () => o.image, set: (v) => { o.image = v as OcrImageMode; }, effect: 'changed' },
+      { kind: 'check', label: '预排版前 N 页', hint: '仅下次导入文档时生效', badge: B_WEAK, get: () => p.reflowEnabled, set: (v) => { p.reflowEnabled = v; }, effect: 'save' },
+      { kind: 'number', label: '预排版页数', unit: '页', min: 0, max: 100, badge: B_WEAK, get: () => p.reflowPages, set: (v) => { p.reflowPages = v; }, effect: 'save' },
+      { kind: 'check', label: '预解读前 N 页', hint: '解读预处理代码已撤，置位无效', badge: B_DEAD, get: () => p.digestEnabled, set: (v) => { p.digestEnabled = v; }, effect: 'save' },
+      { kind: 'number', label: '预解读页数', unit: '页', min: 0, max: 100, badge: B_DEAD, get: () => p.digestPages, set: (v) => { p.digestPages = v; }, effect: 'save' },
+    ] },
+  ];
+}
+
+function setRowHtml(r: SetRow, id: string): string {
+  const badge = `<span class="set-badge ${r.badge.c}">${esc(r.badge.t)}</span>`;
+  const hint = r.hint ? `<div class="cset-hint">${esc(r.hint)}</div>` : '';
+  let ctl: string;
+  if (r.kind === 'check') ctl = `<input type="checkbox" id="${id}"${r.get() ? ' checked' : ''}>`;
+  else if (r.kind === 'select') ctl = `<select id="${id}">${r.opts.map(([v, t]) => `<option value="${esc(v)}"${v === r.get() ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+  else ctl = `<input type="number" id="${id}" min="${r.min}" max="${r.max}" step="1" value="${r.get()}"><span class="cset-unit">${esc(r.unit)}</span>`;
+  return `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">${esc(r.label)}</span>${badge}</div>${hint}</div><div class="cset-control">${ctl}</div></div>`;
+}
+
+function applySetEffect(effect: 'changed' | 'save'): void {
+  if (effect === 'changed') bus.emit('settings:changed'); // → main cancelTimers + clearSession
+  saveSettings();
+}
+
+let resetArmed = false;
+function renderSettings(c: HTMLDivElement): void {
+  let n = 0;
+  const flat: Array<{ id: string; row: SetRow }> = [];
+  const secHtml = setSections().map((s) => {
+    const rowsHtml = s.rows.map((row) => { const id = `cset-${n++}`; flat.push({ id, row }); return setRowHtml(row, id); }).join('');
+    const note = s.note ? `<div class="cset-sec-note">${esc(s.note)}</div>` : '';
+    return s.fold
+      ? `<details class="cset-fold cset-sec"><summary>${esc(s.title)}</summary>${note}${rowsHtml}</details>`
+      : `<div class="cset-sec"><div class="cset-sec-h">${esc(s.title)}</div>${note}${rowsHtml}</div>`;
+  }).join('');
+  c.innerHTML =
+    `<div class="cns-head"><h2>⚙ 设置</h2><div class="cns-head-ctl">`
+    + `<button class="cns-btn" id="cset-reset" title="清掉 localStorage 里存的设置、重载回代码默认">恢复默认设置</button>`
+    + `</div></div>`
+    + `<div class="cns-thread"><div class="cset-wrap">${secHtml}`
+    + `<div class="cset-actions"><span class="cset-hint">设置存于浏览器 localStorage（inkloop.settings.v1），即时生效；个别项需翻页/重导/清上下文才显现，已在各项标注。徽标含义：生效=v3 主路真读 · 调试叠层=只影响可视化 · 弱效=读它的路径当前主路不走或仅导入时生效 · 失效=当前无人按它分流。</span></div>`
+    + `</div></div>`;
+  for (const { id, row } of flat) {
+    const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+    if (!el) continue;
+    el.addEventListener('change', () => {
+      if (row.kind === 'check') row.set((el as HTMLInputElement).checked);
+      else if (row.kind === 'select') row.set(el.value);
+      else { const v = Math.min(row.max, Math.max(row.min, Math.round(+el.value || 0))); row.set(v); (el as HTMLInputElement).value = String(v); }
+      applySetEffect(row.effect);
+    });
+  }
+  resetArmed = false;
+  const resetBtn = c.querySelector<HTMLButtonElement>('#cset-reset');
+  resetBtn?.addEventListener('click', () => {
+    if (!resetArmed) { resetArmed = true; resetBtn.textContent = '再点一次确认（清存档·重载）'; resetBtn.classList.add('cset-danger'); return; }
+    try { localStorage.removeItem('inkloop.settings.v1'); } catch { /* ignore */ }
+    location.reload();
+  });
 }
 
 /* ── 路由 / 初始化 ───────────────────────────────────────────────────────── */
