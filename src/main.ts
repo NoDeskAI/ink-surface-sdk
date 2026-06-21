@@ -23,7 +23,6 @@ import { initAnchorLayer } from './surface/anchor-layer';
 import { openBook, appendMsg } from './chat/buffer';
 import { initInsightPanel } from './surface/insight-panel';
 import { initToolbar } from './surface/toolbar';
-import { initDevDrawer, toggleDrawer } from './dev/dev-drawer';
 import { initDevOverlay } from './dev/dev-overlay';
 import { initNavShell } from './dev/console';
 
@@ -260,17 +259,8 @@ initInsightPanel({
   foot: $('panel-foot'),
   count: $('insight-count'),
 });
-initDevDrawer({
-  drawer: $('dev-drawer'),
-  inferSelect: $<HTMLSelectElement>('infer-provider'),
-  metricsBody: $('metrics-body'),
-  traceLog: $('trace-log'),
-  selftest: $('selftest'),
-  downloadBtn: $('dl-trace'),
-  closeBtn: $('drawer-close'),
-});
-initDevOverlay();
-initNavShell();
+initDevOverlay(); // 画布叠层（独立于旧 dev 抽屉，由设置页 devOverlay/showRegion/showRelations 控）
+initNavShell();   // 全局导航壳：阅读 / AI 会话 / 采集取证 / 设置（旧 #dev 抽屉已退役）
 
 const fileIn = $<HTMLInputElement>('file-in');
 fileIn.addEventListener('change', () => {
@@ -465,7 +455,6 @@ $('stage-wrap').addEventListener('wheel', (e) => {
 }, { passive: false });
 $('zoom-in').addEventListener('click', () => setZoom(state.zoom + 0.25));
 $('zoom-out').addEventListener('click', () => setZoom(state.zoom - 0.25));
-$('dev-toggle').addEventListener('click', () => toggleDrawer());
 
 const insight = $('insight');
 $('insight-toggle').addEventListener('click', () => insight.classList.toggle('open'));

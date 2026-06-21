@@ -10,9 +10,11 @@
  *   · 采集取证（感知层）：一页两段、深度联动——「HMP 取证（全书逐笔）」+「SurfaceIndex 对象（本页对象表）」；
  *     二者是同一批对象 id 的消费者/生产者（HMP.target_object_refs 指进对象表），命中 ref ↔ 对象行互跳。
  *     看"感知对不对"，是 AI 会话的姊妹镜。【已实现】
- *   · 设置：迁出旧 dev 抽屉的全部设置控件；按代码审计**诚实标注每项可用性**（生效/调试叠层/弱效/失效）。【已实现】
+ *   · 设置：迁出旧 dev 抽屉的全部设置控件 + 「诊断」段（坐标自测/延迟指标/预处理进度/trace 导出）；
+ *     按代码审计**诚实标注每项可用性**（生效/调试叠层/弱效/失效）。【已实现】
  *
- * 至此除「阅读」外的页全部搬进导航壳，`#dev` 仅余作旧抽屉直达（取证浮窗等），可后续退役。
+ * 旧 `#dev` 抽屉已整体退役（dev-drawer.ts 删除、index.html 标记移除）；dev-overlay（画布叠层）独立保留，
+ * 由设置页的 devOverlay/showRegion/showRelations 控。
  *
  * 非「阅读」的页面渲染进 #app-pages（覆盖正文区、不挡侧栏）。侧栏可折叠（键 m / 折叠钮），折叠时正文占满。
  */
@@ -21,6 +23,9 @@ import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks } from '../local/store';
 import type { PersistedAiTurn, PersistedMark } from '../core/store-format';
 import type { HMP, PipelineStage, PipelineStageIO, SurfaceObject } from '../core/contracts';
+import { downloadTrace, traceCount } from '../core/trace';
+import { snapshot } from '../core/metrics';
+import { selfTest } from '../core/transform';
 
 const esc = (s: string): string => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] ?? c));
 
@@ -249,8 +254,7 @@ function buildShell(): void {
   rail.innerHTML =
     `<div class="rail-head"><span class="rail-brand">◐ InkLoop</span><button class="rail-iconbtn" id="rail-collapse" title="收起侧栏（m）">«</button></div>`
     + PAGES.map((p) => `<button class="rail-item" data-page="${p.id}"><span class="rail-ico">${p.icon}</span><span>${esc(p.label)}</span>${p.ready ? '' : '<span class="rail-soon">迁移中</span>'}</button>`).join('')
-    + `<div class="rail-spacer"></div>`
-    + `<div class="rail-foot"><button class="rail-item" id="rail-dev" style="font-size:12px;color:var(--mut)"><span class="rail-ico">⌗</span><span>旧 dev 面板（d）</span></button></div>`;
+    + `<div class="rail-spacer"></div>`;
   document.body.appendChild(rail);
 
   const reopen = document.createElement('button');
@@ -275,7 +279,6 @@ function buildShell(): void {
   rail.querySelectorAll<HTMLButtonElement>('.rail-item[data-page]').forEach((btn) => {
     btn.addEventListener('click', () => go(btn.dataset.page as PageId));
   });
-  rail.querySelector('#rail-dev')!.addEventListener('click', () => { location.hash = 'dev'; });
   rail.querySelector('#rail-collapse')!.addEventListener('click', () => setCollapsed(true));
   reopen.addEventListener('click', () => setCollapsed(false));
 }
@@ -290,12 +293,10 @@ function highlight(): void {
     .forEach((b) => b.classList.toggle('active', b.dataset.page === activePage));
 }
 
-/** 导航到某页（迁移中的页跳旧 dev；reader 收起页面层；其余渲染进 #app-pages）。 */
+/** 导航到某页（reader 收起页面层；其余渲染进 #app-pages）。所有页均已实现，无"迁移中"跳转。 */
 function go(id: PageId): void {
-  const def = PAGES.find((p) => p.id === id);
-  if (def && !def.ready) { location.hash = 'dev'; return; }
   if (id === 'reader') {
-    if (location.hash === '#chat') history.replaceState(null, '', location.pathname + location.search);
+    if (location.hash) history.replaceState(null, '', location.pathname + location.search);
     showPage('reader');
   } else {
     if (location.hash !== '#' + id) location.hash = id; else showPage(id);
@@ -317,11 +318,6 @@ function renderPage(id: PageId, content: HTMLDivElement): void {
   if (id === 'chat') { renderChat(content); return; }
   if (id === 'hmp') { renderCapture(content); return; }
   if (id === 'settings') { renderSettings(content); return; }
-  const label = PAGES.find((p) => p.id === id)?.label ?? '';
-  content.innerHTML = `<div class="cns-placeholder"><div style="font-size:15px">「${esc(label)}」迁移中</div>`
-    + `<div style="font-size:12.5px;margin-top:6px">暂时还在旧 dev 页，稍后搬进来。</div>`
-    + `<button class="cns-btn" id="cns-open-dev">打开旧 dev 页（d）</button></div>`;
-  content.querySelector('#cns-open-dev')?.addEventListener('click', () => { location.hash = 'dev'; });
 }
 
 /* ── AI 会话页（ChatGPT 式对话流）─────────────────────────────────────────── */
@@ -720,6 +716,25 @@ function applySetEffect(effect: 'changed' | 'save'): void {
   saveSettings();
 }
 
+/* 诊断（迁自旧 #dev 抽屉的几个孤儿读数：坐标自测 / 延迟指标 / 预处理进度 / trace 导出）。 */
+function diagHtml(): string {
+  return `<details class="cset-fold cset-sec" id="cset-diag"><summary>诊断 · 迁自旧 dev 面板</summary>`
+    + `<div class="cset-sec-note">坐标变换自测、各阶段延迟、预处理进度、trace 导出——旧 #dev 退役后搬到这里。</div>`
+    + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">坐标自测</span></div><div class="cset-hint" id="cset-selftest">…</div></div></div>`
+    + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">预处理进度</span></div><div class="cset-hint" id="cset-pp">未运行</div></div></div>`
+    + `<div class="cset-row"><div class="cset-text" style="width:100%"><div class="cset-l"><span class="cset-label">延迟指标（last / P50）</span></div><table class="cap-tbl" id="cset-metrics" style="margin-top:7px"><tbody></tbody></table></div></div>`
+    + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">Trace 事件日志</span></div><div class="cset-hint" id="cset-tracecount">导出本会话所有 trace（NDJSON），离线核对采集/推理细节</div></div><div class="cset-control"><button class="cns-btn" id="cset-dl-trace">下载 JSONL</button></div></div>`
+    + `</details>`;
+}
+function fillDiag(): void {
+  const st = document.getElementById('cset-selftest');
+  if (st) { const r = selfTest(); st.textContent = r.samples ? `${r.ok ? '✓' : '✗'} ${r.samples} 点 · maxErr ${r.maxErr.toExponential(1)} · zoom ${Math.round(state.zoom * 100)}%` : '等待页面渲染'; }
+  const mb = document.getElementById('cset-metrics')?.querySelector('tbody');
+  if (mb) mb.innerHTML = snapshot().map((r) => `<tr><td>${esc(r.label)}</td><td class="cap-mono">${r.last == null ? '–' : r.last + 'ms'}</td><td class="cap-mono">${r.p50 == null ? '–' : r.p50 + 'ms'}</td></tr>`).join('') || '<tr><td class="cap-dim" colspan="3">暂无计时</td></tr>';
+  const tc = document.getElementById('cset-tracecount');
+  if (tc) tc.textContent = `本会话 ${traceCount()} 条 trace；导出 NDJSON 离线核对采集/推理细节`;
+}
+
 let resetArmed = false;
 function renderSettings(c: HTMLDivElement): void {
   let n = 0;
@@ -735,9 +750,11 @@ function renderSettings(c: HTMLDivElement): void {
     `<div class="cns-head"><h2>⚙ 设置</h2><div class="cns-head-ctl">`
     + `<button class="cns-btn" id="cset-reset" title="清掉 localStorage 里存的设置、重载回代码默认">恢复默认设置</button>`
     + `</div></div>`
-    + `<div class="cns-thread"><div class="cset-wrap">${secHtml}`
+    + `<div class="cns-thread"><div class="cset-wrap">${secHtml}${diagHtml()}`
     + `<div class="cset-actions"><span class="cset-hint">设置存于浏览器 localStorage（inkloop.settings.v1），即时生效；个别项需翻页/重导/清上下文才显现，已在各项标注。徽标含义：生效=v3 主路真读 · 调试叠层=只影响可视化 · 弱效=读它的路径当前主路不走或仅导入时生效 · 失效=当前无人按它分流。</span></div>`
     + `</div></div>`;
+  document.getElementById('cset-dl-trace')?.addEventListener('click', () => downloadTrace());
+  fillDiag();
   for (const { id, row } of flat) {
     const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
     if (!el) continue;
@@ -762,8 +779,8 @@ function renderSettings(c: HTMLDivElement): void {
 function syncFromHash(): void {
   const id = location.hash.replace(/^#/, '') as PageId;
   const def = PAGES.find((p) => p.id === id);
-  if (def && def.ready && id !== 'reader') showPage(id); // #chat / #hmp 等已实现页
-  else showPage('reader'); // 含 #dev：让 dev 模块接管覆盖，本壳回到阅读底
+  if (def && def.ready && id !== 'reader') showPage(id); // #chat / #hmp / #settings 已实现页
+  else showPage('reader'); // 其余（含历史 #dev 链接）一律回到阅读底
 }
 
 export function initNavShell(): void {
@@ -805,6 +822,12 @@ export function initNavShell(): void {
   const liveHmp = () => { if (activePage === 'hmp') void renderCaptureContent(); };
   bus.on('hmp:updated', liveHmp);
   bus.on('surface:indexed', liveHmp);
+  // 设置页「诊断」读数实时刷新（迁自旧 #dev：延迟指标 / 坐标自测 / 预处理进度）
+  const liveDiag = () => { if (activePage === 'settings') fillDiag(); };
+  bus.on('metrics', liveDiag);
+  bus.on('page:rendered', liveDiag);
+  bus.on('preprocess:progress', (i, n) => { const el = document.getElementById('cset-pp'); if (el) el.textContent = `预处理中 ${i as number}/${n as number} 页…`; });
+  bus.on('preprocess:done', () => { const el = document.getElementById('cset-pp'); if (el) el.textContent = '预处理完成'; });
   // 切书后默认跟随当前书
   bus.on('document:loaded', () => {
     selectedBook = state.documentId ?? selectedBook;
