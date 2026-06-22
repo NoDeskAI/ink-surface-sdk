@@ -385,12 +385,15 @@ async function restoreFromLedger(): Promise<void> {
   }
 
   // 2) AI 旁注 + 对话 buffer：书日志折叠（每 overlay_id 取最新；dismissed 不显示）
+  //    overlay 恢复 = 所有非 dismissed turn（显示需要）；buffer 只回放最近 3 轮（延续性主要靠空间召回，不靠长 transcript）。
   const turns = await getBookAiTurns(docId);
   state.overlays = [];
-  for (const t of turns) {
-    if (t.overlay_state === 'dismissed') continue;
+  const shown = turns.filter((t) => t.overlay_state !== 'dismissed');
+  for (const t of shown) {
     t.overlay.object_refs = t.anchor.object_refs; // 跨视图锚（兼容早于 object_refs 的旧快照）
     state.overlays.push(t.overlay);
+  }
+  for (const t of shown.slice(-3)) { // 仅最近 3 轮进 buffer（与 buffer.ts MAX_TURNS=6 一致）
     appendMsg(docId, { role: 'user', content: t.prompt_snapshot });
     appendMsg(docId, { role: 'assistant', content: t.ai_reply });
   }

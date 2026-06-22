@@ -280,6 +280,8 @@ export interface MarkGraph {
 export interface PriorNeighbor {
   text: string;                     // 旧标注的 marked_text（空则"（无字）"）
   rel: 'proximity' | 'containment' | 'same_row'; // 几何关系：紧邻 / 当前标注圈住了它 / 同一阅读行（边注↔正文，跨栏沟）
+  mark_id?: string;                 // 召回到的旧标注 id（用于回查它当时那轮的 AI 回复）
+  reply?: string;                   // 该旧标注当时的 AI 旧回复（截断）；替代长 buffer 的延续性
 }
 
 /** inference-view：标注图蒸馏成的精简推理载荷（确定性产出，丢坐标/stroke/分数）。 */
@@ -296,6 +298,7 @@ export interface InferenceView {
   page_id: string;
   recall?: PriorNeighbor[];         // 这附近先前标过的旧标注（空间召回；调试/账本可见）
   referent_lines?: string;          // 孤立手写问题纵向压着的印刷正文行（②：指出"问的是这行"）
+  thematic?: Array<{ text: string; pageIndex: number; score: number; anchorRefs?: string[] }>; // 全书主题联想（向量召回·现 no-op 恒空）
   version: string;
 }
 

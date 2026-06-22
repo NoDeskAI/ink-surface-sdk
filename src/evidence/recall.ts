@@ -54,7 +54,7 @@ export async function findSpatialRecall(docId: string, sessionMarks: Mark[]): Pr
     }
 
     type Rel = 'proximity' | 'containment' | 'same_row';
-    const hits: Array<{ dist: number; rel: Rel; text: string }> = [];
+    const hits: Array<{ dist: number; rel: Rel; text: string; mark_id: string }> = [];
     for (const cand of candidates) {
       const curs = curByPage.get(cand.page_id);
       if (!curs?.length) continue;
@@ -73,16 +73,16 @@ export async function findSpatialRecall(docId: string, sessionMarks: Mark[]): Pr
         }
       }
       if (bestDist === Infinity) continue; // 三条通道都没近 → 不召回
-      hits.push({ dist: bestDist, rel: bestRel, text: (cand.marked_text || '').trim() || '（无字）' });
+      hits.push({ dist: bestDist, rel: bestRel, text: (cand.marked_text || '').trim() || '（无字）', mark_id: cand.mark_id });
     }
 
     hits.sort((a, b) => a.dist - b.dist);
     const seen = new Set<string>();
     const out: PriorNeighbor[] = [];
     for (const h of hits) {
-      if (seen.has(h.text)) continue; // 同文字旧标注合并一条
+      if (seen.has(h.text)) continue; // 同文字旧标注合并一条（保留最近那条的 mark_id）
       seen.add(h.text);
-      out.push({ text: h.text, rel: h.rel });
+      out.push({ text: h.text, rel: h.rel, mark_id: h.mark_id });
       if (out.length >= RECALL_K) break;
     }
     return out;

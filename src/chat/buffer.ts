@@ -7,7 +7,7 @@
  */
 export interface ChatMsg { role: 'user' | 'assistant'; content: string; }
 
-const MAX_TURNS = 24; // 滑动窗：留最近 N 条，防上下文无限增长（更久的连贯交 durable 库）
+const MAX_TURNS = 6; // 滑动窗：留最近 3 轮=6 条（user+assistant）。更久的延续不靠长 transcript——交空间召回（旧标注+旧回复）+ 向量主题层
 const buffers = new Map<string, ChatMsg[]>();
 
 /** 开书：非阻塞预热（建空 buffer）。重复调用幂等。 */

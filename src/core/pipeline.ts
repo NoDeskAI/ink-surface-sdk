@@ -1,11 +1,12 @@
 import type { AnnotationEvent, EventType, HMP, InferenceResult, InferenceView, MarkFeatureType, MarkShape, NormBBox, PipelineStage, ScreenOverlay, SurfaceIndex, SurfaceObject } from './contracts';
 import { RESULT_TO_OVERLAY, SCHEMA_VERSION } from './contracts';
 import { DEVICE_ID, SESSION_ID, shortId } from './ids';
-import { appendAiTurnEntry, getReflow, setSynthesisWatermark } from '../local/store';
+import { appendAiTurnEntry, getReflow, setSynthesisWatermark, getBookAiTurns } from '../local/store';
 import { bboxOf, classify, markShapeOf, type StrokeFeature } from '../capture/classify';
 import { resolveTarget, buildHmp } from '../evidence/target';
 import { buildMarkGraph } from '../evidence/mark-graph';
 import { findSpatialRecall } from '../evidence/recall';
+import { findThematicRecall } from '../evidence/thematic';
 import { projectInferenceView } from '../evidence/inference-view';
 import type { Mark, Session } from '../capture/session';
 import { mark } from './metrics';
@@ -344,11 +345,13 @@ export async function captureMark(
  */
 function renderUserTurn(view: ReturnType<typeof projectInferenceView>): string {
   const ctx = view.page_context ? `\n\n（本页上下文，仅供消歧）：${view.page_context}` : '';
+  // 全书主题联想（向量召回）——单独贴标签、与"你正指的这行"严格区隔，防语义关联反过来制造主题漂移。现 no-op 恒空。
+  const themes = view.thematic?.length ? `\n\n【全书别处你也提过】：${view.thematic.map((t) => `「${t.text}」`).join('、')}` : '';
   if (view.trigger === 'handwriting') {
     const ref = view.referent_lines ? `读者在这句旁边写道：「${view.referent_lines}」。` : ''; // ②指代：问的就是这行
-    return `读者手写问：「${view.question || view.marked}」。${ref}相关标注脉络：${view.narrative}。${ctx}`;
+    return `读者手写问：「${view.question || view.marked}」。${ref}相关标注脉络：${view.narrative}。${themes}${ctx}`;
   }
-  return `读者这一阵连续标注的脉络：${view.narrative}。所标内容：「${view.marked || '（未提取到文字）'}」。${ctx}`;
+  return `读者这一阵连续标注的脉络：${view.narrative}。所标内容：「${view.marked || '（未提取到文字）'}」。${themes}${ctx}`;
 }
 
 /**
@@ -410,11 +413,20 @@ export async function commitSessionDiscussion(
     if (draw?.hmp?.vector_ref) crop = { role: 'ink', data: draw.hmp.vector_ref };
   }
 
-  // 空间召回（治本·根因 A）与滑窗上下文并发取，省 commit 路径串行延迟
-  const [priorNeighbors, pageCtx] = await Promise.all([
-    findSpatialRecall(session.bookId, marks), // 账本捞回同页邻近旧标注（不进 graph.nodes）
-    slidingContext(3000),                     // 以当前页为中心、前后共 ~3000 字滑动窗
+  // 空间召回（治本·根因 A）+ 滑窗上下文 + 全书主题召回（向量·现 no-op）+ 账本（回查旧回复）并发取，省串行延迟
+  const recallQuery = marks.map((m) => m.markedText).filter(Boolean).join(' ').slice(0, 300);
+  const [priorNeighbors, pageCtx, thematic, bookTurns] = await Promise.all([
+    findSpatialRecall(session.bookId, marks),  // 账本捞回同页邻近旧标注（不进 graph.nodes）
+    slidingContext(3000),                      // 以当前页为中心、前后共 ~3000 字滑动窗
+    findThematicRecall(session.bookId, recallQuery), // 全书主题联想（向量 stub，现恒返 []）
+    getBookAiTurns(session.bookId),            // 回查召回旧标注当时的 AI 回复（替代长 buffer 延续性）
   ]);
+  // 召回带回旧回复：按 mark_id 在账本里找它当时所属那轮，取其 ai_reply（截断）。本轮尚未入账，不会自引。
+  for (const n of priorNeighbors) {
+    if (!n.mark_id) continue;
+    const t = bookTurns.find((tt) => tt.anchor.mark_ids.includes(n.mark_id!));
+    if (t?.ai_reply) n.reply = t.ai_reply.slice(0, 80);
+  }
   // ②：手写问题（孤立边注本身不带指代）取它纵向压着的印刷正文行作显式指代。
   // 仅当锚点 mark 就在当前页（刚写下的手写恒成立）才有现成 textBlocks；否则跳过、退回页面上下文。
   const rowText = (reason === 'handwriting' && anchorMark.event.page_id === state.pageId)
@@ -428,6 +440,7 @@ export async function commitSessionDiscussion(
     anchorMarkId: anchorMark.id,
     priorNeighbors,
     rowText,
+    thematic,
   });
   mirrorView(view, reason, discId); // dev 通道：喂模型前的精简载荷可离线核对
 
@@ -553,7 +566,8 @@ export async function commitSessionDiscussion(
         ...(view.question ? [{ k: '手写问 question', v: view.question }] : []),
         ...(view.referent_lines ? [{ k: '指代行原文（②）', v: view.referent_lines }] : []),
         { k: '滑窗上下文', v: `${view.page_context?.length ?? 0} 字` },
-        { k: '回访 recall', v: view.recall?.length ? view.recall.map((r) => `「${r.text}」`).join('、') : '无' },
+        { k: '回访 recall', v: view.recall?.length ? view.recall.map((r) => r.reply ? `「${r.text}」(当时:${r.reply.slice(0, 20)}…)` : `「${r.text}」`).join('、') : '无' },
+        { k: '主题召回（向量）', v: view.thematic?.length ? view.thematic.map((t) => `「${t.text}」`).join('、') : '无（向量未接入）' },
         { k: '锚点', v: `${view.anchor_refs.length} 对象` },
         { k: '随图 crop', v: view.crop ? `有（${view.crop.role}）` : '无' },
       ],

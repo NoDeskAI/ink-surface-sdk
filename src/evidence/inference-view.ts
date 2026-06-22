@@ -72,6 +72,7 @@ export function projectInferenceView(
     anchorMarkId?: string;
     priorNeighbors?: PriorNeighbor[]; // 空间召回回来的同页邻近旧标注（回访子句用；不进 graph.nodes）
     rowText?: string;                 // ②：手写问题纵向压着的印刷正文行（指代用）
+    thematic?: InferenceView['thematic']; // 全书主题联想（向量召回·现 no-op）
   },
 ): InferenceView {
   const { trigger, pageText } = opts;
@@ -128,7 +129,7 @@ export function projectInferenceView(
 
   // 回访子句（根因 A）：这附近先前已标过的旧标注（空间召回·账本捞回，**非当前动作**，清晰区隔）。
   const recall = opts.priorNeighbors ?? [];
-  if (recall.length) narrative += `（这附近你先前标过：${recall.map((r) => `「${r.text}」`).join('、')}）`;
+  if (recall.length) narrative += `（这附近你先前标过：${recall.map((r) => r.reply ? `「${r.text}」(当时我说:${r.reply})` : `「${r.text}」`).join('、')}）`;
 
   const marked = texts.filter(Boolean).join(' / ');
   const anchor = (opts.anchorMarkId ? nodes.find((n) => n.mark_id === opts.anchorMarkId) : null) ?? nodes[nodes.length - 1] ?? null;
@@ -146,6 +147,7 @@ export function projectInferenceView(
     page_id: anchor?.page_id ?? '',
     recall: recall.length ? recall : undefined,
     referent_lines: opts.rowText?.trim() || undefined,
+    thematic: opts.thematic?.length ? opts.thematic : undefined,
     version: INFERVIEW_SCHEMA_VERSION,
   };
 }

@@ -343,7 +343,7 @@ function renderChat(c: HTMLDivElement): void {
     `<div class="cns-head"><h2>💬 AI 会话</h2><div class="cns-head-ctl">`
     + `<select id="cns-book-sel"></select>`
     + `<button class="cns-btn" id="cns-refresh">⟳ 刷新</button>`
-    + `<button class="cns-btn" id="cns-clear" title="清空这本书模型当下记得的对话上下文（≤24 轮滑动窗），不影响账本">🗑 清空上下文</button>`
+    + `<button class="cns-btn" id="cns-clear" title="清空这本书模型当下记得的对话上下文（≤3 轮滑动窗），不影响账本">🗑 清空上下文</button>`
     + `</div></div>`
     + `<div class="cns-thread" id="cns-thread"><div class="cns-thread-inner" id="cns-thread-inner"></div></div>`;
 
