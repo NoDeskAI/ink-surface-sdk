@@ -335,9 +335,12 @@ export async function captureMark(
   } else if (layers.ink && (feature.raw.ocrWorthy || freeformOverride)) {
     recog = await recognizeInk(layers.ink);
     const isText = recog.kind === 'handwriting' || recog.kind === 'mixed';
-    resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: recog.kind === 'none' ? 0.3 : 0.85 };
-    // 文字→转写；画→粗描述（让画也带"内容"进 markedText/叙事/召回；意图仍交推理模型）。
-    textHint = (isText ? recog.reading : recog.description) || undefined;
+    const hasDrawing = recog.kind === 'sketch' || recog.kind === 'mixed'; // 含可视化的画（mixed=图+字，仍含画）
+    resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: recog.kind === 'none' ? 0.3 : 0.85, hasDrawing };
+    // 文字→转写；画→粗描述。**mixed（图+字）两者都留**：描述进 markedText/叙事/召回，原图另送推理（见下方"原图送达"按 hasDrawing 放宽）。
+    textHint = recog.kind === 'mixed'
+      ? [recog.reading, recog.description && `（画：${recog.description}）`].filter(Boolean).join(' ') || undefined
+      : (isText ? recog.reading : recog.description) || undefined;
     recogGate = freeformOverride ? 'circle 未圈住内容+含多笔(疑涂鸦/表情)·推翻 markup 送识别' : 'freeform 过几何门(ocrWorthy)·送识别';
     if (DEV) pl.push({
       stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'ran',
@@ -477,7 +480,8 @@ export async function commitSessionDiscussion(
   // 原图送达：上面没选出图、但本段里有"画"（self_content 带笔迹图）→ 选最近一张画的原图送进推理模型。
   // 让"画不是最后一笔"（如画完又写了句问题）时，画的原图仍到模型手里，由模型在上下文里解读其含义。
   if (!crop) {
-    const draw = [...marks].reverse().find((m) => m.feature.type === 'drawing' && m.hmp?.mode === 'self_content' && !!m.hmp?.vector_ref);
+    // 含画的笔（drawing 纯画，或 mixed=图+字虽定型 handwriting 仍含画）→ 把它的白底原图送进推理，让模型直接看那张画。
+    const draw = [...marks].reverse().find((m) => (m.feature.type === 'drawing' || m.feature.hasDrawing) && m.hmp?.mode === 'self_content' && !!m.hmp?.vector_ref);
     if (draw?.hmp?.vector_ref) crop = { role: 'ink', data: draw.hmp.vector_ref };
   }
 

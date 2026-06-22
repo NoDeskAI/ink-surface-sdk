@@ -130,6 +130,7 @@ export interface StrokeFeature {
   type: MarkFeatureType;
   confidence: number;
   scaleRatio: number;     // mark 高 ÷ 局部正文字高（无标尺时 NaN）
+  hasDrawing?: boolean;   // 这笔含可视化的画/涂鸦（识别 kind=sketch 或 mixed）；mixed 虽定型为 handwriting 仍含画，供下游决定送不送原图
   raw: { strokeCount: number; templateScore: number; templateType: EventType; scaleRatio: number; complexity: number; ocrWorthy: boolean; tplSpan: number };
 }
 
