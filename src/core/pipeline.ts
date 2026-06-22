@@ -14,7 +14,7 @@ import { mark } from './metrics';
 import { trace } from './trace';
 import { bus, settings, state, type Stroke } from '../app/state';
 import { grabLayers, grabRegion } from '../evidence/ocr';
-import { pageText, blocksToText, linesInBand } from '../evidence/focus';
+import { pageText, blocksToText, linesInBand, pointInPolygon } from '../evidence/focus';
 import { extractPageBlocks } from '../surface/renderer';
 import { pushInspect } from './inspect';
 import { chatTurn } from '../chat/stream-client';
@@ -283,6 +283,29 @@ async function recognizeInk(inkData: string): Promise<{ kind: string; reading: s
 }
 
 /**
+ * "跳出来"语义复判：几何把一笔判成了 markup（圈/划/箭头），但它可能其实是画在空白处的涂鸦/表情。
+ * 判据（语义，非几何形状）：圈注的天职是圈住内容；一个**没真圈住任何内容、内部却含其他笔画**的圈，
+ * 更像"脸轮廓 + 五官"。命中则推翻几何 markup、转 freeform 送 interpret 让 VLM 定夺（脸 vs 圈）。
+ *
+ * 真·圈内判定用 pointInPolygon（对象中心是否落在笔迹内），**排除 bbox 边角假命中**——
+ * 这正是哭脸误判的根：它 bbox 蹭到正文"，制"、却没真圈住它。
+ *
+ * ⚠️ 当前仅处理 circle（表情/涂鸦轮廓几乎都是圈），strokeCount≥2（孤零圈意图不明、不强判）。
+ * TODO（通用化·用户留的心眼）：未来若别的模板/场景也撞上"几何形状 ≠ 语义意图"，
+ *   把"没命中内容 + 伴随笔画"这套语义信号抽成按 templateType 配置的通用复判，替掉这个 circle 特例。
+ */
+function markupLooksLikeDrawing(feature: StrokeFeature, event: AnnotationEvent, index: SurfaceIndex): boolean {
+  if (feature.raw.templateType !== 'circle') return false; // 仅圈（特例，待通用化）
+  if (feature.raw.strokeCount < 2) return false;           // 孤零零一个圈 → 不强判
+  // 圈住任何非空白内容对象（含图片）→ 是正经圈注；都没圈住、却含多笔 → 疑涂鸦/表情。
+  const enclosesContent = index.objects.some((o) =>
+    o.type !== 'blank_region' &&
+    pointInPolygon(o.bbox[0] + o.bbox[2] / 2, o.bbox[1] + o.bbox[3] / 2, event.stroke_points),
+  );
+  return !enclosesContent;
+}
+
+/**
  * 落笔当时（该页仍是当前页）就建好这个 mark 的 HMP + 定型 + 解析所标文字。
  * 跨页 session 提交时画布已是别页、无法重取，故必须在此刻捕获并随 mark 存下。
  *   · markup（圈/划/箭头）：几何已定型，所标内容取自结构层（命中字）。
@@ -298,24 +321,25 @@ export async function captureMark(
   const layers = grabLayers(event.geometry.bbox, 0.04);
   const pl: PipelineStage[] = []; // 这笔经手的组件阶段（识别/OCR兜底/取证），提交时拼进整轮流水线
 
-  // freeform 且几何门判 ocrWorthy（非散笔/线条）→ 识别定型（handwriting/drawing）+ 读出文字。
-  // 不值得（单笔近直线/太小）→ 跳过识别、留 drawing，省调用、也避免把线条误转写成字。
+  // 识别定型：freeform 过几何门(ocrWorthy) → 送识别判 handwriting/drawing；markup 默认几何定型不送识别。
+  // 但"跳出来"复判会推翻明显是涂鸦的圈（没真圈住内容+含多笔 → 疑表情）→ 也走识别（见 markupLooksLikeDrawing）。
+  const freeformOverride = feature.type === 'markup' && markupLooksLikeDrawing(feature, event, index);
   let resolved = feature;
   let textHint: string | undefined;
   let recog: { kind: string; reading: string; description: string } | null = null; // interpret 结果（仅调用时）
   let recogGate: string; // 为何送/跳过识别（dev 遥测核对哭脸式漏判）
-  if (feature.type === 'markup') {
+  if (feature.type === 'markup' && !freeformOverride) {
     recogGate = 'markup（几何已定型）·不送识别';
-  } else if (feature.raw.ocrWorthy && layers.ink) {
+  } else if (layers.ink && (feature.raw.ocrWorthy || freeformOverride)) {
     recog = await recognizeInk(layers.ink);
     const isText = recog.kind === 'handwriting' || recog.kind === 'mixed';
     resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: recog.kind === 'none' ? 0.3 : 0.85 };
     // 文字→转写；画→粗描述（让画也带"内容"进 markedText/叙事/召回；意图仍交推理模型）。
     textHint = (isText ? recog.reading : recog.description) || undefined;
-    recogGate = 'freeform 过几何门(ocrWorthy)·送识别';
+    recogGate = freeformOverride ? 'circle 未圈住内容+含多笔(疑涂鸦/表情)·推翻 markup 送识别' : 'freeform 过几何门(ocrWorthy)·送识别';
     if (DEV) pl.push({
       stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'ran',
-      note: '自由笔且过几何门(ocrWorthy)：判「手写 vs 画」、转写文字、给画一句粗描述（context-free，不看上下文、不揣测意图）',
+      note: (freeformOverride ? '⤷ markup 圈复判：没圈住内容+含多笔→疑涂鸦/表情，推翻几何 markup。' : '自由笔且过几何门(ocrWorthy)。') + '判「手写 vs 画」、转写文字、给画一句粗描述（context-free，不揣测意图）',
       input: [{ k: '模型', v: settings.inferModel }, { k: '输入', v: '白底笔迹图 ink' }],
       output: [
         { k: '判定 kind', v: recog.kind },
@@ -333,7 +357,7 @@ export async function captureMark(
       output: [{ k: '定型', v: `${feature.type}（未经识别）` }],
     });
   }
-  // dev：每笔都发识别裁判（含 markup 跳过的——哭脸式"被组装成 markup 而漏判画"靠这条一眼看穿）
+  // dev：每笔都发识别裁判（含 markup 跳过的、含被复判推翻的——哭脸式漏判靠这条一眼看穿）
   mirrorRecognize({
     event_id: event.event_id, page_id: event.page_id, region: event.geometry.bbox,
     feature_in: feature.type, feature_out: resolved.type, ocrWorthy: !!feature.raw.ocrWorthy, hasInk: !!layers.ink,
