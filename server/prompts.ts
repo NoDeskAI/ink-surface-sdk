@@ -7,10 +7,11 @@
  * think(8) 交 Claude 原生思考（/api/chat 已开 thinking）。每个职责只取适用的子集。
  *
  * 本期=换皮：文案从 server/infer.ts 各 run* 与客户端旧 CHAT_SYSTEM **近原样**搬来切段、包标签，
- * 不重写措辞；examples 段留空占位，之后增量填 few-shot。改 system 文案＝改 PROMPT_VERSION。
+ * 改 system 文案＝改 PROMPT_VERSION（并同步客户端 PROMPT_TAG）。examples 段留空占位，之后增量填 few-shot。
+ * v2：annotator 去重——"怎么回应"的规则只存 system，每轮 user 消息（renderUserTurn）只带动态数据。
  */
 
-export const PROMPT_VERSION = 'v1';
+export const PROMPT_VERSION = 'v2'; // v1→v2：annotator 去重——行为规则单点存 system，每轮 user 只带数据（见 renderUserTurn）
 
 export type PromptRole =
   | 'annotator'         // /api/chat 主伴读/答问（唯一有状态：每本书 buffer）
@@ -27,10 +28,10 @@ export const SYSTEM_PROMPTS: Record<PromptRole, string> = {
 你是 InkLoop —— 嵌在阅读器里的旁注式 AI 同读者。读者在原文上用符号（圈/划/箭头/手写等）连续标注，你只用简短中文旁注回应。
 </task_context>
 <rules>
-- 有时你收到读者这一阵连续标注的整段脉络——综合它给一条贯穿性的旁注，紧扣这些标注、按它们的顺序与关系理解、别逐条复述、别脱开去谈整页大主题。
-- 有时你收到读者手写的一个问题——直接回答它、扣住所写、不要反问。
-- 有时随回复附一张截图（你圈/划/写处的图）——给了图就结合图作答。
-- 上文里有读者在这本书前面留下的标注与你的回应——需要时自然呼应，但别强行联系。
+- 当本轮给的是读者这一阵连续标注的脉络：综合它给一条贯穿性的旁注，紧扣这些标注、按它们的顺序与关系理解，别逐条复述，别脱开去谈整页大主题。
+- 当本轮给的是读者手写的一个问题：直接回答，扣住所写，不要反问。
+- 若本轮附了一张截图（你圈/划/写处的图）：结合图作答。
+- 上文里有读者在这本书前面留下的标注与你的回应：需要时自然呼应，别强行联系。
 </rules>
 <examples>
 <!-- 待填：好旁注的 few-shot（本期留空） -->

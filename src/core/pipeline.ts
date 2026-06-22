@@ -22,7 +22,7 @@ import { postJson } from './api';
 
 /** 伴读 persona 已搬到服务端 server/prompts.ts（按 role 索引、与模型解耦）；/api/chat 收 role='annotator'。
  *  下面这个标签随账本存 system_prompt_hash，标识本轮提示词版本（与 server PROMPT_VERSION 对齐，改 system 文案时同步）。 */
-const PROMPT_TAG = 'annotator@v1';
+const PROMPT_TAG = 'annotator@v2';
 
 /* ── 处理流水线（调试）：逐组件「收到什么 → 产出什么」，含缩略图，串成一轮链路 ─────────
  * 仅 DEV 落库（gate 同 mirror*）；图压成 ~220px 缩略图控 IndexedDB 体积。供 AI 会话调试页复盘。 */
@@ -338,13 +338,16 @@ export async function captureMark(
   return { hmp, markedText, feature: resolved, trace: DEV ? pl : undefined };
 }
 
-/** 把 inference-view 渲染成喂模型的 user turn：idle=整段综合 / handwriting=定向答问。 */
+/**
+ * 把 inference-view 渲染成喂模型的 user turn：idle=整段综合 / handwriting=定向答问。
+ * v2 去重：只带本轮动态数据 + 一句标明类别；"怎么回应"的规则单点存 server/prompts.ts 的 annotator system。
+ */
 function renderUserTurn(view: ReturnType<typeof projectInferenceView>): string {
-  const ctx = view.page_context ? `\n\n（仅供消歧的本页上下文，别据此跑题到整页主题）：${view.page_context}` : '';
+  const ctx = view.page_context ? `\n\n（本页上下文，仅供消歧）：${view.page_context}` : '';
   if (view.trigger === 'handwriting') {
-    return `读者手写问：「${view.question || view.marked}」。相关标注脉络：${view.narrative}。直接作答、扣住所写，不要反问。${ctx}`;
+    return `读者手写问：「${view.question || view.marked}」。相关标注脉络：${view.narrative}。${ctx}`;
   }
-  return `读者这一阵连续标注的脉络：${view.narrative}。所标内容：「${view.marked || '（未提取到文字）'}」。综合整段脉络给一条贯穿性的旁注，按标注的顺序与关系理解，别逐条复述。${ctx}`;
+  return `读者这一阵连续标注的脉络：${view.narrative}。所标内容：「${view.marked || '（未提取到文字）'}」。${ctx}`;
 }
 
 /**
