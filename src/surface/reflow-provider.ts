@@ -42,6 +42,7 @@ async function refine(base: ReflowBlock[], image?: string): Promise<ReflowBlock[
     refined = await postJson<Array<{ id: string; type: string; level: number; text: string }>>('/api/reflow', {
       blocks: base.map((b) => ({ id: b.id, type: b.type, text: b.type === 'list' ? `（列表）${(b.items ?? []).join(' / ')}` : b.text })),
       image,
+      model: settings.reflowModel,
     });
     if (!Array.isArray(refined)) return base;
   } catch {
@@ -83,7 +84,7 @@ const rewrite: ReflowProvider = async () => {
   if (!image) return [];
   let arr: Array<{ type?: string; level?: number; text?: string; items?: string[]; ordered?: boolean; bbox?: number[] }>;
   try {
-    arr = await postJson<Array<{ type?: string; level?: number; text?: string; items?: string[]; ordered?: boolean; bbox?: number[] }>>('/api/reflow-vlm', { image });
+    arr = await postJson<Array<{ type?: string; level?: number; text?: string; items?: string[]; ordered?: boolean; bbox?: number[] }>>('/api/reflow-vlm', { image, model: settings.reflowModel });
     if (!Array.isArray(arr)) return [];
   } catch { return []; }
   return arr.map((b, i): ReflowBlock => {

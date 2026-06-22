@@ -162,7 +162,7 @@ async function explainFigure(cap: HTMLElement, source: NormBBox, image?: string)
   const nearby = nearbyText(source);
   const prevSummary = ''; // 跨页记忆撤除（押后）：图解不再带前页摘要
   try {
-    const data = await postJson<{ text?: string }>('/api/explain-image', { image, nearby, prevSummary });
+    const data = await postJson<{ text?: string }>('/api/explain-image', { image, nearby, prevSummary, model: settings.inferModel });
     if (data?.text) { cap.textContent = `图：${String(data.text)}`; putImageExplain(state.pageIndex, source, String(data.text)); }
     else cap.textContent = '（这张图暂时没读出含义）';
   } catch {

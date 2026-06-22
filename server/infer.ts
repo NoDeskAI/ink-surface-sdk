@@ -32,6 +32,17 @@ function route(model: string): { channel: string; channel_url: string } {
   return { channel: 'DMX', channel_url: 'https://www.dmxapi.cn/v1/messages' };
 }
 
+/**
+ * 思考配置按模型家族派生（与 route() 同按前缀，构成"家族→{渠道, thinking}"单一真源）。
+ * 2026-06-22 网关探针实测：Claude（adaptive/enabled 都回）与 Kimi（enabled+budget→thinking_delta）经网关回思考块；
+ * Gemini 经 DMX 不回传思考摘要（请求也无益、白吃 token）。minTokens 给思考留头寸（保持原 claude 的 1280 等效上限）。
+ */
+function thinkingFor(model: string): { thinking: any; minTokens: number } | null {
+  if (model.startsWith('claude')) return { thinking: { type: 'adaptive', display: 'summarized' }, minTokens: 1280 };
+  if (model.startsWith('kimi')) return { thinking: { type: 'enabled', budget_tokens: 1024 }, minTokens: 1280 };
+  return null; // gemini / 其它：网关不回传思考，不请求
+}
+
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
 async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string }): Promise<any> {
   const { url, key } = cfg();
@@ -61,8 +72,8 @@ type GwEvent = { type: 'text' | 'thinking'; delta: string };
 
 /**
  * 流式网关调用（事件级）：逐段 yield {type:'text'|'thinking', delta}。
- *  · thinking 仅对 Claude 请求并回传——gemini 原生思考不经 anthropic thinking 字段回链、kimi 远端思考不回传，
- *    对它们请求 thinking 无益（甚至吃 max_tokens），故 wantThink 只在 model 以 claude 开头时成立。
+ *  · thinking 按模型家族派生（thinkingFor·实测）：Claude 用 adaptive、Kimi 用 enabled+budget，都经网关回思考块；
+ *    Gemini 经 DMX 不回传思考摘要（请求也无益），故不请求。
  *  · 网关不支持 SSE 时退化为一次性读出 content 块（text + 可能的 thinking 块）。
  */
 async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
@@ -70,12 +81,11 @@ async function* gatewayEventStream(opts: { system: string; messages: any[]; maxT
   const model = opts.model || cfg().model;
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
   const { channel, channel_url } = route(model);
-  const wantThink = !!opts.thinking && model.startsWith('claude'); // 只有 Claude 经网关真返回思考块
-  const budget = 1024;
+  const tc = opts.thinking ? thinkingFor(model) : null; // 按家族派生（Claude/Kimi 回思考，Gemini 不请求）
   let max_tokens = model.startsWith('gemini') ? Math.max(opts.maxTokens, 2048) : opts.maxTokens;
-  if (wantThink) max_tokens = Math.max(max_tokens, budget + 256); // anthropic 约束：max_tokens 必须 > thinking.budget_tokens
+  if (tc) max_tokens = Math.max(max_tokens, tc.minTokens); // 给思考留头寸
   const body: any = { model, max_tokens, system: opts.system, messages: opts.messages, channel, channel_url, stream: true };
-  if (wantThink) body.thinking = { type: 'enabled', budget_tokens: budget };
+  if (tc) body.thinking = tc.thinking;
   const resp = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', 'anthropic-version': '2023-06-01', accept: 'text/event-stream' },
@@ -249,7 +259,7 @@ export async function runReflow(payload: any): Promise<any[]> {
   const user = img
     ? `这是该页的图，以及按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n看着图判断真实版面，${rules}`
     : `下面是按几何切好的文本块（序号、粗类型、id、文字）：\n${list}\n\n${rules}`;
-  const raw = await gateway(system, user, 2500, img);
+  const raw = await gateway(system, user, 2500, img, payload?.model || REFLOW_MODEL);
   const refined = extractJsonArray(raw);
   // 校验：只保留出现过的 id；模型漏掉的块前端会按原样补回
   const ids = new Set(blocks.map((b) => b.id));
@@ -385,7 +395,7 @@ export async function runExplainImage(payload: any): Promise<{ text: string }> {
   const system = SYSTEM_PROMPTS.image_explain;
   const ctx = [prev ? `前页梗概：${prev}` : '', nearby ? `图附近的正文：${nearby}` : ''].filter(Boolean).join('\n');
   const user = `${ctx ? ctx + '\n\n' : ''}看这张图，给读者一句解读：`;
-  const text = await gateway(system, user, 300, image);
+  const text = await gateway(system, user, 300, image, payload?.model);
   return { text: text.trim() };
 }
 
@@ -398,7 +408,7 @@ export async function runReflowVlm(payload: any): Promise<any[]> {
   const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
   if (!image) return [];
   const system = SYSTEM_PROMPTS.reflow_vlm;
-  const raw = await gateway(system, '看这张页面图，按上面格式重排：', 3000, image);
+  const raw = await gateway(system, '看这张页面图，按上面格式重排：', 3000, image, payload?.model || REFLOW_MODEL);
   const arr = extractJsonArray(raw);
   return arr.filter((b) => b && (b.type === 'heading' || b.type === 'para' || b.type === 'list')).map((b) => ({
     type: b.type,
