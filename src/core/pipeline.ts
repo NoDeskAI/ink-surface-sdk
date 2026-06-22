@@ -5,7 +5,7 @@ import { appendAiTurnEntry, getReflow, setSynthesisWatermark, getBookAiTurns } f
 import { bboxOf, classify, markShapeOf, type StrokeFeature } from '../capture/classify';
 import { resolveTarget, buildHmp } from '../evidence/target';
 import { buildMarkGraph } from '../evidence/mark-graph';
-import { findSpatialRecall } from '../evidence/recall';
+import { findSpatialRecall, type RecallCandDiag } from '../evidence/recall';
 import { findThematicRecall } from '../evidence/thematic';
 import { projectInferenceView } from '../evidence/inference-view';
 import type { Mark, Session } from '../capture/session';
@@ -220,6 +220,24 @@ function mirrorClassify(o: { respond: boolean; reason: string; question: string;
   }).catch(() => { /* dev sink 不在/出错都无所谓 */ });
 }
 
+/**
+ * dev-only：把空间召回的逐候选判定镜像到调试通道（kind='recall'）。
+ * 召回为空时尤其有用——直接看到每条邻近旧标注的 euclid/dy/dx/sameRow/verdict，
+ * 无需进浏览器展开折叠复制。target=当前锚点笔（手写）的 bbox/文字，candidates=evals。
+ */
+function mirrorRecall(o: { discId: string; target: { text: string; bbox: NormBBox } | null; evals: RecallCandDiag[]; recalled: number }): void {
+  if (!(import.meta as { env?: { DEV?: boolean } }).env?.DEV) return;
+  void fetch('/api/__debug/event', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      kind: 'recall', ts: new Date().toISOString(), discId: o.discId,
+      target: o.target ? { text: o.target.text, bbox: o.target.bbox.map((n) => +n.toFixed(4)), ycenter: +(o.target.bbox[1] + o.target.bbox[3] / 2).toFixed(4) } : null,
+      thresholds: { SPATIAL_NEAR: 0.12, ROW_BAND: 0.03, ROW_REACH: 0.5 },
+      recalled: o.recalled, candidates: o.evals,
+    }),
+  }).catch(() => { /* dev sink 不在/出错都无所谓 */ });
+}
+
 /** dev-only：把蒸馏出的 inference-view（喂模型的精简载荷）镜像到调试通道（kind='inferview'）。 */
 function mirrorView(view: InferenceView, reason: string, discId: string): void {
   if (!(import.meta as { env?: { DEV?: boolean } }).env?.DEV) return;
@@ -415,8 +433,9 @@ export async function commitSessionDiscussion(
 
   // 空间召回（治本·根因 A）+ 滑窗上下文 + 全书主题召回（向量·现 no-op）+ 账本（回查旧回复）并发取，省串行延迟
   const recallQuery = marks.map((m) => m.markedText).filter(Boolean).join(' ').slice(0, 300);
+  const recallDiag: RecallCandDiag[] | undefined = (import.meta as { env?: { DEV?: boolean } }).env?.DEV ? [] : undefined;
   const [priorNeighbors, pageCtx, thematic, bookTurns] = await Promise.all([
-    findSpatialRecall(session.bookId, marks),  // 账本捞回同页邻近旧标注（不进 graph.nodes）
+    findSpatialRecall(session.bookId, marks, recallDiag), // 账本捞回同页邻近旧标注（不进 graph.nodes）；diag 收逐候选判定
     slidingContext(3000),                      // 以当前页为中心、前后共 ~3000 字滑动窗
     findThematicRecall(session.bookId, recallQuery), // 全书主题联想（向量 stub，现恒返 []）
     getBookAiTurns(session.bookId),            // 回查召回旧标注当时的 AI 回复（替代长 buffer 延续性）
@@ -427,6 +446,8 @@ export async function commitSessionDiscussion(
     const t = bookTurns.find((tt) => tt.anchor.mark_ids.includes(n.mark_id!));
     if (t?.ai_reply) n.reply = t.ai_reply.slice(0, 80);
   }
+  // dev：把逐候选判定（含被拒的，带 euclid/dy/dx/verdict）镜像到 telemetry，便于离线核对"召回为空"根因。
+  if (recallDiag) mirrorRecall({ discId, target: { text: anchorMark.markedText || `「${reason}」`, bbox: anchorMark.event.geometry.bbox }, evals: recallDiag, recalled: priorNeighbors.length });
   // ②：手写问题（孤立边注本身不带指代）取它纵向压着的印刷正文行作显式指代。
   // 仅当锚点 mark 就在当前页（刚写下的手写恒成立）才有现成 textBlocks；否则跳过、退回页面上下文。
   const rowText = (reason === 'handwriting' && anchorMark.event.page_id === state.pageId)
