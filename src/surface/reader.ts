@@ -371,14 +371,17 @@ function contentPoint(e: PointerEvent): { x: number; y: number } {
   return { x: e.clientX - r.left, y: e.clientY - r.top + el.scrollTop };
 }
 
-/** 命中哪一段：手势内容-y 中心落在哪个块的纵向范围内。 */
-function hitBlock(pts: { x: number; y: number }[]): BlockRef | null {
+/** 命中哪一段：手势内容-y 中心落在哪个块的纵向范围内。
+ *  返回块在**#reader 内容坐标**里的 top/height（与 contentPoint 同系），onPenUp 直接拿来做 y 映射——
+ *  绝不可改用 ref.el.offsetTop/offsetHeight：offsetParent 是 .reader-page、与内容坐标差一个页边距，
+ *  会把 (p.y-top)/bh 整体平移、写在行下半/行下方的笔全被 c01 夹到 1 → bbox 高度塌成 0 → 手写散成点被丢。 */
+function hitBlock(pts: { x: number; y: number }[]): { ref: BlockRef; top: number; height: number } | null {
   const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
   const top = el.getBoundingClientRect().top;
   for (const ref of blockRefs) {
     const r = ref.el.getBoundingClientRect();
     const a = r.top - top + el.scrollTop;
-    if (cy >= a - 6 && cy <= a + r.height + 6) return ref;
+    if (cy >= a - 6 && cy <= a + r.height + 6) return { ref, top: a, height: r.height };
   }
   return null;
 }
@@ -397,11 +400,12 @@ function makeEvent(kind: EventType, pts: StrokePoint[]): AnnotationEvent {
 
 function onPenUp(raw: { x: number; y: number }[]): void {
   if (raw.length < 2) return;
-  const ref = hitBlock(raw);
-  if (!ref) return; // 没画在任何段上 → 不入
+  const hit = hitBlock(raw);
+  if (!hit) return; // 没画在任何段上 → 不入
   if (!settings.gesture.enabled) return;
+  const { ref, top, height } = hit; // top/height 已是 #reader 内容坐标（与下方 p.y 同系，不能用 offsetTop）
+  const bh = height || 1;
   // 内容坐标 → 命中块的 PDF 归一化坐标（落进块 bbox，供 resolveTarget 命中该块的字符对象）
-  const top = ref.el.offsetTop, bh = ref.el.offsetHeight || 1;
   const c01 = (v: number) => Math.max(0, Math.min(1, v));
   const pts: StrokePoint[] = raw.map((p, i) => ({
     x: ref.source[0] + c01(p.x / (el.clientWidth || 1)) * ref.source[2],
