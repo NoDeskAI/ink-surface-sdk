@@ -502,6 +502,7 @@ function legacySection(t: PersistedAiTurn, markMap: Map<string, PersistedMark>):
  */
 function turnBlock(t: PersistedAiTurn, idx: number, markMap: Map<string, PersistedMark>): string {
   const trig = TRIGGER_CN[t.trigger] ?? { t: t.trigger, c: '#8a877f' };
+  const folded = t.overlay_state === 'folded'; // 手写被判「写给自己」→ 静默未回应，仍入账供此处复盘
   const reply = t.ai_reply || '（空回复）';
   const think = (t.thinking || '').trim();
   const userInner = (t.pipeline && t.pipeline.length) ? pipelineSection(t.pipeline) : legacySection(t, markMap);
@@ -510,13 +511,21 @@ function turnBlock(t: PersistedAiTurn, idx: number, markMap: Map<string, Persist
     ? `<details class="cns-think"><summary>💭 思考过程（${think.length} 字）</summary><div class="cns-think-body">${esc(think)}</div></details>`
     : `<div class="cns-nothink">无思考过程返回（当前模型不回传；切到 claude-sonnet-4-6 可见）</div>`;
 
+  // 折叠轮：不渲 AI 气泡，改给一条"未回应"说明（判否理由已在上方 legacySection 的「分类器判定」里）。
+  const resultSection = folded
+    ? `<div class="cns-label" style="margin-top:14px">结果</div>`
+      + `<div class="cns-row ai"><div class="cns-col"><div class="cns-bub" style="background:#f3efe7;border:1px dashed #d8cdbb;color:#6d655c">`
+      + `🚫 折叠为「写给自己的笔记」——上下文分类器判无需回应，未触发主模型。这条手写仍留在 session，计入下次长停顿综合。`
+      + `</div><div class="cns-meta">#${idx} · 未回应（fold）</div></div></div>`
+    : `<div class="cns-label" style="margin-top:14px">AI 回复</div>`
+      + `<div class="cns-row ai"><div class="cns-col"><div class="cns-bub ai">${esc(reply)}</div>`
+      + thinkBlock
+      + `<div class="cns-meta">#${idx} · ${esc(t.model || '')}${t.supersedes ? ' · 改写' : ''}</div></div></div>`;
+
   return `<div class="cns-turn">`
-    + `<div class="cns-label">发送给 AI 的内容 · 第 ${(t.page_index ?? 0) + 1} 页 · <span class="cns-trig" style="background:${trig.c}">${esc(trig.t)}</span> · ${fmtTime(t.created_at)}</div>`
+    + `<div class="cns-label">发送给 AI 的内容 · 第 ${(t.page_index ?? 0) + 1} 页 · <span class="cns-trig" style="background:${trig.c}">${esc(trig.t)}</span>${folded ? ' · <span class="cns-trig" style="background:#a99">折叠</span>' : ''} · ${fmtTime(t.created_at)}</div>`
     + `<div class="cns-userwrap"><div class="cns-usercard">` + userInner + `</div></div>`
-    + `<div class="cns-label" style="margin-top:14px">AI 回复</div>`
-    + `<div class="cns-row ai"><div class="cns-col"><div class="cns-bub ai">${esc(reply)}</div>`
-    + thinkBlock
-    + `<div class="cns-meta">#${idx} · ${esc(t.model || '')}${t.supersedes ? ' · 改写' : ''}</div></div></div>`
+    + resultSection
     + `</div>`;
 }
 

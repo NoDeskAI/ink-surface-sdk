@@ -511,7 +511,7 @@ export async function commitSessionDiscussion(
   // 免得和召回子句重复；上限最近 6 条防膨胀。本轮尚未入账，天然不在内。
   const focusMarkIds = new Set(priorNeighbors.map((n) => n.mark_id).filter(Boolean) as string[]);
   const pageAnnotations = bookTurns
-    .filter((t) => t.page_index === state.pageIndex && t.overlay_state !== 'dismissed')
+    .filter((t) => t.page_index === state.pageIndex && t.overlay_state !== 'dismissed' && t.overlay_state !== 'folded')
     .filter((t) => !t.anchor.mark_ids.some((id) => focusMarkIds.has(id)))
     .map((t) => ({ marked: String(t.inference_view?.marked || '').slice(0, 50), reply: String(t.ai_reply || '').slice(0, 80) }))
     .filter((x) => x.marked || x.reply)
@@ -543,7 +543,33 @@ export async function commitSessionDiscussion(
     classifyDiag = { respond: decision.respond, reason: decision.reason };
     trace('ClassifyContext', { respond: decision.respond, reason: decision.reason, question: view.question ?? '' });
     mirrorClassify({ respond: decision.respond, reason: decision.reason, question: view.question ?? '', discId });
-    if (!decision.respond) return false;
+    if (!decision.respond) {
+      // fold = 写给自己的笔记 → 静默、不落 reader overlay、marks 留 session（计入下次综合）。
+      // 仍把这一轮作为「折叠」条目落账本——否则 AI 会话 dev 页（只读 ai_turns）完全看不到判否的流程。
+      // overlay_state='folded'：restore 不恢复其 overlay、不回放进 buffer（见 main.restoreFromLedger）；
+      // 不调 setSynthesisWatermark（提前 return，marks 自然留 pending）。
+      const foldPageId = view.page_id || anchorMark.event.page_id;
+      const foldOverlay: ScreenOverlay = {
+        overlay_id: discId, trace_id: anchorMark.event.trace_id, page_id: foldPageId,
+        result_id: shortId('res'), overlay_type: 'note', geometry: { anchor_bbox: view.anchor_bbox },
+        display_text: '', dismissible: true, created_at: new Date().toISOString(),
+        state: 'folded', result_type: 'inspiration', object_refs: view.anchor_refs,
+      };
+      await appendAiTurnEntry({
+        document_id: bookId, page_id: foldPageId, page_index: state.pageIndex,
+        overlay_id: discId, overlay: foldOverlay, overlay_state: 'folded', user_edited_text: null,
+        ai_reply: '',
+        anchor: { surface_id: view.page_id, mark_ids: marks.map((m) => m.id), object_refs: view.anchor_refs },
+        inference_view: { ...view, crop: undefined }, // 存料不存图
+        prompt_snapshot: renderUserTurn(view),        // 当时本会回应的话会发的内容（折叠没真送）
+        system_prompt_hash: PROMPT_TAG,
+        settings_snapshot: { inferModel: settings.inferModel, reflowProvider: settings.reflowProvider },
+        trigger: 'handwriting', model: settings.inferModel, supersedes: null,
+        diag: { classify: classifyDiag, sent_image: false },
+      });
+      bus.emit('aiturn:appended', bookId); // 会话页开着 → 刷新即见这条折叠轮
+      return false;
+    }
   }
   openBook(bookId);
   const userContent = renderUserTurn(view);

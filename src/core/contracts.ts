@@ -124,7 +124,9 @@ export interface InferenceResult {
 }
 
 export type OverlayType = 'note' | 'highlight' | 'link' | 'question' | 'suggestion_card';
-export type OverlayState = 'shown' | 'accepted' | 'edited' | 'dismissed';
+// 'folded' 仅用于 ai_turns 账本：手写被上下文分类器判「写给自己」(respond=false) 的那一轮——
+// 静默不回应、不落 reader overlay、不进对话 buffer，但仍作为一条折叠记录入账，供 AI 会话 dev 页显示判否流程。
+export type OverlayState = 'shown' | 'accepted' | 'edited' | 'dismissed' | 'folded';
 
 export interface ScreenOverlay {
   overlay_id: string;
