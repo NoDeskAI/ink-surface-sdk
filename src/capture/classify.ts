@@ -144,6 +144,12 @@ function pathComplexity(points: StrokePoint[], bbox: NormBBox, dimW: number, dim
   return diag > 1 ? len / diag : 0;
 }
 
+/** underline markup 的"整体要扁"闸（治英文被当下划线吃掉）：英文沿基线写、常有一笔长横拿 underline
+ *  满分且 span≥0.6（why 的笔本就是横的），但整个 mark 仍有一行字那么高。真下划线扁、英文手写高——
+ *  实测(page14 标定)真下划线 scaleRatio≤0.17、手写≥1.48，中间一整段空带 → 卡 0.6（两头各留 ~3×/~2.5× 余量）。 */
+const UNDERLINE_FLAT_MAX = 0.6;   // scaleRatio = mark 高 ÷ 本行字高；< 此值才算真下划线
+const UNDERLINE_ABS_FLOOR = 0.015; // 无字高标尺(scaleRatio=NaN，如页边手写)时退回绝对高度地板
+
 export function classifyStrokeFeature(
   perStroke: ScoredGesture[],
   strokeBboxes: NormBBox[],
@@ -177,7 +183,11 @@ export function classifyStrokeFeature(
 
   // ① 圈/划/箭头模板 **且这笔占满了整个 mark（它就是那个手势）** → markup（纯几何）。
   //    自相对闸是关键：否则中文字里的"横"(=underline 1.0)/"口"(=circle) 会把整段手写误判成 markup。
-  if (tplScore >= 0.45 && spanRatio >= 0.6) {
+  //    underline 再过一道"整体要扁"闸：英文长横拿 underline 满分+span≥0.6，但 mark 有一行字那么高 → 不是划线，
+  //    落回 freeform 送识别（见 UNDERLINE_FLAT_MAX）。circle/arrow 不受此闸（circle 另有 markupLooksLikeDrawing 反判）。
+  const underlineTooTall = tplType === 'underline'
+    && (Number.isFinite(scaleRatio) ? scaleRatio >= UNDERLINE_FLAT_MAX : bbox[3] >= UNDERLINE_ABS_FLOOR);
+  if (tplScore >= 0.45 && spanRatio >= 0.6 && !underlineTooTall) {
     return { type: 'markup', confidence: tplScore, scaleRatio, raw };
   }
   // ② freeform：保守 OCR 门——非太小 且 (多笔 或 单笔够复杂) → 值得送识别定型；否则散笔/线条，记 drawing。

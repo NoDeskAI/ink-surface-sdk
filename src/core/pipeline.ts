@@ -211,15 +211,29 @@ function mirrorRecognize(o: {
   event_id: string; page_id: string; region: NormBBox;
   feature_in: string; feature_out: string; ocrWorthy: boolean; hasInk: boolean;
   interpretCalled: boolean; gate: string;
+  feat?: StrokeFeature;
   kind?: string; reading?: string; description?: string;
 }): void {
-  devEmit('recognize', () => ({
-    event_id: o.event_id, page_id: o.page_id, region: o.region.map((n) => +n.toFixed(4)),
-    feature_in: o.feature_in, feature_out: o.feature_out, ocrWorthy: o.ocrWorthy, hasInk: o.hasInk,
-    interpretCalled: o.interpretCalled, gate: o.gate,
-    // VLM 判定值字段名用 interp_kind，**不要叫 kind**——会和 envelope 的事件 kind 撞名。
-    ...(o.interpretCalled ? { interp_kind: o.kind ?? '', reading: o.reading ?? '', description: o.description ?? '' } : {}),
-  }));
+  devEmit('recognize', () => {
+    // 几何判别 raw（"先量再改"：定 markup/underline 闸阈值用）——markup 把英文长横判 underline 吃掉的根因，
+    // 靠 scale_ratio(mark 高÷本行字高) 与真下划线区分：真划线很扁(scale_ratio 小)、英文手写有一行字那么高。
+    const r = o.feat?.raw;
+    const markLong = Math.max(o.region[2], o.region[3]) || 1e-6;
+    return {
+      event_id: o.event_id, page_id: o.page_id, region: o.region.map((n) => +n.toFixed(4)),
+      feature_in: o.feature_in, feature_out: o.feature_out, ocrWorthy: o.ocrWorthy, hasInk: o.hasInk,
+      interpretCalled: o.interpretCalled, gate: o.gate,
+      ...(r ? { feat: {
+        tpl_type: r.templateType, tpl_score: +r.templateScore.toFixed(3),
+        tpl_span: +r.tplSpan.toFixed(4), span_ratio: +(r.tplSpan / markLong).toFixed(3),
+        scale_ratio: Number.isFinite(r.scaleRatio) ? +r.scaleRatio.toFixed(3) : null,
+        mark_w: +o.region[2].toFixed(4), mark_h: +o.region[3].toFixed(4),
+        stroke_count: r.strokeCount, complexity: +r.complexity.toFixed(2),
+      } } : {}),
+      // VLM 判定值字段名用 interp_kind，**不要叫 kind**——会和 envelope 的事件 kind 撞名。
+      ...(o.interpretCalled ? { interp_kind: o.kind ?? '', reading: o.reading ?? '', description: o.description ?? '' } : {}),
+    };
+  });
 }
 
 
@@ -366,7 +380,7 @@ export async function captureMark(
   mirrorRecognize({
     event_id: event.event_id, page_id: event.page_id, region: event.geometry.bbox,
     feature_in: feature.type, feature_out: resolved.type, ocrWorthy: !!feature.raw.ocrWorthy, hasInk: !!layers.ink,
-    interpretCalled: !!recog, gate: recogGate, kind: recog?.kind, reading: recog?.reading, description: recog?.description,
+    interpretCalled: !!recog, gate: recogGate, feat: feature, kind: recog?.kind, reading: recog?.reading, description: recog?.description,
   });
   const action = markActionOf(resolved.type, event.event_type, score);
   // markup 锚它所标的内容；freeform（手写/画）属 self_content——它本身就是内容，不锚到 bbox 碰巧蹭到的正文
