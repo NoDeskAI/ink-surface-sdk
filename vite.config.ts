@@ -91,6 +91,9 @@ function inferenceProxy(env: Record<string, string>): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
+    // 相对基址：安卓 WebViewAssetLoader 从本地 assets 加载 index.html，绝对 /assets/ 路径会错。
+    // dev 下相对基址同样工作；public 资产仍服务于根，配合 renderer 的 BASE_URL 相对解析。
+    base: './',
     server: { port: 8765, strictPort: true },
     build: { target: 'es2022' },
     plugins: [inferenceProxy(env)],

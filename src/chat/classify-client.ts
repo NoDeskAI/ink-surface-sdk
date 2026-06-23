@@ -18,7 +18,7 @@ export async function classifyContext(
       view_narrative: view.narrative,
       marked: view.marked,
       conversation: conversation.map((m) => ({ role: m.role, content: m.content })),
-      model: settings.inferModel,
+      model: settings.classifyModel || settings.inferModel,
     });
     return { respond: j?.respond !== false, reason: String(j?.reason || '') };
   } catch {

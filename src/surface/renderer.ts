@@ -15,6 +15,11 @@ import { getReflow, openDoc, putReflow, storePdfBlob, loadPdfBlob, lastReadPage 
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
+// public/ 资产的运行期 URL：基于 Vite BASE_URL 相对解析。
+// dev（页面在根）→ /cmaps/；安卓 WebView（页面在 /assets/index.html）→ /assets/cmaps/。绝对 '/cmaps/' 在后者会错。
+const publicAssetUrl = (path: string): string =>
+  new URL(`${import.meta.env.BASE_URL || './'}${path}`, window.location.href).toString();
+
 let pdf: PDFDocumentProxy | null = null;
 let renderTask: { cancel(): void; promise: Promise<void> } | null = null;
 
@@ -100,9 +105,9 @@ async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob |
   // 资产在 public/（cp 自 pdfjs-dist），dev 与 build 均自动服务于根路径。
   pdf = await pdfjsLib.getDocument({
     data: buf,
-    cMapUrl: '/cmaps/',
+    cMapUrl: publicAssetUrl('cmaps/'),
     cMapPacked: true,
-    standardFontDataUrl: '/standard_fonts/',
+    standardFontDataUrl: publicAssetUrl('standard_fonts/'),
   }).promise;
   state.pageCount = pdf.numPages;
   state.strokesByPage.clear();

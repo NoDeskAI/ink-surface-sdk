@@ -55,6 +55,10 @@ export interface Settings {
   // 推理模型：按前缀路由渠道——kimi*→moonshot；claude/gpt/gemini*→DMX。默认 sonnet-4-6。
   // （无状态端点：识别/答问/重排走各 /api/* 端点；跨标注连贯交 chat/ 每本书 buffer。）
   inferModel: string;
+  // 识别分类器(/api/interpret)、上下文分类器(/api/classify-context)可各自单独选模型(A/B 评估用)；
+  // 空字符串 = 继承 inferModel。
+  interpretModel: string;
+  classifyModel: string;
   // 是否把合成图(墨迹叠原文)送给理解模型。**合成图非徐智强方案**——他的路线靠 HMP 取证事实
   //（命中原文 + text_hint）让 AI 理解，不靠截图。默认 false=纯徐路线验证；dev 控制台可临时 true 做 A/B。
   sendMarkImage: boolean;
@@ -76,6 +80,8 @@ export const settings: Settings = {
   gesture: { enabled: true, idleSeconds: 90 },
   inferModel: 'claude-sonnet-4-6', // 默认推理+识别模型：sonnet-4.6（DMX，中文手写实测准）。recognizeInk/chat 都随它。
   //   注：旧用户 localStorage 里存了别的会覆盖此默认——要用 sonnet 需在 dev 面板「推理模型」选一次或清 inkloop.settings.v1。
+  interpretModel: '', // 识别分类器(/api/interpret)模型；空=继承 inferModel。
+  classifyModel: '',  // 上下文分类器(/api/classify-context)模型；空=继承 inferModel。
   sendMarkImage: false, // 默认不送合成图：纯验证徐智强的取证路线（AI 只吃 HMP 事实+整页上下文）。
   devOverlay: false,    // dev bbox 叠层默认关。
   showRegion: true,     // dev 组装区域实时可视：默认开（手写时看受影响区域）。

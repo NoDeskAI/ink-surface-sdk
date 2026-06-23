@@ -14,13 +14,15 @@ import { mark } from './metrics';
 import { trace } from './trace';
 import { bus, settings, state, type Stroke } from '../app/state';
 import { grabLayers, grabRegion } from '../evidence/ocr';
+import { ondeviceRecognizeInk, ondeviceOcrRegion } from '../evidence/ondevice';
+import { classifyIntentLocal } from '../evidence/intent-rules';
 import { pageText, blocksToText, linesInBand, pointInPolygon } from '../evidence/focus';
 import { extractPageBlocks } from '../surface/renderer';
 import { pushInspect } from './inspect';
 import { chatTurn } from '../chat/stream-client';
 import { openBook, bookMessages } from '../chat/buffer';
 import { classifyContext } from '../chat/classify-client';
-import { postJson } from './api';
+import { postJson, postBeacon } from './api';
 
 /** 伴读 persona 已搬到服务端 server/prompts.ts（按 role 索引、与模型解耦）；/api/chat 收 role='annotator'。
  *  下面这个标签随账本存 system_prompt_hash，标识本轮提示词版本（与 server PROMPT_VERSION 对齐，改 system 文案时同步）。 */
@@ -151,8 +153,13 @@ async function enrichHmp(hmp: HMP, evt: AnnotationEvent, targets: SurfaceObject[
   try {
     let readOut = '';
     try {
-      const j = await postJson<{ text?: string }>('/api/ocr-vlm', { image: crop, model: settings.inferModel });
-      readOut = String(j?.text || '').trim();
+      // 端侧优先：原生桥可用 → 本地区域 OCR；不可用/失败 → 云端 /api/ocr-vlm（Kimi 视觉）。
+      const local = await ondeviceOcrRegion(crop);
+      if (local) readOut = String(local.text || '').trim();
+      else {
+        const j = await postJson<{ text?: string }>('/api/ocr-vlm', { image: crop, model: settings.inferModel });
+        readOut = String(j?.text || '').trim();
+      }
     } catch { /* http/网络错 → readOut 留空，下方仍记 DEV 阶段 */ }
     if (readOut) {
       hmp.text_hint = readOut; // 识别只补内容，不改 mode/类型
@@ -290,12 +297,47 @@ function resolveMarkedText(hmp: HMP, index: SurfaceIndex): string {
   return targetText || hint;
 }
 
-/** 云端识别当类型分类器（context-free）：读这团墨是不是文字 → kind + 转写 + 画的粗描述。失败默认 none。 */
-async function recognizeInk(inkData: string): Promise<{ kind: string; reading: string; description: string }> {
+/**
+ * 识别当类型分类器（context-free）：读这团墨是不是文字 → kind + 转写 + 画的粗描述。
+ * 端侧优先：原生桥可用 → 本地识别（有 GMS 走 ML Kit，否则降级 PP-OCR 栅格），source=local_board；
+ * 不可用/失败 → 云端 /api/interpret，source=cloud。两路均失败默认 none。
+ */
+async function recognizeInk(
+  inkData: string, strokes?: unknown,
+): Promise<{ kind: string; reading: string; description: string; source: 'local_board' | 'cloud' }> {
+  const local = await ondeviceRecognizeInk(inkData, strokes);
+  if (local) return {
+    kind: String(local.kind || 'none'), reading: String(local.reading || '').trim(),
+    description: String(local.description || '').trim(), source: 'local_board',
+  };
   try {
-    const j = await postJson<{ kind?: string; reading?: string; description?: string }>('/api/interpret', { image: inkData, model: settings.inferModel });
-    return { kind: String(j.kind || 'none'), reading: String(j.reading || '').trim(), description: String(j.description || '').trim() };
-  } catch { return { kind: 'none', reading: '', description: '' }; }
+    const j = await postJson<{ kind?: string; reading?: string; description?: string }>('/api/interpret', { image: inkData, model: settings.interpretModel || settings.inferModel });
+    return { kind: String(j.kind || 'none'), reading: String(j.reading || '').trim(), description: String(j.description || '').trim(), source: 'cloud' };
+  } catch { return { kind: 'none', reading: '', description: '', source: 'cloud' }; }
+}
+
+/**
+ * intent A/B 影子对照（Seam C，**不替换**上下文分类器）。
+ * 用 IntentClassifier 的 TS 移植（intent-rules.ts）算 6 标签 → respond/fold 预测，与云端决定一起落账算一致率。
+ * 规则纯本地、web/dev/套壳都跑（不依赖原生桥/AAR/板子）；云端仍权威驱动行为，端侧仅影子。
+ * 收集：postBeacon → 代理 /api/ab/intent（.ab-intent.jsonl，板上生产也发）；并 devEmit 供 dev 面板可视。
+ */
+function intentToRespond(intent: string): boolean {
+  // self_note / reject → 写给自己(fold)；question / todo / attention / relation → 要回答(respond)。
+  return !(intent === 'self_note' || intent === 'reject');
+}
+function emitIntentAb(text: string, cloud: { respond: boolean; reason: string }, discId: string): void {
+  const intent = classifyIntentLocal('handwriting', text);
+  const respondPred = intentToRespond(intent);
+  const rec = {
+    disc_id: discId,
+    text: text.slice(0, 120),
+    cloud: { respond: cloud.respond, reason: cloud.reason },
+    local: { intent, respond_pred: respondPred },
+    agree: respondPred === cloud.respond,
+  };
+  postBeacon('/api/ab/intent', rec); // 生产持久化收集（板上也发）
+  devEmit('intent_ab', () => rec);    // dev 面板可视
 }
 
 /**
@@ -342,12 +384,12 @@ export async function captureMark(
   const freeformOverride = feature.type === 'markup' && markupLooksLikeDrawing(feature, event, index);
   let resolved = feature;
   let textHint: string | undefined;
-  let recog: { kind: string; reading: string; description: string } | null = null; // interpret 结果（仅调用时）
+  let recog: { kind: string; reading: string; description: string; source: 'local_board' | 'cloud' } | null = null; // 识别结果（仅调用时）
   let recogGate: string; // 为何送/跳过识别（dev 遥测核对哭脸式漏判）
   if (feature.type === 'markup' && !freeformOverride) {
     recogGate = 'markup（几何已定型）·不送识别';
   } else if (layers.ink && (feature.raw.ocrWorthy || freeformOverride)) {
-    recog = await recognizeInk(layers.ink);
+    recog = await recognizeInk(layers.ink, event.stroke_points);
     const isText = recog.kind === 'handwriting' || recog.kind === 'mixed';
     const hasDrawing = recog.kind === 'sketch' || recog.kind === 'mixed'; // 含可视化的画（mixed=图+字，仍含画）
     resolved = { ...feature, type: isText ? 'handwriting' : 'drawing', confidence: recog.kind === 'none' ? 0.3 : 0.85, hasDrawing };
@@ -357,9 +399,9 @@ export async function captureMark(
       : (isText ? recog.reading : recog.description) || undefined;
     recogGate = freeformOverride ? 'circle 未圈住内容+含多笔(疑涂鸦/表情)·推翻 markup 送识别' : 'freeform 过几何门(ocrWorthy)·送识别';
     if (DEV) pl.push({
-      stage: 'recognize', label: '识别分类器 · /api/interpret', status: 'ran',
+      stage: 'recognize', label: '识别分类器 · ' + (recog.source === 'local_board' ? '端侧 OCR (local_board)' : '/api/interpret'), status: 'ran',
       note: (freeformOverride ? '⤷ markup 圈复判：没圈住内容+含多笔→疑涂鸦/表情，推翻几何 markup。' : '自由笔且过几何门(ocrWorthy)。') + '判「手写 vs 画」、转写文字、给画一句粗描述（context-free，不揣测意图）',
-      input: [{ k: '模型', v: settings.inferModel }, { k: '输入', v: '白底笔迹图 ink' }],
+      input: [{ k: '识别源', v: recog.source }, { k: '模型', v: recog.source === 'cloud' ? (settings.interpretModel || settings.inferModel) : '端侧模型' }, { k: '输入', v: '白底笔迹图 ink' + (recog.source === 'local_board' ? ' + 笔迹点序' : '') }],
       output: [
         { k: '判定 kind', v: recog.kind },
         { k: '转写 reading', v: recog.reading || '（无）' },
@@ -557,6 +599,7 @@ export async function commitSessionDiscussion(
     classifyDiag = { respond: decision.respond, reason: decision.reason };
     trace('ClassifyContext', { respond: decision.respond, reason: decision.reason, question: view.question ?? '' });
     mirrorClassify({ respond: decision.respond, reason: decision.reason, question: view.question ?? '', discId });
+    void emitIntentAb(view.question || view.marked || '', decision, discId); // 端侧 intent 影子对照（不改行为）
     if (!decision.respond) {
       // fold = 写给自己的笔记 → 静默、不落 reader overlay、marks 留 session（计入下次综合）。
       // 仍把这一轮作为「折叠」条目落账本——否则 AI 会话 dev 页（只读 ai_turns）完全看不到判否的流程。
