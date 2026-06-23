@@ -123,13 +123,20 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
   const pid = batch[0].page_id;
   const bookId = state.documentId ?? 'book';
 
-  // 每笔单独分类 + 滤点按（per-stroke）
+  // 每笔单独分类。点按滤除要克制：**多笔且含实笔的区域里，短笔是真笔画的一部分**（汉字的点/小撇/钩、
+  // 标点，行程常 <13px 或 ≤3 点 → 被 classifyScored 判 tap_region）——一律滤掉就是"手写丢笔画"的病根
+  // （那些笔留在屏上、却不进 mark、不落账本，reload 后凭空消失，也不进识别图）。故只在「孤立单笔点按」
+  // 或「整团都是点按」时才丢（真·误触/掌触）；其余全保留，绝不丢用户落下的笔。
   const scoredAll = batch.map((e) => classifyScored(e.stroke_points, e.geometry.bbox));
-  const keep = batch.map((e, i) => ({ e, s: scoredAll[i], st: strokes[i] })).filter((x) => x.s.type !== 'tap_region');
+  const cand = batch.map((e, i) => ({ e, s: scoredAll[i], st: strokes[i] }));
+  const realCount = scoredAll.filter((s) => s.type !== 'tap_region').length;
+  const keepShortStrokes = batch.length >= 2 && realCount >= 1; // 多笔实质区域 → 短笔也留
+  const keep = keepShortStrokes ? cand : cand.filter((x) => x.s.type !== 'tap_region');
   if (!keep.length) {
     gtrace({ page_id: pid, strokes: diagOf(scoredAll), resolved: '— 点按/误触，不计入', flush: flushInfo });
     return;
   }
+  const droppedTaps = batch.length - keep.length; // 被滤掉的点按数（>0 即有笔未进 mark，补观测缺口）
   const realEvents = keep.map((x) => x.e);
   const realScored = keep.map((x) => x.s);
   const realStrokes = keep.map((x) => x.st);
@@ -160,7 +167,7 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
     hmp: cap.hmp ? { ...cap.hmp, crop_ref: undefined, vector_ref: undefined } : null,
     marked_text: cap.markedText, is_tombstone: false,
   });
-  gtrace({ page_id: pid, strokes: diagOf(realScored), feature: feature.type, conf: Number(feature.confidence.toFixed(2)), shape: markScored.type, marked: cap.markedText.slice(0, 40), resolved: `mark·${feature.type}（累积静默）`, flush: flushInfo });
+  gtrace({ page_id: pid, strokes: diagOf(realScored), ...(droppedTaps ? { droppedTaps } : {}), feature: feature.type, conf: Number(feature.confidence.toFixed(2)), shape: markScored.type, marked: cap.markedText.slice(0, 40), resolved: `mark·${feature.type}（累积静默）`, flush: flushInfo });
 
   // 手写 = 唯一早提交边界事件（区域冷却已落定 + 识别已可靠定型，无需再额外等）
   if (feature.type === 'handwriting') void commitSession(bookId, 'handwriting', mark);
@@ -382,11 +389,12 @@ async function restoreFromLedger(): Promise<void> {
     state.strokesByPage.set(m.page_id, arr);
   }
 
-  // 2) AI 旁注 + 对话 buffer：书日志折叠（每 overlay_id 取最新；dismissed 不显示）
-  //    overlay 恢复 = 所有非 dismissed turn（显示需要）；buffer 只回放最近 3 轮（延续性主要靠空间召回，不靠长 transcript）。
+  // 2) AI 旁注 + 对话 buffer：书日志折叠（每 overlay_id 取最新；dismissed/folded 不显示）
+  //    overlay 恢复 = 非 dismissed 且非 folded（folded=自我笔记，静默：无 reader 旁注、不进 buffer）；
+  //    buffer 只回放最近 3 轮（延续性主要靠空间召回，不靠长 transcript）。
   const turns = await getBookAiTurns(docId);
   state.overlays = [];
-  const shown = turns.filter((t) => t.overlay_state !== 'dismissed');
+  const shown = turns.filter((t) => t.overlay_state !== 'dismissed' && t.overlay_state !== 'folded');
   for (const t of shown) {
     t.overlay.object_refs = t.anchor.object_refs; // 跨视图锚（兼容早于 object_refs 的旧快照）
     state.overlays.push(t.overlay);
