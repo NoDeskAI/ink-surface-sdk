@@ -66,9 +66,10 @@ class MainActivity : ComponentActivity() {
         setContentView(webView)
         configureWebView(assetLoader)
 
-        // Phase 2（端侧 OCR）：拷入 POC 源码 + 加依赖后取消下一行注释 → 注册 window.InkLoopOcr 桥。
-        // 套壳 MVP 阶段保持注释：window.InkLoopOcr 不存在 → 前端 ondevice.available()=false → 自动走云端识别。
-        // com.example.hmpocrpoc.OcrBridge.attach(webView, this)
+        // 端侧印刷区域 OCR 桥：注册 window.InkLoopOcr（ocrRegion=ML Kit text+PP-OCR 兜底）。
+        // 注册后前端 ondevice.available()=true → ocrRegion 走端侧；recognizeInk 端侧返回 unavailable → 前端自动降级云端。
+        // 要纯套壳（全部走云）只需注释下一行。
+        com.example.hmpocrpoc.OcrBridge.attach(webView, this)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {

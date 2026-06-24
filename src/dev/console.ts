@@ -21,6 +21,7 @@
 import { bus, state, settings, saveSettings, type Placement } from '../app/state';
 import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks } from '../local/store';
+import { reopenBook } from '../surface/renderer';
 import type { PersistedAiTurn, PersistedMark } from '../core/store-format';
 import type { HMP, PipelineStage, PipelineStageIO, SurfaceObject } from '../core/contracts';
 import { downloadTrace, traceCount } from '../core/trace';
@@ -29,19 +30,45 @@ import { selfTest } from '../core/transform';
 
 const esc = (s: string): string => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] ?? c));
 
-type PageId = 'reader' | 'chat' | 'hmp' | 'settings';
+type PageId = 'reader' | 'meeting' | 'chat' | 'hmp' | 'settings';
 const PAGES: Array<{ id: PageId; icon: string; label: string; ready: boolean }> = [
   { id: 'reader', icon: '📖', label: '阅读', ready: true },
+  { id: 'meeting', icon: '🗓', label: '会议', ready: true }, // 群聊工作区 → 会议日程 + 资料书架（阶段一脚手架）
   { id: 'chat', icon: '💬', label: 'AI 会话', ready: true }, // 含逐组件处理流水线，已取代旧「上下文监控」
   { id: 'hmp', icon: '🔬', label: '采集取证', ready: true }, // 合并 HMP 取证 + SurfaceIndex 对象，深度联动
   { id: 'settings', icon: '⚙', label: '设置', ready: true }, // 全部设置 + 逐项可用性标注
 ];
+// 导航布局：顶层目的地（阅读 / 会议）+ 折叠的 dev 抽屉（AI会话 / 采集取证 / 设置 收进去）
+const TOP_NAV: PageId[] = ['reader', 'meeting'];
+const DEV_NAV: PageId[] = ['chat', 'hmp', 'settings'];
+const pageDef = (id: PageId): { id: PageId; icon: string; label: string; ready: boolean } => PAGES.find((p) => p.id === id)!;
+
+/* 线性图标（inline SVG·stroke 跟随 currentColor）——替代 emoji，统一线性风格。 */
+const ICON_PATHS: Record<string, string> = {
+  book: '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+  calendar: '<rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/>',
+  message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  sliders: '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+  chevron: '<path d="m9 18 6-6-6-6"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  library: '<path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/>',
+  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v6h6"/>',
+};
+const NAV_ICON: Record<PageId, string> = { reader: 'book', meeting: 'calendar', chat: 'message', hmp: 'scan', settings: 'settings' };
+function icon(name: string, cls = ''): string {
+  return `<svg class="ico${cls ? ' ' + cls : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] ?? ''}</svg>`;
+}
 
 let activePage: PageId = 'reader';
 let selectedBook: string | null = null;
 
 const fmtTime = (iso: string): string => {
   try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); } catch { return iso; }
+};
+const fmtDate = (iso: string): string => {
+  try { return new Date(iso).toLocaleDateString('zh-CN'); } catch { return iso; }
 };
 const TRIGGER_CN: Record<string, { t: string; c: string }> = {
   idle: { t: '长停顿综合', c: '#3b82f6' },
@@ -256,6 +283,48 @@ function injectStyle(): void {
   details.cset-fold[open] > summary::before { content: '▾ '; }
   .cset-actions { margin-top: 24px; }
   .cset-danger { color: var(--bad); border-color: var(--bad); }
+
+  /* 线性图标（inline SVG，stroke=currentColor）*/
+  .ico { width: 16px; height: 16px; flex-shrink: 0; display: inline-block; vertical-align: -3px; }
+  .rail-item .rail-ico { display: flex; align-items: center; justify-content: center; }
+  .rail-item .rail-ico .ico { width: 17px; height: 17px; vertical-align: 0; opacity: .9; }
+  .rail-item.active .rail-ico .ico { opacity: 1; }
+  .cns-head h2 { display: inline-flex; align-items: center; gap: 8px; }
+  .cns-head h2 .ico { width: 17px; height: 17px; color: var(--mut); }
+
+  /* dev 抽屉（折叠组）：AI会话 / 采集取证 / 设置 收进去 */
+  .rail-group .rail-caret { margin-left: auto; display: flex; align-items: center; color: var(--hint); transition: transform .16s ease; }
+  .rail-group .rail-caret .ico { width: 14px; height: 14px; vertical-align: 0; }
+  .rail-group.open .rail-caret { transform: rotate(90deg); }
+  .rail-sub { display: none; margin: 1px 0 1px 9px; padding-left: 8px; border-left: 1px solid var(--line); }
+  .rail-sub.open { display: block; }
+  .rail-sub-item { font-size: 12.5px; padding: 7px 10px; }
+
+  /* 会议页：纯白风格（ChatGPT / 飞书）——独立于暖色纸感主题 */
+  #app-pages .mtg-page { flex: 1; min-height: 0; background: #fff; color: #0d0d0d; display: flex; flex-direction: column; font-family: var(--sans); }
+  .mtg-top { display: flex; align-items: center; gap: 10px; padding: 15px 28px; border-bottom: 1px solid #ededed; flex-shrink: 0; }
+  .mtg-title { margin: 0; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 9px; white-space: nowrap; }
+  .mtg-title .ico { width: 18px; height: 18px; color: #5b5b66; }
+  .mtg-ghost { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; flex-shrink: 0; font: 13px var(--sans); color: #5b5b66; background: #fff; border: 1px solid #e6e6e6; border-radius: 8px; padding: 6px 11px; cursor: pointer; }
+  .mtg-ghost:hover { background: #f7f7f8; }
+  .mtg-ghost .ico { width: 14px; height: 14px; }
+  .mtg-scroll { flex: 1; min-height: 0; overflow-y: auto; background: #fff; }
+  .mtg-wrap { max-width: 880px; margin: 0 auto; padding: 26px 28px 60px; }
+  .mtg-note { font-size: 12.5px; color: #8e8ea0; line-height: 1.7; margin: 0 0 28px; }
+  .mtg-note b { color: #5b5b66; font-weight: 600; }
+  .mtg-sec { margin-bottom: 34px; }
+  .mtg-sec-h { font-size: 13px; font-weight: 600; color: #0d0d0d; margin: 0 0 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; white-space: nowrap; }
+  .mtg-sec-h .ico { width: 16px; height: 16px; color: #9a9aa6; }
+  .mtg-soon { font-size: 11px; font-weight: 400; color: #9a9aa6; background: #f5f5f6; border-radius: 6px; padding: 2px 9px; margin-left: 2px; }
+  .mtg-sched { border: 1px dashed #e4e4e7; border-radius: 14px; background: #fcfcfd; }
+  .mtg-empty { color: #9a9aa6; font-size: 13px; text-align: center; line-height: 1.75; padding: 38px 18px; }
+  .mtg-shelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .mtg-mat { display: flex; align-items: center; gap: 12px; text-align: left; padding: 14px 15px; border: 1px solid #ececec; border-radius: 14px; background: #fff; color: #0d0d0d; cursor: pointer; font-family: var(--sans); transition: border-color .12s ease, box-shadow .12s ease; }
+  .mtg-mat:hover { border-color: #d7d7dc; box-shadow: 0 2px 12px rgba(0,0,0,.05); }
+  .mtg-mat .ico { width: 19px; height: 19px; color: #8e8ea0; }
+  .mtg-mat-body { display: flex; flex-direction: column; min-width: 0; }
+  .mtg-mat-name { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mtg-mat-meta { font-size: 11.5px; color: #9a9aa6; margin-top: 2px; }
   `;
   document.head.appendChild(s);
 }
@@ -264,11 +333,15 @@ function buildShell(): void {
   if (document.getElementById('app-rail')) return;
   injectStyle();
 
+  const railItem = (id: PageId, sub = false): string =>
+    `<button class="rail-item${sub ? ' rail-sub-item' : ''}" data-page="${id}"><span class="rail-ico">${icon(NAV_ICON[id])}</span><span>${esc(pageDef(id).label)}</span></button>`;
   const rail = document.createElement('nav');
   rail.id = 'app-rail';
   rail.innerHTML =
     `<div class="rail-head"><span class="rail-brand">◐ InkLoop</span><button class="rail-iconbtn" id="rail-collapse" title="收起侧栏（m）">«</button></div>`
-    + PAGES.map((p) => `<button class="rail-item" data-page="${p.id}"><span class="rail-ico">${p.icon}</span><span>${esc(p.label)}</span>${p.ready ? '' : '<span class="rail-soon">迁移中</span>'}</button>`).join('')
+    + TOP_NAV.map((id) => railItem(id)).join('')
+    + `<button class="rail-item rail-group" id="rail-dev-toggle" title="开发 / 调试页"><span class="rail-ico">${icon('sliders')}</span><span>dev</span><span class="rail-caret">${icon('chevron')}</span></button>`
+    + `<div class="rail-sub" id="rail-dev-sub">` + DEV_NAV.map((id) => railItem(id, true)).join('') + `</div>`
     + `<div class="rail-spacer"></div>`;
   document.body.appendChild(rail);
 
@@ -294,6 +367,7 @@ function buildShell(): void {
   rail.querySelectorAll<HTMLButtonElement>('.rail-item[data-page]').forEach((btn) => {
     btn.addEventListener('click', () => go(btn.dataset.page as PageId));
   });
+  rail.querySelector('#rail-dev-toggle')!.addEventListener('click', () => setDevExpanded(!railDevOpen()));
   rail.querySelector('#rail-collapse')!.addEventListener('click', () => setCollapsed(true));
   reopen.addEventListener('click', () => setCollapsed(false));
 }
@@ -301,6 +375,14 @@ function buildShell(): void {
 function setCollapsed(c: boolean): void {
   document.body.classList.toggle('rail-collapsed', c);
   try { localStorage.setItem('inkloop.rail.collapsed', c ? '1' : '0'); } catch { /* ignore */ }
+}
+
+const railDevOpen = (): boolean => !!document.getElementById('rail-dev-sub')?.classList.contains('open');
+/** 展开/收起 dev 抽屉（AI会话 / 采集取证 / 设置）。 */
+function setDevExpanded(open: boolean): void {
+  document.getElementById('rail-dev-sub')?.classList.toggle('open', open);
+  document.getElementById('rail-dev-toggle')?.classList.toggle('open', open);
+  try { localStorage.setItem('inkloop.rail.dev', open ? '1' : '0'); } catch { /* ignore */ }
 }
 
 function highlight(): void {
@@ -321,6 +403,7 @@ function go(id: PageId): void {
 function showPage(id: PageId): void {
   activePage = id;
   highlight();
+  if (DEV_NAV.includes(id)) setDevExpanded(true); // 进 dev 子页时保持抽屉展开，露出高亮项
   const pages = document.getElementById('app-pages');
   if (!pages) return;
   if (id === 'reader') { pages.classList.remove('show'); return; }
@@ -330,9 +413,57 @@ function showPage(id: PageId): void {
 }
 
 function renderPage(id: PageId, content: HTMLDivElement): void {
+  if (id === 'meeting') { renderMeeting(content); return; }
   if (id === 'chat') { renderChat(content); return; }
   if (id === 'hmp') { renderCapture(content); return; }
   if (id === 'settings') { renderSettings(content); return; }
+}
+
+/* ── 会议页（群聊工作区 → 会议日程 + 资料书架；阶段一脚手架）─────────────────────────
+ * 顶层实体 = 群聊/工作区，持有 [会议日程, 资料书架]；会议 = 群里的时间事件，开始后才长出
+ * 录音 / 实时转写 / 对照阅读（后续逐步叠加）。本阶段先搭壳：
+ *   · 日程区：占位（来源＝飞书日历，接线后置，先把结构摆出来）。
+ *   · 书架区：复用 listBooks 列出已导入资料，点开经 reopenBook 借「阅读」页阅读标注
+ *            （"书架点开借阅读器"最纯复用闭环）。按群聊归类待工作区 store 落地。 */
+async function renderMeetingShelf(): Promise<void> {
+  const shelf = document.getElementById('mtg-shelf');
+  if (!shelf) return;
+  const books = await listBooks();
+  if (!books.length) {
+    shelf.innerHTML = `<p class="mtg-empty" style="text-align:left;padding:14px 2px">还没有资料。到「阅读」页导入 PDF（或后续从飞书群聊汇入），资料会归类到对应群聊的书架里。</p>`;
+    return;
+  }
+  shelf.innerHTML = books.map((b) =>
+    `<button class="mtg-mat" data-doc="${esc(b.document_id)}" data-name="${esc(b.filename)}" title="点开，借「阅读」页阅读标注">`
+    + `${icon('file')}<span class="mtg-mat-body">`
+    + `<span class="mtg-mat-name">${esc(b.filename || '(未命名)')}</span>`
+    + `<span class="mtg-mat-meta">${b.page_count} 页 · ${esc(fmtDate(b.saved_at))}</span></span></button>`
+  ).join('');
+  shelf.querySelectorAll<HTMLButtonElement>('.mtg-mat').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const doc = btn.dataset.doc;
+      if (!doc) return;
+      go('reader');                                  // 切到阅读页
+      void reopenBook(doc, btn.dataset.name || '');  // 免重导打开 → document:loaded → restoreFromLedger
+    });
+  });
+}
+
+/** 会议页：群聊工作区脚手架（日程占位 + 书架复用阅读器）·纯白风格。 */
+function renderMeeting(c: HTMLDivElement): void {
+  c.innerHTML =
+    `<div class="mtg-page">`
+    + `<header class="mtg-top"><h2 class="mtg-title">${icon('calendar')} 会议</h2>`
+    + `<button class="mtg-ghost" id="mtg-refresh">${icon('refresh')} 刷新</button></header>`
+    + `<div class="mtg-scroll"><div class="mtg-wrap">`
+    + `<p class="mtg-note">阶段一脚手架：顶层是<b>群聊工作区</b>，每个工作区持有 <b>会议日程</b> + <b>资料书架</b>。会议正式开始后再长出录音 / 实时转写 / 对照阅读（后续逐步叠加）。</p>`
+    + `<section class="mtg-sec"><div class="mtg-sec-h">${icon('calendar')} 会议日程 <span class="mtg-soon">待接入飞书日历</span></div>`
+    + `<div class="mtg-sched"><p class="mtg-empty">接下来几天的会议安排会显示在这里。<br>来源＝飞书日历，接线后置；先把结构摆出来。</p></div></section>`
+    + `<section class="mtg-sec"><div class="mtg-sec-h">${icon('library')} 群聊书架 <span class="mtg-soon">当前：全部已导入资料 · 群聊归类待落地</span></div>`
+    + `<div class="mtg-shelf" id="mtg-shelf"></div></section>`
+    + `</div></div></div>`;
+  c.querySelector('#mtg-refresh')?.addEventListener('click', () => { void renderMeetingShelf(); });
+  void renderMeetingShelf();
 }
 
 /* ── AI 会话页（ChatGPT 式对话流）─────────────────────────────────────────── */
@@ -340,7 +471,7 @@ function renderPage(id: PageId, content: HTMLDivElement): void {
 function renderChat(c: HTMLDivElement): void {
   if (!selectedBook) selectedBook = state.documentId ?? null;
   c.innerHTML =
-    `<div class="cns-head"><h2>💬 AI 会话</h2><div class="cns-head-ctl">`
+    `<div class="cns-head"><h2>${icon('message')} AI 会话</h2><div class="cns-head-ctl">`
     + `<select id="cns-book-sel"></select>`
     + `<button class="cns-btn" id="cns-refresh">⟳ 刷新</button>`
     + `<button class="cns-btn" id="cns-clear" title="清空这本书模型当下记得的对话上下文（≤3 轮滑动窗），不影响账本">🗑 清空上下文</button>`
@@ -715,7 +846,7 @@ function flashTarget(sel: string): void {
 function renderCapture(c: HTMLDivElement): void {
   if (!selectedBook) selectedBook = state.documentId ?? null;
   c.innerHTML =
-    `<div class="cns-head"><h2>🔬 采集取证</h2>`
+    `<div class="cns-head"><h2>${icon('scan')} 采集取证</h2>`
     + `<div id="cap-seg"><button class="cap-segbtn" data-seg="hmp">HMP 取证</button><button class="cap-segbtn" data-seg="objects">SurfaceIndex 对象</button></div>`
     + `<div class="cns-head-ctl"><select id="cap-book-sel"></select><button class="cns-btn" id="cap-refresh">⟳ 刷新</button></div></div>`
     + `<div class="cns-thread"><div id="cap-wrap" data-seg="${captureSeg}">`
@@ -751,8 +882,8 @@ function setSections(): SetSection[] {
   return [
     { title: '核心 · 影响真实行为', rows: [
       { kind: 'select', label: '推理模型（答问 · 分类器默认）', badge: B_LIVE, opts: [['kimi-k2.6', 'kimi-k2.6（中文笔迹稳）'], ['claude-opus-4-8', 'claude-opus-4-8（最新·慢）'], ['claude-opus-4-7', 'claude-opus-4-7（质量·慢）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（快·能回思考）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（快）']], get: () => settings.inferModel, set: (v) => { settings.inferModel = v; }, effect: 'changed' },
-      { kind: 'select', label: '识别分类器模型 · /api/interpret（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.interpretModel, set: (v) => { settings.interpretModel = v; }, effect: 'changed' },
-      { kind: 'select', label: '上下文分类器模型 · /api/classify-context（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.classifyModel, set: (v) => { settings.classifyModel = v; }, effect: 'changed' },
+      { kind: 'select', label: '识别分类器模型 · /api/interpret（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['__local_hwr__', '端侧手写·OpenVINO 英文(徐方案·走本地端点)'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.interpretModel, set: (v) => { settings.interpretModel = v; }, effect: 'changed' },
+      { kind: 'select', label: '上下文分类器模型 · /api/classify-context（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['__local_rules__', '端侧规则·徐 IntentClassifier（驱动 respond/fold·不调云）'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.classifyModel, set: (v) => { settings.classifyModel = v; }, effect: 'changed' },
       { kind: 'check', label: '送合成图给模型', hint: '强制把合成图/笔迹图也送进主模型；默认关＝纯文字取证路线（徐方案）', badge: B_LIVE, get: () => settings.sendMarkImage, set: (v) => { settings.sendMarkImage = v; }, effect: 'changed' },
       { kind: 'select', label: '输出落点', badge: B_LIVE, opts: [['margin', '右侧留白'], ['inline', '贴正文浮动']], get: () => settings.placement, set: (v) => { settings.placement = v as Placement; }, effect: 'changed' },
       { kind: 'check', label: '手势响应（总开关）', hint: '关掉后停笔不再生成 HMP+旁注、不触发综合', badge: B_LIVE, get: () => g.enabled, set: (v) => { g.enabled = v; }, effect: 'changed' },
@@ -819,7 +950,7 @@ function renderSettings(c: HTMLDivElement): void {
       : `<div class="cset-sec"><div class="cset-sec-h">${esc(s.title)}</div>${note}${rowsHtml}</div>`;
   }).join('');
   c.innerHTML =
-    `<div class="cns-head"><h2>⚙ 设置</h2><div class="cns-head-ctl">`
+    `<div class="cns-head"><h2>${icon('settings')} 设置</h2><div class="cns-head-ctl">`
     + `<button class="cns-btn" id="cset-reset" title="清掉 localStorage 里存的设置、重载回代码默认">恢复默认设置</button>`
     + `</div></div>`
     + `<div class="cns-thread"><div class="cset-wrap">${secHtml}${diagHtml()}`
@@ -859,6 +990,7 @@ export function initNavShell(): void {
   buildShell();
 
   try { if (localStorage.getItem('inkloop.rail.collapsed') === '1') document.body.classList.add('rail-collapsed'); } catch { /* ignore */ }
+  try { if (localStorage.getItem('inkloop.rail.dev') === '1') setDevExpanded(true); } catch { /* ignore */ }
 
   // 流水线/取证缩略图 → 点开放大（事件委托，重渲后仍生效）
   document.addEventListener('click', (e) => {
@@ -910,6 +1042,7 @@ export function initNavShell(): void {
     selectedBook = state.documentId ?? selectedBook;
     if (activePage === 'chat') { void fillBookSelect(); void renderConversation(); }
     if (activePage === 'hmp') { void fillBookSelect('cap-book-sel').then(() => renderCaptureContent()); }
+    if (activePage === 'meeting') void renderMeetingShelf();
   });
 
   window.addEventListener('hashchange', syncFromHash);

@@ -60,7 +60,10 @@ function rpc<T>(method: string, args: unknown, timeoutMs = 6000): Promise<T | nu
   });
 }
 
-/** Seam A：手写/涂鸦识别。inkPng=白底笔迹图；strokes=原始点序（有 GMS 走 ML Kit，否则 PP-OCR 栅格）。 */
+/** Seam A：手写/涂鸦识别（判 kind+转写+描述）。inkPng=白底笔迹图；strokes=原始点序。
+ *  ⚠️ 端侧目前无可用手写引擎：Digital Ink 需 GMS（徐实测汉王无 Play 服务即死、已禁用，目标 RK3588 板多半同样无 GMS），
+ *  PP-OCR/ML Kit-text 读手写栅格实测基本不可用（exact≈0.5）。故板上拿不到引擎即返回 null → 调用方降级云 /api/interpret。
+ *  待商业 raw-stroke HWR SDK（汉王/Onyx 厂商 SDK / MyScript iink）接入后，此路才真正承载手写转写。 */
 export function ondeviceRecognizeInk(
   inkPng: string | undefined, strokes?: unknown,
 ): Promise<{ kind: string; reading: string; description: string } | null> {
@@ -78,7 +81,8 @@ export function ondeviceClassifyIntent(action: string, text: string): Promise<{ 
   return rpc('classifyIntent', { action, text });
 }
 
-/** 能力探测：主要看 gms（决定手写走 ML Kit 还是降级 PP-OCR）。 */
+/** 能力探测：gms=板上有无 Google Play 服务（决定 ML Kit Digital Ink 手写是否可用；无 gms 则手写留云）。
+ *  印刷区域 OCR（ML Kit text-recognition，模型打进 APK）不依赖 gms、恒可用——端侧真正能承载的就是它。 */
 export function ondeviceCapabilities(): Promise<{ gms?: boolean } | null> {
   return rpc('capabilities', {});
 }

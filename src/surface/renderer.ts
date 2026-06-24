@@ -10,6 +10,7 @@ import { trace } from '../core/trace';
 import { reflowLocal } from './reflow';
 import { reflowProviders } from './reflow-provider';
 import { wrapSurfaceIndex } from '../evidence/target';
+import { ensureScannedPageLayer } from '../evidence/page-ocr';
 import { bus, settings, state } from '../app/state';
 import { getReflow, openDoc, putReflow, storePdfBlob, loadPdfBlob, lastReadPage } from '../local/store';
 
@@ -280,6 +281,10 @@ export async function renderPage(): Promise<void> {
   // 徐智强 step①：把本页结构（文本层 + 图像区）包成显式 SurfaceIndex（复用 reflowLocal 分 title/text_block）。
   state.surfaceIndex = wrapSurfaceIndex(state.pageId!, state.pageIndex, state.textBlocks, state.imageRegions);
   bus.emit('surface:indexed', state.surfaceIndex);
+
+  // 图片版/扫描页（无文字层、只有图）→ 后台建 OCR 文本层：Phase 2 位置文本层（带 bbox·主路），
+  // 失败退 Phase 1 纯文本上下文。让 AI 在图片版 PDF 上不再"看不见字"。
+  void ensureScannedPageLayer(state.pageId);
 
   // 急算开关（默认关·留给端侧）：渲染即后台跑当前引擎重排并缓存，让 AI 上下文用真实阅读序（"重排前置"）。
   if (settings.reflowEager) {

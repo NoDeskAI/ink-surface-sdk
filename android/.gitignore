@@ -9,5 +9,5 @@ captures/
 # 由 scripts/sync-android-assets.mjs 生成（dist + 端侧模型），不入库
 app/src/main/assets/
 
-# Phase 2 第三方库（徐智强 的 PaddleOCR AAR 等）
+# 第三方 AAR（如将来需要；ppocr-sdk 现为源码模块、不走 AAR）
 app/libs/

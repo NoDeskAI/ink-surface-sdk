@@ -21,7 +21,8 @@ import { extractPageBlocks } from '../surface/renderer';
 import { pushInspect } from './inspect';
 import { chatTurn } from '../chat/stream-client';
 import { openBook, bookMessages } from '../chat/buffer';
-import { classifyContext } from '../chat/classify-client';
+import { classifyContext, LOCAL_RULES } from '../chat/classify-client';
+import { getPageOcrText } from '../evidence/page-ocr';
 import { postJson, postBeacon } from './api';
 
 /** 伴读 persona 已搬到服务端 server/prompts.ts（按 role 索引、与模型解耦）；/api/chat 收 role='annotator'。
@@ -297,10 +298,15 @@ function resolveMarkedText(hmp: HMP, index: SurfaceIndex): string {
   return targetText || hint;
 }
 
+/** 识别分类器选「端侧手写模型」的哨兵值（dev）：手写转写走本地 OpenVINO 英文手写端点 /api/interpret-hwr，不调云。 */
+export const LOCAL_HWR = '__local_hwr__';
+
 /**
  * 识别当类型分类器（context-free）：读这团墨是不是文字 → kind + 转写 + 画的粗描述。
- * 端侧优先：原生桥可用 → 本地识别（有 GMS 走 ML Kit，否则降级 PP-OCR 栅格），source=local_board；
- * 不可用/失败 → 云端 /api/interpret，source=cloud。两路均失败默认 none。
+ * 端侧优先：原生桥可用且板上有可用手写引擎 → 本地识别，source=local_board。
+ * 次选：识别分类器选「端侧手写模型」(LOCAL_HWR) → 走本地 OpenVINO 英文手写端点 /api/interpret-hwr
+ *       （dev=mac OpenVINO 跑徐方案模型；图像式行识别，只出 reading、kind 当 handwriting）。
+ * 否则降级云端 /api/interpret（source=cloud）；判 kind / 画描述本就留云 VLM。两路均失败默认 none。
  */
 async function recognizeInk(
   inkData: string, strokes?: unknown,
@@ -310,8 +316,17 @@ async function recognizeInk(
     kind: String(local.kind || 'none'), reading: String(local.reading || '').trim(),
     description: String(local.description || '').trim(), source: 'local_board',
   };
+  // dev：选了「端侧手写模型」→ 本地 OpenVINO 英文手写（白底笔迹图当一行）。失败/端点不在 → 落云端。
+  if (settings.interpretModel === LOCAL_HWR) {
+    try {
+      const j = await postJson<{ reading?: string }>('/api/interpret-hwr', { image: inkData });
+      const reading = String(j?.reading || '').trim();
+      if (reading) return { kind: 'handwriting', reading, description: '', source: 'local_board' };
+    } catch { /* 端点不在/失败 → 落云端 */ }
+  }
   try {
-    const j = await postJson<{ kind?: string; reading?: string; description?: string }>('/api/interpret', { image: inkData, model: settings.interpretModel || settings.inferModel });
+    const model = (settings.interpretModel && settings.interpretModel !== LOCAL_HWR) ? settings.interpretModel : settings.inferModel;
+    const j = await postJson<{ kind?: string; reading?: string; description?: string }>('/api/interpret', { image: inkData, model });
     return { kind: String(j.kind || 'none'), reading: String(j.reading || '').trim(), description: String(j.description || '').trim(), source: 'cloud' };
   } catch { return { kind: 'none', reading: '', description: '', source: 'cloud' }; }
 }
@@ -500,7 +515,7 @@ async function pageTextAt(i: number): Promise<string> {
 function pageTextFromReflow(maxChars: number): string {
   const ekey = settings.reflowProvider === 'ai' ? `ai@${settings.reflowModel}` : settings.reflowProvider;
   const blocks = getReflow(state.pageIndex, ekey);
-  if (!blocks?.length) return pageText(maxChars);
+  if (!blocks?.length) return pageText(maxChars) || getPageOcrText(state.pageId).slice(0, maxChars); // 扫描页退整页 OCR 文本
   return blocks.map((b) => (b.type === 'list' ? (b.items ?? []).join('\n') : b.text)).join('\n').slice(0, maxChars);
 }
 
@@ -594,12 +609,20 @@ export async function commitSessionDiscussion(
   if (reason === 'handwriting') {
     classifyConvoLen = bookMessages(bookId).length;
     const tCls0 = performance.now();
-    const decision = await classifyContext(view, bookMessages(bookId));
+    // dev：上下文分类器选「端侧规则」时，respond/fold 直接由徐 IntentClassifier 的 TS 移植驱动（不调云）。
+    const useLocalRules = settings.classifyModel === LOCAL_RULES;
+    let decision: { respond: boolean; reason: string };
+    if (useLocalRules) {
+      const intent = classifyIntentLocal('handwriting', view.question || view.marked || '');
+      decision = { respond: intentToRespond(intent), reason: `端侧规则 · intent=${intent}` };
+    } else {
+      decision = await classifyContext(view, bookMessages(bookId));
+    }
     classifyMs = Math.round(performance.now() - tCls0);
     classifyDiag = { respond: decision.respond, reason: decision.reason };
     trace('ClassifyContext', { respond: decision.respond, reason: decision.reason, question: view.question ?? '' });
     mirrorClassify({ respond: decision.respond, reason: decision.reason, question: view.question ?? '', discId });
-    void emitIntentAb(view.question || view.marked || '', decision, discId); // 端侧 intent 影子对照（不改行为）
+    if (!useLocalRules) void emitIntentAb(view.question || view.marked || '', decision, discId); // 云端驱动时才做影子对照
     if (!decision.respond) {
       // fold = 写给自己的笔记 → 静默、不落 reader overlay、marks 留 session（计入下次综合）。
       // 仍把这一轮作为「折叠」条目落账本——否则 AI 会话 dev 页（只读 ai_turns）完全看不到判否的流程。

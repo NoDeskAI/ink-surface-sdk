@@ -2,6 +2,8 @@ import { defineConfig, loadEnv } from 'vite';
 import type { Plugin } from 'vite';
 import { runReflow, runReflowAi, reflowAiStream, chatStream, runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReflowVlm } from './server/infer';
 import { debugEvent, debugSnapshot } from './server/debug.mjs';
+import { runOcrLayout } from './server/ocr-layout-dev.mjs'; // dev-only：扫描页带坐标 OCR（mac_runner），不进生产代理
+import { runInterpretHwr } from './server/hwr-dev.mjs';     // dev-only：英文手写识别（OpenVINO 徐方案模型），不进生产代理
 
 /** dev-only AI 代理：浏览器 POST /api/* → 网关 → 各识别/重排/对话端点。Key 留服务端。 */
 function inferenceProxy(env: Record<string, string>): Plugin {
@@ -60,6 +62,8 @@ function inferenceProxy(env: Record<string, string>): Plugin {
         });
       });
       post('/api/ocr-vlm', runOcrVlm);
+      post('/api/ocr-layout', runOcrLayout); // dev-only：扫描页带坐标 OCR → 位置文本层（Phase 2）
+      post('/api/interpret-hwr', runInterpretHwr); // dev-only：英文手写识别（OpenVINO 徐方案模型）
       post('/api/explain-image', runExplainImage);
       post('/api/interpret', runInterpret);
       post('/api/classify-context', runClassifyContext);
