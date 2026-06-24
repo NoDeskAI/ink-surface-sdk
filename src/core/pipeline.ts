@@ -389,7 +389,7 @@ function markupLooksLikeDrawing(feature: StrokeFeature, event: AnnotationEvent, 
  */
 export async function captureMark(
   event: AnnotationEvent, feature: StrokeFeature, score: number,
-): Promise<{ hmp: HMP | null; markedText: string; feature: StrokeFeature; trace?: PipelineStage[] }> {
+): Promise<{ hmp: HMP | null; markedText: string; feature: StrokeFeature; kind?: string; kindSource?: string; trace?: PipelineStage[] }> {
   const index = state.surfaceIndex;
   if (!index || event.page_id !== index.surface_id) return { hmp: null, markedText: '', feature };
   const targets = resolveTarget([event], event.geometry.bbox, index);
@@ -471,7 +471,7 @@ export async function captureMark(
     ],
     images: [{ role: 'composite（笔迹叠原文）', thumb: await thumb(layers.composite) }].filter((x) => x.thumb),
   });
-  return { hmp, markedText, feature: resolved, trace: DEV ? pl : undefined };
+  return { hmp, markedText, feature: resolved, kind: recog?.kind, kindSource: recog?.source, trace: DEV ? pl : undefined };
 }
 
 /** 「本页已有批注」动态背景段：本页其他批注+你的旧回应，帮模型理解整页脉络（背景、非焦点）；空则空串。 */
@@ -554,8 +554,14 @@ export async function commitSessionDiscussion(
   // 让"画不是最后一笔"（如画完又写了句问题）时，画的原图仍到模型手里，由模型在上下文里解读其含义。
   if (!crop) {
     // 含画的笔（drawing 纯画，或 mixed=图+字虽定型 handwriting 仍含画）→ 把它的白底原图送进推理，让模型直接看那张画。
-    const draw = [...marks].reverse().find((m) => (m.feature.type === 'drawing' || m.feature.hasDrawing) && m.hmp?.mode === 'self_content' && !!m.hmp?.vector_ref);
-    if (draw?.hmp?.vector_ref) crop = { role: 'ink', data: draw.hmp.vector_ref };
+    const draw = [...marks].reverse().find((m) => (m.feature.type === 'drawing' || m.feature.hasDrawing) && m.hmp?.mode === 'self_content');
+    if (draw?.hmp?.vector_ref) crop = { role: 'ink', data: draw.hmp.vector_ref };             // 本 session 刚画的，图还在内存
+    else if (draw && draw.event.page_id === state.pageId) {
+      // 召回/重载的画：vector_ref 落库时被剥（"存料不存图"），但笔迹点序无损存着、redrawInk 已把它画回当前墨水层 →
+      // 从墨水层按 bbox 重抓一张白底栅格喂模型，补"日后会话拿不到那张画"的缺口（仅当画仍在当前页）。
+      const ink = grabLayers(draw.event.geometry.bbox).ink;
+      if (ink) crop = { role: 'ink', data: ink };
+    }
   }
 
   // 空间召回（治本·根因 A）+ 滑窗上下文 + 全书主题召回（向量·现 no-op）+ 账本（回查旧回复）并发取，省串行延迟
