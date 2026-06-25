@@ -28,6 +28,7 @@ import { initToolbar } from './surface/toolbar';
 import { initDevOverlay } from './dev/dev-overlay';
 import { initNavShell } from './dev/console';
 import { initEinkMirror, signalInkArea } from './surface/eink';
+import { features } from './config/features';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -292,7 +293,7 @@ initDevOverlay(); // 画布叠层（独立于旧 dev 抽屉，由设置页 devOv
 initNavShell();   // 全局导航壳：阅读 / AI 会话 / 采集取证 / 设置（旧 #dev 抽屉已退役）
 // 窄屏(电纸屏竖向 / 手机)：导航栏默认收起为抽屉，避免在 ~405px 宽挤占正文（点 ☰ 以浮层拉出）
 if (window.matchMedia('(max-width: 640px)').matches) document.body.classList.add('rail-collapsed');
-initEinkMirror(); // 电纸屏镜像：套壳内容变化(page:rendered/view/overlay) → 推 IT8951（web/dev 无桥则 no-op）
+if (features.einkBridge) initEinkMirror(); // 电纸屏镜像：套壳内容变化 → 推 IT8951（web/dev 无桥则 no-op；D1 flag 可关）
 
 const fileIn = $<HTMLInputElement>('file-in');
 fileIn.addEventListener('change', () => {
@@ -539,6 +540,6 @@ window.addEventListener('resize', () => {
 });
 
 declare global {
-  interface Window { __inkloop?: { state: typeof state; settings: typeof settings; bus: typeof bus } }
+  interface Window { __inkloop?: { state: typeof state; settings: typeof settings; bus: typeof bus; features: typeof features } }
 }
-window.__inkloop = { state, settings, bus };
+window.__inkloop = { state, settings, bus, features };
