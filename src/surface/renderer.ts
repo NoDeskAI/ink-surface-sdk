@@ -6,6 +6,7 @@ import type { NormBBox, OcrTextBlock } from '../core/contracts';
 import { SCHEMA_VERSION } from '../core/contracts';
 import { sha256Hex } from '../core/ids';
 import { setPageSize, GUTTER_W } from '../core/transform';
+import { blankSurfaceIndex } from '../core/surface-index';
 import { trace } from '../core/trace';
 import { reflowLocal } from './reflow';
 import { reflowProviders } from './reflow-provider';
@@ -21,7 +22,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 const publicAssetUrl = (path: string): string =>
   new URL(`${import.meta.env.BASE_URL || './'}${path}`, window.location.href).toString();
 
-// pdf（当前 PDFDocumentProxy）已迁入 ReaderContext（方案 B Stage 1）：读写走 getActiveContext().pdf，
+// pdf（当前 PDFDocumentProxy）已迁入 SurfaceContext（方案 B Stage 1）：读写走 getActiveContext().pdf，
 // 切回主阅读/已开会议资料免重新 fetch/decode。renderTask 是单 DOM 渲染锁，留模块级（单激活不双渲）。
 let renderTask: { cancel(): void; promise: Promise<void> } | null = null;
 
@@ -215,7 +216,7 @@ export function renderBlankSurface(documentId: string, title = '空白页'): voi
   state.overlays = [];
   state.textBlocks = [];
   state.imageRegions = [];
-  state.surfaceIndex = { surface_id: pageId, surface_type: 'whiteboard', page_index: 0, objects: [{ id: 'blank_0', type: 'blank_region', bbox: [0, 0, 1, 1], source: 'structure' }] };
+  state.surfaceIndex = blankSurfaceIndex(pageId);
 
   bus.emit('document:loaded'); // → restoreFromLedger() 自动重绘本白板已存的笔
   bus.emit('page:rendered');

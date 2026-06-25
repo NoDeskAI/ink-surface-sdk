@@ -22,7 +22,7 @@ import { bus, state, settings, saveSettings, getActiveContext, setActiveContext,
 import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks, createWorkspace, listWorkspaces, getWorkspace, upsertFeishuWorkspace, createMeeting, listMeetings, listAllMeetings, getMeeting, updateMeeting, startSimMeeting } from '../local/store';
 import { reopenBook, renderBlankSurface, openPdfFromUrl } from '../surface/renderer';
-import { ReaderContext } from '../app/reader-context';
+import { SurfaceContext } from '../app/surface-context';
 import type { MeetingStatus, PersistedAiTurn, PersistedDoc, PersistedMark, PersistedMeeting } from '../core/store-format';
 import type { HMP, PipelineStage, PipelineStageIO, SurfaceObject } from '../core/contracts';
 import { downloadTrace, traceCount } from '../core/trace';
@@ -643,10 +643,10 @@ function mtgGoMeeting(mtgId: string, wsId?: string): void { mtgView = { level: '
 
 /* ── 会中工作台：点会议=直达画板（方案A：进存档主阅读 / 退还原）+ 右侧半掩群资料栏 ──────────── */
 let mtgMode: { meetingId: string; wsId: string; chatId?: string; title: string } | null = null;
-// 方案 B Stage 1：阅读与每个会议各持独立 ReaderContext。readerCtx=主阅读实例（initNavShell 捕获 boot context）；
+// 方案 B Stage 1：阅读与每个会议各持独立 SurfaceContext。readerCtx=主阅读实例（initNavShell 捕获 boot context）；
 // meetingCtx=当前会议实例（进会议新建、退会议释放）。进/退 = setActiveContext 切换激活实例（取代旧 savedReaderDoc 存档恢复）。
-let readerCtx: ReaderContext | null = null;
-let meetingCtx: ReaderContext | null = null;
+let readerCtx: SurfaceContext | null = null;
+let meetingCtx: SurfaceContext | null = null;
 
 /** 进入会议 = 直达画板（不经详情页）。方案B：会议持独立实例 meetingCtx，切过去渲染空白手写页；挂右侧资料栏。
  *  主阅读实例 readerCtx 原封不动（不再被覆写）→ 退会议切回即瞬时复原、不重新 decode。 */
@@ -657,7 +657,7 @@ async function enterMeeting(mtgId: string): Promise<void> {
   if (m.status !== 'live' || !m.started_at) await updateMeeting(mtgId, { status: 'live', started_at: m.started_at ?? new Date().toISOString() }); // 时间脊原点
   mtgMode = { meetingId: mtgId, wsId: m.workspace_id, chatId: ws?.feishu_chat_id, title: m.title };
   // 每次进会议新建会议实例（白板/资料笔迹都在账本，renderBlankSurface 从账本重建 → 无损）。
-  meetingCtx = new ReaderContext('mtg_' + mtgId, 'meeting');
+  meetingCtx = new SurfaceContext('mtg_' + mtgId, 'meeting');
   go('reader');
   setActiveContext(meetingCtx);                    // 切到会议实例（fresh：pdf=null → context:switched 不触发异步重渲，无竞态）
   renderBlankSurface('mtgboard_' + mtgId, m.title); // 写入 meetingCtx → document:loaded → 重绘白板 + 还原本会议墨迹

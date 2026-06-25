@@ -10,7 +10,7 @@ import { trace } from './core/trace';
 import { devEmit } from './core/dev-telemetry';
 import { shortId, DEVICE_ID } from './core/ids';
 import { bus, state, settings, strokeMarkIds, type Stroke, type Tool } from './app/state';
-import type { ReaderContext } from './app/reader-context';
+import type { SurfaceContext } from './app/surface-context';
 import { appendMarkEntry, getBookAiTurns, getFoldedMarks, getPendingMarks, listBooks, setLastReadPage, updateOverlayState } from './local/store';
 import type { PersistedMark } from './core/store-format';
 import type { ScreenOverlay } from './core/contracts';
@@ -392,7 +392,7 @@ bus.on('document:loaded', () => { void restoreFromLedger(); });
 // 切回已加载的 PDF 实例（如退会议回主阅读）→ 重渲当前页 + 复原 chrome/墨迹/旁注，全程不重新 fetch/decode。
 // 白板/聊天 surface 由调用方（enterMeeting）显式 renderBlankSurface 处理；空实例（无书）→ 回空屏。
 bus.on('context:switched', (ctx) => {
-  const c = ctx as ReaderContext;
+  const c = ctx as SurfaceContext;
   if (c.pdf && c.surfaceType === 'article') {
     void renderPage().then(() => restoreFromLedger());
   } else if (!c.documentId) {

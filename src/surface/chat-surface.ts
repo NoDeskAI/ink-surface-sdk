@@ -11,6 +11,7 @@ import type { NormBBox, SurfaceObject } from '../core/contracts';
 import { SCHEMA_VERSION } from '../core/contracts';
 import { bus, state, getActiveContext } from '../app/state';
 import { setPageSize, GUTTER_W } from '../core/transform';
+import { makeSurfaceIndex } from '../core/surface-index';
 import { trace } from '../core/trace';
 
 interface ChatMsg {
@@ -163,7 +164,7 @@ export function renderChatSurface(): void {
   state.pageId = 'chat_sample_0';
   state.pageRecord = { page_id: 'chat_sample_0', document_id: 'chat_sample', page_index: 0, width: W, height: H, unit: 'pt', rotation: 0, render_dpi: 96, version: SCHEMA_VERSION };
   state.overlays = [];
-  state.surfaceIndex = { surface_id: 'chat_sample_0', surface_type: 'chat', page_index: 0, objects };
+  state.surfaceIndex = makeSurfaceIndex('chat_sample_0', 'chat', objects);
   state.textBlocks = objects
     .filter((o) => o.type === 'chat_message' && o.text)
     .map((o) => ({ id: o.id, text: o.text!, bbox: o.bbox, confidence: 1, language: 'auto' }));
