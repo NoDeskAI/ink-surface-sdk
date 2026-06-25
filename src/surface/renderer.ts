@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from 'pdfjs-dist';
+import type { PDFPageProxy, PageViewport } from 'pdfjs-dist';
 import type { TextItem } from 'pdfjs-dist/types/src/display/api';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { NormBBox, OcrTextBlock } from '../core/contracts';
@@ -11,7 +11,7 @@ import { reflowLocal } from './reflow';
 import { reflowProviders } from './reflow-provider';
 import { wrapSurfaceIndex } from '../evidence/target';
 import { ensureScannedPageLayer } from '../evidence/page-ocr';
-import { bus, settings, state } from '../app/state';
+import { bus, getActiveContext, settings, state } from '../app/state';
 import { getReflow, openDoc, putReflow, storePdfBlob, loadPdfBlob, lastReadPage } from '../local/store';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -21,7 +21,8 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 const publicAssetUrl = (path: string): string =>
   new URL(`${import.meta.env.BASE_URL || './'}${path}`, window.location.href).toString();
 
-let pdf: PDFDocumentProxy | null = null;
+// pdf（当前 PDFDocumentProxy）已迁入 ReaderContext（方案 B Stage 1）：读写走 getActiveContext().pdf，
+// 切回主阅读/已开会议资料免重新 fetch/decode。renderTask 是单 DOM 渲染锁，留模块级（单激活不双渲）。
 let renderTask: { cancel(): void; promise: Promise<void> } | null = null;
 
 let pageCv: HTMLCanvasElement;
@@ -39,7 +40,7 @@ export function initRenderer(els: {
 }
 
 export function hasDocument(): boolean {
-  return pdf !== null;
+  return getActiveContext().pdf !== null;
 }
 
 // ── 原页图像区域抽取（扫 PDF 操作流找 paintImage* 算子，用累计变换矩阵求图在页面的 bbox）──
@@ -104,12 +105,13 @@ async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob |
   // cMapUrl/standardFontDataUrl：救老中文 PDF —— 非嵌入 CID 字体 + 预定义 CJK CMap（如 GBK-EUC-H）
   // 需要 CMap 表才能把字符码映射成字形，否则中文画布渲染与 getTextContent 都出空白/乱码。
   // 资产在 public/（cp 自 pdfjs-dist），dev 与 build 均自动服务于根路径。
-  pdf = await pdfjsLib.getDocument({
+  const pdf = await pdfjsLib.getDocument({
     data: buf,
     cMapUrl: publicAssetUrl('cmaps/'),
     cMapPacked: true,
     standardFontDataUrl: publicAssetUrl('standard_fonts/'),
   }).promise;
+  getActiveContext().pdf = pdf; // 迁入激活实例（切回免重新 fetch/decode）
   state.pageCount = pdf.numPages;
   state.strokesByPage.clear();
   // 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录。真书常有，喂重排/AI 排版。
@@ -178,7 +180,7 @@ export async function openPdfFromUrl(documentId: string, filename: string, pdfUr
  * 组件」（底座层，阅读+每会议各持独立实例）记为后面做，别在阅读上板前动引擎结构。
  */
 export function renderBlankSurface(documentId: string, title = '空白页'): void {
-  pdf = null; // 脱离上一份 PDF（防 zoom/翻页误渲旧页）
+  getActiveContext().pdf = null; // 脱离上一份 PDF（防 zoom/翻页误渲旧页）
   state.fileHash = documentId;
   state.documentId = documentId;
   state.fileName = title;
@@ -190,13 +192,13 @@ export function renderBlankSurface(documentId: string, title = '空白页'): voi
   state.outline = null;
 
   const dpr = window.devicePixelRatio || 1;
-  const W = Math.min(860, Math.max(480, stageWrap.clientWidth - 56 - GUTTER_W));
+  const { fit: W, gutter: gut } = pageMetrics();
   const H = Math.round(W * 1.32); // 一张竖向「纸」
   for (const cv of [pageCv, inkCv]) {
     cv.width = W * dpr; cv.height = H * dpr;
     cv.style.width = W + 'px'; cv.style.height = H + 'px';
   }
-  stage.style.width = (W + GUTTER_W) + 'px';
+  stage.style.width = (W + gut) + 'px';
   stage.style.height = H + 'px';
   stage.style.setProperty('--page-w', W + 'px');
   setPageSize(W, H);
@@ -244,6 +246,7 @@ async function extractTextBlocks(page: PDFPageProxy, vp: PageViewport): Promise<
 
 /** 取任意页的文本块（只读文本层、不渲染画布）——供重排预热下一页用，墨水屏友好。 */
 export async function extractPageBlocks(pageIndex: number): Promise<OcrTextBlock[]> {
+  const pdf = getActiveContext().pdf;
   if (!pdf || pageIndex < 0 || pageIndex >= pdf.numPages) return [];
   try {
     const page = await pdf.getPage(pageIndex + 1);
@@ -261,13 +264,14 @@ let preprocessing = false;
  * 只取文本层、不渲染画布，省性能（墨水屏友好）；已缓存的页跳过。
  */
 export async function preprocess(reflowCap: number): Promise<void> {
+  const pdf = getActiveContext().pdf;
   if (!pdf || !state.documentId || preprocessing) return;
   preprocessing = true;
   const docId = state.documentId;
   const cap = Math.min(pdf.numPages, reflowCap);
   try {
     for (let i = 0; i < cap; i++) {
-      if (!pdf || state.documentId !== docId) break; // 文档换了 → 停
+      if (state.documentId !== docId) break; // 文档/实例换了 → 停（pdf 快照非空，原 !pdf 检查由 docId 守卫覆盖）
       try {
         const page = await pdf.getPage(i + 1);
         const vp = page.getViewport({ scale: 1 });
@@ -287,13 +291,28 @@ export async function preprocess(reflowCap: number): Promise<void> {
   }
 }
 
+/**
+ * 页面渲染预算。横屏=页宽 + 右侧 AI 留白(gutter=300)；窄屏(电纸屏竖向 / 手机，≤640px)=
+ * 铺满可用宽、无 gutter、下限降到 300，让正文页填满竖向面板（消除 480 桌面下限造成的横向溢出）。
+ */
+function pageMetrics(): { fit: number; gutter: number } {
+  const narrow = window.matchMedia('(max-width: 640px)').matches;
+  if (narrow) {
+    const avail = stageWrap.clientWidth - 24;            // 竖屏 stage-wrap padding 较小
+    return { fit: Math.min(900, Math.max(300, avail)), gutter: 0 };
+  }
+  const avail = stageWrap.clientWidth - 56 - GUTTER_W;
+  return { fit: Math.min(860, Math.max(480, avail)), gutter: GUTTER_W };
+}
+
 export async function renderPage(): Promise<void> {
+  const pdf = getActiveContext().pdf;
   if (!pdf || !state.documentId) return;
   const page = await pdf.getPage(state.pageIndex + 1);
   const dpr = window.devicePixelRatio || 1;
   const vp1 = page.getViewport({ scale: 1 });
-  // 预算里扣掉右侧留白，保证「页面 + 留白」不溢出阅读区
-  const fitWidth = Math.min(860, Math.max(480, stageWrap.clientWidth - 56 - GUTTER_W));
+  // 预算里扣掉右侧留白，保证「页面 + 留白」不溢出阅读区（窄屏=铺满、无 gutter）
+  const { fit: fitWidth, gutter: gut } = pageMetrics();
   const baseScale = fitWidth / vp1.width;
   const vp = page.getViewport({ scale: baseScale * state.zoom });
   setPageSize(vp.width, vp.height);
@@ -304,8 +323,8 @@ export async function renderPage(): Promise<void> {
     cv.style.width = vp.width + 'px';
     cv.style.height = vp.height + 'px';
   }
-  // stage 容纳「页面 + 右侧留白」；页面靠左，留白供 AI 输出
-  stage.style.width = vp.width + GUTTER_W + 'px';
+  // stage 容纳「页面 + 右侧留白」；页面靠左，留白供 AI 输出（窄屏 gut=0 即铺满）
+  stage.style.width = vp.width + gut + 'px';
   stage.style.height = vp.height + 'px';
   stage.style.setProperty('--page-w', vp.width + 'px');
 
@@ -367,7 +386,7 @@ export async function renderPage(): Promise<void> {
 }
 
 export function gotoPage(delta: number): void {
-  if (!pdf) return;
+  if (!getActiveContext().pdf) return;
   const next = state.pageIndex + delta;
   if (next < 0 || next >= state.pageCount) return;
   state.pageIndex = next;
@@ -376,5 +395,5 @@ export function gotoPage(delta: number): void {
 
 export function setZoom(z: number): void {
   state.zoom = Math.min(3, Math.max(0.5, z));
-  if (pdf) void renderPage();
+  if (getActiveContext().pdf) void renderPage();
 }
