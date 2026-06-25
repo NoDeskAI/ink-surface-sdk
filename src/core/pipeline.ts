@@ -9,6 +9,7 @@ import { buildMarkGraph } from '../evidence/mark-graph';
 import { findSpatialRecall, type RecallCandDiag } from '../evidence/recall';
 import { findThematicRecall } from '../evidence/thematic';
 import { vectorStore } from '../local/vector';
+import { makeThumbnail as thumb } from '../platform/web/thumbnail';
 import { projectInferenceView } from '../evidence/inference-view';
 import type { Mark, Session } from '../capture/session';
 import { mark } from './metrics';
@@ -34,26 +35,7 @@ const PROMPT_TAG = 'annotator@v3';
  * 仅 DEV 落库（gate 同 mirror*）；图压成 ~220px 缩略图控 IndexedDB 体积。供 AI 会话调试页复盘。 */
 const DEV = !!(import.meta as { env?: { DEV?: boolean } }).env?.DEV;
 
-/** 缩略图：把 dataURL 压到长边 ≤max → JPEG（控存储体积）。失败/无图返回空串。 */
-function thumb(dataUrl: string | undefined | null, max = 220): Promise<string> {
-  if (!dataUrl) return Promise.resolve('');
-  return new Promise((resolve) => {
-    try {
-      const img = new Image();
-      img.onload = () => {
-        try {
-          const scale = Math.min(1, max / Math.max(img.width, img.height));
-          const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
-          const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
-          cv.getContext('2d')!.drawImage(img, 0, 0, w, h);
-          resolve(cv.toDataURL('image/jpeg', 0.6));
-        } catch { resolve(''); }
-      };
-      img.onerror = () => resolve('');
-      img.src = dataUrl;
-    } catch { resolve(''); }
-  });
-}
+// thumb() 已抽到 platform/web/thumbnail.ts（F2：core 不再直接碰 Image/canvas）。
 
 /** 一笔在流水线里的短标签（手写「…」/ 画「…」/ 标记「…」），逐 mark 阶段挂它。 */
 function markTraceLabel(feature: MarkFeatureType, markedText: string): string {
