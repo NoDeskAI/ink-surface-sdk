@@ -17,8 +17,15 @@ android {
     }
 
     buildTypes {
-        release {
+        debug {
+            // 内网联调用 debug 包：明文代理豁免在 src/debug/res 的 network_security_config，不进 release。
             isMinifyEnabled = false
+        }
+        release {
+            // R8 混淆 + 资源收缩。保活规则(端侧 OCR native/JS 桥)见 proguard-rules.pro。
+            // ⚠ 本机无 Android SDK，未真机验；首次 release 构建须 Android Studio 出包后真机验 OCR/桥不被裁。
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

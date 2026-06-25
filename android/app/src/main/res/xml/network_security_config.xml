@@ -1,9 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- release/默认：全程禁明文，只走 https 托管代理。
+     内网明文豁免(10.4.36.30)只在 debug 构建(src/debug/res/xml/network_security_config.xml)，不进 release。 -->
 <network-security-config>
-    <!-- 默认禁明文：生产代理走 https。 -->
     <base-config cleartextTrafficPermitted="false" />
-    <!-- 内网代理(10.4.36.30:3000，npm run serve)走 http 明文。IP 变了改这里。 -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">10.4.36.30</domain>
-    </domain-config>
 </network-security-config>
