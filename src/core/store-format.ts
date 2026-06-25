@@ -15,7 +15,7 @@ import type { HMP, InferenceView, MarkFeatureType, NormBBox, OverlayState, Pipel
 import type { ReflowBlock } from '../surface/reflow';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
-export const DB_VERSION = 5;      // IDB 结构版本：v4→v5 自愈——HMR 中途升级导致"v4 却缺表"的坏库，重跑 onupgradeneeded 用 if(!contains) 补建 workspaces/meetings（不丢已有数据）
+export const DB_VERSION = 6;      // v5→v6：marks 加 context_id + by_context 索引（C2 时间脊：按 surface 会话取笔）。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
 
 /** 一张图的解读：图本身可从 PDF 重渲，故只存 bbox + 文字解读。 */
 export interface PersistedImage {
@@ -83,6 +83,7 @@ export interface PersistedMark extends BaseEntry {
   pointer_type: string;             // pen / touch / mouse / unknown
   device_id: string;
   abs_timestamp: number;            // 组装时 Date.now()（reload 折回 perf 时间线算关系）
+  context_id?: string;              // C2 时间脊：落笔时活跃 surface 实例 id（'__reader__' / 'mtg_<id>' / 日记…）；按会话取笔用，老条目缺=undefined
   feature_type: MarkFeatureType;    // markup / handwriting / drawing（路由/显示粗类型）
   feature_confidence: number;
   kind?: string;                   // 识别裁定原始 kind：handwriting/sketch/mixed/none（比 feature_type 更细，保住 mixed=图+字）

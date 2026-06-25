@@ -34,6 +34,9 @@ function openDB(): Promise<IDBDatabase | null> {
         if (!db.objectStoreNames.contains(TURNS)) db.createObjectStore(TURNS, { keyPath: 'entry_id' }).createIndex('by_doc', 'document_id', { unique: false });
         if (!db.objectStoreNames.contains(WORKSPACES)) db.createObjectStore(WORKSPACES, { keyPath: 'workspace_id' });
         if (!db.objectStoreNames.contains(MEETINGS)) db.createObjectStore(MEETINGS, { keyPath: 'meeting_id' }).createIndex('by_ws', 'workspace_id', { unique: false });
+        // v6：marks 加 by_context 索引（时间脊：按 surface 会话取本会话的笔）。幂等：老库升级也补建。
+        const marksStore = req.transaction!.objectStore(MARKS);
+        if (!marksStore.indexNames.contains('by_context')) marksStore.createIndex('by_context', 'context_id', { unique: false });
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => resolve(null);

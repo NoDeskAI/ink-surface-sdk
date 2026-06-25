@@ -9,7 +9,7 @@ import { localCharHeight } from './evidence/target';
 import { trace } from './core/trace';
 import { devEmit } from './core/dev-telemetry';
 import { shortId, DEVICE_ID } from './core/ids';
-import { bus, state, settings, strokeMarkIds, type Stroke, type Tool } from './app/state';
+import { bus, state, settings, strokeMarkIds, getActiveContext, type Stroke, type Tool } from './app/state';
 import type { SurfaceContext } from './app/surface-context';
 import { appendMarkEntry, getBookAiTurns, getFoldedMarks, getPendingMarks, listBooks, setLastReadPage, updateOverlayState } from './local/store';
 import type { PersistedMark } from './core/store-format';
@@ -191,6 +191,7 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
     strokes: realStrokes.map((s) => ({ tool: s.tool, points: s.points })),
     bbox, tool, color: tool === 'highlighter' ? 'rgba(212,207,202,0.85)' : '#1A1A1A',
     pointer_type: repr.pointer_type, device_id: repr.device_id, abs_timestamp: Date.now(),
+    context_id: getActiveContext().id,
     feature_type: feature.type, feature_confidence: feature.confidence,
     kind: cap.kind, kind_source: cap.kindSource,
     scored_type: markScored.type, scored_score: markScored.score,
@@ -272,6 +273,7 @@ bus.on('mark:erase', (mid) => {
     document_id: bookId, page_id: state.pageId ?? '', page_index: state.pageIndex, mark_id: markId,
     strokes: [], bbox: [0, 0, 0, 0], tool: 'pen', color: '',
     pointer_type: 'unknown', device_id: DEVICE_ID, abs_timestamp: Date.now(),
+    context_id: getActiveContext().id,
     feature_type: 'drawing', feature_confidence: 0, scored_type: 'stroke', scored_score: 0,
     hmp: null, marked_text: '', is_tombstone: true,
   });
