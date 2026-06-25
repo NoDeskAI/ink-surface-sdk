@@ -8,6 +8,11 @@
     "build": "npm run check && vite build",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
     "clean": "node scripts/clean.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "audit": "npm audit --audit-level=high",
     "preview": "vite preview",
     "serve": "tsx server/standalone.ts",
     "postinstall": "node scripts/copy-pdfjs-assets.mjs"
@@ -18,9 +23,11 @@
     "pdfjs-dist": "^4.6.82"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.7.4",
     "tsx": "^4.22.4",
     "typescript": "^5.5.4",
-    "vite": "^5.4.8"
+    "vite": "^5.4.8",
+    "vitest": "^2.1.9"
   }
 }
