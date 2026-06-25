@@ -18,10 +18,11 @@
  *
  * 非「阅读」的页面渲染进 #app-pages（覆盖正文区、不挡侧栏）。侧栏可折叠（键 m / 折叠钮），折叠时正文占满。
  */
-import { bus, state, settings, saveSettings, type Placement } from '../app/state';
+import { bus, state, settings, saveSettings, getActiveContext, setActiveContext, type Placement } from '../app/state';
 import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks, createWorkspace, listWorkspaces, getWorkspace, upsertFeishuWorkspace, createMeeting, listMeetings, listAllMeetings, getMeeting, updateMeeting, startSimMeeting } from '../local/store';
 import { reopenBook, renderBlankSurface, openPdfFromUrl } from '../surface/renderer';
+import { ReaderContext } from '../app/reader-context';
 import type { MeetingStatus, PersistedAiTurn, PersistedDoc, PersistedMark, PersistedMeeting } from '../core/store-format';
 import type { HMP, PipelineStage, PipelineStageIO, SurfaceObject } from '../core/contracts';
 import { downloadTrace, traceCount } from '../core/trace';
@@ -642,31 +643,35 @@ function mtgGoMeeting(mtgId: string, wsId?: string): void { mtgView = { level: '
 
 /* ── 会中工作台：点会议=直达画板（方案A：进存档主阅读 / 退还原）+ 右侧半掩群资料栏 ──────────── */
 let mtgMode: { meetingId: string; wsId: string; chatId?: string; title: string } | null = null;
-let savedReaderDoc: { id: string; name: string } | null = null; // 进会议前主阅读在看的真书，退出还原
+// 方案 B Stage 1：阅读与每个会议各持独立 ReaderContext。readerCtx=主阅读实例（initNavShell 捕获 boot context）；
+// meetingCtx=当前会议实例（进会议新建、退会议释放）。进/退 = setActiveContext 切换激活实例（取代旧 savedReaderDoc 存档恢复）。
+let readerCtx: ReaderContext | null = null;
+let meetingCtx: ReaderContext | null = null;
 
-/** 进入会议 = 直达画板（不经详情页）。方案A：存下主阅读正看的真书；渲染会议空白手写页；挂右侧资料栏。 */
+/** 进入会议 = 直达画板（不经详情页）。方案B：会议持独立实例 meetingCtx，切过去渲染空白手写页；挂右侧资料栏。
+ *  主阅读实例 readerCtx 原封不动（不再被覆写）→ 退会议切回即瞬时复原、不重新 decode。 */
 async function enterMeeting(mtgId: string): Promise<void> {
   const m = await getMeeting(mtgId);
   if (!m) return;
   const ws = await getWorkspace(m.workspace_id);
-  // 方案A：只在当前是真书（PDF、非白板）时存档，退出 reopenBook 还原
-  savedReaderDoc = (state.documentId && state.surfaceType === 'pdf' && !state.documentId.startsWith('mtgboard_'))
-    ? { id: state.documentId, name: state.fileName } : null;
   if (m.status !== 'live' || !m.started_at) await updateMeeting(mtgId, { status: 'live', started_at: m.started_at ?? new Date().toISOString() }); // 时间脊原点
   mtgMode = { meetingId: mtgId, wsId: m.workspace_id, chatId: ws?.feishu_chat_id, title: m.title };
+  // 每次进会议新建会议实例（白板/资料笔迹都在账本，renderBlankSurface 从账本重建 → 无损）。
+  meetingCtx = new ReaderContext('mtg_' + mtgId, 'meeting');
   go('reader');
-  renderBlankSurface('mtgboard_' + mtgId, m.title);
+  setActiveContext(meetingCtx);                    // 切到会议实例（fresh：pdf=null → context:switched 不触发异步重渲，无竞态）
+  renderBlankSurface('mtgboard_' + mtgId, m.title); // 写入 meetingCtx → document:loaded → 重绘白板 + 还原本会议墨迹
   await mountMtgSide();
 }
 
-/** 退出会议：拆资料栏 + 还原主阅读（如有）+ 回到该群会议列表。 */
+/** 退出会议：拆资料栏 + 切回主阅读实例（瞬时复原，不重新 decode）+ 回到该群会议列表。 */
 async function exitMeeting(): Promise<void> {
   const wsId = mtgMode?.wsId;
   mtgMode = null;
+  meetingCtx = null; // 释放会议实例（笔迹已在账本，下次进会议重建）
   document.getElementById('mtg-side')?.remove();
   document.getElementById('mtg-exit')?.remove();
-  const saved = savedReaderDoc; savedReaderDoc = null;
-  if (saved) await reopenBook(saved.id, saved.name); // 主阅读还原（留在阅读页）
+  if (readerCtx) setActiveContext(readerCtx); // 切回主阅读实例 → context:switched：pdf 还在则 renderPage 瞬时复原；无书则回空屏
   if (wsId) mtgView = { level: 'workspace', wsId };
   go('meeting');
 }
@@ -1495,6 +1500,7 @@ function syncFromHash(): void {
 }
 
 export function initNavShell(): void {
+  readerCtx = getActiveContext(); // 捕获 boot 主阅读实例（方案 B Stage 1：进/退会议时切回它）
   buildShell();
 
   try { if (localStorage.getItem('inkloop.rail.collapsed') === '1') document.body.classList.add('rail-collapsed'); } catch { /* ignore */ }
