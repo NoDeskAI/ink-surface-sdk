@@ -18,7 +18,7 @@
  *
  * 非「阅读」的页面渲染进 #app-pages（覆盖正文区、不挡侧栏）。侧栏可折叠（键 m / 折叠钮），折叠时正文占满。
  */
-import { bus, state, settings, saveSettings, type Placement } from '../app/state';
+import { bus, state, settings, saveSettings, resetSettings, type Placement } from '../app/state';
 import { resetBook } from '../chat/buffer';
 import { listBooks, getBookAiTurns, getFoldedMarks } from '../local/store';
 import { icon } from '../surface/icons';
@@ -545,7 +545,7 @@ function renderCapture(c: HTMLDivElement): void {
 }
 
 /* ── 设置页（迁出旧 #dev 抽屉；按代码审计诚实标注每项是否真生效）─────────────────────
- * settings 落 localStorage('inkloop.settings.v1')；多数项改完 effect='changed'（emit settings:changed
+ * settings 落 localStorage（inkloop.prefs.v1 产品键 / inkloop.devflags.v1 dev 键）；多数项改完 effect='changed'（emit settings:changed
  * → main 取消在途计时 + 清当前 session），少数仅 saveSettings()。可用性徽标来自本会话审计：
  * 生效=v3 主路真读；调试叠层=只影响可视化；弱效=仅下次导入文档时生效（预排版预热）。 */
 
@@ -637,7 +637,7 @@ function renderSettings(c: HTMLDivElement): void {
     + `<button class="cns-btn" id="cset-reset" title="清掉 localStorage 里存的设置、重载回代码默认">恢复默认设置</button>`
     + `</div></div>`
     + `<div class="cns-thread"><div class="cset-wrap">${secHtml}${diagHtml()}`
-    + `<div class="cset-actions"><span class="cset-hint">设置存于浏览器 localStorage（inkloop.settings.v1），即时生效；个别项需翻页/重导/清上下文才显现，已在各项标注。徽标含义：生效=v3 主路真读 · 调试叠层=只影响可视化 · 弱效=读它的路径当前主路不走或仅导入时生效 · 失效=当前无人按它分流。</span></div>`
+    + `<div class="cset-actions"><span class="cset-hint">设置存于浏览器 localStorage（inkloop.prefs.v1 / inkloop.devflags.v1），即时生效；个别项需翻页/重导/清上下文才显现，已在各项标注。徽标含义：生效=v3 主路真读 · 调试叠层=只影响可视化 · 弱效=读它的路径当前主路不走或仅导入时生效 · 失效=当前无人按它分流。</span></div>`
     + `</div></div>`;
   document.getElementById('cset-dl-trace')?.addEventListener('click', () => downloadTrace());
   fillDiag();
@@ -655,7 +655,7 @@ function renderSettings(c: HTMLDivElement): void {
   const resetBtn = c.querySelector<HTMLButtonElement>('#cset-reset');
   resetBtn?.addEventListener('click', () => {
     if (!resetArmed) { resetArmed = true; resetBtn.textContent = '再点一次确认（清存档·重载）'; resetBtn.classList.add('cset-danger'); return; }
-    try { localStorage.removeItem('inkloop.settings.v1'); } catch { /* ignore */ }
+    resetSettings(); // 删产品键 + dev 键 + 旧扁平键（state 层收口，不再硬编码单键）
     location.reload();
   });
 }

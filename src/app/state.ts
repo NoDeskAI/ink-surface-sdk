@@ -139,6 +139,14 @@ export function saveSettings(): void {
   } catch { /* 忽略 */ }
 }
 
+/** 清掉所有持久化设置键（产品键 + dev 键 + 旧扁平键）——供 UI「恢复默认」复用，UI 不再硬编码 key。
+ *  LEGACY_KEY 必须一并删：否则 reload 后回填 IIFE 的「!prod && !dev」分支会从旧扁平键重新导入，等于没重置。 */
+export function resetSettings(): void {
+  for (const key of [PRODUCT_KEY, DEV_KEY, LEGACY_KEY]) {
+    try { localStorage.removeItem(key); } catch { /* 忽略 */ }
+  }
+}
+
 // 模块加载即回填：消费方从一开始就拿到持久值。
 (() => {
   const prod = loadSettingsBlob(PRODUCT_KEY);
