@@ -9,7 +9,6 @@
  */
 export type IntentLabel = 'question' | 'todo' | 'reject' | 'relation' | 'self_note' | 'attention';
 
-const has = (t: string, ...needles: string[]): boolean => needles.some((n) => t.includes(n));
 /** 返回第一个命中的 needle（用于"命中了哪条"的机械定位）。 */
 const firstHit = (t: string, ...needles: string[]): string | undefined => needles.find((n) => t.includes(n));
 
