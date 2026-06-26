@@ -99,10 +99,13 @@ async function extractImageRegions(page: PDFPageProxy, vp: PageViewport): Promis
  * 注意 getDocument({data}) 可能 detach buf，故 Blob 拷贝在调用前由 loadFile 先建好。
  */
 async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob | null, docId?: string): Promise<void> {
-  state.fileHash = await sha256Hex(buf);
-  state.documentId = docId ?? ('doc_' + state.fileHash.slice(0, 12)); // 默认 hash 派生；docId 显式覆盖（会议资料按稳定 id 归档，转换非确定性也不漂）
-  state.fileName = filename;
-  state.surfaceType = 'article';
+  // 载入归属的实例（会议资料=meetingCtx、主阅读=readerCtx）。下方所有 doc 字段都写 capturedCtx 而非
+  // state proxy / getActiveContext()——否则载入期间退会议/切实例，迟到的 await 会把本文档灌进切换后的实例（P0-5）。
+  const sctx = getActiveContext();
+  sctx.fileHash = await sha256Hex(buf);
+  sctx.documentId = docId ?? ('doc_' + sctx.fileHash.slice(0, 12)); // 默认 hash 派生；docId 显式覆盖（会议资料按稳定 id 归档，转换非确定性也不漂）
+  sctx.fileName = filename;
+  sctx.surfaceType = 'article';
   // cMapUrl/standardFontDataUrl：救老中文 PDF —— 非嵌入 CID 字体 + 预定义 CJK CMap（如 GBK-EUC-H）
   // 需要 CMap 表才能把字符码映射成字形，否则中文画布渲染与 getTextContent 都出空白/乱码。
   // 资产在 public/（cp 自 pdfjs-dist），dev 与 build 均自动服务于根路径。
@@ -112,27 +115,30 @@ async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob |
     cMapPacked: true,
     standardFontDataUrl: publicAssetUrl('standard_fonts/'),
   }).promise;
-  getActiveContext().pdf = pdf; // 迁入激活实例（切回免重新 fetch/decode）
-  state.pageCount = pdf.numPages;
-  state.strokesByPage.clear();
+  sctx.pdf = pdf; // 迁入归属实例（切回免重新 fetch/decode）
+  sctx.pageCount = pdf.numPages;
+  sctx.strokesByPage.clear();
   // 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录。真书常有，喂重排/AI 排版。
-  try { const m = await pdf.getMetadata(); state.docMeta = (m && m.info) ? m.info as Record<string, unknown> : null; } catch { state.docMeta = null; }
-  try { state.outline = await pdf.getOutline(); } catch { state.outline = null; }
+  try { const m = await pdf.getMetadata(); sctx.docMeta = (m && m.info) ? m.info as Record<string, unknown> : null; } catch { sctx.docMeta = null; }
+  try { sctx.outline = await pdf.getOutline(); } catch { sctx.outline = null; }
   // 载入本地已存的语义蒸馏（重排/记忆/图解缓存）；没有则新建。重开同一文档即恢复。
-  await openDoc({ document_id: state.documentId, file_hash: state.fileHash, filename, page_count: state.pageCount });
-  getActiveContext().storeDoc = activeDoc(); // 把载入的文档挂到激活实例，供切回时 store.current 重指向（P0-4）
-  state.pageIndex = Math.min(Math.max(lastReadPage(), 0), Math.max(0, state.pageCount - 1)); // 重开跳回阅读位置
-  if (persist) await storePdfBlob(state.documentId, persist); // 导入：PDF 字节落库（重开免重导）
+  await openDoc({ document_id: sctx.documentId, file_hash: sctx.fileHash, filename, page_count: sctx.pageCount });
+  sctx.storeDoc = activeDoc(); // 把载入的文档挂到归属实例，供切回时 store.current 重指向（P0-4）
+  sctx.pageIndex = Math.min(Math.max(lastReadPage(), 0), Math.max(0, sctx.pageCount - 1)); // 重开跳回阅读位置
+  if (persist) await storePdfBlob(sctx.documentId, persist); // 导入：PDF 字节落库（重开免重导）
   trace('PDFDocument', {
-    document_id: state.documentId,
-    file_hash: state.fileHash,
+    document_id: sctx.documentId,
+    file_hash: sctx.fileHash,
     filename,
-    page_count: state.pageCount,
+    page_count: sctx.pageCount,
     uploaded_at: new Date().toISOString(),
     source_type: persist ? 'upload' : 'reopen',
     local_original_path: '(browser memory ref)',
     version: SCHEMA_VERSION,
   });
+  // openDoc 已把模块 current 设成本文档；若载入期间切走，重指向回真正活跃实例的 doc，维持「current=活跃实例文档」不变式（P0-4）。
+  setActiveDoc(getActiveContext().storeDoc);
+  if (getActiveContext() !== sctx) return; // 切走了：本文档已正确落在 sctx，不对当前活跃实例触发它的重绘/恢复（P0-5）
   bus.emit('document:loaded');
   await renderPage();
   // 后台预处理（默认关，dev 面板开关）：预排版 + 内容解读，不阻塞首屏
