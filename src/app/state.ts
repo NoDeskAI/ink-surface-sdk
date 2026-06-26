@@ -1,5 +1,6 @@
 import type { HMP, NormBBox, OcrTextBlock, PDFPageRecord, ScreenOverlay, StrokePoint, SurfaceIndex, SurfaceType } from '../core/contracts';
 import { SurfaceContext } from './surface-context';
+import { setActiveDoc } from '../local/store';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -224,6 +225,7 @@ export function getActiveContext(): SurfaceContext { return activeCtx; }
 /** 切换激活实例（进/退会议）。发 'context:switched' 让 main.ts 决定如何重绘（PDF→renderPage / 白板→renderBlankSurface）。 */
 export function setActiveContext(ctx: SurfaceContext): void {
   activeCtx = ctx;
+  setActiveDoc(ctx.storeDoc); // store.current 跟随激活实例的文档：切回阅读 A 时 current 回到 A，不再误写会议材料 B（P0-4）
   bus.emit('context:switched', ctx);
 }
 

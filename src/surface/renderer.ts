@@ -13,7 +13,7 @@ import { reflowProviders } from './reflow-provider';
 import { wrapSurfaceIndex } from '../evidence/target';
 import { ensureScannedPageLayer } from '../evidence/page-ocr';
 import { bus, getActiveContext, settings, state } from '../app/state';
-import { getReflow, openDoc, putReflow, storePdfBlob, loadPdfBlob, lastReadPage } from '../local/store';
+import { getReflow, openDoc, putReflow, storePdfBlob, loadPdfBlob, lastReadPage, activeDoc, setActiveDoc } from '../local/store';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -120,6 +120,7 @@ async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob |
   try { state.outline = await pdf.getOutline(); } catch { state.outline = null; }
   // 载入本地已存的语义蒸馏（重排/记忆/图解缓存）；没有则新建。重开同一文档即恢复。
   await openDoc({ document_id: state.documentId, file_hash: state.fileHash, filename, page_count: state.pageCount });
+  getActiveContext().storeDoc = activeDoc(); // 把载入的文档挂到激活实例，供切回时 store.current 重指向（P0-4）
   state.pageIndex = Math.min(Math.max(lastReadPage(), 0), Math.max(0, state.pageCount - 1)); // 重开跳回阅读位置
   if (persist) await storePdfBlob(state.documentId, persist); // 导入：PDF 字节落库（重开免重导）
   trace('PDFDocument', {
@@ -182,6 +183,7 @@ export async function openPdfFromUrl(documentId: string, filename: string, pdfUr
  */
 export function renderBlankSurface(documentId: string, title = '空白页'): void {
   getActiveContext().pdf = null; // 脱离上一份 PDF（防 zoom/翻页误渲旧页）
+  getActiveContext().storeDoc = null; setActiveDoc(null); // 白板无持久化文档：store.current 置空，页缓存/阅读位置写操作变 no-op（P0-4）
   state.fileHash = documentId;
   state.documentId = documentId;
   state.fileName = title;

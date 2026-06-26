@@ -1,5 +1,6 @@
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import type { HMP, NormBBox, OcrTextBlock, PDFPageRecord, ScreenOverlay, SurfaceIndex, SurfaceType } from '../core/contracts';
+import type { PersistedDoc } from '../core/store-format';
 import type { Stroke } from './state';
 
 /** surface 实例的「所属模式」（谁拥有这个 context）。与 surfaceType（article/chat/whiteboard，渲染类型）正交。 */
@@ -23,6 +24,10 @@ export class SurfaceContext {
 
   /** 当前加载的 PDF 文档对象（从 renderer.ts 模块级变量搬入）。切回本 context 免重新 fetch/decode。 */
   pdf: PDFDocumentProxy | null = null;
+
+  /** 本实例的持久化文档（store 的 PersistedDoc：页缓存/阅读位置/水位线）。renderer 载入后挂上，
+   *  setActiveContext 切换时据此把 store.current 重指向本实例的文档——根除跨文档串写（P0-4）。白板=null。 */
+  storeDoc: PersistedDoc | null = null;
 
   // ── 以下 17 个字段从 app/state.ts 的全局 state 字面量搬出（初值与原默认一致）──
   fileName = '';

@@ -102,6 +102,7 @@ function nextSeq(): number { seqCounter = Math.max(seqCounter + 1, Date.now()); 
 
 /** 打开文档：从 IndexedDB 载入已存的语义蒸馏（没有则新建）。返回 true=命中缓存。 */
 export async function openDoc(meta: { document_id: string; file_hash: string; filename: string; page_count: number }): Promise<boolean> {
+  flushSave(); // 切档前先落盘上一份在途改动（防去抖丢写）
   const saved = await idbGet(meta.document_id);
   const hit = !!(saved && saved.version === STORE_VERSION);
   if (hit) {
@@ -115,6 +116,19 @@ export async function openDoc(meta: { document_id: string; file_hash: string; fi
   scheduleSave(); // 即便不标注也落库（导入后直接刷新也能在书架列出）
   return hit;
 }
+
+/**
+ * 把"当前文档"重指向给定 doc——切 SurfaceContext 时调，使 store.current 始终 = 活跃实例的文档。
+ * 根除"模块级 current 与 SurfaceContext.documentId 双真相"导致的跨文档串写（P0-4）：
+ * 退会议切回阅读 A 时，current 跟着回到 A，翻页/水位线/页缓存不再误写进会议材料 B。
+ */
+export function setActiveDoc(doc: PersistedDoc | null): void {
+  if (doc === current) return;
+  flushSave();    // 落盘上一份在途改动，再切
+  current = doc;
+}
+/** 当前活跃文档引用（renderer 载入文档后挂到 SurfaceContext.storeDoc，供切回时重指向）。 */
+export function activeDoc(): PersistedDoc | null { return current; }
 
 // ── 书籍持久化：PDF 原始字节 + 书目列表 + 阅读位置 ──
 
@@ -287,11 +301,18 @@ function page(i: number): PersistedPage | null {
 }
 
 function scheduleSave(): void {
-  if (!current) return;
+  const doc = current; // 绑定到这个 doc：current 之后被重指向/切档，定时器仍落到正确的书，不串档
+  if (!doc) return;
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    if (current) { current.saved_at = new Date().toISOString(); void idbPut(current); }
-  }, 600);
+  saveTimer = window.setTimeout(() => { doc.saved_at = new Date().toISOString(); void idbPut(doc); }, 600);
+}
+
+/** 立即落盘当前 doc 的在途改动并清掉去抖定时器（切档前调，防丢写）。 */
+function flushSave(): void {
+  if (saveTimer === undefined) return;
+  window.clearTimeout(saveTimer);
+  saveTimer = undefined;
+  if (current) { current.saved_at = new Date().toISOString(); void idbPut(current); }
 }
 
 function overlap(a: NormBBox, b: NormBBox): number {
