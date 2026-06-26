@@ -27,10 +27,12 @@ import { openBook, bookMessages } from '../chat/buffer';
 import { classifyContext, LOCAL_RULES } from '../chat/classify-client';
 import { getPageOcrText } from '../evidence/page-ocr';
 import { postJson, postBeacon } from './api';
+import { promptVersion } from './prompt-versions';
 
 /** 伴读 persona 已搬到服务端 server/prompts.ts（按 role 索引、与模型解耦）；/api/chat 收 role='annotator'。
- *  下面这个标签随账本存 system_prompt_hash，标识本轮提示词版本（与 server PROMPT_VERSION 对齐，改 system 文案时同步）。 */
-const PROMPT_TAG = 'annotator@v3';
+ *  下面这个标签随账本存 system_prompt_hash，标识本轮提示词版本。版本号取自前后端单源 prompt-versions，
+ *  bump 服务端某 role 版本即自动同步、不再手工对齐漂移（R8）。 */
+const PROMPT_TAG = `annotator@${promptVersion('annotator')}`;
 
 /* ── 处理流水线（调试）：逐组件「收到什么 → 产出什么」，含缩略图，串成一轮链路 ─────────
  * 仅 DEV 落库（gate 同 mirror*）；图压成 ~220px 缩略图控 IndexedDB 体积。供 AI 会话调试页复盘。 */

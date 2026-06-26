@@ -11,25 +11,12 @@
  * v2：annotator 去重——"怎么回应"的规则只存 system，每轮 user 消息（renderUserTurn）只带动态数据。
  */
 
-export const PROMPT_VERSION = 'v3'; // v2→v3：annotator 加静态 <background> 段（伴读场景 + 旁注与同页批注并存的语境；动态整页背景仍在 messages）
-
-export type PromptRole =
-  | 'annotator'         // /api/chat 主伴读/答问（唯一有状态：每本书 buffer）
-  | 'ink_classifier'    // /api/interpret 笔迹"手写 vs 画"分类 + 转写 + 草图描述
-  | 'context_classifier'// /api/classify-context respond/fold
-  | 'ocr'               // /api/ocr-vlm 转写
-  | 'image_explain'     // /api/explain-image 图解读
-  | 'reflow_refine'     // /api/reflow 逐块精修
-  | 'reflow_structure'  // /api/reflow-ai[-stream] 结构重建
-  | 'reflow_vlm';       // /api/reflow-vlm 看图重排
-
-/** 各 role 的提示词版本（D2 prompt manifest 种子）：改某 role 的 system 文案就 bump 它这条；
- *  调用可观测 / 客户端 PROMPT_TAG 用 `${role}@${promptVersion(role)}`。现都 v3，留待按 role 分别演进。 */
-export const PROMPT_VERSIONS: Record<PromptRole, string> = {
-  annotator: 'v3', ink_classifier: 'v3', context_classifier: 'v3', ocr: 'v3',
-  image_explain: 'v3', reflow_refine: 'v3', reflow_structure: 'v3', reflow_vlm: 'v3',
-};
-export function promptVersion(role: PromptRole): string { return PROMPT_VERSIONS[role]; }
+// 提示词版本表 + PromptRole 抽到前后端单源（src/core/prompt-versions.ts）：改版本只此一处，客户端 PROMPT_TAG 不再漂移（R8）。
+import { PROMPT_VERSIONS, promptVersion } from '../src/core/prompt-versions';
+import type { PromptRole } from '../src/core/prompt-versions';
+export { PROMPT_VERSIONS, promptVersion };
+export type { PromptRole };
+export const PROMPT_VERSION = PROMPT_VERSIONS.annotator; // 兼容旧引用：单一版本号，派生自共享表
 
 export const SYSTEM_PROMPTS: Record<PromptRole, string> = {
   annotator: `<task_context>
