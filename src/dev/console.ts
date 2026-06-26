@@ -260,7 +260,10 @@ function ioRows(rows?: PipelineStageIO[]): string {
 function imgRow(imgs?: Array<{ role: string; thumb: string }>): string {
   if (!imgs?.length) return '';
   return `<div class="cns-pl-imgs">`
-    + imgs.map((im) => `<div class="cns-pl-img"><img class="cns-zoom" src="${im.thumb}" alt=""><span>${esc(im.role)}</span></div>`).join('')
+    + imgs.map((im) => {
+      const safeThumb = /^data:image\//.test(im.thumb) ? esc(im.thumb) : ''; // 只放行本地截图 data:image/ URL + esc，杜绝 src 属性逃逸
+      return `<div class="cns-pl-img"><img class="cns-zoom" src="${safeThumb}" alt=""><span>${esc(im.role)}</span></div>`;
+    }).join('')
     + `</div>`;
 }
 /** 一个组件阶段卡：summary（mark 标 + 名 + 状态 + note）+ body（收到 → 图 → 产出）。 */
