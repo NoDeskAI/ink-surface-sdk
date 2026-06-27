@@ -14,7 +14,11 @@
     "allowJs": true,
     "checkJs": false,
     "resolveJsonModule": true,
+    "baseUrl": ".",
+    "paths": {
+      "ink-surface-sdk": ["../../src/index.ts"]
+    },
     "types": ["node"]
   },
-  "include": ["server", "scripts", "vite.config.ts", "vitest.config.ts", "packages/ink-surface-sdk/vite.config.ts"]
+  "include": ["server", "scripts", "vite.config.ts", "vitest.config.ts"]
 }

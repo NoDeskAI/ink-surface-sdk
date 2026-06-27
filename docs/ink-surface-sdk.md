@@ -35,15 +35,15 @@ The package declares:
 ## Build
 
 ```bash
-npm run build:sdk
+npm run build
 ```
 
 Outputs:
 
 ```text
-packages/ink-surface-sdk/dist/inkloop-surface-sdk.es.js
-packages/ink-surface-sdk/dist/inkloop-surface-sdk.iife.js
-packages/ink-surface-sdk/dist/index.d.ts
+dist/inkloop-surface-sdk.es.js
+dist/inkloop-surface-sdk.iife.js
+dist/index.d.ts
 ```
 
 ## ESM Usage
@@ -93,7 +93,7 @@ document.querySelector('#app')?.replaceChildren(renderInkLoopVisualModel(model))
 ## IIFE Usage
 
 ```html
-<script src="./packages/ink-surface-sdk/dist/inkloop-surface-sdk.iife.js"></script>
+<script src="./dist/inkloop-surface-sdk.iife.js"></script>
 <script>
   const {
     installInkLoopSurfaceStyles,
@@ -158,8 +158,8 @@ Hosts can allow points outside `[0, 1]` for infinite-canvas style overflow. The 
 After building the SDK and starting the dev server:
 
 ```bash
-npm run build:sdk
-npm run dev -- --host 127.0.0.1
+npm run build
+npm run demo:dev -- --host 127.0.0.1
 ```
 
 Open:
@@ -168,7 +168,7 @@ Open:
 http://127.0.0.1:8765/examples/ink-surface/basic.html
 ```
 
-The example imports the ESM bundle from `dist/` and renders a local in-memory model. It performs no network calls and does not write storage.
+The example imports `ink-surface-sdk` through the demo host's local alias and renders a local in-memory model. It performs no network calls and does not write storage.
 
 ## Host Responsibilities
 

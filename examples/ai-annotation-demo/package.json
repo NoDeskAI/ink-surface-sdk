@@ -1,0 +1,38 @@
+{
+  "name": "ink-surface-ai-annotation-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run check && vite build",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "clean": "node scripts/clean.mjs",
+    "test": "cd ../.. && vitest run --config examples/ai-annotation-demo/vitest.config.ts",
+    "test:watch": "cd ../.. && vitest --config examples/ai-annotation-demo/vitest.config.ts",
+    "lint": "biome check .",
+    "lint:ci": "biome check --error-on-warnings .",
+    "format": "biome format --write .",
+    "validate:fixtures": "cd ../.. && tsx examples/ai-annotation-demo/scripts/validate-fixtures.ts",
+    "obsidian:smoke": "tsx scripts/smoke-real-obsidian-flow.ts",
+    "inkloop-adapter": "tsx src/adapters/obsidian-fs/cli.ts",
+    "obsidian:install-plugin": "node scripts/install-obsidian-plugin.mjs",
+    "verify": "npm run check && npm run test && vite build",
+    "preview": "vite preview",
+    "serve": "tsx server/standalone.ts",
+    "postinstall": "node scripts/copy-pdfjs-assets.mjs"
+  },
+  "dependencies": {
+    "ink-surface-sdk": "file:../..",
+    "pdfjs-dist": "^4.6.82",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.7.4",
+    "tsx": "^4.22.4",
+    "typescript": "^5.5.4",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.6"
+  }
+}

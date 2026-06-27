@@ -18,6 +18,17 @@
     }
   },
   "files": {
-    "ignore": ["dist", ".inkloop-smoke-runs", "node_modules", "android", "legacy", "public", "**/*.mjs", "mobile.html"]
+    "ignore": [
+      "dist",
+      ".inkloop-smoke-runs",
+      "node_modules",
+      "examples/ai-annotation-demo/dist",
+      "examples/ai-annotation-demo/.inkloop-smoke-runs",
+      "examples/ai-annotation-demo/android",
+      "examples/ai-annotation-demo/legacy",
+      "examples/ai-annotation-demo/public",
+      "examples/ai-annotation-demo/mobile.html",
+      "**/*.mjs"
+    ]
   }
 }

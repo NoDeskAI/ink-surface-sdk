@@ -41,9 +41,9 @@ User-facing Markdown remains clean. Generated block identity, annotations, strok
 npm install
 npm run verify
 npm run obsidian:smoke -- --out-dir .inkloop-smoke-runs/obsidian-runtime-mvp --force-clean
-npm run build:sdk
+npm run build
 npm run obsidian:install-plugin -- --vault .inkloop-smoke-runs/obsidian-runtime-mvp/obsidian-vault
-INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run dev -- --host 0.0.0.0
+INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run demo:dev -- --host 0.0.0.0
 ```
 
 Open:

@@ -1,8 +1,12 @@
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PLUGIN_ID = 'inkloop-sync';
-const DEFAULT_VAULT = path.resolve('.inkloop-smoke-runs/20260626-real-flow/obsidian-vault');
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEMO_ROOT = path.resolve(SCRIPT_DIR, '..');
+const REPO_ROOT = path.resolve(DEMO_ROOT, '..', '..');
+const DEFAULT_VAULT = path.join(DEMO_ROOT, '.inkloop-smoke-runs/20260626-real-flow/obsidian-vault');
 const ALLOWED_FLAGS = new Set(['--vault', '--use-smoke-default-vault', '--allow-missing-sdk']);
 
 function fail(message) {
@@ -50,9 +54,9 @@ if (!vaultArg && !useSmokeDefaultVault) fail('Missing --vault. Use --use-smoke-d
 
 const warnings = [];
 const vaultRoot = path.resolve(vaultArg ?? DEFAULT_VAULT);
-const pluginSource = path.resolve('obsidian-plugin', PLUGIN_ID);
+const pluginSource = path.join(DEMO_ROOT, 'obsidian-plugin', PLUGIN_ID);
 const pluginTarget = path.join(vaultRoot, '.obsidian', 'plugins', PLUGIN_ID);
-const sdkBundleSource = path.resolve('packages', 'ink-surface-sdk', 'dist', 'inkloop-surface-sdk.iife.js');
+const sdkBundleSource = path.join(REPO_ROOT, 'dist', 'inkloop-surface-sdk.iife.js');
 const sdkBundleTarget = path.join(pluginTarget, 'inkloop-surface-sdk.iife.js');
 
 await mkdir(path.join(vaultRoot, '.obsidian'), { recursive: true });
@@ -63,7 +67,7 @@ try {
   sdkBundleInstalled = true;
 } catch (error) {
   if (!allowMissingSdk) {
-    throw new Error(`Missing SDK bundle at ${sdkBundleSource}. Run npm run build:sdk before installing the plugin.`);
+    throw new Error(`Missing SDK bundle at ${sdkBundleSource}. Run npm run build from the repository root before installing the plugin.`);
   }
   warnings.push(`SDK bundle was not installed: ${String(error?.message || error)}`);
 }

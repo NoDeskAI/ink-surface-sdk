@@ -1,5 +1,6 @@
 node_modules/
 dist/
+examples/*/dist/
 .DS_Store
 *.log
 .idea/
@@ -15,6 +16,6 @@ dist/
 # intent A/B 影子数据（standalone 代理落盘）
 .ab-intent.jsonl
 
-# pdfjs CMap/字体资产：postinstall 自动从 node_modules 拷入，不入库（见 scripts/copy-pdfjs-assets.mjs）
-public/cmaps/
-public/standard_fonts/
+# pdfjs CMap/字体资产：demo postinstall 自动从 node_modules 拷入，不入库。
+**/public/cmaps/
+**/public/standard_fonts/

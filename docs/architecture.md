@@ -60,7 +60,7 @@ flowchart TB
 
 ### InkSurface SDK
 
-Location: `packages/ink-surface-sdk/`
+Location: `src/`
 
 The SDK turns an `InkLoopVisualModel` or InkLoop projection Markdown into DOM nodes. It supports:
 
@@ -77,9 +77,9 @@ The SDK is side-effect-free on import. It does not inject styles, mutate the hos
 Build outputs:
 
 ```text
-packages/ink-surface-sdk/dist/inkloop-surface-sdk.es.js
-packages/ink-surface-sdk/dist/inkloop-surface-sdk.iife.js
-packages/ink-surface-sdk/dist/index.d.ts
+dist/inkloop-surface-sdk.es.js
+dist/inkloop-surface-sdk.iife.js
+dist/index.d.ts
 ```
 
 The compatibility bundle name remains `inkloop-surface-sdk` and the IIFE global remains `InkLoopSurfaceSDK`, while the public product/package name is `InkSurface SDK`.
@@ -89,8 +89,8 @@ The compatibility bundle name remains `inkloop-surface-sdk` and the IIFE global 
 Locations:
 
 ```text
-src/knowledge/
-src/knowledge-builder/
+examples/ai-annotation-demo/src/knowledge/
+examples/ai-annotation-demo/src/knowledge-builder/
 ```
 
 `KnowledgeObject` represents discrete knowledge records such as annotations, AI notes, excerpts, Q&A, and tasks.
@@ -109,7 +109,7 @@ src/knowledge-builder/
 
 ### Adapter Core
 
-Location: `src/adapters/core/`
+Location: `examples/ai-annotation-demo/src/adapters/core/`
 
 Adapter Core defines the portable contract for external workspaces:
 
@@ -125,7 +125,7 @@ Core concepts avoid Obsidian-specific paths so future adapters can reuse them.
 
 ### Markdown Adapter Layer
 
-Location: `src/adapters/markdown/`
+Location: `examples/ai-annotation-demo/src/adapters/markdown/`
 
 This layer renders adapter contracts into Markdown and parses external edits from Markdown. It owns:
 
@@ -140,7 +140,7 @@ Generated sections and editable regions are intentionally separated. Remote edit
 
 ### Obsidian FS Adapter
 
-Location: `src/adapters/obsidian-fs/`
+Location: `examples/ai-annotation-demo/src/adapters/obsidian-fs/`
 
 The Obsidian FS adapter writes native Markdown and hidden sidecar files into an Obsidian vault. It owns:
 
@@ -164,7 +164,7 @@ Locations:
 
 ```text
 src/runtime/
-src/adapters/obsidian-fs/sidecar-runtime.ts
+examples/ai-annotation-demo/src/adapters/obsidian-fs/sidecar-runtime.ts
 ```
 
 The sidecar runtime is the hidden source of truth for runtime rendering and mutation state inside a host vault. It stores:
@@ -181,7 +181,7 @@ The sidecar runtime is the hidden source of truth for runtime rendering and muta
 
 ### Obsidian Plugin
 
-Location: `obsidian-plugin/inkloop-sync/`
+Location: `examples/ai-annotation-demo/obsidian-plugin/inkloop-sync/`
 
 The plugin is a quiet InkLoop Runtime host inside Obsidian. It:
 
@@ -202,7 +202,7 @@ Locations:
 ```text
 obsidian-lab.html
 src/obsidian-lab.ts
-vite.config.ts
+examples/ai-annotation-demo/vite.config.ts
 ```
 
 Web Lab is a local validation host for the same Obsidian runtime shape. It lets developers test:
@@ -423,9 +423,9 @@ Obsidian runtime smoke:
 
 ```bash
 npm run obsidian:smoke -- --out-dir .inkloop-smoke-runs/obsidian-runtime-mvp --force-clean
-npm run build:sdk
+npm run build
 npm run obsidian:install-plugin -- --vault .inkloop-smoke-runs/obsidian-runtime-mvp/obsidian-vault
-INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run dev -- --host 0.0.0.0
+INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run demo:dev -- --host 0.0.0.0
 ```
 
 Then open:
@@ -437,18 +437,15 @@ http://localhost:8765/obsidian-lab.html
 ## Repository Map
 
 ```text
-packages/ink-surface-sdk/      Standalone shared SDK package
-src/knowledge/                 KO, DocumentProjection, ExternalEdit contracts
-src/knowledge-builder/         Builders from InkLoop runtime data to contracts
-src/adapters/core/             Adapter-neutral contracts and storage
-src/adapters/markdown/         Markdown rendering and parsing
-src/adapters/obsidian-fs/      Obsidian file-system adapter and watcher
-src/runtime/                   Sidecar runtime store and runtime sync runner
-src/sync/                      Adapter sync store abstractions
-src/obsidian-lab.ts            Web Lab runtime validation host
-obsidian-plugin/inkloop-sync/  Obsidian runtime host plugin
-examples/ink-surface/          Minimal SDK example
-docs/                          Architecture, SDK, handoff, and plan docs
+src/                                   Standalone shared SDK package source
+dist/                                  Generated SDK bundles and declarations
+examples/ai-annotation-demo/src/       Web/PDF/adapter/runtime validation app
+examples/ai-annotation-demo/server/    Demo AI proxy and dev-only handlers
+examples/ai-annotation-demo/scripts/   Demo smoke, fixture, and plugin scripts
+examples/ai-annotation-demo/obsidian-plugin/  Obsidian runtime host plugin
+examples/ai-annotation-demo/examples/ink-surface/ Minimal SDK example
+packages/ko-schema/                    Protocol fixture data
+docs/                                  SDK architecture and usage docs
 ```
 
 ## Current Limits
