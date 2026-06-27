@@ -181,7 +181,9 @@ The sidecar runtime is the hidden source of truth for runtime rendering and muta
 
 ### Obsidian Plugin
 
-Location: `examples/ai-annotation-demo/obsidian-plugin/inkloop-sync/`
+Source location: `plugins/obsidian/inkloop-sync/`
+
+Package bundle location after `npm run build`: `dist/obsidian-plugin/inkloop-sync/`
 
 The plugin is a quiet InkLoop Runtime host inside Obsidian. It:
 
@@ -439,10 +441,10 @@ http://localhost:8765/obsidian-lab.html
 ```text
 src/                                   Standalone shared SDK package source
 dist/                                  Generated SDK bundles and declarations
+plugins/obsidian/inkloop-sync/         Obsidian runtime host plugin source
 examples/ai-annotation-demo/src/       Web/PDF/adapter/runtime validation app
 examples/ai-annotation-demo/server/    Demo AI proxy and dev-only handlers
-examples/ai-annotation-demo/scripts/   Demo smoke, fixture, and plugin scripts
-examples/ai-annotation-demo/obsidian-plugin/  Obsidian runtime host plugin
+examples/ai-annotation-demo/scripts/   Demo smoke and fixture scripts
 examples/ai-annotation-demo/examples/ink-surface/ Minimal SDK example
 packages/ko-schema/                    Protocol fixture data
 docs/                                  SDK architecture and usage docs

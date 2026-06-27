@@ -16,7 +16,7 @@
     "validate:fixtures": "cd ../.. && tsx examples/ai-annotation-demo/scripts/validate-fixtures.ts",
     "obsidian:smoke": "tsx scripts/smoke-real-obsidian-flow.ts",
     "inkloop-adapter": "tsx src/adapters/obsidian-fs/cli.ts",
-    "obsidian:install-plugin": "node scripts/install-obsidian-plugin.mjs",
+    "obsidian:install-plugin": "node ../../scripts/install-obsidian-plugin.mjs",
     "verify": "npm run check && npm run test && vite build",
     "preview": "vite preview",
     "serve": "tsx server/standalone.ts",

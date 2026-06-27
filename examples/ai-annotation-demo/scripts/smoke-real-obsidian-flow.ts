@@ -2,6 +2,7 @@ import { createHash, webcrypto } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   DocumentProjectionBuilder,
   KnowledgeBuilder,
@@ -28,6 +29,9 @@ import {
   obsidianFsDocumentAdapter,
   scanObsidianFsChanges,
 } from '../src/adapters/obsidian-fs';
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(SCRIPT_DIR, '..', '..', '..');
 
 if (!globalThis.crypto) {
   Object.defineProperty(globalThis, 'crypto', { value: webcrypto });
@@ -66,7 +70,7 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 
 async function installInkLoopPlugin(vaultRoot: string): Promise<void> {
   const pluginId = 'inkloop-sync';
-  const pluginSource = path.resolve('obsidian-plugin', pluginId);
+  const pluginSource = path.join(REPO_ROOT, 'plugins', 'obsidian', pluginId);
   const pluginTarget = path.join(vaultRoot, '.obsidian', 'plugins', pluginId);
   await cp(pluginSource, pluginTarget, { recursive: true, force: true });
   await writeJson(path.join(vaultRoot, '.obsidian', 'community-plugins.json'), [pluginId]);

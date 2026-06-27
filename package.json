@@ -18,6 +18,9 @@
   "files": [
     "dist",
     "src/index.ts",
+    "plugins/obsidian/inkloop-sync",
+    "scripts/build-obsidian-plugin.mjs",
+    "scripts/install-obsidian-plugin.mjs",
     "README.md",
     "docs/ink-surface-sdk.md",
     "docs/architecture.md"
@@ -26,7 +29,8 @@
     "examples/ai-annotation-demo"
   ],
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.build.json",
+    "build": "vite build && tsc -p tsconfig.build.json && node scripts/build-obsidian-plugin.mjs",
+    "build:obsidian-plugin": "node scripts/build-obsidian-plugin.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
     "clean": "node scripts/clean.mjs",
     "test": "vitest run",
@@ -45,7 +49,7 @@
     "demo:verify": "npm --workspace ink-surface-ai-annotation-demo run verify",
     "demo:preview": "npm --workspace ink-surface-ai-annotation-demo run preview --",
     "obsidian:smoke": "npm --workspace ink-surface-ai-annotation-demo run obsidian:smoke --",
-    "obsidian:install-plugin": "node examples/ai-annotation-demo/scripts/install-obsidian-plugin.mjs",
+    "obsidian:install-plugin": "node scripts/install-obsidian-plugin.mjs",
     "prepare": "npm run build"
   },
   "devDependencies": {

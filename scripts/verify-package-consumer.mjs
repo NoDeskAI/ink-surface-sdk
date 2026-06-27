@@ -61,7 +61,17 @@ try {
 
   const packed = parseNpmPackJson(run('npm', ['pack', '--dry-run', '--json']))[0];
   const packedFiles = new Set(packed.files.map((file) => file.path));
-  for (const required of ['dist/index.d.ts', 'dist/inkloop-surface-sdk.es.js', 'dist/inkloop-surface-sdk.iife.js']) {
+  for (const required of [
+    'dist/index.d.ts',
+    'dist/inkloop-surface-sdk.es.js',
+    'dist/inkloop-surface-sdk.iife.js',
+    'dist/obsidian-plugin/inkloop-sync/main.js',
+    'dist/obsidian-plugin/inkloop-sync/manifest.json',
+    'dist/obsidian-plugin/inkloop-sync/styles.css',
+    'dist/obsidian-plugin/inkloop-sync/inkloop-surface-sdk.iife.js',
+    'plugins/obsidian/inkloop-sync/main.js',
+    'scripts/install-obsidian-plugin.mjs',
+  ]) {
     if (!packedFiles.has(required)) throw new Error(`packed SDK is missing ${required}`);
   }
   for (const forbidden of ['src/index.test.ts', 'examples/ai-annotation-demo/package.json']) {

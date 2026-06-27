@@ -44,7 +44,10 @@ Outputs:
 dist/inkloop-surface-sdk.es.js
 dist/inkloop-surface-sdk.iife.js
 dist/index.d.ts
+dist/obsidian-plugin/inkloop-sync/
 ```
+
+`dist/obsidian-plugin/inkloop-sync/` is an installable Obsidian plugin bundle. It contains the plugin's `main.js`, `manifest.json`, `styles.css`, and the SDK IIFE bundle used by the plugin host.
 
 ## ESM Usage
 

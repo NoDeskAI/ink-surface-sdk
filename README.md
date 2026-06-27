@@ -9,6 +9,8 @@ The repository root is the SDK package. Demo and integration hosts live under `e
 - npm package: `ink-surface-sdk`
 - SDK source: `src/index.ts`
 - SDK build output: `dist/`
+- Obsidian plugin source: `plugins/obsidian/inkloop-sync/`
+- Obsidian plugin package output: `dist/obsidian-plugin/inkloop-sync/`
 - IIFE global: `window.InkLoopSurfaceSDK`
 - Web/Obsidian validation app: `examples/ai-annotation-demo/`
 
@@ -73,7 +75,8 @@ document.querySelector('#app')?.replaceChildren(renderInkLoopVisualModel(model))
 ```bash
 npm run check             # Type-check the SDK package
 npm run test              # SDK unit tests
-npm run build             # ESM/IIFE bundle + .d.ts output
+npm run build             # ESM/IIFE bundle + .d.ts output + installable Obsidian plugin bundle
+npm run build:obsidian-plugin # Rebuild the Obsidian plugin package after SDK build
 npm run pack:check        # Verify npm package contents
 npm run verify:consumer   # Install packed SDK into a temp consumer and test imports/types
 npm run verify            # SDK checks + package checks + demo verification
@@ -99,7 +102,8 @@ The full Web/PDF/Obsidian validation app is documented in [examples/ai-annotatio
 
 ```text
 src/                         SDK source only
-dist/                        Generated SDK bundles and declarations
+dist/                        Generated SDK bundles, declarations, and Obsidian plugin package
+plugins/obsidian/inkloop-sync/ Obsidian runtime host plugin source
 docs/                        SDK architecture and usage docs
 examples/ai-annotation-demo/ Web, PDF, Obsidian, Android, adapter validation host
 packages/ko-schema/          Protocol fixture data owned outside the SDK runtime layer
