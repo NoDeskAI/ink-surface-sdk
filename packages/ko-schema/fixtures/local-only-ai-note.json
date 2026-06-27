@@ -1,0 +1,28 @@
+{
+  "schema_version": "inkloop.knowledge_object.v1",
+  "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9PRVCY1",
+  "kind": "ai_note",
+  "title": "Local-only note",
+  "body_md": "This note is intentionally blocked by the privacy gate.",
+  "source": {
+    "document_id": "doc_local",
+    "document_title": "Local Only",
+    "object_refs": [],
+    "inkloop_uri": "inkloop://doc/doc_local"
+  },
+  "provenance": {
+    "created_from": "manual"
+  },
+  "tags": [
+    "inkloop",
+    "inkloop/ai-note"
+  ],
+  "status": "export_ready",
+  "privacy": "local_only",
+  "render_hints": {
+    "markdown_callout": "note"
+  },
+  "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "created_at": "2026-06-26T06:32:07.829Z",
+  "updated_at": "2026-06-26T06:32:07.829Z"
+}

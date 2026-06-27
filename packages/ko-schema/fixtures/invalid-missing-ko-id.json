@@ -1,0 +1,23 @@
+{
+  "schema_version": "inkloop.knowledge_object.v1",
+  "kind": "ai_note",
+  "title": "Invalid object",
+  "body_md": "Missing ko_id.",
+  "source": {
+    "document_id": "doc_invalid",
+    "document_title": "Invalid",
+    "object_refs": [],
+    "inkloop_uri": "inkloop://doc/doc_invalid"
+  },
+  "provenance": {
+    "created_from": "manual"
+  },
+  "tags": [
+    "inkloop"
+  ],
+  "status": "export_ready",
+  "privacy": "export_allowed",
+  "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "created_at": "2026-06-26T06:32:07.829Z",
+  "updated_at": "2026-06-26T06:32:07.829Z"
+}

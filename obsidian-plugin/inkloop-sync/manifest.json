@@ -1,0 +1,10 @@
+{
+  "id": "inkloop-sync",
+  "name": "InkLoop Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "InkLoop runtime host and background sync for native Markdown/PDF files with hidden sidecar state.",
+  "author": "InkLoop",
+  "authorUrl": "https://inkloop.local",
+  "isDesktopOnly": true
+}

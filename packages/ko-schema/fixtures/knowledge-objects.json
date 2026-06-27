@@ -1,0 +1,212 @@
+{
+  "schema_version": "inkloop.knowledge_export.v1",
+  "export_id": "export_fixture_20260626T063207Z",
+  "generated_at": "2026-06-26T06:32:07.829Z",
+  "source": {
+    "app": "inkloop",
+    "app_version": "0.1.0",
+    "document_id": "doc_3f9a1c2b7e04"
+  },
+  "objects": [
+    {
+      "schema_version": "inkloop.knowledge_object.v1",
+      "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9QCJBW2",
+      "kind": "ai_note",
+      "title": "量子纠缠为什么不传递信息",
+      "body_md": "量子纠缠体现的是测量结果之间的强相关，并不是可控的信息发送通道，因此不违反相对论。",
+      "source": {
+        "document_id": "doc_3f9a1c2b7e04",
+        "document_title": "量子力学导论",
+        "page_id": "pg_0ab12cde_13",
+        "page_index": 13,
+        "object_refs": [
+          "run_p14_021_3",
+          "run_p14_021_4"
+        ],
+        "anchor_bbox": [
+          0.31,
+          0.31,
+          0.12,
+          0.02
+        ],
+        "quote": "量子纠缠",
+        "inkloop_uri": "inkloop://doc/doc_3f9a1c2b7e04/page/13?anchor=run_p14_021_3"
+      },
+      "provenance": {
+        "created_from": "ai_turn",
+        "mark_ids": [
+          "mark_9b2c"
+        ],
+        "ai_turn_ids": [
+          "turn_7a01"
+        ]
+      },
+      "tags": [
+        "inkloop",
+        "inkloop/ai-note"
+      ],
+      "status": "export_ready",
+      "privacy": "export_allowed",
+      "render_hints": {
+        "markdown_callout": "note"
+      },
+      "created_at": "2026-06-26T06:32:07.829Z",
+      "updated_at": "2026-06-26T06:32:07.829Z",
+      "content_hash": "sha256:55231bd8950514f2ecc626b65aa426a9a97b1dfb55d7adeb225af31c3973ff70"
+    },
+    {
+      "schema_version": "inkloop.knowledge_object.v1",
+      "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9RBYE10",
+      "kind": "excerpt",
+      "title": "量子力学导论 p14 摘录",
+      "body_md": "量子纠缠",
+      "source": {
+        "document_id": "doc_3f9a1c2b7e04",
+        "document_title": "量子力学导论",
+        "page_id": "pg_0ab12cde_13",
+        "page_index": 13,
+        "object_refs": [
+          "run_p14_021_3"
+        ],
+        "anchor_bbox": [
+          0.31,
+          0.31,
+          0.12,
+          0.02
+        ],
+        "quote": "量子纠缠",
+        "inkloop_uri": "inkloop://doc/doc_3f9a1c2b7e04/page/13?anchor=run_p14_021_3"
+      },
+      "provenance": {
+        "created_from": "mark",
+        "mark_ids": [
+          "mark_9b2c"
+        ]
+      },
+      "tags": [
+        "inkloop",
+        "inkloop/excerpt"
+      ],
+      "status": "accepted",
+      "privacy": "export_allowed",
+      "render_hints": {
+        "markdown_callout": "quote"
+      },
+      "created_at": "2026-06-26T06:32:07.829Z",
+      "updated_at": "2026-06-26T06:32:07.829Z",
+      "content_hash": "sha256:7464bb0dbbf92ede72d91fdc21f09c0e84a4a2f356a6ac018d7567695e4bb0e4"
+    },
+    {
+      "schema_version": "inkloop.knowledge_object.v1",
+      "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9ASK001",
+      "kind": "qa",
+      "title": "为什么这段说不违反相对论？",
+      "body_md": "因为纠缠相关性不能被单方控制成消息；接收方仍需要经典通信才能比对结果。",
+      "source": {
+        "document_id": "doc_3f9a1c2b7e04",
+        "document_title": "量子力学导论",
+        "page_id": "pg_0ab12cde_13",
+        "page_index": 13,
+        "object_refs": [
+          "run_p14_030_1"
+        ],
+        "anchor_bbox": [
+          0.2,
+          0.48,
+          0.5,
+          0.04
+        ],
+        "quote": "不违反相对论",
+        "inkloop_uri": "inkloop://doc/doc_3f9a1c2b7e04/page/13?anchor=run_p14_030_1"
+      },
+      "provenance": {
+        "created_from": "ai_turn",
+        "mark_ids": [
+          "mark_ask_1"
+        ],
+        "ai_turn_ids": [
+          "turn_ask_1"
+        ]
+      },
+      "tags": [
+        "inkloop",
+        "inkloop/qa"
+      ],
+      "status": "export_ready",
+      "privacy": "export_allowed",
+      "render_hints": {
+        "markdown_callout": "question"
+      },
+      "created_at": "2026-06-26T06:32:07.829Z",
+      "updated_at": "2026-06-26T06:32:07.829Z",
+      "content_hash": "sha256:01b24159a91ac652994ab3c79db17190ebbc83cadb411a59588800cd5bf56f8f"
+    },
+    {
+      "schema_version": "inkloop.knowledge_object.v1",
+      "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9TASK01",
+      "kind": "task",
+      "title": "查贝尔不等式实验",
+      "body_md": "TODO: 查 2022 诺奖相关贝尔不等式实验的原始论文。",
+      "source": {
+        "document_id": "doc_3f9a1c2b7e04",
+        "document_title": "量子力学导论",
+        "page_id": "pg_0ab12cde_21",
+        "page_index": 21,
+        "object_refs": [],
+        "anchor_bbox": [
+          0.73,
+          0.62,
+          0.18,
+          0.08
+        ],
+        "inkloop_uri": "inkloop://doc/doc_3f9a1c2b7e04/page/21"
+      },
+      "provenance": {
+        "created_from": "mark",
+        "mark_ids": [
+          "mark_task_1"
+        ]
+      },
+      "tags": [
+        "inkloop",
+        "inkloop/task"
+      ],
+      "status": "export_ready",
+      "privacy": "export_allowed",
+      "render_hints": {
+        "markdown_callout": "todo"
+      },
+      "created_at": "2026-06-26T06:32:07.829Z",
+      "updated_at": "2026-06-26T06:32:07.829Z",
+      "content_hash": "sha256:31c77f81458fd1b0ca3dda86cfc06da055f14bfa5e10da7e1b8cf181087d21d7"
+    },
+    {
+      "schema_version": "inkloop.knowledge_object.v1",
+      "ko_id": "ko_01JZ7D5E7WJK4F5NTAT9SM001X",
+      "kind": "summary",
+      "title": "量子纠缠阅读小结",
+      "body_md": "本节重点是纠缠的相关性、贝尔不等式实验验证，以及它与信息传递限制之间的边界。",
+      "source": {
+        "document_id": "doc_3f9a1c2b7e04",
+        "document_title": "量子力学导论",
+        "object_refs": [],
+        "inkloop_uri": "inkloop://doc/doc_3f9a1c2b7e04"
+      },
+      "provenance": {
+        "created_from": "session"
+      },
+      "tags": [
+        "inkloop",
+        "inkloop/summary"
+      ],
+      "status": "export_ready",
+      "privacy": "export_allowed",
+      "render_hints": {
+        "markdown_callout": "summary"
+      },
+      "created_at": "2026-06-26T06:32:07.829Z",
+      "updated_at": "2026-06-26T06:32:07.829Z",
+      "content_hash": "sha256:e01179ba03fdf9ea1343e265c0eaf810e14901bffb593c6f46a53d5ca83ec949"
+    }
+  ]
+}

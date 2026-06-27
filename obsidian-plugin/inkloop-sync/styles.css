@@ -1,0 +1,599 @@
+.markdown-preview-view.inkloop-native-preview-root {
+  --inkloop-paper: var(--background-primary);
+  --inkloop-ink: var(--text-normal);
+  --inkloop-muted: var(--text-muted);
+  --inkloop-line: var(--background-modifier-border);
+  --inkloop-highlight: rgba(238, 205, 82, 0.24);
+  --inkloop-pencil: var(--text-normal);
+  --inkloop-ai: rgba(93, 121, 127, 0.82);
+  overflow-x: hidden;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .markdown-preview-sizer {
+  max-width: 1080px;
+}
+
+.inkloop-surface-controls {
+  position: sticky;
+  top: 10px;
+  float: right;
+  z-index: 30;
+  margin: 0 0 10px 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.inkloop-mode-toggle,
+.inkloop-tool-btn {
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font: 12px/1.2 var(--font-interface);
+  cursor: pointer;
+}
+
+.inkloop-tool-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding-left: 4px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.inkloop-color-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 4px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.markdown-preview-view.inkloop-native-preview-root .inkloop-color-input {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .inkloop-color-input::-webkit-color-swatch-wrapper {
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .inkloop-color-input::-webkit-color-swatch {
+  border: 0;
+  border-radius: inherit;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .inkloop-color-input::-moz-color-swatch {
+  border: 0;
+  border-radius: inherit;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .inkloop-color-input:disabled {
+  opacity: .45;
+  cursor: default;
+}
+
+.inkloop-color-swatches {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.markdown-preview-view.inkloop-native-preview-root button.inkloop-color-swatch {
+  -webkit-appearance: none;
+  appearance: none;
+  display: inline-block;
+  width: 22px !important;
+  min-width: 22px !important;
+  max-width: 22px;
+  height: 22px !important;
+  min-height: 22px !important;
+  max-height: 22px;
+  padding: 0 !important;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 999px !important;
+  background: var(--inkloop-swatch-color) !important;
+  background-color: var(--inkloop-swatch-color) !important;
+  background-image: none !important;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16), 0 1px 2px rgba(0, 0, 0, 0.28);
+  color: transparent !important;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.markdown-preview-view.inkloop-native-preview-root button.inkloop-color-swatch.is-active {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--background-primary),
+    0 0 0 4px var(--text-normal),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+}
+
+.markdown-preview-view.inkloop-native-preview-root button.inkloop-color-swatch:disabled {
+  opacity: .45;
+  cursor: default;
+}
+
+.inkloop-tool-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.inkloop-tool-btn:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.inkloop-mode-toggle:hover,
+.inkloop-mode-toggle:focus-visible,
+.inkloop-tool-btn:hover,
+.inkloop-tool-btn:focus-visible {
+  color: var(--text-normal);
+  outline: none;
+}
+
+.markdown-preview-view.inkloop-focus-mode .inkloop-tool-switch,
+.markdown-preview-view.inkloop-focus-mode .inkloop-color-row {
+  display: none;
+}
+
+.markdown-preview-view.inkloop-native-preview-root .metadata-container,
+.markdown-preview-view.inkloop-native-preview-root .metadata-properties,
+.markdown-preview-view.inkloop-native-preview-root .metadata-content,
+.markdown-preview-view.inkloop-native-preview-root .metadata-property,
+.markdown-preview-view.inkloop-native-preview-root .metadata-add-button,
+.markdown-preview-view.inkloop-native-preview-root .metadata-properties-heading,
+.markdown-preview-view.inkloop-native-preview-root .frontmatter-container,
+.markdown-preview-view.inkloop-native-preview-root .inline-title,
+.markdown-preview-view.inkloop-native-preview-root .inkloop-native-hidden {
+  display: none;
+}
+
+.inkloop-native-preview .inkloop-fallback-hidden,
+.inkloop-native-preview .inkloop-annotation-fallback {
+  display: none;
+}
+
+.inkloop-visual-block {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 212px;
+  gap: 28px;
+  margin: 18px 0 24px;
+  padding: 14px 0;
+  min-height: 78px;
+}
+
+.inkloop-content-plane {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+}
+
+.inkloop-content-plane > p,
+.inkloop-content-plane > li,
+.inkloop-content-plane > blockquote,
+.inkloop-content-plane > h1,
+.inkloop-content-plane > h2,
+.inkloop-content-plane > h3,
+.inkloop-content-plane > h4,
+.inkloop-content-plane > h5,
+.inkloop-content-plane > h6 {
+  position: relative;
+  z-index: 2;
+  margin-top: 0;
+  margin-bottom: 0;
+  font-size: 1.02em;
+  line-height: 1.78;
+}
+
+.inkloop-visual-block.is-plain {
+  margin: 8px 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  min-height: auto;
+}
+
+.markdown-preview-view.inkloop-focus-mode .inkloop-visual-block {
+  grid-template-columns: minmax(0, 760px);
+  gap: 0;
+  min-height: auto;
+}
+
+.markdown-preview-view.inkloop-focus-mode .inkloop-content-plane {
+  max-width: 760px;
+}
+
+.markdown-preview-view.inkloop-focus-mode .inkloop-mark-layer,
+.markdown-preview-view.inkloop-focus-mode .inkloop-margin-notes {
+  display: none;
+}
+
+.markdown-preview-view.inkloop-thinking-mode .inkloop-visual-block[data-editable="true"] .inkloop-content-plane > :is(p, h1, h2, h3, h4, h5, h6, li, blockquote) {
+  cursor: crosshair;
+}
+
+.markdown-preview-view.inkloop-thinking-mode[data-inkloop-tool="text"] .inkloop-visual-block[data-editable="true"] .inkloop-content-plane > :is(p, h1, h2, h3, h4, h5, h6, li, blockquote) {
+  cursor: text;
+}
+
+.markdown-preview-view.inkloop-thinking-mode:is([data-inkloop-tool="pen"], [data-inkloop-tool="highlighter"]) .inkloop-visual-block,
+.markdown-preview-view.inkloop-thinking-mode:is([data-inkloop-tool="pen"], [data-inkloop-tool="highlighter"]) .inkloop-content-plane {
+  touch-action: none;
+  overscroll-behavior: contain;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.markdown-preview-view.inkloop-thinking-mode .inkloop-visual-block.is-saving .inkloop-content-plane > :is(p, h1, h2, h3, h4, h5, h6, li, blockquote) {
+  opacity: 0.72;
+}
+
+.markdown-preview-view.inkloop-thinking-mode [contenteditable="true"]:focus {
+  outline: none;
+}
+
+.inkloop-preview-modebar,
+.inkloop-edit-button,
+.inkloop-annotation-edit-button,
+.inkloop-editor,
+.inkloop-annotation-editor {
+  display: none !important;
+}
+
+.inkloop-mark-layer {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  left: -10px;
+  top: -7px;
+  right: auto;
+  width: calc(100% + 20px);
+  height: calc(100% + 14px);
+  overflow: visible;
+}
+
+.inkloop-mark-highlight {
+  fill: var(--inkloop-highlight);
+  stroke: none;
+}
+
+.inkloop-mark-box,
+.inkloop-mark-circle,
+.inkloop-mark-task {
+  fill: none;
+  stroke: var(--inkloop-pencil);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.inkloop-mark-circle {
+  stroke: rgba(132, 91, 39, 0.72);
+  stroke-width: 2;
+}
+
+.inkloop-mark-task,
+.inkloop-mark-underline {
+  fill: none;
+  stroke: rgba(84, 112, 118, 0.78);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.inkloop-mark-rail {
+  fill: none;
+  stroke: var(--inkloop-ai);
+  stroke-width: 3;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.inkloop-mark-freehand {
+  fill: none;
+  stroke: var(--inkloop-pencil);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.inkloop-mark-freehand.is-highlighter {
+  stroke: rgba(238, 205, 82, 0.56);
+  stroke-width: 10;
+}
+
+.inkloop-margin-notes {
+  position: relative;
+  top: auto;
+  right: auto;
+  z-index: 3;
+  grid-column: 2;
+  grid-row: 1;
+  width: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.inkloop-margin-note {
+  position: relative;
+  padding: 2px 0;
+  color: var(--inkloop-muted);
+}
+
+.inkloop-margin-note.is-editing {
+  padding-bottom: 8px;
+}
+
+.inkloop-margin-note-kind {
+  margin-bottom: 2px;
+  font-size: 10px;
+  font-family: var(--font-monospace);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.72;
+}
+
+.inkloop-margin-note-title {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--inkloop-ink);
+}
+
+.inkloop-margin-note-body {
+  margin-top: 4px;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.55;
+}
+
+.inkloop-annotation-field {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font: 12px/1.45 var(--font-interface);
+}
+
+.inkloop-annotation-textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+
+.inkloop-annotation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.inkloop-annotation-action {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  font: 12px/1.2 var(--font-interface);
+  cursor: pointer;
+}
+
+.inkloop-annotation-action.is-primary {
+  background: var(--text-normal);
+  color: var(--background-primary);
+}
+
+.inkloop-runtime-view {
+  --inkloop-paper: var(--background-primary);
+  --inkloop-ink: var(--text-normal);
+  --inkloop-muted: var(--text-muted);
+  --inkloop-line: var(--background-modifier-border);
+  --inkloop-highlight: rgba(238, 205, 82, 0.24);
+  --inkloop-pencil: rgba(142, 107, 47, 0.72);
+  --inkloop-ai: rgba(93, 121, 127, 0.82);
+  height: 100%;
+  overflow: hidden;
+  color: var(--inkloop-ink);
+  background: var(--inkloop-paper);
+}
+
+.inkloop-runtime-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.inkloop-runtime-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.inkloop-runtime-actions {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.inkloop-runtime-mode {
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.inkloop-runtime-mode.is-active {
+  background: var(--text-normal);
+  color: var(--background-primary);
+}
+
+.inkloop-runtime-workspace {
+  height: 100%;
+  overflow: auto;
+}
+
+.inkloop-runtime-source {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 28px 36px 72px;
+}
+
+.inkloop-runtime-canvas {
+  position: relative;
+  min-width: 1180px;
+  min-height: 1400px;
+  padding: 34px 42px;
+}
+
+.inkloop-runtime-canvas-source {
+  position: relative;
+  z-index: 1;
+  width: min(820px, calc(100vw - 180px));
+  min-height: 960px;
+  padding: 28px 32px;
+  background: var(--background-primary);
+}
+
+.inkloop-runtime-canvas-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  min-width: 1180px;
+  min-height: 1400px;
+  touch-action: none;
+}
+
+.inkloop-runtime-node {
+  position: absolute;
+  box-sizing: border-box;
+}
+
+.inkloop-runtime-live-ink {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.inkloop-runtime-ink-node {
+  pointer-events: none;
+  overflow: visible;
+}
+
+.inkloop-runtime-ink-path {
+  fill: none;
+  stroke: var(--inkloop-pencil);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.inkloop-runtime-text-node {
+  min-height: 38px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--background-primary) 92%, var(--background-secondary));
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.inkloop-runtime-text-node.is-editing {
+  outline: 1px solid var(--interactive-accent);
+  outline-offset: 2px;
+  background: var(--background-primary);
+}
+
+.inkloop-runtime-pdf-shell {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 24px;
+  height: 100%;
+  min-height: 720px;
+  padding: 18px 24px;
+}
+
+.inkloop-runtime-pdf {
+  width: 100%;
+  height: calc(100vh - 92px);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.inkloop-runtime-gutter {
+  color: var(--inkloop-muted);
+}
+
+@media (max-width: 980px) {
+  .inkloop-visual-block {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .inkloop-margin-notes {
+    position: relative;
+    top: auto;
+    right: auto;
+    grid-column: 1;
+    grid-row: 2;
+    width: auto;
+    margin-top: 12px;
+  }
+
+  .inkloop-runtime-source {
+    padding: 20px 18px 56px;
+  }
+
+  .inkloop-runtime-pdf-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .inkloop-runtime-gutter {
+    display: none;
+  }
+}

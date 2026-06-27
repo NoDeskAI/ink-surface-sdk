@@ -13,9 +13,11 @@
  */
 import type { HMP, InferenceView, MarkFeatureType, NormBBox, OverlayState, PipelineStage, ScreenOverlay, StrokePoint } from './contracts';
 import type { ReflowBlock } from '../surface/reflow';
+import type { DocumentProjection } from '../knowledge/document-projection';
+import type { ExternalEdit } from '../knowledge/external-edit';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
-export const DB_VERSION = 6;      // v5→v6：marks 加 context_id + by_context 索引（C2 时间脊：按 surface 会话取笔）。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
+export const DB_VERSION = 7;      // v6→v7：adapter sync stores（document projections / external edits / conflicts / cursors）。
 
 /** 一张图的解读：图本身可从 PDF 重渲，故只存 bbox + 文字解读。 */
 export interface PersistedImage {
@@ -146,5 +148,36 @@ export interface PersistedMeeting {
   material_doc_ids: string[];       // 可能有用的文件（指向 docs/pdf_blobs 的 document_id）
   summary?: string;                 // 会后「思路总结」（AI 综合，先空）
   created_at: string;
+  updated_at: string;
+}
+
+/* ── Adapter sync records（v7）───────────────────────────────────────────── */
+
+export type PersistedDocumentProjection = DocumentProjection;
+export type PersistedExternalEdit = ExternalEdit;
+
+export interface PersistedAdapterConflict {
+  conflict_id: string;
+  provider: string;
+  target_id: string;
+  ko_id: string;
+  code: string;
+  severity: 'low' | 'medium' | 'high';
+  remote_path?: string;
+  detail: string;
+  resolution_status: 'open' | 'resolved' | 'ignored';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PersistedAdapterSyncCursor {
+  cursor_id: string;
+  provider: string;
+  target_id: string;
+  document_id: string;
+  remote_path?: string;
+  remote_revision?: string;
+  last_pulled_at?: string;
+  last_pushed_at?: string;
   updated_at: string;
 }

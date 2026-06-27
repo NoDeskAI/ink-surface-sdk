@@ -1,11 +1,13 @@
 {
-  "name": "inkloop",
+  "name": "ink-surface-sdk",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "sideEffects": false,
   "scripts": {
     "dev": "vite",
-    "build": "npm run check && vite build",
+    "build": "npm run check && vite build && npm run build:sdk",
+    "build:sdk": "vite build --config vite.sdk.config.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
     "clean": "node scripts/clean.mjs",
     "test": "vitest run",
@@ -14,7 +16,11 @@
     "lint:ci": "biome check --error-on-warnings .",
     "format": "biome format --write .",
     "audit": "npm audit --audit-level=high",
-    "verify": "npm run check && npm run lint:ci && npm run test && vite build",
+    "validate:fixtures": "tsx scripts/validate-fixtures.ts",
+    "obsidian:smoke": "tsx scripts/smoke-real-obsidian-flow.ts",
+    "inkloop-adapter": "tsx src/adapters/obsidian-fs/cli.ts",
+    "obsidian:install-plugin": "node scripts/install-obsidian-plugin.mjs",
+    "verify": "npm run check && npm run lint:ci && npm run test && vite build && npm run build:sdk",
     "preview": "vite preview",
     "serve": "tsx server/standalone.ts",
     "postinstall": "node scripts/copy-pdfjs-assets.mjs"

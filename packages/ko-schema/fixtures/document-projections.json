@@ -1,0 +1,107 @@
+{
+  "schema_version": "inkloop.document_projection_export.v1",
+  "export_id": "projection_fixture_20260626T083500Z",
+  "generated_at": "2026-06-26T08:35:00.000Z",
+  "source": {
+    "app": "inkloop",
+    "app_version": "0.1.0",
+    "document_id": "doc_3f9a1c2b7e04"
+  },
+  "document_projections": [
+    {
+      "schema_version": "inkloop.document_projection.v1",
+      "projection_id": "dp_doc_3f9a1c2b7e04_v1",
+      "document_id": "doc_3f9a1c2b7e04",
+      "document_title": "量子力学导论",
+      "document_uri": "inkloop://doc/doc_3f9a1c2b7e04",
+      "revision_id": "rev_fixture_20260626T083500Z",
+      "generated_at": "2026-06-26T08:35:00.000Z",
+      "source": {
+        "app": "inkloop",
+        "app_version": "0.1.0"
+      },
+      "privacy": "export_allowed",
+      "export_policy": {
+        "include_full_text": true,
+        "include_pdf_asset": false,
+        "include_raw_strokes": false,
+        "include_debug_evidence": false
+      },
+      "blocks": [
+        {
+          "block_id": "blk_p014_h001",
+          "kind": "heading",
+          "heading_level": 1,
+          "text_md": "量子纠缠",
+          "region": "generated",
+          "source": {
+            "page_id": "pg_0ab12cde_13",
+            "page_index": 13,
+            "object_refs": [
+              "run_p14_001_1"
+            ]
+          },
+          "knowledge_object_ids": []
+        },
+        {
+          "block_id": "blk_p014_p001",
+          "kind": "paragraph",
+          "text_md": "量子纠缠体现的是测量结果之间的强相关，并不是可控的信息发送通道，因此不违反相对论。",
+          "region": "editable",
+          "source": {
+            "page_id": "pg_0ab12cde_13",
+            "page_index": 13,
+            "object_refs": [
+              "run_p14_021_3",
+              "run_p14_021_4"
+            ],
+            "source_range": {
+              "start": 1280,
+              "end": 1324
+            },
+            "anchor_bbox": [
+              0.31,
+              0.31,
+              0.12,
+              0.02
+            ]
+          },
+          "knowledge_object_ids": [
+            "ko_01JZ7D5E7WJK4F5NTAT9QCJBW2",
+            "ko_01JZ7D5E7WJK4F5NTAT9RBYE10"
+          ]
+        }
+      ],
+      "body_hash": "sha256:416a57cf44f37614b830e430dcf5908f738de533317c6029b4bc9d5a75fd5c6f",
+      "content_hash": "sha256:a0e4450277e9494b54e3b4e8f055cf4f735978c49c95d80d27a292e88e0d4abc",
+      "created_at": "2026-06-26T08:35:00.000Z",
+      "updated_at": "2026-06-26T08:35:00.000Z"
+    }
+  ],
+  "external_edits": [
+    {
+      "schema_version": "inkloop.external_edit.v1",
+      "edit_id": "edit_doc_3f9a1c2b7e04_001",
+      "document_id": "doc_3f9a1c2b7e04",
+      "projection_id": "dp_doc_3f9a1c2b7e04_v1",
+      "block_id": "blk_p014_p001",
+      "adapter": {
+        "adapter_id": "obsidian-fs",
+        "target_id": "vault_fixture",
+        "remote_id": "InkLoop/Sources/量子力学导论.md",
+        "remote_path": "InkLoop/Sources/量子力学导论.md"
+      },
+      "kind": "document_body",
+      "operation": "update",
+      "status": "pending",
+      "payload": {
+        "before_md": "量子纠缠体现的是测量结果之间的强相关，并不是可控的信息发送通道，因此不违反相对论。",
+        "after_md": "量子纠缠体现的是测量结果之间的强相关，并不是可控的信息发送通道，因此不违反相对论。\n\n我的理解：这里的关键是不能主动传递消息。"
+      },
+      "observed_at": "2026-06-26T08:40:00.000Z",
+      "created_at": "2026-06-26T08:40:00.000Z",
+      "updated_at": "2026-06-26T08:40:00.000Z",
+      "content_hash": "sha256:8ffe0695111a929330f20144bb972583300372a80751eb4639e0810e2755273a"
+    }
+  ]
+}

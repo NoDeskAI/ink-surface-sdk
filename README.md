@@ -1,198 +1,263 @@
-# InkLoop · AI 标注阅读 demo
+# InkSurface SDK
 
-在原文上**圈、划、写**，停笔片刻，AI 以低打扰的旁注在标注旁/页边轻声指路；翻页后还记得你前面读过什么。
+InkSurface SDK 是 InkLoop 的共享文档 surface 渲染 SDK。它把原生文档文本、锚点标注、AI 旁注、高亮、框选和自由笔迹渲染成同一套可嵌入的 DOM surface，供 Web 端、Obsidian 插件和后续宿主复用。
 
-> A 组（实时闭环组）验证工程。第一周定位：用 Web 验证「标注 → 理解 → 回屏」的交互与数据闭环（决策 D2：脚手架运行时可换，设计语言与契约迁移到硬件电子纸）。
+推荐项目名：
 
----
+- 产品名：`InkSurface SDK`
+- GitHub/package 名：`ink-surface-sdk`
+- 兼容构建产物：`dist/inkloop-surface-sdk/*`
+- IIFE 全局变量：`window.InkLoopSurfaceSDK`
 
-## 快速开始
+保留旧构建名是为了兼容当前 Obsidian 插件加载路径；对外文档使用 InkSurface SDK。
+
+## SDK 能做什么
+
+- 解析 InkLoop Markdown projection，生成可渲染的 visual model。
+- 渲染文档正文、页标题、margin note、AI note、excerpt、QA、task、框选、高亮和自由笔迹。
+- 支持铅笔/高亮的 `color` 和 `opacity`，适配深色主题。
+- 提供纯字符串编辑 helpers：替换 block、追加 annotation、更新 annotation。
+- ESM 和 IIFE 双构建，方便 Web App 和插件宿主接入。
+- import 无副作用：不自动改 DOM、不注入 CSS、不启动网络/同步/监听。
+
+详细 SDK 使用文档见 [docs/ink-surface-sdk.md](./docs/ink-surface-sdk.md)。
+
+## 快速使用 SDK
 
 ```bash
 npm install
-cp .env.example .env      # 然后填入网关 Key（见下「团队上手」）
-npm run dev               # http://localhost:8765
+npm run build:sdk
+npm run dev -- --host 127.0.0.1
 ```
 
-- `?dev=1` 或按 `d` 唤出**开发面板**（provider 切换 / 行为设置 / 坐标自测 / 延迟 / trace）。
-- `npm run check` 跑 TS 严格类型检查；`npm run build` 类型检查 + 生产构建。
-- 导入**数字版 PDF**（有文本层的）效果最佳——扫描版要等 B 组 OCR。
+打开最小示例：
 
----
-
-## 核心交互
-
-### 1. 手势集（符号 = 意图，纯几何识别，0 OCR）
-
-笔迹无损采集（Pointer Events，决策 D3），`classifyScored` 按几何给每笔打**相似度分**——画得像范例才算手势，随手涂、半截笔画被忽略（门槛 `GESTURE_MIN_SCORE`）。
-
-| 手势 | 含义 | AI 行为 |
-|---|---|---|
-| **圈** ◯ | 这是什么 | 解释圈住的概念 |
-| **划线** ‾ | 重点 | 提炼要点 + 为什么重要 |
-| **圈 + 记号(问号)** | 提问 | 针对圈住的内容直接作答 |
-| **写字（页边批注）** | 自由批注 | 把手写当想法，结合附近正文呼应（手写内容读取待 B 组 OCR） |
-
-「圈住了什么字」靠**标注 bbox 与 PDF 文本层几何相交**取得（数字版免 OCR）——不是看截图。
-
-### 2. 段落讨论触发（防打扰 + 原地更新）
-
-同一段上的连续手势聚成一次**讨论**；**停笔 `pauseSeconds`（默认 5s）后才生成**（避免边画边弹）；同段继续画 → **原地刷新同一条**（按 `discId` upsert），不每段各占空间。
-
-### 3. AI 注的落点
-
-- **页面模式**：右侧留白（gutter），按标注 y 对齐、多条防重叠下推；或切「贴正文浮动」。
-- **重排模式**：绝对定位进右侧留白、与所属段同行对齐、斜体 + 半透明、不进文档流（**零排版变动**）。
-- 全局开关在开发面板「输出落点」。
-
-### 4. 重排阅读（reader mode）
-
-顶栏「重排」切换 **原版 PDF ⇄ 重排**。把文本层重排成干净单栏版心，**重排可圈画**（手势命中哪一段就用该段的原页 bbox 入管线）。三档引擎（开发面板「重排引擎」）：
-
-- `local`：纯几何启发式，离线即时、保 bbox。
-- `hybrid`：几何打骨架 + 模型逐块精修（纯文字），保 bbox。
-- `vision`：几何打骨架 + **Kimi 看页面图**重判角色/阅读顺序（多栏/标题更准），按 id 重排不合并拆分 → 原页 bbox 原样保留。
-
-> 重排只保留**逻辑结构**（标题/段落/顺序），不保留视觉版式；想要原版式就用「原版 PDF」。
-
-### 5. 跨页阅读记忆（让 AI 读懂全书而非一页）
-
-- 每段讨论记一条标注记忆（符号 + 原文 + AI 回应，逐页存）。
-- **翻页时**把上一页压成一句摘要（`/api/summarize`）。
-- 答题时模型**按需 `recall_page(n)`** 回看相关前页来综合（Kimi 工具循环）；回看了哪些页在开发面板可见。
-
----
-
-## 架构
-
-```
-src/
-  core/         纯逻辑，无 DOM
-    contracts.ts   七个 v0 数据契约（D1 归一化坐标 / D3 stroke 无损 / D4 version 冻结）
-    transform.ts   坐标换算唯一入口 + GUTTER 布局常量
-    classify.ts    笔迹几何分类 + 相似度分（classifyScored）+ 求解意图
-    gesture.ts     手势集（圈/划/问/写 → 意图）+ 形状门槛 isDeliberate
-    reflow.ts      本地启发式重排（行→段→标题，保 bbox，确定性 id）
-    memory.ts      逐页阅读记忆 + 跨页快照（喂 Tier2 recall）
-    pipeline.ts    recordEvent（逐笔无损）+ commitDiscussion（段落讨论 upsert）+ summarizePage
-    ids / trace / metrics
-  providers/    可替换接缝（契约即接口，B 组在此接真实现）
-    ocr.ts         textlayer(真实) / mock / vlm(stub) / local(B 组)
-    inference.ts   mock / fail / cloud(→ 本地 /api/infer 代理 → 网关)
-    reflow.ts      local / hybrid / vision
-  ui/           DOM 层
-    renderer / ink / whisper(页面留白) / reader(重排面+行内注) / insight-panel / toolbar / dev-drawer
-  app/state.ts  事件总线 + 全局状态 + 行为设置(settings)
-  main.ts       装配 + 手势调度（组装窗 + 停顿窗）+ 翻页总结
-server/infer.ts dev 代理逻辑：runInference（单发 / Tier2 工具循环）/ runReflow / runSummarize
-vite.config.ts  /api/infer · /api/reflow · /api/summarize 中间件（Key 留服务端）
+```text
+http://127.0.0.1:8765/examples/ink-surface/basic.html
 ```
 
-**数据流**：笔迹 → 手势分类/门槛 → 段落聚类 → `commitDiscussion`（OCR 取圈住原文 → 推理 → overlay）→ 渲染 + 记入逐页记忆。
+ESM 用法：
 
----
+```ts
+import {
+  installInkLoopSurfaceStyles,
+  renderInkLoopVisualModel,
+} from './dist/inkloop-surface-sdk/inkloop-surface-sdk.es.js';
 
-## AI 网关
+installInkLoopSurfaceStyles();
+document.querySelector('#app')?.replaceChildren(renderInkLoopVisualModel(model));
+```
 
-- **当前底座 = 裸 `fetch` 打 NoDesk AI Gateway**（Anthropic 兼容 `/v1/messages`，body 注入 `channel/channel_url`）。**不是** `@anthropic-ai/sdk`（该包当前闲置，可清）。
-- 默认模型 `kimi-k2.6`（moonshot，支持视觉 + 工具调用，已验证）。
-- **切 Sonnet**：改 `.env` 的 `LLM_MODEL=claude-sonnet-4-6` 即可（channel 自动路由到 DMXAPI，需该账户有余额）。
-- 三个 dev 端点（Vite 中间件，仅开发期）：`/api/infer`（旁注/讨论，可走 Tier2 工具循环）、`/api/reflow`（重排精修，可带页面图）、`/api/summarize`（翻页摘要）。
-- **Key 只在服务端**（`.env` → `process.env`），绝不进前端 bundle；`source_refs` 由服务端从请求装配，不让模型编造（PRD 红线）。
+`installInkLoopSurfaceStyles()` 和 `replaceChildren(...)` 都是显式调用；单纯 import SDK 不会产生宿主副作用。
 
----
+## 本仓库还包含什么
 
-## 配置旋钮
+本仓库同时保留 InkLoop Web demo 和 Obsidian Runtime MVP，用来验证 SDK 在真实阅读/标注/同步场景下是否能跑通：
 
-| 旋钮 | 默认 | 位置 |
-|---|---|---|
-| 形状门槛 `GESTURE_MIN_SCORE` | 0.4 | `src/core/gesture.ts` |
-| 聚簇纵向间隙 `GAP` | 0.06 | `src/main.ts` |
-| 停笔生成秒数 `pauseSeconds` | 5 | 开发面板 |
-| 右侧留白宽 `GUTTER_W` | 300 | `src/core/transform.ts` |
-| 模型 `LLM_MODEL` | kimi-k2.6 | `.env` |
-| 输出落点 / 重排引擎 / 手势开关 | — | 开发面板 |
+> PDF 原文圈画/手写 → InkLoop 生成标注/AI 旁注 → SDK 渲染 surface → Web 和 Obsidian 共用同一套 sidecar 数据。
 
----
+- 导入数字版 PDF，并用 PDF.js 渲染页面。
+- 用笔、鼠标或触控笔在页面上圈、划、写、高亮、擦除。
+- 用纯几何过滤误触，并识别圈、划线、箭头、自由笔迹。
+- 从 PDF 文本层命中被圈/划的文字；图片或手写才走视觉识别兜底。
+- 把连续标注合成一次 session，长停顿或手写问题后触发 AI。
+- 把 AI 旁注贴到原版页面右侧留白，或贴到重排阅读视图对应段落旁。
+- 把 PDF、笔迹、AI 回复、重排缓存存进 IndexedDB，刷新后可以恢复。
+- 提供调试页查看 HMP 取证、AI 会话、设置和遥测。
+- 提供 Obsidian Runtime MVP：原生 Markdown 文档、隐藏 `.inkloop` sidecar、Obsidian 后台插件、Web Lab 双端编辑/标注/同步验证。
 
-## 诚实边界
+## 快速跑起来
 
-- `textlayer` 取文本只对**数字版 PDF**精确；扫描版 / 手写内容要 OCR（B 组 B3）。
-- 多栏 / 表格 / 图 / 公式：本地启发式搞不定，用 `vision` 引擎或等 VLM 文档解析（B 组 C 档）。
-- 「圈+问号」是「圈 + 任意小记号」的几何近似；精确符号意图最终靠 LLM。
-- 重排圈画的命中容差 / 停顿时长仍在调手感。
-- Sonnet 经 DMXAPI 当前欠费、Bedrock 在内网——故默认用 Kimi。
+项目是 Vite + TypeScript。当前机器已验证：
 
----
+- Node.js `v24.14.0`
+- npm `11.9.0`
 
-## 项目盘点（截至 2026-06-13）
+第一次准备：
 
-### 一、完成度（对照第一周计划任务 ID）
+```bash
+npm install
+cp .env.example .env
+```
 
-**A 组（实时闭环组，本工程覆盖了 Dev A + Dev C 全部任务）—— A1–A11 在 Web 上全部跑通：**
+启动：
 
-| 任务 | 状态 |
-|---|---|
-| A1 PDFDocument/PDFPage 契约 | ✅ contracts.ts |
-| A2 AnnotationEvent（stroke/highlight/circle/underline/tap_region） | ✅ |
-| A3/A4 屏幕路径 + 页面渲染 | ✅ PDF.js 桌面模拟器 |
-| A5/A6 PDF ingest + 标注 listener（≤1s 出 event） | ✅ |
-| A7 Pointer Events 触摸/笔采集（无损） | ✅ ink.ts |
-| A8 云端推理 API client | ✅ /api/infer 代理 |
-| A9/A10 overlay renderer + 回屏更新 | ✅ whisper / reader |
-| A11 error/retry/timeout 不崩 | ✅ errorResult 降级 |
+```bash
+npm run dev -- --host 127.0.0.1
+```
 
-**B 组任务（理解推理组）—— 为把 demo 跑整，本工程替 B 组填了几处：**
+打开：
 
-| 任务 | 状态 / 归属 |
-|---|---|
-| B1 OCRResult 契约 / B2 trace / B5·B8 trace 写入 | ✅ 契约/trace 共建 |
-| B3 离线 OCR worker（PaddleOCR） | ⛔ 未做；用 textlayer（数字版免 OCR）+ stub 占位 → **B 组本职** |
-| B6 context builder（nearby text / OCR blocks / 跨页 context） | ⚠️ 本工程实现了 → **B 组本职（越界）** |
-| B7 result taxonomy（5 类输出模式） | ✅ 共建，已用 |
-| B9 真实云端推理模型 | ⚠️ 接了 Kimi → 模型/推理是 **B 组本职**；越界 |
-| B10 端到端 trace viewer | ✅ 开发面板（含引用 + 回看监控） |
-| B11 MCP/CLI 只读 | ⛔ P1，未做 |
+```text
+http://127.0.0.1:8765/
+```
 
-**第一周 Demo（I1 闭环）：已达成**——PDF 导入→渲染→标注→（textlayer 代 OCR）→**真实 Kimi 推理**→overlay 回屏→trace 可复现。I3「真·离线 OCR 报告」未做（无 PaddleOCR）。
+Vite 端口在 [vite.config.ts](./vite.config.ts) 里固定为 `8765`，`strictPort: true`。如果端口被占用，先停掉旧进程再启动。
 
-### 二、本职 vs 越界（角色边界）
+## Obsidian Runtime MVP
 
-- **Dev C 本职（你的位，稳在界内）**：页面渲染、标注/笔迹采集、overlay 回屏、坐标换算、设备/模拟器——A4/A7/A9/A10 都是你的，且都完成。
-- **Dev A 的活（A 组队友，本工程一并做了）**：契约 A1/A2、ingest A5、listener A6、API client A8、降级 A11——属 A 组内，但不是 Dev C 的位。
-- **越界到 B 组（demo 打通用，本应归 B 组）**：
-  - **context builder（B6）**：圈住原文的 nearby_text 拼装 + 跨页记忆/脉络。
-  - **真实推理模型（B9）**：Kimi 接入（API client 那半属 A 组，模型/推理这半属 B 组）。
-  - **文档重排 / layout parser**：PRD 把"标题/段落/表格粗分类"列在 OCR 的 B 档/C 档（VLM 文档解析）——本工程做了 local 启发式 + vision 重排当占位。
-  - **跨页 agent 记忆**：属 annotation context，B 组线。
-  - **低成本语义序列**：ADR 明确「序列化在 OCR 之后、推理之前，归 B 组」；会上"让小克研究"= 我做**格式研究**（非 A 组 build）。手势几何分类是其前端雏形，正式序列化归 B 组。
-  - → 这些都做成了 **provider 接缝**（ocr/inference/reflow），标了"B 组接入点"。solo demo 阶段填上无妨，**团队并行时应交还 B 组 / 走 contract 对齐**，否则有 A/B 协议漂移风险。
-- **我们自创（不在任何文档里，本项目的设计）**：v1 手势集词表、形状门槛、段落讨论触发（5s+聚类+原地更新）、重排 reader + 三档引擎、右侧留白/行内注落点、跨页 recall 工具循环、NoDesk 网关 + Kimi 选型。
+当前 Obsidian 集成不是简单导出插件，而是把 Obsidian 作为 InkLoop Runtime 的宿主：
 
-### 三、技术规范：照文档 vs 自己实现
+- 用户文档保持原生 Markdown，默认显示在 `InkLoop/`。
+- 笔迹、AI 旁注、画布、锚点、同步事件存进隐藏目录 `.inkloop/`。
+- Obsidian 插件负责后台监听、渲染宿主、sidecar 写入和同步触发。
+- Web Lab 和 Obsidian 使用同一套 InkLoop surface SDK 渲染标注和文档流。
 
-**照技术文档（严格遵守）**：四条定死决策 **D1 归一化坐标 / D2 Web 渲染层 / D3 stroke 无损 / D4 契约冻结**全部遵守；七个 v0 数据契约 + version 冻结（新增的跨页 `memory` 是 **proxy 级 wire 附加，不动冻结的 typed 契约**）；result taxonomy（5 类）、source_refs 可追溯不编造（PRD 红线，服务端装配）；PRD 护城河「局部 OCR + nearby text builder」、交互原则「不抢笔 / 电子纸减动画 / 接受·编辑·忽略 / 旁注」。
+从零跑一套本地验收：
 
-**自己实现（文档未规定）**：手势→意图的词表与门槛；段落讨论触发与原地更新；重排的 reader 化与 local/vision 实现；AI 注落点与防重叠；跨页 recall 工具循环；网关与模型选型。
+```bash
+npm run verify
+npm run obsidian:smoke -- --out-dir .inkloop-smoke-runs/obsidian-runtime-mvp --force-clean
+npm run build:sdk
+npm run obsidian:install-plugin -- --vault .inkloop-smoke-runs/obsidian-runtime-mvp/obsidian-vault
+INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run dev -- --host 0.0.0.0
+```
 
-### 四、当前原型 vs 设想原型的差距
+Web Lab 页面内的写入请求走同源校验；如果要从局域网脚本直接调用写接口，设置 `INKLOOP_LAB_WRITE_TOKEN` 并发送 `x-inkloop-lab-token`。
 
-- **第一周设想（Web 验证闭环）**：✅ 已达成，且在 AI（真实模型而非 mock）、交互（手势/重排/跨页）上**超出**计划。
-- **缺口（相对第一周完整设想）**：真·离线 OCR（PaddleOCR/手写识别）、低成本语义序列格式 + ≥90% 双盲评测、proper layout parser（VLM 文档解析）、设备/开发板实测（现仅桌面模拟器）。
-- **相对硬件愿景（PRD AI 墨水屏设备）**：处于「阶段 0 模拟器验证」，距 SOM/EVT/自研主板/native 渲染尚远——但这是 D2 既定路线（Web 先行），不算落后。
-- **后置（P1/P2/P3，不该现在做）**：accepted memory 沉淀、用户画像、多文档关联、模板市场、自研硬件。
+打开 Web Lab：
 
-### 五、方向核对：没有偏离
+```text
+http://localhost:8765/obsidian-lab.html
+```
 
-- **核心方向 = annotation-aware AI（标注即理解 → 贴回原文现场 → 可追溯）**：手势→意图→AI 旁注贴回标注处、source_refs 指回原页 bbox、不抢笔低打扰、电子纸友好——**全部对齐**。
-- **需留意（非偏离，是前压/扩张）**：① 重排去掉视觉版式曾与"贴回原文现场"有张力，已用"每块保留原页 bbox + 可切换 + 不强制"化解；② 跨页 agent 超前到 P1/P2；③ **越界 B 组的部分以接缝存在，团队并行时须交还、走契约——这是当前最该盯的协作风险，不是方向问题。**
+打开 Obsidian Vault：
 
----
+```text
+.inkloop-smoke-runs/obsidian-runtime-mvp/obsidian-vault
+```
 
-## 团队上手（同组工程师）
+详细验收和交接见 [docs/obsidian-runtime-mvp-handoff.md](./docs/obsidian-runtime-mvp-handoff.md)。
 
-1. clone 本仓库，`npm install`。
-2. **拿 `.env`**：网关 Key 不进仓库（已 gitignore）。向 xiaokebuyu 索取 `.env` 文件（含 `LLM_GATEWAY_URL` / `LLM_GATEWAY_KEY` / `LLM_MODEL`），放到项目根目录；或 `cp .env.example .env` 后填入 Key。
-3. `npm run dev` → 打开 `http://localhost:8765/?dev=1` → 导入数字版 PDF → 圈/划/写，停 5s 看 AI 旁注；切「重排」「重排引擎」看版面理顺；翻页后在新页提问看跨页综合。
+## AI Key 怎么配
 
-> 所有密钥/网关配置都集中在**一个文件 `.env`** 里，方便统一管理与分发。
+`.env.example` 已经给出网关地址：
+
+```bash
+LLM_GATEWAY_URL=https://llm-gateway-api.nodesk.tech/default/passthrough
+LLM_GATEWAY_KEY=
+LLM_MODEL=kimi-k2.6
+```
+
+需要把真实 key 填到 `.env` 的 `LLM_GATEWAY_KEY`。这个 key 只在 Vite dev server 的 Node 侧读取，不会打包进前端。
+
+没有 key 时，页面仍能打开、导入 PDF、渲染、画笔迹；但需要模型的功能会失败或降级，例如手写识别、图像 OCR、AI 旁注、AI 重排。
+
+注意当前代码里有两层默认模型：
+
+- `LLM_MODEL` 是服务端兜底模型，不传 model 时用它。
+- 前端设置里的 `settings.inferModel` 默认是 `claude-sonnet-4-6`，多数 `/api/*` 请求会显式带这个值。
+- 重排默认走 `settings.reflowModel = gemini-3.1-flash-lite`。
+
+实际想换模型，优先在左侧「设置」页里改“推理模型”和“重排模型”。
+
+## 怎么试这个 demo
+
+1. 启动服务后打开 `http://127.0.0.1:8765/`。
+2. 点「导入 PDF」，选一个有文本层的数字 PDF。扫描版 PDF 的文字命中会弱很多。
+3. 选择钢笔工具，在正文上圈一个词或划一行。
+4. 停笔。默认长停顿阈值是 90 秒；为了冒烟测试，可以在左侧「设置」页把“长停顿综合阈值”调到 10 秒。
+5. 在页边写一个问题，系统会先判断这是“问 AI”还是“写给自己”。如果判定需要回应，会立刻走 AI。
+6. 点顶部「重排」切到重排阅读视图，再在重排文本上圈画。它仍会映射回原 PDF 的 bbox 和同一套账本。
+
+左侧导航默认可见，按 `m` 可以折叠或展开。
+
+## 常用命令
+
+```bash
+npm run dev      # 本地开发服务，含 /api/* AI 代理
+npm run check    # TypeScript 严格类型检查
+npm run build    # 类型检查 + Vite 生产构建
+npm run build:sdk # 构建 InkSurface SDK ESM/IIFE bundle
+npm run preview  # 预览构建产物
+npm run verify   # 类型检查 + lint + 测试 + Web 构建 + SDK 构建
+npm run obsidian:smoke          # 生成 Obsidian Runtime smoke vault
+npm run obsidian:install-plugin -- --vault <vault-path> # 安装 InkLoop Obsidian 插件到指定 vault
+```
+
+`npm install` 后会自动跑：
+
+```bash
+node scripts/copy-pdfjs-assets.mjs
+```
+
+它会把 PDF.js 的 CMap 和标准字体复制到 `public/cmaps`、`public/standard_fonts`，用于老中文 PDF 正常渲染。
+
+## 代码地图
+
+```text
+src/main.ts
+  应用装配；区域组装；停顿/手写触发；恢复账本；页面操作。
+
+src/app/state.ts
+  全局状态、设置、事件总线、当前工具、当前页笔迹。
+
+src/capture/
+  ink.ts        Pointer Events 采集、笔/手指分流、擦除、撤销。
+  classify.ts   纯几何分类：tap、circle、underline、arrow、freeform。
+  session.ts    Mark / Session 累积器。
+
+src/core/
+  contracts.ts      数据契约。
+  pipeline.ts       主处理链：recordEvent、captureMark、commitSessionDiscussion。
+  transform.ts      归一化坐标和像素坐标换算。
+  store-format.ts   IndexedDB 账本格式。
+
+src/evidence/
+  target.ts          SurfaceIndex、字符级对象、HMP 取证。
+  mark-graph.ts      时空关系图。
+  inference-view.ts  把复杂图蒸馏成给模型看的文字载荷。
+  recall.ts          从历史 mark 账本召回同页邻近标注。
+  focus.ts           页面文字、行带命中、点在多边形内。
+  ocr.ts             从 canvas 裁取笔迹图 / 合成图。
+
+src/surface/
+  renderer.ts        PDF.js 渲染、文本层抽取、图片区域抽取、SurfaceIndex 构建。
+  reflow.ts          本地几何重排。
+  reflow-provider.ts AI / VLM 重排 provider。
+  reader.ts          重排阅读视图和重排视图里的圈画。
+  whisper.ts         原版页面旁注。
+  anchor-layer.ts    流式锚点预览。
+  toolbar.ts         底部工具栏。
+
+src/local/store.ts
+  IndexedDB 持久化：docs、pdf_blobs、marks、ai_turns。
+
+src/chat/
+  buffer.ts          每本书最近 3 轮对话 buffer。
+  stream-client.ts   流式 /api/chat 客户端。
+  classify-client.ts 手写 respond/fold 分类客户端。
+
+server/
+  infer.ts           Vite dev 中间件背后的 AI 代理实现。
+  prompts.ts         各角色 system prompt 注册表。
+  debug.mjs          dev 遥测 JSONL。
+```
+
+## 主链路一句话版
+
+```text
+PointerEvent
+→ Stroke
+→ AnnotationEvent
+→ 区域组装成 Mark
+→ captureMark 取证成 HMP
+→ Session 累积
+→ 手写问题或长停顿触发提交
+→ MarkGraph
+→ InferenceView
+→ /api/chat
+→ ScreenOverlay
+→ 原版页面或重排页面回屏
+→ IndexedDB 账本持久化
+```
+
+详细解释见 [docs/前端标注链路-技术文档.md](./docs/%E5%89%8D%E7%AB%AF%E6%A0%87%E6%B3%A8%E9%93%BE%E8%B7%AF-%E6%8A%80%E6%9C%AF%E6%96%87%E6%A1%A3.md)。
+
+## 已知边界
+
+- 数字版 PDF 最适合，因为文本层能直接提供文字和位置。
+- 扫描版 PDF 需要 OCR/VLM 兜底，没 key 时基本只能看图，无法准确命中文字。
+- 本地重排适合单栏正文；多栏、表格、公式、网页截图 PDF 需要 AI 或 VLM 重排。
+- 这是 Web demo，不是硬件端实现；但全链路都用归一化坐标，后续迁移到电子纸/原生运行时比较容易。
+- IndexedDB 不可用时会退化成仅内存，刷新后无法恢复。

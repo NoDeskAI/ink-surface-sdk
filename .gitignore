@@ -6,6 +6,8 @@ dist/
 .env
 .env.bedrock
 .env.kimi
+.inkloop-smoke-runs/
+.context/
 
 # dev-only 调试通道遥测（server/debug.mjs 落盘，仅本地定位问题用）
 .dev-telemetry.jsonl

@@ -8,6 +8,7 @@ export interface Features {
   einkBridge: boolean;  // 电纸屏推帧镜像（无桥自动 no-op）
   mobileShell: boolean; // 移动版 shell（reMarkable 式，开发中）
   localOcr: boolean;    // 端侧印刷 OCR（无桥降级云）
+  adapterSync: boolean; // 外部 App Adapter / Obsidian 双向同步 MVP
 }
 
 /** 运行期 flags（live 单例）。初值=随包默认；config/manifest.ts 的 applyManifest 可整体覆盖。 */
@@ -17,4 +18,5 @@ export const features: Features = {
   einkBridge: true,
   mobileShell: false,
   localOcr: true,
+  adapterSync: true,
 };

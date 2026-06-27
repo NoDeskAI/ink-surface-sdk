@@ -8,9 +8,23 @@
  */
 import type { NormBBox, OverlayState, ScreenOverlay } from '../core/contracts';
 import type { ReflowBlock } from '../surface/reflow';
-import type { MeetingStatus, PersistedAiTurn, PersistedDoc, PersistedMark, PersistedMeeting, PersistedPage, PersistedPdfBlob, PersistedWorkspace } from '../core/store-format';
+import type { ConflictRecord } from '../adapters/core/types';
+import type { DocumentProjection } from '../knowledge/document-projection';
+import type { ExternalEdit } from '../knowledge/external-edit';
+import type {
+  MeetingStatus,
+  PersistedAdapterConflict,
+  PersistedAdapterSyncCursor,
+  PersistedAiTurn,
+  PersistedDoc,
+  PersistedMark,
+  PersistedMeeting,
+  PersistedPage,
+  PersistedPdfBlob,
+  PersistedWorkspace,
+} from '../core/store-format';
 import { DB_VERSION, STORE_VERSION } from '../core/store-format';
-import { shortId } from '../core/ids';
+import { pageIdFor, shortId } from '../core/ids';
 import { vectorStore } from './vector';
 
 const DB_NAME = 'inkloop';
@@ -20,6 +34,10 @@ const MARKS = 'marks';           // 页账本条目
 const TURNS = 'ai_turns';        // 书日志条目
 const WORKSPACES = 'workspaces'; // 会议工作区（≈群聊）
 const MEETINGS = 'meetings';     // 会议（属某 workspace）
+const DOCUMENT_PROJECTIONS = 'document_projections';
+const EXTERNAL_EDITS = 'external_edits';
+const ADAPTER_CONFLICTS = 'adapter_conflicts';
+const SYNC_CURSORS = 'adapter_sync_cursors';
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 
 /** 幂等建 store（连同建表时的初始 index）。已存在则跳过——自愈"版本到位却缺表"。 */
@@ -53,6 +71,10 @@ function openDB(): Promise<IDBDatabase | null> {
         ensureStore(db, TURNS, 'entry_id', ['by_doc', 'document_id']);
         ensureStore(db, WORKSPACES, 'workspace_id');
         ensureStore(db, MEETINGS, 'meeting_id', ['by_ws', 'workspace_id']);
+        ensureStore(db, DOCUMENT_PROJECTIONS, 'projection_id');
+        ensureStore(db, EXTERNAL_EDITS, 'edit_id');
+        ensureStore(db, ADAPTER_CONFLICTS, 'conflict_id');
+        ensureStore(db, SYNC_CURSORS, 'cursor_id');
 
         // ② 阶梯迁移：每次 DB_VERSION 升级追加一块 if (oldV < N) {...}——给已存在 store 加 index /
         //    字段级 backfill（须恰好跑一次的数据迁移放这）。
@@ -336,6 +358,29 @@ export function putReflow(i: number, engine: string, blocks: ReflowBlock[]): voi
   scheduleSave();
 }
 
+export interface DocumentProjectionPageSnapshot {
+  page_id: string;
+  page_index: number;
+  reflow: ReflowBlock[] | null;
+  reflow_engine: string | null;
+  status: PersistedPage['status'];
+}
+
+export async function getDocumentProjectionPages(documentId: string, options: { reflow_engine?: string } = {}): Promise<DocumentProjectionPageSnapshot[]> {
+  const doc = current?.document_id === documentId ? current : await idbGet(documentId);
+  if (!doc) return [];
+  return Object.values(doc.pages)
+    .filter((p) => !options.reflow_engine || p.reflow_engine === options.reflow_engine)
+    .sort((a, b) => a.page_index - b.page_index)
+    .map((p) => ({
+      page_id: pageIdFor(documentId, p.page_index),
+      page_index: p.page_index,
+      reflow: p.reflow ?? null,
+      reflow_engine: p.reflow_engine ?? null,
+      status: p.status,
+    }));
+}
+
 // ── 图像解读缓存（按 bbox 高度重叠匹配）──
 export function getImageExplain(i: number, bbox: NormBBox): string | null {
   const p = current?.pages[i];
@@ -400,6 +445,62 @@ function byIndexFrom<T>(storeName: string, index: string, key: string): Promise<
       } catch { resolve([] as T[]); }
     });
   });
+}
+
+function queryRecords<T extends Record<string, unknown>>(items: T[], query: Partial<T> = {}): T[] {
+  return items.filter((item) => Object.entries(query).every(([key, value]) => value === undefined || item[key] === value));
+}
+
+export async function upsertAdapterDocumentProjection(projection: DocumentProjection): Promise<void> {
+  await putInto(DOCUMENT_PROJECTIONS, projection);
+}
+
+export async function listAdapterDocumentProjections(query: { document_id?: string; projection_id?: string } = {}): Promise<DocumentProjection[]> {
+  const records = (await getAllFrom<DocumentProjection>(DOCUMENT_PROJECTIONS)) as unknown as Record<string, unknown>[];
+  return queryRecords(records, query) as unknown as DocumentProjection[];
+}
+
+export async function upsertAdapterExternalEdit(edit: ExternalEdit): Promise<void> {
+  await putInto(EXTERNAL_EDITS, edit);
+}
+
+export async function listAdapterExternalEdits(query: { document_id?: string; projection_id?: string; status?: ExternalEdit['status'] } = {}): Promise<ExternalEdit[]> {
+  const records = (await getAllFrom<ExternalEdit>(EXTERNAL_EDITS)) as unknown as Record<string, unknown>[];
+  return queryRecords(records, query) as unknown as ExternalEdit[];
+}
+
+function persistableConflict(conflict: ConflictRecord): PersistedAdapterConflict {
+  return {
+    conflict_id: conflict.conflict_id,
+    provider: conflict.provider,
+    target_id: conflict.target_id,
+    ko_id: conflict.ko_id,
+    code: conflict.code,
+    severity: conflict.severity,
+    remote_path: conflict.remote_path,
+    detail: conflict.detail,
+    resolution_status: conflict.resolution_status,
+    created_at: conflict.created_at,
+    updated_at: conflict.updated_at,
+  };
+}
+
+export async function upsertAdapterConflict(conflict: ConflictRecord | PersistedAdapterConflict): Promise<void> {
+  await putInto(ADAPTER_CONFLICTS, 'local_content_hash' in conflict ? persistableConflict(conflict as ConflictRecord) : conflict);
+}
+
+export async function listAdapterConflicts(query: { ko_id?: string; resolution_status?: PersistedAdapterConflict['resolution_status'] } = {}): Promise<PersistedAdapterConflict[]> {
+  const records = (await getAllFrom<PersistedAdapterConflict>(ADAPTER_CONFLICTS)) as unknown as Record<string, unknown>[];
+  return queryRecords(records, query) as unknown as PersistedAdapterConflict[];
+}
+
+export async function upsertAdapterSyncCursor(cursor: PersistedAdapterSyncCursor): Promise<void> {
+  await putInto(SYNC_CURSORS, cursor);
+}
+
+export async function listAdapterSyncCursors(query: { document_id?: string; target_id?: string; provider?: string } = {}): Promise<PersistedAdapterSyncCursor[]> {
+  const records = (await getAllFrom<PersistedAdapterSyncCursor>(SYNC_CURSORS)) as unknown as Record<string, unknown>[];
+  return queryRecords(records, query) as unknown as PersistedAdapterSyncCursor[];
 }
 
 /** 新建工作区（群聊）。 */
