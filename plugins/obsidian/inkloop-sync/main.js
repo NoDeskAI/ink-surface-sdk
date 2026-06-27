@@ -1368,7 +1368,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     }
   }
 
-  requestMarkdownPreviewRerender(view, sourcePath) {
+  requestMarkdownPreviewRerender(view, sourcePath, options = {}) {
     let didRequest = false;
     for (const target of [view?.previewMode, view?.currentMode, view]) {
       if (typeof target?.rerender === "function") {
@@ -1382,20 +1382,33 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         break;
       }
     }
-    window.setTimeout(() => void this.enhanceMarkdownView(view, sourcePath), didRequest ? 120 : 0);
+    window.setTimeout(() => void this.enhanceMarkdownView(view, sourcePath, { force: options.force === true }), didRequest ? 120 : 0);
     return didRequest;
   }
 
-  async enhanceMarkdownView(view, sourcePath) {
+  resetEnhancedPreview(target) {
+    for (const wrapper of [...target.querySelectorAll(".inkloop-visual-block")]) {
+      const contentPlane = wrapper.querySelector(".inkloop-content-plane");
+      const sourceNode = contentPlane?.firstElementChild;
+      if (sourceNode && wrapper.parentNode) wrapper.parentNode.insertBefore(sourceNode, wrapper);
+      wrapper.remove();
+    }
+    for (const controls of target.querySelectorAll(".inkloop-surface-controls")) controls.remove();
+    delete target.dataset.inkloopVisualEnhanced;
+  }
+
+  async enhanceMarkdownView(view, sourcePath, options = {}) {
     if (!sourcePath) return false;
     const root = view?.contentEl?.querySelector?.(".markdown-preview-view")
       || view?.containerEl?.querySelector?.(".markdown-preview-view");
     if (!root) return false;
     const target = root.querySelector(".markdown-preview-sizer") || root;
-    if (target.querySelector(".inkloop-visual-block")) {
+    const hasExistingSurface = target.querySelector(".inkloop-visual-block");
+    if (hasExistingSurface && options.force !== true) {
       this.applySurfaceModeToRoot(root);
       return true;
     }
+    if (hasExistingSurface) this.resetEnhancedPreview(target);
     delete target.dataset.inkloopVisualEnhanced;
     await this.enhancePreview(target, { sourcePath });
     return target.querySelector(".inkloop-visual-block") !== null;
@@ -1422,7 +1435,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         }
         if (previousSignature === nextSignature) continue;
         this.previewSignatures.set(file.path, nextSignature);
-        this.requestMarkdownPreviewRerender(view, file.path);
+        this.requestMarkdownPreviewRerender(view, file.path, { force: true });
       }
     } finally {
       this.refreshPreviewsRunning = false;
@@ -1451,7 +1464,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       const leafDocId = await this.docIdForPath(file.path);
       if (leafDocId !== docId) continue;
       this.previewSignatures.delete(file.path);
-      this.requestMarkdownPreviewRerender(view, file.path);
+      this.requestMarkdownPreviewRerender(view, file.path, { force: true });
     }
   }
 
