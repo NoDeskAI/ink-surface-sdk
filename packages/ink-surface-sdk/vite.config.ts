@@ -5,10 +5,10 @@ export default defineConfig({
   publicDir: false,
   build: {
     target: 'es2022',
-    outDir: 'dist/inkloop-surface-sdk',
+    outDir: 'dist',
     emptyOutDir: true,
     lib: {
-      entry: resolve(import.meta.dirname, 'src/inkloop-surface-sdk/index.ts'),
+      entry: resolve(import.meta.dirname, 'src/index.ts'),
       name: 'InkLoopSurfaceSDK',
       formats: ['es', 'iife'],
       fileName: (format) => `inkloop-surface-sdk.${format}.js`,

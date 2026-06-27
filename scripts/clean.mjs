@@ -5,6 +5,7 @@ import { rmSync } from 'node:fs';
 
 const TARGETS = [
   'dist',
+  'packages/ink-surface-sdk/dist',
   '.dev-telemetry.jsonl',
   '.ab-intent.jsonl',
   'vite.log',

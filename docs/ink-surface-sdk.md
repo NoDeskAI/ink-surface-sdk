@@ -41,8 +41,9 @@ npm run build:sdk
 Outputs:
 
 ```text
-dist/inkloop-surface-sdk/inkloop-surface-sdk.es.js
-dist/inkloop-surface-sdk/inkloop-surface-sdk.iife.js
+packages/ink-surface-sdk/dist/inkloop-surface-sdk.es.js
+packages/ink-surface-sdk/dist/inkloop-surface-sdk.iife.js
+packages/ink-surface-sdk/dist/index.d.ts
 ```
 
 ## ESM Usage
@@ -52,7 +53,7 @@ import {
   installInkLoopSurfaceStyles,
   renderInkLoopVisualModel,
   type InkLoopVisualModel,
-} from './dist/inkloop-surface-sdk/inkloop-surface-sdk.es.js';
+} from 'ink-surface-sdk';
 
 const model: InkLoopVisualModel = {
   documentTitle: 'Demo document',
@@ -92,7 +93,7 @@ document.querySelector('#app')?.replaceChildren(renderInkLoopVisualModel(model))
 ## IIFE Usage
 
 ```html
-<script src="./dist/inkloop-surface-sdk/inkloop-surface-sdk.iife.js"></script>
+<script src="./packages/ink-surface-sdk/dist/inkloop-surface-sdk.iife.js"></script>
 <script>
   const {
     installInkLoopSurfaceStyles,
@@ -112,7 +113,7 @@ The SDK can parse and render Markdown documents that contain InkLoop projection 
 import {
   parseInkLoopVisualModel,
   renderInkLoopDocument,
-} from './dist/inkloop-surface-sdk/inkloop-surface-sdk.es.js';
+} from 'ink-surface-sdk';
 
 const model = parseInkLoopVisualModel(markdown);
 const node = renderInkLoopDocument(markdown);

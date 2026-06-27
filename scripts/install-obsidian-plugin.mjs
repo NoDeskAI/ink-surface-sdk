@@ -52,7 +52,7 @@ const warnings = [];
 const vaultRoot = path.resolve(vaultArg ?? DEFAULT_VAULT);
 const pluginSource = path.resolve('obsidian-plugin', PLUGIN_ID);
 const pluginTarget = path.join(vaultRoot, '.obsidian', 'plugins', PLUGIN_ID);
-const sdkBundleSource = path.resolve('dist', 'inkloop-surface-sdk', 'inkloop-surface-sdk.iife.js');
+const sdkBundleSource = path.resolve('packages', 'ink-surface-sdk', 'dist', 'inkloop-surface-sdk.iife.js');
 const sdkBundleTarget = path.join(pluginTarget, 'inkloop-surface-sdk.iife.js');
 
 await mkdir(path.join(vaultRoot, '.obsidian'), { recursive: true });

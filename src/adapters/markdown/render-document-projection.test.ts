@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { DocumentProjection } from '../../knowledge/document-projection';
 import type { KnowledgeObject } from '../../knowledge/knowledge-object';
-import { appendInkLoopAnnotation, updateInkLoopAnnotation } from '../../inkloop-surface-sdk';
+import { appendInkLoopAnnotation, updateInkLoopAnnotation } from 'ink-surface-sdk';
 import { parseDocumentExternalEdits } from './parse-document-edits';
 import { renderDocumentProjectionMarkdown } from './render-document-projection';
 

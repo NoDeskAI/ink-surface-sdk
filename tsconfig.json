@@ -8,7 +8,11 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "ink-surface-sdk": ["packages/ink-surface-sdk/src/index.ts"]
+    },
     "types": ["vite/client", "node"]
   },
-  "include": ["src", "scripts/**/*.ts"]
+  "include": ["src", "packages/ink-surface-sdk/src", "scripts/**/*.ts"]
 }

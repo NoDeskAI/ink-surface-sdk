@@ -7,7 +7,7 @@ import {
   type InkLoopVisualBlock,
   type InkLoopVisualStroke,
   type InkLoopVisualModel,
-} from './inkloop-surface-sdk';
+} from 'ink-surface-sdk';
 
 interface LabState {
   ok: boolean;

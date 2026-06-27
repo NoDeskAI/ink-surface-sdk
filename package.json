@@ -1,14 +1,16 @@
 {
-  "name": "ink-surface-sdk",
+  "name": "ink-surface-sdk-workspace",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "sideEffects": false,
+  "workspaces": [
+    "packages/ink-surface-sdk"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "npm run check && vite build && npm run build:sdk",
-    "build:sdk": "vite build --config vite.sdk.config.ts",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "build:sdk": "npm run build -w ink-surface-sdk",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit && npm run check -w ink-surface-sdk",
     "clean": "node scripts/clean.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -26,6 +28,7 @@
     "postinstall": "node scripts/copy-pdfjs-assets.mjs"
   },
   "dependencies": {
+    "ink-surface-sdk": "file:packages/ink-surface-sdk",
     "pdfjs-dist": "^4.6.82",
     "zod": "^3.23.8"
   },

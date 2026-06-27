@@ -565,6 +565,11 @@ export default defineConfig(({ mode }) => {
     // 相对基址：安卓 WebViewAssetLoader 从本地 assets 加载 index.html，绝对 /assets/ 路径会错。
     // dev 下相对基址同样工作；public 资产仍服务于根，配合 renderer 的 BASE_URL 相对解析。
     base: './',
+    resolve: {
+      alias: {
+        'ink-surface-sdk': path.resolve(import.meta.dirname, 'packages/ink-surface-sdk/src/index.ts'),
+      },
+    },
     server: {
       port: 8765,
       strictPort: true,
