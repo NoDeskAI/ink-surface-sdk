@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { defineConfig, loadEnv } from 'vite';
@@ -11,6 +11,7 @@ import { parseDocumentProjection } from './src/knowledge/document-projection';
 import { parseKnowledgeObject } from './src/knowledge/knowledge-object';
 import { koId } from './src/knowledge/ulid';
 import { RuntimeSyncRunner, SidecarRuntimeStore, type RuntimeSyncTransportPort, type RuntimeSyncEvent } from './src/runtime';
+import { resetObsidianLabVault } from './src/obsidian-lab-reset';
 import {
   JsonAdapterStorage,
   JsonlWatchOutbox,
@@ -433,10 +434,11 @@ function inferenceProxy(env: Record<string, string>): Plugin {
         if (!requireLabMutation(req, res)) return;
         try {
           const { vaultRoot, target, objects, projections } = await labContext();
-          await Promise.all([
-            rm(target.sources_dir, { recursive: true, force: true }),
-            rm(path.join(vaultRoot, target.base_dir), { recursive: true, force: true }),
-          ]);
+          const reset = await resetObsidianLabVault({
+            vaultRoot,
+            documentsDir: target.documents_dir,
+            baseDir: target.base_dir,
+          });
 
           const resetTarget = await obsidianFsAdapter.resolveTarget({ vault_root: vaultRoot });
           const resetStorage = JsonAdapterStorage.forVault(resetTarget.vault_root, resetTarget.base_dir);
@@ -449,6 +451,7 @@ function inferenceProxy(env: Record<string, string>): Plugin {
 
           await writeFile(path.join(LAB_RUN_DIR, 'lab-watch-snapshot.json'), '{}\n', 'utf8');
           await writeFile(path.join(LAB_RUN_DIR, 'watch-events.jsonl'), '', 'utf8');
+          await writeFile(path.join(LAB_RUN_DIR, 'runtime-cloud-inbox.jsonl'), '', 'utf8');
           writeJsonResponse(res, {
             ok: true,
             vault_root: vaultRoot,
@@ -456,6 +459,7 @@ function inferenceProxy(env: Record<string, string>): Plugin {
             base_dir: resetTarget.base_dir,
             document_results: documentResult?.results ?? [],
             object_results: objectResult?.results ?? [],
+            reset,
             updated_at: new Date().toISOString(),
           });
         } catch (error) {

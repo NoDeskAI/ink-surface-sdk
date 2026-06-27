@@ -638,6 +638,17 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     return index?.items?.[path]?.doc_id || null;
   }
 
+  docIdForSidecarPath(path) {
+    const prefix = `${this.settings.baseDir}/docs/`;
+    if (!path?.startsWith(prefix)) return null;
+    return path.slice(prefix.length).split("/").filter(Boolean)[0] || null;
+  }
+
+  async sourcePathForDocId(docId) {
+    const source = await this.readJson(this.sidecarPath("docs", docId, "source.json"), null);
+    return source?.vault_file?.path || null;
+  }
+
   async trackedDocIdForPath(path) {
     if (!path) return null;
     return this.docIdForPath(path);
@@ -1212,17 +1223,21 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     if (this.isIgnoredPath(file.path) || (oldPath && this.isIgnoredPath(oldPath))) return;
     const trackedDocId = await this.trackedDocIdForPath(file.path);
     const oldTrackedDocId = oldPath ? await this.trackedDocIdForPath(oldPath) : null;
+    const sidecarDocId = this.docIdForSidecarPath(file.path);
+    const oldSidecarDocId = oldPath ? this.docIdForSidecarPath(oldPath) : null;
     const isTracked = this.isInkLoopPath(file.path) || trackedDocId || (oldPath && (this.isInkLoopPath(oldPath) || oldTrackedDocId));
     if (!isTracked) return;
     if (eventType === "rename" && oldPath && oldTrackedDocId) await this.updateTrackedSourcePath(file, oldPath);
+    const refreshDocId = trackedDocId || oldTrackedDocId || sidecarDocId || oldSidecarDocId;
     this.lastChange = {
       event_type: eventType,
       path: file.path,
       old_path: oldPath,
-      doc_id: trackedDocId || oldTrackedDocId || undefined,
+      doc_id: refreshDocId || undefined,
       observed_at: new Date().toISOString(),
     };
     void this.writeStatus({ status: "event_observed", last_change: this.lastChange });
+    if (refreshDocId) void this.refreshDocPreview(refreshDocId);
     this.scheduleSync(eventType);
   }
 
@@ -1314,12 +1329,13 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     el.dataset.inkloopVisualEnhanced = "pending";
 
     let model = null;
+    let previewRuntime = null;
     let didEnhance = false;
     try {
       const docId = await this.docIdForPath(ctx.sourcePath);
       if (docId) {
         const runtime = await this.loadRuntimeDocument(docId);
-        if (runtime) this.previewSignatures.set(ctx.sourcePath, runtimeSignature(runtime));
+        previewRuntime = runtime;
         if (runtime?.document?.source_type === "markdown") {
           model = {
             documentTitle: runtime.document.title,
@@ -1363,6 +1379,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         this.decorateBlock(target, block, docId);
       }
       this.applySurfaceModeToRoot(el.closest(".markdown-preview-view") || el);
+      if (previewRuntime) this.previewSignatures.set(ctx.sourcePath, runtimeSignature(previewRuntime));
     } finally {
       if (!didEnhance && el.dataset.inkloopVisualEnhanced === "pending") delete el.dataset.inkloopVisualEnhanced;
     }
@@ -1456,13 +1473,14 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   }
 
   async refreshDocPreview(docId) {
+    const sourcePath = await this.sourcePathForDocId(docId).catch(() => null);
     const leaves = this.app.workspace.getLeavesOfType?.("markdown") || [];
     for (const leaf of leaves) {
       const view = leaf.view;
       const file = view?.file;
       if (!file?.path) continue;
       const leafDocId = await this.docIdForPath(file.path);
-      if (leafDocId !== docId) continue;
+      if (leafDocId !== docId && file.path !== sourcePath) continue;
       this.previewSignatures.delete(file.path);
       this.requestMarkdownPreviewRerender(view, file.path, { force: true });
     }
