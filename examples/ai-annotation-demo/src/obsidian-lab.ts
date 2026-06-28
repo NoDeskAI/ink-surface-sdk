@@ -34,6 +34,13 @@ interface PullResult {
   external_edit_count: number;
 }
 
+interface RuntimeSyncResult {
+  ok: boolean;
+  latency_ms: number;
+  runtime_sync?: unknown;
+  error?: string;
+}
+
 interface MutationResult {
   ok: boolean;
   source_path?: string;
@@ -667,6 +674,15 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
   return await response.json() as T;
 }
 
+async function syncRuntimeAfterMutation(): Promise<RuntimeSyncResult> {
+  return await postJson<RuntimeSyncResult>('/api/obsidian-lab/sync-runtime');
+}
+
+function isTextEditingActive(): boolean {
+  const active = document.activeElement as HTMLElement | null;
+  return !!active?.closest?.('#editor, [contenteditable="true"], input, textarea, select');
+}
+
 function updateModeButtons(): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>('.lab-mode-btn')) {
     button.classList.toggle('is-active', button.dataset.mode === labMode);
@@ -772,7 +788,8 @@ function markdownForEditableBlock(block: InkLoopVisualBlock, visibleText: string
 async function saveBlockContent(block: InkLoopVisualBlock, content: string, wrapper?: HTMLElement): Promise<void> {
   wrapper?.classList.add('is-saving');
   const result = await postJson<MutationResult>('/api/obsidian-lab/update-block', { block_id: block.id, content });
-  $('pull-log').textContent = JSON.stringify(result, null, 2);
+  const sync = result.ok ? await syncRuntimeAfterMutation() : null;
+  $('pull-log').textContent = JSON.stringify({ mutation: result, runtime_sync: sync }, null, 2);
   window.setTimeout(() => wrapper?.classList.remove('is-saving'), 450);
 }
 
@@ -809,7 +826,8 @@ function makeField(label: string, input: HTMLElement): HTMLLabelElement {
 async function saveMutation(url: string, body: unknown): Promise<void> {
   $('pull-log').textContent = 'saving...';
   const result = await postJson<MutationResult>(url, body);
-  $('pull-log').textContent = JSON.stringify(result, null, 2);
+  const sync = result.ok ? await syncRuntimeAfterMutation() : null;
+  $('pull-log').textContent = JSON.stringify({ mutation: result, runtime_sync: sync }, null, 2);
   await loadState();
 }
 
@@ -1173,11 +1191,14 @@ function attachFreeCanvas(canvas: HTMLElement, surfaceRoot: HTMLElement, model: 
     });
     if (result.ok) {
       path?.setAttribute('data-saved-ko-id', result.annotation?.ko_id ?? 'true');
+      const sync = await syncRuntimeAfterMutation();
+      $('pull-log').textContent = JSON.stringify({ mutation: result, runtime_sync: sync }, null, 2);
+      await loadState();
     } else {
       path?.remove();
+      $('pull-log').textContent = JSON.stringify(result, null, 2);
     }
     path = null;
-    $('pull-log').textContent = JSON.stringify(result, null, 2);
   };
 
   canvas.addEventListener('pointerdown', start, true);
@@ -1271,5 +1292,5 @@ $<HTMLButtonElement>('reset').onclick = async () => {
 
 void loadState();
 window.setInterval(() => {
-  if (!isDrawing && !isStateLoading && (labMode === 'focus' || inkTool !== 'text')) void loadState();
+  if (!isDrawing && !isStateLoading && !isTextEditingActive()) void loadState();
 }, 2000);

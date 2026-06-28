@@ -911,7 +911,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_text_edit", path: sourcePath, doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_text_edit");
-    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
+    void this.refreshDocPreview(docId);
   }
 
   async updateSidecarAnnotation(docId, koId, patch) {
@@ -940,7 +940,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_annotation_edit", doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_annotation_edit");
-    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
+    void this.refreshDocPreview(docId);
   }
 
   async addSidecarAnnotation(docId, blockId, annotation) {
@@ -968,7 +968,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_handwriting_add", doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_handwriting_add");
-    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
+    void this.refreshDocPreview(docId);
     return annotation;
   }
 
@@ -1448,6 +1448,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         const previousSignature = this.previewSignatures.get(file.path);
         if (previousSignature === undefined) {
           this.previewSignatures.set(file.path, nextSignature);
+          this.requestMarkdownPreviewRerender(view, file.path, { force: true });
           continue;
         }
         if (previousSignature === nextSignature) continue;
