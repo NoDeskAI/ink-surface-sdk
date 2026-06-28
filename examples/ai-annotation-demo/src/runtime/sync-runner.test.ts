@@ -111,7 +111,7 @@ describe('RuntimeSyncRunner', () => {
 
   it('rejects HTTP sync responses without explicit acks', async () => {
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ batch_id: 'batch_without_acks' }), { status: 200 }));
-    const transport = new HttpRuntimeSyncTransport({ endpoint: 'https://example.test/runtime-sync' });
+    const transport = new HttpRuntimeSyncTransport({ endpoint: 'https://example.test/runtime-sync', deviceId: 'device_http' });
 
     await expect(transport.send([event({ event_id: 'evt_http' })])).rejects.toThrow(/acks array/);
   });
@@ -120,7 +120,7 @@ describe('RuntimeSyncRunner', () => {
     vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new Error('aborted by test timeout')));
     }));
-    const transport = new HttpRuntimeSyncTransport({ endpoint: 'https://example.test/runtime-sync', requestTimeoutMs: 1 });
+    const transport = new HttpRuntimeSyncTransport({ endpoint: 'https://example.test/runtime-sync', deviceId: 'device_http', requestTimeoutMs: 1 });
 
     await expect(transport.send([event({ event_id: 'evt_hung' })])).rejects.toThrow(/aborted/);
   });

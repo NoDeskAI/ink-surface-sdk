@@ -8,7 +8,7 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     lib: {
-      entry: resolve(import.meta.dirname, 'src/index.ts'),
+      entry: resolve(import.meta.dirname, 'packages/surface-web/src/index.ts'),
       name: 'InkLoopSurfaceSDK',
       formats: ['es', 'iife'],
       fileName: (format) => `inkloop-surface-sdk.${format}.js`,

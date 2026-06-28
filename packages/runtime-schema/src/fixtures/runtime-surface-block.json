@@ -1,0 +1,31 @@
+{
+  "schema_version": "inkloop.surface_object.v1",
+  "object_id": "blk_fixture",
+  "doc_id": "doc_fixture",
+  "text": "A cached paragraph that can render offline.",
+  "projection": {
+    "block_id": "blk_fixture",
+    "kind": "paragraph",
+    "region": "editable",
+    "knowledge_object_ids": ["ko_fixture"]
+  },
+  "annotations": [
+    {
+      "ko_id": "ko_fixture",
+      "kind": "annotation",
+      "title": "Offline stroke",
+      "render_mode": "stroke_only",
+      "visual_strokes": [
+        {
+          "tool": "highlighter",
+          "color": "#facc15",
+          "opacity": 0.56,
+          "points": [
+            { "x": 0.1, "y": 0.3 },
+            { "x": 0.9, "y": 0.3 }
+          ]
+        }
+      ]
+    }
+  ]
+}

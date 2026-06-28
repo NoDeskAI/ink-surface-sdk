@@ -1,0 +1,15 @@
+{
+  "name": "@inksurface/native-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local WebView bridge message contract for InkSurface native and desktop hosts.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  }
+}
