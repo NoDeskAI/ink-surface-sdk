@@ -5,10 +5,8 @@ export function buildObsidianOpenUri(input: {
   headingOrBlock?: string;
 }): string {
   const params = new URLSearchParams();
-  if (input.absolutePath) params.set('path', input.absolutePath);
-  else {
-    if (input.vault) params.set('vault', input.vault);
-    if (input.file) params.set('file', input.headingOrBlock ? `${input.file}#${input.headingOrBlock}` : input.file);
-  }
+  if (input.vault) params.set('vault', input.vault);
+  if (input.file) params.set('file', input.headingOrBlock ? `${input.file}#${input.headingOrBlock}` : input.file);
+  if (!input.vault && !input.file && input.absolutePath) params.set('path', input.absolutePath);
   return `obsidian://open?${params.toString()}`;
 }

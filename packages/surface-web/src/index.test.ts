@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { appendInkLoopAnnotation, parseInkLoopVisualModel, replaceInkLoopBlockContent, updateInkLoopAnnotation } from './index';
+import { appendInkLoopAnnotation, parseInkLoopVisualModel, renderMarkLayer, replaceInkLoopBlockContent, updateInkLoopAnnotation } from './index';
 
 const projectionMarkdown = `---
 inkloop_projection_id: "dp_demo"
@@ -31,6 +31,37 @@ Marked paragraph.
 
 <!-- inkloop:document-end projection=dp_demo -->
 `;
+
+class FakeElement {
+  readonly attributes = new Map<string, string>();
+  readonly childNodes: FakeElement[] = [];
+  readonly style = {
+    values: new Map<string, string>(),
+    setProperty: (name: string, value: string) => {
+      this.style.values.set(name, value);
+    },
+    getPropertyValue: (name: string) => this.style.values.get(name) ?? '',
+  };
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+
+  appendChild(child: FakeElement): FakeElement {
+    this.childNodes.push(child);
+    return child;
+  }
+}
+
+function fakeDocument(): Document {
+  return {
+    createElementNS: () => new FakeElement(),
+  } as unknown as Document;
+}
 
 describe('InkLoop surface SDK', () => {
   it('parses document projection blocks and annotation metadata for visual rendering', () => {
@@ -126,5 +157,42 @@ describe('InkLoop surface SDK', () => {
       render_mode: 'stroke_only',
     });
     expect(next).not.toContain('<li>Hidden pen stroke</li>');
+  });
+
+  it('keeps saved freehand stroke color as an inline SVG style', () => {
+    const svg = renderMarkLayer(
+      {
+        id: 'blk_1',
+        kind: 'paragraph',
+        region: 'editable',
+        content: 'Marked paragraph.',
+        annotations: [
+          {
+            ko_id: 'ko_pen',
+            kind: 'annotation',
+            title: 'Pen stroke',
+            body_md: '',
+            visual_strokes: [
+              {
+                tool: 'pen',
+                color: '#ff6b81',
+                opacity: 0.8,
+                points: [
+                  { x: 0.1, y: 0.2 },
+                  { x: 0.3, y: 0.4 },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      fakeDocument(),
+    ) as unknown as FakeElement;
+    const path = svg.childNodes[0];
+
+    expect(path.getAttribute('stroke')).toBe('#ff6b81');
+    expect(path.style.getPropertyValue('stroke')).toBe('#ff6b81');
+    expect(path.getAttribute('stroke-opacity')).toBe('0.8');
+    expect(path.style.getPropertyValue('stroke-opacity')).toBe('0.8');
   });
 });

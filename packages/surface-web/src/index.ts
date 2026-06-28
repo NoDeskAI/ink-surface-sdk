@@ -232,7 +232,12 @@ function addSvgPath(svg: SVGElement, cls: string, d: string, doc: Document, attr
   const path = createSvgElement('path', doc);
   path.setAttribute('class', cls);
   path.setAttribute('d', d);
-  for (const [key, value] of Object.entries(attrs)) path.setAttribute(key, String(value));
+  for (const [key, value] of Object.entries(attrs)) {
+    path.setAttribute(key, String(value));
+    if (key === 'stroke' || key === 'stroke-opacity' || key === 'stroke-width' || key === 'fill') {
+      path.style.setProperty(key, String(value));
+    }
+  }
   svg.appendChild(path);
 }
 

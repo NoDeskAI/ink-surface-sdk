@@ -162,7 +162,12 @@ function addSvgPath(svg, cls, d, attrs = {}) {
   const path = createSvgElement("path");
   path.setAttribute("class", cls);
   path.setAttribute("d", d);
-  for (const [key, value] of Object.entries(attrs)) path.setAttribute(key, String(value));
+  for (const [key, value] of Object.entries(attrs)) {
+    path.setAttribute(key, String(value));
+    if (key === "stroke" || key === "stroke-opacity" || key === "stroke-width" || key === "fill") {
+      path.style.setProperty(key, String(value));
+    }
+  }
   svg.appendChild(path);
 }
 
@@ -911,7 +916,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_text_edit", path: sourcePath, doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_text_edit");
-    void this.refreshDocPreview(docId);
+    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
   }
 
   async updateSidecarAnnotation(docId, koId, patch) {
@@ -940,7 +945,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_annotation_edit", doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_annotation_edit");
-    void this.refreshDocPreview(docId);
+    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
   }
 
   async addSidecarAnnotation(docId, blockId, annotation) {
@@ -968,7 +973,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     });
     this.lastChange = { event_type: "inkloop_handwriting_add", doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_handwriting_add");
-    void this.refreshDocPreview(docId);
+    void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
     return annotation;
   }
 
@@ -1831,7 +1836,9 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       const path = createSvgElement("path");
       path.setAttribute("class", `inkloop-mark-freehand is-${tool}`);
       path.setAttribute("stroke", this.inkColor(tool));
+      path.style.setProperty("stroke", this.inkColor(tool));
       path.setAttribute("stroke-opacity", String(this.inkOpacity(tool)));
+      path.style.setProperty("stroke-opacity", String(this.inkOpacity(tool)));
       const t0 = performance.now();
       const point = this.nativePoint(event, rect, t0);
       path.setAttribute("d", `M${(point.x * 100).toFixed(2)},${(point.y * 100).toFixed(2)}`);
@@ -1986,8 +1993,14 @@ class InkLoopDocumentView extends ItemView {
       const path = createSvgElement("path");
       path.setAttribute("class", "inkloop-runtime-ink-path");
       path.setAttribute("d", points.map((point, index) => `${index === 0 ? "M" : "L"}${point.x - (node.frame?.x || 0)},${point.y - (node.frame?.y || 0)}`).join(" "));
-      if (node.payload?.color) path.setAttribute("stroke", node.payload.color);
-      if (node.payload?.opacity !== undefined) path.setAttribute("stroke-opacity", String(node.payload.opacity));
+      if (node.payload?.color) {
+        path.setAttribute("stroke", node.payload.color);
+        path.style.setProperty("stroke", node.payload.color);
+      }
+      if (node.payload?.opacity !== undefined) {
+        path.setAttribute("stroke-opacity", String(node.payload.opacity));
+        path.style.setProperty("stroke-opacity", String(node.payload.opacity));
+      }
       svg.appendChild(path);
     }
     layer.appendChild(svg);
@@ -2021,7 +2034,9 @@ class InkLoopDocumentView extends ItemView {
       const path = createSvgElement("path");
       path.setAttribute("class", "inkloop-runtime-ink-path");
       path.setAttribute("stroke", this.plugin.inkColor("pen"));
+      path.style.setProperty("stroke", this.plugin.inkColor("pen"));
       path.setAttribute("stroke-opacity", String(this.plugin.inkOpacity("pen")));
+      path.style.setProperty("stroke-opacity", String(this.plugin.inkOpacity("pen")));
       svg.appendChild(path);
       layer.appendChild(svg);
       this.activeStroke = { points: [point], svg, path, color: this.plugin.inkColor("pen"), opacity: this.plugin.inkOpacity("pen") };
