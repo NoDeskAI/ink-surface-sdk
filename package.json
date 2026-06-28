@@ -13,23 +13,104 @@
       "import": "./dist/inkloop-surface-sdk.es.js",
       "default": "./dist/inkloop-surface-sdk.es.js"
     },
+    "./adapter-contracts": {
+      "types": "./dist/packages/adapter-contracts/src/index.d.ts",
+      "import": "./dist/packages/adapter-contracts/src/index.js",
+      "default": "./dist/packages/adapter-contracts/src/index.js"
+    },
+    "./native-bridge": {
+      "types": "./dist/packages/native-bridge/src/index.d.ts",
+      "import": "./dist/packages/native-bridge/src/index.js",
+      "default": "./dist/packages/native-bridge/src/index.js"
+    },
+    "./offline-store": {
+      "types": "./dist/packages/offline-store/src/index.d.ts",
+      "import": "./dist/packages/offline-store/src/index.js",
+      "default": "./dist/packages/offline-store/src/index.js"
+    },
+    "./offline-store/file-sidecar": {
+      "types": "./dist/packages/offline-store/src/file-sidecar-store.d.ts",
+      "import": "./dist/packages/offline-store/src/file-sidecar-store.js",
+      "default": "./dist/packages/offline-store/src/file-sidecar-store.js"
+    },
+    "./offline-store/indexeddb": {
+      "types": "./dist/packages/offline-store/src/indexeddb-store.d.ts",
+      "import": "./dist/packages/offline-store/src/indexeddb-store.js",
+      "default": "./dist/packages/offline-store/src/indexeddb-store.js"
+    },
+    "./runtime-schema": {
+      "types": "./dist/packages/runtime-schema/src/index.d.ts",
+      "import": "./dist/packages/runtime-schema/src/index.js",
+      "default": "./dist/packages/runtime-schema/src/index.js"
+    },
+    "./surface-model": {
+      "types": "./dist/packages/surface-model/src/index.d.ts",
+      "import": "./dist/packages/surface-model/src/index.js",
+      "default": "./dist/packages/surface-model/src/index.js"
+    },
+    "./surface-web": {
+      "types": "./dist/packages/surface-web/src/index.d.ts",
+      "import": "./dist/packages/surface-web/src/index.js",
+      "default": "./dist/packages/surface-web/src/index.js"
+    },
+    "./sync-client": {
+      "types": "./dist/packages/sync-client/src/index.d.ts",
+      "import": "./dist/packages/sync-client/src/index.js",
+      "default": "./dist/packages/sync-client/src/index.js"
+    },
     "./iife": "./dist/inkloop-surface-sdk.iife.js"
   },
   "files": [
     "dist",
     "src/index.ts",
+    "apps/sync-api/README.md",
+    "apps/sync-api/contracts",
+    "packages/adapter-contracts/package.json",
+    "packages/adapter-contracts/src/index.ts",
+    "packages/adapter-contracts/README.md",
+    "packages/native-bridge/package.json",
+    "packages/native-bridge/src/index.ts",
+    "packages/native-bridge/src/webview-host.md",
+    "packages/native-bridge/src/offline-state-matrix.md",
+    "packages/native-bridge/README.md",
+    "packages/offline-store/package.json",
+    "packages/offline-store/src/index.ts",
+    "packages/offline-store/src/file-sidecar-store.ts",
+    "packages/offline-store/src/indexeddb-store.ts",
+    "packages/offline-store/README.md",
+    "packages/runtime-schema/package.json",
+    "packages/runtime-schema/src/index.ts",
+    "packages/runtime-schema/src/schema-versioning.md",
+    "packages/runtime-schema/src/fixtures",
+    "packages/runtime-schema/README.md",
+    "packages/surface-model/package.json",
+    "packages/surface-model/src/index.ts",
+    "packages/surface-model/README.md",
+    "packages/sync-client/package.json",
+    "packages/sync-client/src/index.ts",
+    "packages/sync-client/README.md",
+    "packages/surface-web/package.json",
+    "packages/surface-web/src/index.ts",
+    "packages/surface-web/README.md",
     "plugins/obsidian/inkloop-sync",
+    "native/ios/README.md",
+    "native/android/README.md",
     "scripts/build-obsidian-plugin.mjs",
+    "scripts/finalize-types.mjs",
     "scripts/install-obsidian-plugin.mjs",
     "README.md",
     "docs/ink-surface-sdk.md",
-    "docs/architecture.md"
+    "docs/architecture.md",
+    "docs/cross-platform-offline-runtime.md",
+    "docs/platform-renderer-strategy.md",
+    "tsconfig.packages.json"
   ],
   "workspaces": [
+    "packages/*",
     "examples/ai-annotation-demo"
   ],
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.build.json && node scripts/build-obsidian-plugin.mjs",
+    "build": "vite build && tsc -p tsconfig.packages.json && tsc -p tsconfig.build.json && node scripts/finalize-types.mjs && node scripts/build-obsidian-plugin.mjs",
     "build:obsidian-plugin": "node scripts/build-obsidian-plugin.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
     "clean": "node scripts/clean.mjs",
@@ -55,6 +136,7 @@
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.7.4",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "^5.5.4",
     "vite": "^6.4.3",
     "vitest": "^3.2.6"

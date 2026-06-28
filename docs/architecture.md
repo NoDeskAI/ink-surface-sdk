@@ -18,7 +18,7 @@ The architecture has one central rule: user documents stay native to the host ap
 - Obsidian does not run InkLoop AI workflows.
 - The SDK does not parse PDFs, perform OCR, call models, watch files, or sync data.
 - Obsidian is not a full mirror of all InkLoop runtime internals.
-- Production cloud sync is not implemented in this MVP; current cloud behavior is represented by local JSONL-shaped sync records.
+- Production cloud sync is not implemented in this MVP; current cloud behavior is represented by the sync API contract app and local/test transports.
 
 ## System Overview
 
@@ -58,11 +58,27 @@ flowchart TB
 
 ## Main Components
 
+### Runtime Schema
+
+Location: `packages/runtime-schema/`
+
+Runtime Schema is the platform-neutral contract for document runtime records, surface blocks, annotations, strokes, local mutation inputs, and runtime sync events. It has no DOM, Node file API, Obsidian, PDF, or cloud dependency.
+
+The demo runtime keeps `examples/ai-annotation-demo/src/runtime/types.ts` as a compatibility re-export so existing Web Lab, sidecar store, and sync runner code can migrate incrementally.
+
 ### InkSurface SDK
 
-Location: `src/`
+Locations:
 
-The SDK turns an `InkLoopVisualModel` or InkLoop projection Markdown into DOM nodes. It supports:
+```text
+packages/surface-model/src/   Platform-neutral visual model and pure edit helpers
+packages/surface-web/src/     DOM/SVG surface renderer and pure edit helpers
+src/index.ts                  Compatibility re-export for existing root package imports
+```
+
+The SDK turns an `InkLoopVisualModel` or InkLoop projection Markdown into DOM nodes. The Surface Model package owns the platform-neutral input contract, parser, normalization, and pure edit helpers. The Surface Web package owns DOM/SVG rendering and style installation.
+
+It supports:
 
 - document title and ordered blocks
 - editable and generated regions
@@ -80,9 +96,15 @@ Build outputs:
 dist/inkloop-surface-sdk.es.js
 dist/inkloop-surface-sdk.iife.js
 dist/index.d.ts
+dist/packages/*/src/*.js
+dist/packages/*/src/*.d.ts
 ```
 
 The compatibility bundle name remains `inkloop-surface-sdk` and the IIFE global remains `InkLoopSurfaceSDK`, while the public product/package name is `InkSurface SDK`.
+
+Public runtime modules ship as subpath exports of the root package, such as `ink-surface-sdk/runtime-schema`,
+`ink-surface-sdk/offline-store/indexeddb`, and `ink-surface-sdk/sync-client`. The `packages/*` names remain
+workspace source modules in this release, not separate public npm packages.
 
 ### Knowledge Layer
 
@@ -122,6 +144,18 @@ Adapter Core defines the portable contract for external workspaces:
 - in-memory storage used by tests and smoke flows
 
 Core concepts avoid Obsidian-specific paths so future adapters can reuse them.
+
+### Adapter Authority Contracts
+
+Location: `packages/adapter-contracts/`
+
+Adapter authority contracts classify adapters as `client_local`, `cloud_api`, or `hybrid`. This prevents backend code from trying to access local vaults/files and prevents client code from owning cloud API jobs that belong on the backend.
+
+Current examples:
+
+- `obsidian-fs` is `client_local`.
+- Notion-style API adapters are `cloud_api`.
+- Drive-style adapters can be `hybrid` when metadata and file permissions split across cloud/client surfaces.
 
 ### Markdown Adapter Layer
 
@@ -163,8 +197,9 @@ The adapter enforces exportability gates before rendering full document projecti
 Locations:
 
 ```text
-src/runtime/
+examples/ai-annotation-demo/src/runtime/
 examples/ai-annotation-demo/src/adapters/obsidian-fs/sidecar-runtime.ts
+packages/offline-store/src/file-sidecar-store.ts
 ```
 
 The sidecar runtime is the hidden source of truth for runtime rendering and mutation state inside a host vault. It stores:
@@ -178,6 +213,47 @@ The sidecar runtime is the hidden source of truth for runtime rendering and muta
 - runtime sync events
 
 `SidecarRuntimeStore` exposes a runtime port for updating block text, adding/updating annotations, patching Markdown source ranges, appending sync events, and listing outbox state.
+
+### Offline Store Contract
+
+Location: `packages/offline-store/`
+
+The offline store package defines cache records, offline document open states, missing asset behavior, eviction policy rules, and the current concrete MVP stores:
+
+- cached metadata and surface models can open without network
+- missing large assets produce partial document states instead of blank failure
+- pending mutations and pinned documents are never evicted
+- newer cached schemas enter migration-required state before local mutation
+- file sidecars back Obsidian/desktop vault hosts
+- IndexedDB backs Web/WebView app shells
+
+### Sync Client
+
+Location: `packages/sync-client/`
+
+The sync client owns reusable sync behavior: outbox push batching, dedupe, retry metadata, timeout-safe HTTP transport, explicit per-event acknowledgements, pull by device cursor, and inbox application. It operates on `RuntimeOutboxPort`, `RuntimeSyncEvent`, and host-provided `RuntimeInboxPort`, so file sidecars, IndexedDB stores, native stores, and future production transports can share the same sync runner.
+
+The HTTP transport requires a stable device id and sends it through the sync contract as `device_id`. Pull cursors
+are advanced only after inbox application succeeds without conflicts; conflicted pulls leave the previous cursor
+intact so hosts can persist conflict records or open a merge flow.
+
+The demo keeps `examples/ai-annotation-demo/src/runtime/sync-runner.ts` as a compatibility re-export while Web Lab and Obsidian migration continues.
+
+### Cloud Sync API Boundary
+
+Location: `apps/sync-api/`
+
+The sync API directory documents the future production backend boundary. It defines push, pull, asset metadata, and conflict-listing contracts with JSONL fixtures. It is not a deployed service in this repository.
+
+The backend owns authenticated device identity, event ordering, per-device cursors, conflict records, asset authorization, and cloud adapter jobs. Clients continue to own local stores, local adapters, caches, and immediate offline mutations.
+
+### Native Bridge
+
+Location: `packages/native-bridge/`
+
+The native bridge package defines the local message protocol between a bundled WebView renderer and a native/offline Runtime Host. It covers document snapshot requests, mutation application, asset requests, sync status requests, validation, and typed success/error responses.
+
+The bridge requires hosts to load renderer assets locally from the app bundle or verified cache. Network is used for sync and downloads, not to boot the renderer.
 
 ### Obsidian Plugin
 
@@ -202,8 +278,8 @@ The plugin is not the renderer source of truth. It consumes the SDK bundle when 
 Locations:
 
 ```text
-obsidian-lab.html
-src/obsidian-lab.ts
+examples/ai-annotation-demo/obsidian-lab.html
+examples/ai-annotation-demo/src/obsidian-lab.ts
 examples/ai-annotation-demo/vite.config.ts
 ```
 
@@ -225,12 +301,11 @@ Mutation endpoints are dev-only. They accept loopback requests, same-origin Web 
 Locations:
 
 ```text
-src/local/
-src/core/
-src/capture/
-src/evidence/
-src/surface/
-src/main.ts
+examples/ai-annotation-demo/src/local/
+examples/ai-annotation-demo/src/core/
+examples/ai-annotation-demo/src/capture/
+examples/ai-annotation-demo/src/evidence/
+examples/ai-annotation-demo/src/main.ts
 ```
 
 The original InkLoop Web demo remains in this repository as the source application used to validate real annotation workflows. It owns PDF import, PDF.js rendering, pointer capture, mark classification, evidence extraction, reflow, AI call orchestration, IndexedDB persistence, and reading surface behavior.
@@ -345,6 +420,7 @@ sequenceDiagram
   participant Runner as RuntimeSyncRunner
   participant Transport as Sync Transport
   participant Cloud as Future Cloud
+  participant Inbox as Runtime Inbox
 
   Runtime->>Runner: List pending events
   Runner->>Runner: Dedupe and batch
@@ -353,9 +429,15 @@ sequenceDiagram
   Cloud-->>Transport: Explicit acks
   Transport-->>Runner: Ack list
   Runner->>Runtime: Mark sent or failed
+  Runner->>Inbox: Read device cursor
+  Runner->>Transport: Pull events after cursor
+  Transport->>Cloud: GET runtime events by device cursor
+  Cloud-->>Transport: Events and next cursor
+  Runner->>Inbox: Apply remote events
+  Runner->>Inbox: Persist next cursor
 ```
 
-The current smoke transport writes to local JSONL files. The HTTP transport already expects explicit per-event acknowledgements and has request timeout behavior so failed syncs can retry.
+The current smoke transport writes to local JSONL files. The HTTP transport expects explicit per-event acknowledgements for push and a cursor-shaped pull response for inbox application. Failed push events retain retry metadata; pull cursors advance only after inbox application completes.
 
 ## Privacy and Safety Boundaries
 
@@ -366,6 +448,7 @@ The current smoke transport writes to local JSONL files. The HTTP transport alre
 - Runtime outbox writes preserve concurrent appends during sync status rewrites.
 - Web Lab mutation APIs are guarded for loopback, same-origin, or explicit token access.
 - SDK imports do not mutate host state or start background work.
+- Runtime schema validation is dependency-free and can run in Web, WebView, native bridge tests, or backend contract tests.
 
 ## Conflict Strategy
 
@@ -439,13 +522,22 @@ http://localhost:8765/obsidian-lab.html
 ## Repository Map
 
 ```text
-src/                                   Standalone shared SDK package source
+apps/sync-api/                        Future cloud sync API contract fixtures
+packages/adapter-contracts/           Adapter execution authority and placement rules
+packages/native-bridge/                Local WebView bridge message contract
+packages/offline-store/                Offline cache state and eviction policy contract
+packages/runtime-schema/               Platform-neutral runtime records and sync event contracts
+packages/surface-model/                Platform-neutral visual model and pure edit helpers
+packages/sync-client/                  Runtime outbox push, retry, dedupe, and ack handling
+packages/surface-web/                  DOM/SVG surface renderer and pure edit helpers
+src/                                   Root compatibility re-export for existing SDK consumers
 dist/                                  Generated SDK bundles and declarations
 plugins/obsidian/inkloop-sync/         Obsidian runtime host plugin source
 examples/ai-annotation-demo/src/       Web/PDF/adapter/runtime validation app
 examples/ai-annotation-demo/server/    Demo AI proxy and dev-only handlers
 examples/ai-annotation-demo/scripts/   Demo smoke and fixture scripts
 examples/ai-annotation-demo/examples/ink-surface/ Minimal SDK example
+native/                                Native host integration notes
 packages/ko-schema/                    Protocol fixture data
 docs/                                  SDK architecture and usage docs
 ```

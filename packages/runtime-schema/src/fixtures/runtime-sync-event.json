@@ -1,0 +1,32 @@
+{
+  "schema_version": "inkloop.runtime_sync_event.v1",
+  "event_id": "evt_fixture_annotation_add",
+  "source": "test",
+  "doc_id": "doc_fixture",
+  "operation": "annotation.add",
+  "target": {
+    "type": "annotation",
+    "id": "ko_fixture",
+    "block_id": "blk_fixture"
+  },
+  "payload": {
+    "annotation": {
+      "ko_id": "ko_fixture",
+      "render_mode": "stroke_only",
+      "visual_strokes": [
+        {
+          "tool": "pen",
+          "color": "#111111",
+          "points": [
+            { "x": -0.2, "y": 0.1, "pressure": 0.5 },
+            { "x": 1.4, "y": 0.8, "pressure": 0.7 }
+          ]
+        }
+      ]
+    }
+  },
+  "status": "pending",
+  "dedupe_key": "doc_fixture:annotation.add:ko_fixture",
+  "created_at": "2026-06-28T00:00:00.000Z",
+  "updated_at": "2026-06-28T00:00:00.000Z"
+}
