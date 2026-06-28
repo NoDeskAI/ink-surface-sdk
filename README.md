@@ -132,6 +132,8 @@ The full Web/PDF/Obsidian validation app is documented in [examples/ai-annotatio
 - [Architecture](./docs/architecture.md)
 - [Cross-platform offline runtime](./docs/cross-platform-offline-runtime.md)
 - [Platform renderer strategy](./docs/platform-renderer-strategy.md)
+- [Documentation structure](./docs/documentation-structure-summary.md)
+- [Documented solutions](./docs/solutions/README.md)
 
 ## Repository Map
 
@@ -147,7 +149,7 @@ packages/sync-client/        Runtime push, pull, retry, dedupe, ack, inbox, and 
 src/                         Root compatibility re-export for existing SDK consumers
 dist/                        Generated SDK bundles, declarations, and Obsidian plugin package
 plugins/obsidian/inkloop-sync/ Obsidian runtime host plugin source
-docs/                        SDK architecture and usage docs
+docs/                        SDK architecture, CE workflow docs, and reusable solution docs
 examples/ai-annotation-demo/ Web, PDF, Obsidian, Android, adapter validation host
 native/                      Native host integration notes
 packages/ko-schema/          Protocol fixture data owned outside the SDK runtime layer
