@@ -18,6 +18,11 @@
       "import": "./dist/packages/adapter-contracts/src/index.js",
       "default": "./dist/packages/adapter-contracts/src/index.js"
     },
+    "./export-core": {
+      "types": "./dist/packages/export-core/src/index.d.ts",
+      "import": "./dist/packages/export-core/src/index.js",
+      "default": "./dist/packages/export-core/src/index.js"
+    },
     "./knowledge-schema": {
       "types": "./dist/packages/knowledge-schema/src/index.d.ts",
       "import": "./dist/packages/knowledge-schema/src/index.js",
@@ -73,6 +78,12 @@
     "packages/adapter-contracts/package.json",
     "packages/adapter-contracts/src/index.ts",
     "packages/adapter-contracts/README.md",
+    "packages/export-core/package.json",
+    "packages/export-core/src/concept-layer.ts",
+    "packages/export-core/src/entity-mode.ts",
+    "packages/export-core/src/index.ts",
+    "packages/export-core/src/moc.ts",
+    "packages/export-core/src/taxonomy.ts",
     "packages/knowledge-schema/package.json",
     "packages/knowledge-schema/src/canonical-json.ts",
     "packages/knowledge-schema/src/document-projection.ts",
