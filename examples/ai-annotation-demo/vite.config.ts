@@ -572,6 +572,7 @@ export default defineConfig(({ mode }) => {
     resolve: {
       alias: {
         'ink-surface-sdk': path.resolve(import.meta.dirname, '../../src/index.ts'),
+        '@inksurface/knowledge-schema': path.resolve(import.meta.dirname, '../../packages/knowledge-schema/src/index.ts'),
       },
     },
     server: {

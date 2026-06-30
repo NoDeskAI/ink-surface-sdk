@@ -16,7 +16,8 @@
     "resolveJsonModule": true,
     "baseUrl": ".",
     "paths": {
-      "ink-surface-sdk": ["../../src/index.ts"]
+      "ink-surface-sdk": ["../../src/index.ts"],
+      "@inksurface/knowledge-schema": ["../../packages/knowledge-schema/src/index.ts"]
     },
     "types": ["node"]
   },

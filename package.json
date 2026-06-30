@@ -18,6 +18,11 @@
       "import": "./dist/packages/adapter-contracts/src/index.js",
       "default": "./dist/packages/adapter-contracts/src/index.js"
     },
+    "./knowledge-schema": {
+      "types": "./dist/packages/knowledge-schema/src/index.d.ts",
+      "import": "./dist/packages/knowledge-schema/src/index.js",
+      "default": "./dist/packages/knowledge-schema/src/index.js"
+    },
     "./native-bridge": {
       "types": "./dist/packages/native-bridge/src/index.d.ts",
       "import": "./dist/packages/native-bridge/src/index.js",
@@ -68,6 +73,15 @@
     "packages/adapter-contracts/package.json",
     "packages/adapter-contracts/src/index.ts",
     "packages/adapter-contracts/README.md",
+    "packages/knowledge-schema/package.json",
+    "packages/knowledge-schema/src/canonical-json.ts",
+    "packages/knowledge-schema/src/document-projection.ts",
+    "packages/knowledge-schema/src/external-edit.ts",
+    "packages/knowledge-schema/src/hash.ts",
+    "packages/knowledge-schema/src/index.ts",
+    "packages/knowledge-schema/src/knowledge-object.ts",
+    "packages/knowledge-schema/src/ulid.ts",
+    "packages/knowledge-schema/src/uri.ts",
     "packages/native-bridge/package.json",
     "packages/native-bridge/src/index.ts",
     "packages/native-bridge/src/webview-host.md",
@@ -132,6 +146,9 @@
     "obsidian:smoke": "npm --workspace ink-surface-ai-annotation-demo run obsidian:smoke --",
     "obsidian:install-plugin": "node scripts/install-obsidian-plugin.mjs",
     "prepare": "npm run build"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

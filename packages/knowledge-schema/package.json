@@ -1,0 +1,18 @@
+{
+  "name": "@inksurface/knowledge-schema",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Platform-neutral InkLoop canonical knowledge object, document projection, external edit, hashing, and URI schemas.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}

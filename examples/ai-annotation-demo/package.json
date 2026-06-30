@@ -23,6 +23,7 @@
     "postinstall": "node scripts/copy-pdfjs-assets.mjs"
   },
   "dependencies": {
+    "@inksurface/knowledge-schema": "file:../../packages/knowledge-schema",
     "ink-surface-sdk": "file:../..",
     "pdfjs-dist": "^4.6.82",
     "zod": "^3.23.8"
