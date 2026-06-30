@@ -86,6 +86,21 @@ export type DocumentProjectionBlock = z.infer<typeof DocumentProjectionBlockSche
 export type DocumentProjection = z.infer<typeof DocumentProjectionSchema>;
 export type DocumentProjectionWithoutHash = Omit<DocumentProjection, 'content_hash'>;
 
+export const DOCUMENT_PROJECTION_EXPORT_SCHEMA_VERSION = 'inkloop.document_projection_export.v1' as const;
+
+export interface DocumentProjectionExportEnvelope {
+  schema_version: typeof DOCUMENT_PROJECTION_EXPORT_SCHEMA_VERSION;
+  export_id: string;
+  generated_at: string;
+  source: {
+    app: 'inkloop';
+    app_version?: string;
+    document_id?: string;
+  };
+  document_projections: DocumentProjection[];
+  external_edits: unknown[];
+}
+
 export function parseDocumentProjection(input: unknown): DocumentProjection {
   return DocumentProjectionSchema.parse(input);
 }

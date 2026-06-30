@@ -28,10 +28,26 @@ export interface RuntimeStrokePoint {
   pressure?: number;
 }
 
+export type RuntimeCaptureSurface = 'page' | 'reader' | 'whiteboard' | 'chat';
+export type RuntimeCoordSpace = 'page_norm' | 'reader_px' | 'surface_norm' | 'block_norm';
+export type RuntimeBBox = [number, number, number, number];
+
 export interface RuntimeVisualStroke {
   tool?: 'pen' | 'highlighter';
   color?: string;
   opacity?: number;
+  coord_space?: RuntimeCoordSpace;
+  capture_surface?: RuntimeCaptureSurface;
+  points: RuntimeStrokePoint[];
+}
+
+export interface RuntimeSurfaceStroke {
+  tool?: 'pen' | 'highlighter';
+  color?: string;
+  opacity?: number;
+  capture_surface: RuntimeCaptureSurface;
+  coord_space: RuntimeCoordSpace;
+  bbox?: RuntimeBBox;
   points: RuntimeStrokePoint[];
 }
 
@@ -42,19 +58,25 @@ export interface RuntimeAnnotation extends Record<string, unknown> {
   body_md?: string;
   status?: string;
   render_mode?: 'stroke_only' | 'margin_note' | string;
-  visual_bbox?: [number, number, number, number];
+  visual_bbox?: RuntimeBBox;
   visual_strokes?: RuntimeVisualStroke[];
+  capture_surface?: RuntimeCaptureSurface;
+  surface_coord_space?: RuntimeCoordSpace;
+  surface_bbox?: RuntimeBBox;
+  surface_strokes?: RuntimeSurfaceStroke[];
   created_at?: string;
   updated_at?: string;
 }
 
 export interface RuntimeSurfaceBlock extends Record<string, unknown> {
+  schema_version?: typeof RUNTIME_SURFACE_OBJECT_SCHEMA_VERSION;
   object_id: string;
   doc_id?: string;
   text?: string;
   source_anchor?: {
     quote?: string;
     range?: RuntimeLineRange;
+    object_refs?: string[];
     [key: string]: unknown;
   };
   projection?: {
@@ -62,6 +84,7 @@ export interface RuntimeSurfaceBlock extends Record<string, unknown> {
     kind?: string;
     region?: string;
     page_index?: number;
+    page_id?: string;
     knowledge_object_ids?: string[];
     [key: string]: unknown;
   };
@@ -161,6 +184,10 @@ export interface AddRuntimeAnnotationInput {
   render_mode?: RuntimeAnnotation['render_mode'];
   visual_bbox?: RuntimeAnnotation['visual_bbox'];
   visual_strokes?: RuntimeVisualStroke[];
+  capture_surface?: RuntimeAnnotation['capture_surface'];
+  surface_coord_space?: RuntimeAnnotation['surface_coord_space'];
+  surface_bbox?: RuntimeAnnotation['surface_bbox'];
+  surface_strokes?: RuntimeAnnotation['surface_strokes'];
 }
 
 export interface RuntimeOutboxPort {

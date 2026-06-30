@@ -3,10 +3,16 @@
   "object_id": "blk_fixture",
   "doc_id": "doc_fixture",
   "text": "A cached paragraph that can render offline.",
+  "source_anchor": {
+    "quote": "A cached paragraph that can render offline.",
+    "object_refs": ["run_fixture_001"]
+  },
   "projection": {
     "block_id": "blk_fixture",
     "kind": "paragraph",
     "region": "editable",
+    "page_id": "page_fixture_1",
+    "page_index": 0,
     "knowledge_object_ids": ["ko_fixture"]
   },
   "annotations": [
@@ -15,14 +21,34 @@
       "kind": "annotation",
       "title": "Offline stroke",
       "render_mode": "stroke_only",
+      "visual_bbox": [0.1, 0.25, 0.8, 0.1],
+      "capture_surface": "reader",
+      "surface_coord_space": "reader_px",
+      "surface_bbox": [120, 220, 540, 48],
       "visual_strokes": [
         {
           "tool": "highlighter",
           "color": "#facc15",
           "opacity": 0.56,
+          "coord_space": "block_norm",
+          "capture_surface": "reader",
           "points": [
             { "x": 0.1, "y": 0.3 },
             { "x": 0.9, "y": 0.3 }
+          ]
+        }
+      ],
+      "surface_strokes": [
+        {
+          "tool": "highlighter",
+          "color": "#facc15",
+          "opacity": 0.56,
+          "capture_surface": "reader",
+          "coord_space": "reader_px",
+          "bbox": [120, 220, 540, 48],
+          "points": [
+            { "x": 120, "y": 244 },
+            { "x": 660, "y": 244 }
           ]
         }
       ]

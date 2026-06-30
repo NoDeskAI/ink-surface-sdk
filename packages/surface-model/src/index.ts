@@ -1,3 +1,7 @@
+export type InkLoopCaptureSurface = 'page' | 'reader' | 'whiteboard' | 'chat';
+export type InkLoopCoordSpace = 'page_norm' | 'reader_px' | 'surface_norm' | 'block_norm';
+export type InkLoopBBox = [number, number, number, number];
+
 export interface InkLoopAnnotation {
   ko_id: string;
   kind: string;
@@ -5,10 +9,14 @@ export interface InkLoopAnnotation {
   body_md?: string;
   status?: string;
   render_mode?: 'stroke_only' | 'margin_note';
-  anchor_bbox?: [number, number, number, number];
+  anchor_bbox?: InkLoopBBox;
   page_index?: number;
-  visual_bbox?: [number, number, number, number];
+  visual_bbox?: InkLoopBBox;
   visual_strokes?: InkLoopVisualStroke[];
+  capture_surface?: InkLoopCaptureSurface;
+  surface_coord_space?: InkLoopCoordSpace;
+  surface_bbox?: InkLoopBBox;
+  surface_strokes?: InkLoopSurfaceStroke[];
 }
 
 export interface InkLoopStrokePoint {
@@ -22,6 +30,18 @@ export interface InkLoopVisualStroke {
   tool?: 'pen' | 'highlighter';
   color?: string;
   opacity?: number;
+  coord_space?: InkLoopCoordSpace;
+  capture_surface?: InkLoopCaptureSurface;
+  points: InkLoopStrokePoint[];
+}
+
+export interface InkLoopSurfaceStroke {
+  tool?: 'pen' | 'highlighter';
+  color?: string;
+  opacity?: number;
+  capture_surface: InkLoopCaptureSurface;
+  coord_space: InkLoopCoordSpace;
+  bbox?: InkLoopBBox;
   points: InkLoopStrokePoint[];
 }
 

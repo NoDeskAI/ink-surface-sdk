@@ -16,6 +16,10 @@ interface ParsedAnnotationJson extends Pick<KnowledgeObject, 'ko_id' | 'kind' | 
   render_mode?: 'stroke_only' | 'margin_note';
   visual_bbox?: [number, number, number, number];
   visual_strokes?: unknown[];
+  capture_surface?: unknown;
+  surface_coord_space?: unknown;
+  surface_bbox?: unknown;
+  surface_strokes?: unknown[];
 }
 
 export interface ParsedDocumentExternalEdits {
@@ -113,6 +117,10 @@ async function parseAnnotationExternalEdits(input: {
         render_mode: annotation.render_mode,
         visual_bbox: annotation.visual_bbox,
         visual_strokes: annotation.visual_strokes,
+        capture_surface: annotation.capture_surface,
+        surface_coord_space: annotation.surface_coord_space,
+        surface_bbox: annotation.surface_bbox,
+        surface_strokes: annotation.surface_strokes,
       };
       const withoutHash: ExternalEditWithoutHash = {
         schema_version: 'inkloop.external_edit.v1',
@@ -153,6 +161,10 @@ async function parseAnnotationExternalEdits(input: {
       render_mode: annotation.render_mode,
       visual_bbox: annotation.visual_bbox,
       visual_strokes: annotation.visual_strokes,
+      capture_surface: annotation.capture_surface,
+      surface_coord_space: annotation.surface_coord_space,
+      surface_bbox: annotation.surface_bbox,
+      surface_strokes: annotation.surface_strokes,
     };
     if (
       before.kind === after.kind
@@ -162,6 +174,10 @@ async function parseAnnotationExternalEdits(input: {
       && after.render_mode === undefined
       && after.visual_bbox === undefined
       && after.visual_strokes === undefined
+      && after.capture_surface === undefined
+      && after.surface_coord_space === undefined
+      && after.surface_bbox === undefined
+      && after.surface_strokes === undefined
     ) {
       continue;
     }
