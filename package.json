@@ -18,6 +18,11 @@
       "import": "./dist/packages/adapter-contracts/src/index.js",
       "default": "./dist/packages/adapter-contracts/src/index.js"
     },
+    "./adapters/obsidian": {
+      "types": "./dist/packages/adapter-obsidian/src/index.d.ts",
+      "import": "./dist/packages/adapter-obsidian/src/index.js",
+      "default": "./dist/packages/adapter-obsidian/src/index.js"
+    },
     "./export-core": {
       "types": "./dist/packages/export-core/src/index.d.ts",
       "import": "./dist/packages/export-core/src/index.js",
@@ -78,6 +83,10 @@
     "packages/adapter-contracts/package.json",
     "packages/adapter-contracts/src/index.ts",
     "packages/adapter-contracts/README.md",
+    "packages/adapter-obsidian/package.json",
+    "packages/adapter-obsidian/src/index.ts",
+    "packages/adapter-obsidian/src/markdown-render.ts",
+    "packages/adapter-obsidian/src/vault-layout.ts",
     "packages/export-core/package.json",
     "packages/export-core/src/concept-layer.ts",
     "packages/export-core/src/entity-mode.ts",
