@@ -1,17 +1,21 @@
 import type {
   AddRuntimeAnnotationInput,
+  RuntimeConflictRecord,
   RuntimeAnnotation,
   RuntimeDocumentSnapshot,
+  RuntimeReadingProgress,
   RuntimeMutationResult,
   RuntimeSurfaceBlock,
   RuntimeSyncEvent,
   UpdateRuntimeAnnotationInput,
   UpdateRuntimeBlockContentInput,
 } from '../../runtime-schema/src/index.js';
-import type { OfflineDocumentCacheRecord, OfflineRuntimeStorePort } from './index.js';
+import { assertRuntimeSyncEvent } from '../../runtime-schema/src/index.js';
+import type { OfflineDeviceCursor, OfflineDocumentCacheRecord, OfflineRemoteEventApplyResult, OfflineRuntimeStorePort } from './index.js';
 
-type IndexedDbStoreName = 'documents' | 'cache_records' | 'outbox';
+type IndexedDbStoreName = 'documents' | 'cache_records' | 'outbox' | 'applied_events' | 'cursors' | 'conflicts';
 type StoredRuntimeSyncEvent = RuntimeSyncEvent & { indexeddb_sequence?: number };
+type StoredAppliedEvent = { event_id: string; doc_id: string; applied_at: string };
 
 export interface IndexedDbOfflineRuntimeStoreConfig {
   dbName?: string;
@@ -35,6 +39,31 @@ function normalizeMarkdownText(input: string): string {
 
 function blockId(block: RuntimeSurfaceBlock): string {
   return block.projection?.block_id || block.object_id;
+}
+
+function mergeBootstrapSnapshot(existing: RuntimeDocumentSnapshot | null, incoming: RuntimeDocumentSnapshot): RuntimeDocumentSnapshot {
+  if (!existing) return incoming;
+  const existingBlocks = new Map(existing.blocks.map((block) => [blockId(block), block] as const));
+  const blocks = incoming.blocks.map((block) => {
+    const previous = existingBlocks.get(blockId(block));
+    const previousAnnotations = previous?.annotations ?? [];
+    if (!previousAnnotations.length) return block;
+    const incomingAnnotations = block.annotations ?? [];
+    if (!incomingAnnotations.length) return block;
+    const incomingIds = new Set(incomingAnnotations.map((annotation) => annotation.ko_id));
+    const carriedAnnotations = previousAnnotations.filter((annotation) => annotation.ko_id && !incomingIds.has(annotation.ko_id));
+    if (!carriedAnnotations.length) return block;
+    const carriedIds = carriedAnnotations.map((annotation) => annotation.ko_id);
+    return {
+      ...block,
+      annotations: [...incomingAnnotations, ...carriedAnnotations],
+      projection: {
+        ...(block.projection || {}),
+        knowledge_object_ids: [...new Set([...(block.projection?.knowledge_object_ids || []), ...carriedIds])],
+      },
+    };
+  });
+  return { ...incoming, blocks };
 }
 
 function cleanPatch(patch: Record<string, unknown>): Record<string, unknown> {
@@ -63,6 +92,64 @@ function eventDedupeKey(event: Omit<RuntimeSyncEvent, 'dedupe_key'>): string {
 function stripIndexedDbSequence(event: StoredRuntimeSyncEvent): RuntimeSyncEvent {
   const { indexeddb_sequence: _indexedDbSequence, ...runtimeEvent } = event;
   return runtimeEvent;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normBbox(value: unknown): [number, number, number, number] | undefined {
+  if (!Array.isArray(value) || value.length !== 4) return undefined;
+  const values = value.map((part) => Number(part));
+  return values.every(Number.isFinite) ? values as [number, number, number, number] : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function enrichedRemoteAnnotation(event: RuntimeSyncEvent, annotation: RuntimeAnnotation): RuntimeAnnotation {
+  const existingMeta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+  const bbox = normBbox(event.payload.bbox) ?? normBbox(existingMeta.bbox) ?? normBbox(annotation.visual_bbox);
+  const metaEntries = Object.entries({
+    mark_id: event.payload.mark_id,
+    marked_text: event.payload.marked_text,
+    kind: event.payload.kind,
+    feature_type: event.payload.feature_type,
+    tool: event.payload.tool,
+    origin: event.payload.origin,
+    scored_type: event.payload.scored_type,
+    hmp_action: event.payload.hmp_action,
+    page_id: event.payload.page_id,
+    page_index: event.payload.page_index,
+    bbox,
+    created_at: event.created_at,
+    updated_at: event.updated_at,
+    source_device_id: event.origin?.device_id,
+  }).filter(([, value]) => value !== undefined && value !== null && value !== '');
+  return {
+    ...annotation,
+    ...(bbox ? { visual_bbox: bbox } : {}),
+    inkloop_mark: {
+      ...existingMeta,
+      ...Object.fromEntries(metaEntries),
+    },
+  };
+}
+
+function runtimeAnnotationMarkId(annotation: RuntimeAnnotation): string {
+  const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+  return typeof meta.mark_id === 'string' ? meta.mark_id : '';
+}
+
+function fallbackAnnotationBlockIndex(blocks: RuntimeSurfaceBlock[], event: RuntimeSyncEvent): number {
+  const pageIndex = numberValue(event.payload.page_index)
+    ?? numberValue(isRecord(event.payload.annotation) && isRecord(event.payload.annotation.inkloop_mark) ? event.payload.annotation.inkloop_mark.page_index : undefined);
+  if (typeof pageIndex === 'number') {
+    const pageMatch = blocks.findIndex((block) => block.projection?.page_index === pageIndex);
+    if (pageMatch >= 0) return pageMatch;
+  }
+  return blocks.length ? 0 : -1;
 }
 
 async function sha256Tagged(input: string): Promise<string> {
@@ -95,6 +182,15 @@ function ensureSchema(db: IDBDatabase): void {
     outbox.createIndex('doc_id', 'doc_id', { unique: false });
     outbox.createIndex('status', 'status', { unique: false });
   }
+  if (!db.objectStoreNames.contains('applied_events')) {
+    const applied = db.createObjectStore('applied_events', { keyPath: 'event_id' });
+    applied.createIndex('doc_id', 'doc_id', { unique: false });
+  }
+  if (!db.objectStoreNames.contains('cursors')) db.createObjectStore('cursors', { keyPath: 'device_id' });
+  if (!db.objectStoreNames.contains('conflicts')) {
+    const conflicts = db.createObjectStore('conflicts', { keyPath: 'conflict_id' });
+    conflicts.createIndex('doc_id', 'doc_id', { unique: false });
+  }
 }
 
 export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
@@ -105,7 +201,7 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
 
   constructor(private readonly config: IndexedDbOfflineRuntimeStoreConfig = {}) {
     this.dbName = config.dbName ?? 'inksurface-offline-runtime';
-    this.dbVersion = config.dbVersion ?? 1;
+    this.dbVersion = config.dbVersion ?? 2;
     this.now = config.now ?? nowIso;
   }
 
@@ -150,6 +246,43 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
 
   async listPendingEvents(docId?: string): Promise<RuntimeSyncEvent[]> {
     return (await this.listOutboxEvents()).filter((event) => event.status !== 'sent' && (!docId || event.doc_id === docId));
+  }
+
+  async listAppliedEventIds(docId?: string): Promise<string[]> {
+    return (await this.getAll<StoredAppliedEvent>('applied_events'))
+      .filter((event) => !docId || event.doc_id === docId)
+      .map((event) => event.event_id);
+  }
+
+  async getDeviceCursor(deviceId: string): Promise<OfflineDeviceCursor | null> {
+    return (await this.get<OfflineDeviceCursor>('cursors', deviceId)) ?? null;
+  }
+
+  async writeDeviceCursor(cursor: OfflineDeviceCursor): Promise<void> {
+    await this.put('cursors', cursor);
+  }
+
+  async listConflicts(docId?: string): Promise<RuntimeConflictRecord[]> {
+    return (await this.getAll<RuntimeConflictRecord>('conflicts')).filter((conflict) => !docId || conflict.doc_id === docId);
+  }
+
+  async recordConflict(conflict: RuntimeConflictRecord): Promise<void> {
+    await this.put('conflicts', conflict);
+  }
+
+  async applyRemoteEvent(event: RuntimeSyncEvent): Promise<OfflineRemoteEventApplyResult> {
+    assertRuntimeSyncEvent(event);
+    const applied = await this.get<StoredAppliedEvent>('applied_events', event.event_id);
+    if (applied) return { event_id: event.event_id, status: 'skipped' };
+    try {
+      await this.applyRemoteEventUnchecked(event);
+      await this.put('applied_events', { event_id: event.event_id, doc_id: event.doc_id, applied_at: this.now() });
+      return { event_id: event.event_id, status: 'applied' };
+    } catch (error) {
+      const conflict = this.conflictFromError(event, error);
+      await this.recordConflict(conflict);
+      return { event_id: event.event_id, status: 'conflicted', conflict };
+    }
   }
 
   async updateBlockContent(input: UpdateRuntimeBlockContentInput): Promise<RuntimeMutationResult> {
@@ -306,6 +439,143 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
       visual_strokes: annotation.visual_strokes ?? input.visual_strokes,
       created_at: typeof annotation.created_at === 'string' ? annotation.created_at : now,
       updated_at: now,
+    };
+  }
+
+  private async applyRemoteEventUnchecked(event: RuntimeSyncEvent): Promise<void> {
+    if (event.operation === 'runtime.bootstrap') {
+      const snapshot = event.payload.snapshot as RuntimeDocumentSnapshot | undefined;
+      if (!snapshot || snapshot.doc_id !== event.doc_id) throw new Error('Remote bootstrap snapshot is missing or mismatched.');
+      await this.writeDocumentSnapshot(mergeBootstrapSnapshot(await this.loadDocument(event.doc_id), snapshot));
+      return;
+    }
+
+    const runtime = await this.requireDocument(event.doc_id);
+    if (event.operation === 'block.update') {
+      const blockIdValue = String(event.payload.block_id || event.target.block_id || event.target.id || '');
+      const index = runtime.blocks.findIndex((block) => blockId(block) === blockIdValue);
+      if (index === -1) throw new Error(`Remote block was not found: ${blockIdValue}`);
+      const quote = normalizeMarkdownText(String(event.payload.content_md ?? event.payload.quote ?? ''));
+      const blocks = [...runtime.blocks];
+      const block = blocks[index];
+      blocks[index] = {
+        ...block,
+        text: quote,
+        source_anchor: { ...(block.source_anchor || {}), quote, ...(isRecord(event.payload.range) ? { range: event.payload.range as never } : {}) },
+      };
+      await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
+      return;
+    }
+
+    if (event.operation === 'annotation.add') {
+      const blockIdValue = String(event.payload.block_id || event.target.block_id || '');
+      const annotationPayload = event.payload.annotation as RuntimeAnnotation | undefined;
+      const annotation = annotationPayload?.ko_id ? enrichedRemoteAnnotation(event, annotationPayload) : undefined;
+      if (!annotation?.ko_id) throw new Error('Remote annotation.add is missing annotation payload.');
+      const index = blockIdValue
+        ? runtime.blocks.findIndex((block) => blockId(block) === blockIdValue)
+        : fallbackAnnotationBlockIndex(runtime.blocks, event);
+      if (index === -1) throw new Error(`Remote annotation block was not found: ${blockIdValue}`);
+      const blocks = [...runtime.blocks];
+      const block = blocks[index];
+      const incomingMarkId = runtimeAnnotationMarkId(annotation);
+      const annotations = (block.annotations || []).filter((item) => {
+        const existingMarkId = runtimeAnnotationMarkId(item);
+        if (incomingMarkId && existingMarkId) return existingMarkId !== incomingMarkId;
+        return item.ko_id !== annotation.ko_id;
+      });
+      blocks[index] = {
+        ...block,
+        annotations: [...annotations, annotation],
+        projection: {
+          ...(block.projection || {}),
+          knowledge_object_ids: [...new Set([...(block.projection?.knowledge_object_ids || []), annotation.ko_id])],
+        },
+      };
+      await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
+      return;
+    }
+
+    if (event.operation === 'annotation.update' || event.operation === 'annotation.delete') {
+      const ko = String(event.payload.ko_id || event.target.id || '');
+      if (!ko) throw new Error('Remote annotation event is missing ko_id.');
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).map((annotation) => {
+          if (annotation.ko_id !== ko) return annotation;
+          didUpdate = true;
+          if (event.operation === 'annotation.delete') return { ...annotation, status: 'deleted', deleted_at: event.updated_at };
+          return { ...annotation, ...(event.payload.patch as Record<string, unknown> | undefined), updated_at: event.updated_at };
+        });
+        return { ...block, annotations };
+      });
+      if (!didUpdate) throw new Error(`Remote annotation was not found: ${ko}`);
+      await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
+      return;
+    }
+
+    if (event.operation === 'knowledge.update') {
+      const ko = String(event.payload.ko_id || event.target.id || '');
+      if (!ko) throw new Error('Remote knowledge.update event is missing ko_id.');
+      const patch = isRecord(event.payload.patch) ? event.payload.patch : {};
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).map((annotation) => {
+          if (annotation.ko_id !== ko) return annotation;
+          didUpdate = true;
+          return {
+            ...annotation,
+            ...(typeof patch.status === 'string' ? { status: patch.status } : {}),
+            ...(Array.isArray(patch.tags) ? { tags: patch.tags } : {}),
+            controlled_fields: { ...(annotation.controlled_fields as Record<string, unknown> | undefined || {}), ...patch },
+            updated_at: event.updated_at,
+          };
+        });
+        return { ...block, annotations };
+      });
+      await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
+      void didUpdate;
+      return;
+    }
+
+    if (event.operation === 'progress.update') {
+      const progress = event.payload.progress as RuntimeReadingProgress | undefined;
+      if (!progress) throw new Error('Remote progress.update is missing progress payload.');
+      await this.writeDocumentSnapshot({ ...runtime, reading_progress: progress });
+      return;
+    }
+
+    if (event.operation === 'source.rename') {
+      const sourcePath = String(event.payload.source_path || '');
+      if (!sourcePath) throw new Error('Remote source.rename is missing source_path.');
+      await this.writeDocumentSnapshot({
+        ...runtime,
+        source: {
+          ...runtime.source,
+          vault_file: runtime.source.vault_file ? { ...runtime.source.vault_file, path: sourcePath } : { path: sourcePath },
+          identity: { ...(runtime.source.identity || {}), source_path: sourcePath },
+        },
+        source_revision: { ...(runtime.source_revision || {}), source_path: sourcePath, updated_at: event.updated_at },
+      });
+      return;
+    }
+
+    if (event.operation === 'canvas.node.add' || event.operation === 'canvas.node.delete') {
+      const nodeId = String(event.payload.node_id || event.target.id || '');
+      const nodes = runtime.nodes.filter((node) => String(node.id || node.node_id || '') !== nodeId);
+      await this.writeDocumentSnapshot({ ...runtime, nodes: event.operation === 'canvas.node.add' ? [...nodes, event.payload.node as Record<string, unknown>] : nodes });
+      return;
+    }
+  }
+
+  private conflictFromError(event: RuntimeSyncEvent, error: unknown): RuntimeConflictRecord {
+    return {
+      conflict_id: `conflict_${event.event_id}_${Math.abs(String((error as Error)?.message || error).length)}`,
+      event_id: event.event_id,
+      doc_id: event.doc_id,
+      reason: String((error as Error)?.message || error),
+      created_at: this.now(),
+      remote_revision: event.source_revision,
     };
   }
 

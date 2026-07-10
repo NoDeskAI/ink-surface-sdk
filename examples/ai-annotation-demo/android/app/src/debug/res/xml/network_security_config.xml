@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 仅 debug 构建：内网代理(10.4.36.30:3000，npm run serve)走 http 明文，方便内网/板子联调。
-     此豁免覆盖 src/main 的严格版；release 构建拿不到本文件 → 自动只走 https。IP 变了改这里。 -->
+<!-- 仅 debug 构建：本地开发时 VITE_API_BASE_URL 默认烧录为当前 Mac LAN IP 的 HTTP Cloud Hub
+     (例如 http://172.168.20.112:8731)，并从 http://appassets.androidplatform.net 加载 APK 内页面，
+     避免 debug WebView 出现 Mixed Content warning。需要测试自签 HTTPS 时可显式设置
+     INKLOOP_ANDROID_HTTPS_API_BASE=1 回到 HTTPS 8732；
+     (例如 http://172.168.20.112:8765)，IP 会随 Wi-Fi 改变，无法维护固定白名单。
+     因此 debug 包放开 cleartext，release 仍使用 src/main 的严格 HTTPS 配置。 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">10.4.36.30</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

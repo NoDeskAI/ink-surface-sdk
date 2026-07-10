@@ -60,6 +60,31 @@ const useSmokeDefaultVault = process.argv.includes('--use-smoke-default-vault');
 const vaultArg = argValue('--vault');
 if (!vaultArg && !useSmokeDefaultVault) fail('Missing --vault. Use --use-smoke-default-vault only for local smoke runs.');
 
+function cleanDeviceId(input) {
+  return String(input || 'obsidian-plugin')
+    .normalize('NFKC')
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80) || 'obsidian-plugin';
+}
+
+async function latestLocalSessionToken(tenantId, userId) {
+  if (process.env.INKLOOP_DISABLE_LOCAL_SESSION_DISCOVERY === '1') return '';
+  const authStorePath = process.env.INKLOOP_LOCAL_AUTH_STORE
+    ? path.resolve(process.env.INKLOOP_LOCAL_AUTH_STORE)
+    : path.join(PACKAGE_ROOT, 'examples/ai-annotation-demo/.inkloop/auth-sessions.json');
+  try {
+    const parsed = JSON.parse(await readFile(authStorePath, 'utf8'));
+    const now = Date.now();
+    const sessions = Object.entries(parsed.sessions || {})
+      .filter(([, session]) => session?.tenant_id === tenantId && session?.user_id === userId && Number(session?.expires_at || 0) > now)
+      .sort(([, left], [, right]) => Number(right?.updated_at || right?.created_at || 0) - Number(left?.updated_at || left?.created_at || 0));
+    return String(sessions[0]?.[0] || '');
+  } catch {
+    return '';
+  }
+}
+
 const warnings = [];
 const vaultRoot = path.resolve(vaultArg ?? DEFAULT_VAULT);
 const builtPluginSource = path.join(PACKAGE_ROOT, 'dist', 'obsidian-plugin', PLUGIN_ID);
@@ -69,7 +94,11 @@ const pluginTarget = path.join(vaultRoot, '.obsidian', 'plugins', PLUGIN_ID);
 const sdkBundleSource = path.join(PACKAGE_ROOT, 'dist', 'inkloop-surface-sdk.iife.js');
 const sdkBundleTarget = path.join(pluginTarget, 'inkloop-surface-sdk.iife.js');
 
-await mkdir(path.join(vaultRoot, '.obsidian'), { recursive: true });
+const obsidianConfigDir = path.join(vaultRoot, '.obsidian');
+await mkdir(obsidianConfigDir, { recursive: true });
+const appConfigPath = path.join(obsidianConfigDir, 'app.json');
+if (!(await pathExists(appConfigPath))) await writeJson(appConfigPath, {});
+await writeJson(path.join(obsidianConfigDir, 'restricted-mode.json'), { restrictedMode: false });
 await cp(pluginSource, pluginTarget, { recursive: true, force: true });
 let sdkBundleInstalled = false;
 try {
@@ -89,12 +118,28 @@ await writeJson(enabledPath, nextEnabled);
 
 const pluginDataPath = path.join(pluginTarget, 'data.json');
 const existingData = await readJson(pluginDataPath, {});
+const tenantId = process.env.INKLOOP_TENANT_ID || existingData.tenantId || 'local';
+const userId = process.env.INKLOOP_USER_ID || existingData.userId || 'local_demo';
+const sessionToken = process.env.INKLOOP_SESSION_TOKEN
+  || process.env.INKLOOP_DEVICE_SESSION_TOKEN
+  || existingData.sessionToken
+  || await latestLocalSessionToken(tenantId, userId);
 await writeJson(pluginDataPath, {
+  ...existingData,
   baseDir: '.inkloop',
   documentsDir: 'InkLoop',
-  syncEndpoint: 'http://127.0.0.1:8765/api/obsidian-lab/pull',
+  syncEndpoint: '',
+  runtimePushEndpoint: 'http://127.0.0.1:8731/v1/runtime/events:push',
+  runtimePullEndpoint: 'http://127.0.0.1:8731/v1/runtime/events:pull',
+  knowledgeBaseEndpoint: 'http://127.0.0.1:8731/v1/knowledge',
+  deviceCommandEndpoint: 'http://127.0.0.1:8731/v1/devices/commands',
+  tenantId,
+  userId,
+  sessionToken,
+  deviceId: process.env.INKLOOP_OBSIDIAN_DEVICE_ID || existingData.deviceId || cleanDeviceId(`obsidian_${path.basename(vaultRoot)}`),
   autoSyncOnChange: true,
   debounceMs: 750,
+  runtimePollMs: 2500,
   notifyManualSync: true,
   visualEnhancement: true,
   surfaceMode: 'thinking',
@@ -103,7 +148,6 @@ await writeJson(pluginDataPath, {
     pen: '#38bdf8',
     highlighter: '#facc15',
   },
-  ...existingData,
   previewEditing: false,
 });
 
@@ -115,6 +159,7 @@ console.log(JSON.stringify({
   plugin_target: pluginTarget,
   sdk_bundle: sdkBundleTarget,
   sdk_bundle_installed: sdkBundleInstalled,
+  session_token_configured: !!sessionToken,
   warnings,
   enabled_plugins: nextEnabled,
 }, null, 2));

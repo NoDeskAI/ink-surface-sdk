@@ -38,6 +38,9 @@ try {
     import * as indexeddbStore from 'ink-surface-sdk/offline-store/indexeddb';
     import * as runtimeSchema from 'ink-surface-sdk/runtime-schema';
     import * as syncClient from 'ink-surface-sdk/sync-client';
+    import * as knowledgeSchema from 'ink-surface-sdk/knowledge-schema';
+    import * as exportCore from 'ink-surface-sdk/export-core';
+    import * as obsidianAdapter from 'ink-surface-sdk/adapters/obsidian';
     if (typeof sdk.renderInkLoopVisualModel !== 'function') throw new Error('missing renderer export');
     if (typeof sdk.installInkLoopSurfaceStyles !== 'function') throw new Error('missing style export');
     if (typeof offlineStore.resolveOfflineOpenState !== 'function') throw new Error('missing offline-store export');
@@ -45,6 +48,10 @@ try {
     if (typeof indexeddbStore.IndexedDbOfflineRuntimeStore !== 'function') throw new Error('missing indexeddb export');
     if (typeof runtimeSchema.validateRuntimeSyncEvent !== 'function') throw new Error('missing runtime-schema export');
     if (typeof syncClient.RuntimeSyncRunner !== 'function') throw new Error('missing sync-client export');
+    if (typeof knowledgeSchema.buildInkloopDocUri !== 'function') throw new Error('missing knowledge-schema export');
+    if (typeof knowledgeSchema.buildLessonGraphKnowledgeObjects !== 'function') throw new Error('missing LessonGraph projection export');
+    if (typeof exportCore.taxonomyTags !== 'function') throw new Error('missing export-core taxonomy export');
+    if (typeof obsidianAdapter.renderVaultMarkdown !== 'function') throw new Error('missing Obsidian projection export');
   `;
   run('node', ['--input-type=module', '-e', esmProbe], { cwd: consumerDir });
 
@@ -53,15 +60,28 @@ try {
     "import { resolveOfflineOpenState, type OfflineDocumentCacheRecord } from 'ink-surface-sdk/offline-store';",
     "import { RuntimeSyncRunner, type RuntimeSyncTransportPort } from 'ink-surface-sdk/sync-client';",
     "import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';",
+    "import { buildInkloopDocUri, type KnowledgeObject } from 'ink-surface-sdk/knowledge-schema';",
+    "import { taxonomyTags, type EntityMode } from 'ink-surface-sdk/export-core';",
+    "import { renderVaultMarkdown, type ObsidianVaultRenderInput } from 'ink-surface-sdk/adapters/obsidian';",
     "const model: InkLoopVisualModel | null = parseInkLoopVisualModel('# Plain markdown');",
     "const record: OfflineDocumentCacheRecord | null = null;",
     "const openState = resolveOfflineOpenState(record, 'inkloop.runtime_sync_event.v1');",
     "const event: RuntimeSyncEvent | null = null;",
     "const transport: RuntimeSyncTransportPort | null = null;",
+    "const mode: EntityMode = 'meeting';",
+    "const tags: string[] = taxonomyTags({ documentId: 'meeting_demo', documentTitle: 'Demo', mode });",
+    "const uri: string = buildInkloopDocUri('doc_demo');",
+    "const ko: KnowledgeObject | null = null;",
+    "const vaultInput: ObsidianVaultRenderInput = { entities: [] };",
+    "const rendered = renderVaultMarkdown(vaultInput);",
     "void RuntimeSyncRunner;",
     "void transport;",
     "void event;",
     "void openState;",
+    "void tags;",
+    "void uri;",
+    "void ko;",
+    "void rendered;",
     "console.log(model?.documentTitle);",
     '',
   ].join('\n'));
@@ -88,6 +108,12 @@ try {
     'dist/inkloop-surface-sdk.iife.js',
     'dist/packages/adapter-contracts/src/index.d.ts',
     'dist/packages/adapter-contracts/src/index.js',
+    'dist/packages/adapter-obsidian/src/index.d.ts',
+    'dist/packages/adapter-obsidian/src/index.js',
+    'dist/packages/export-core/src/index.d.ts',
+    'dist/packages/export-core/src/index.js',
+    'dist/packages/knowledge-schema/src/index.d.ts',
+    'dist/packages/knowledge-schema/src/index.js',
     'dist/packages/native-bridge/src/index.d.ts',
     'dist/packages/native-bridge/src/index.js',
     'dist/packages/offline-store/src/file-sidecar-store.d.ts',
@@ -116,6 +142,16 @@ try {
     'docs/platform-renderer-strategy.md',
     'packages/adapter-contracts/package.json',
     'packages/adapter-contracts/src/index.ts',
+    'packages/adapter-contracts/README.md',
+    'packages/adapter-obsidian/package.json',
+    'packages/adapter-obsidian/src/index.ts',
+    'packages/adapter-obsidian/README.md',
+    'packages/export-core/package.json',
+    'packages/export-core/src/index.ts',
+    'packages/export-core/README.md',
+    'packages/knowledge-schema/package.json',
+    'packages/knowledge-schema/src/index.ts',
+    'packages/knowledge-schema/README.md',
     'packages/native-bridge/package.json',
     'packages/native-bridge/src/index.ts',
     'packages/native-bridge/src/webview-host.md',

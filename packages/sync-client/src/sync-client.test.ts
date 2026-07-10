@@ -48,6 +48,9 @@ class MemoryInbox implements RuntimeInboxPort {
       applied_event_ids: applied.map((item) => item.event_id),
       skipped_event_ids: events.filter((item) => seen.has(item.event_id)).map((item) => item.event_id),
       conflict_event_ids: [],
+      applied_doc_ids: [...new Set(applied.map((item) => item.doc_id))],
+      skipped_doc_ids: [...new Set(events.filter((item) => seen.has(item.event_id)).map((item) => item.doc_id))],
+      conflict_doc_ids: [],
     };
   }
 }
@@ -61,6 +64,9 @@ class ConflictInbox extends MemoryInbox {
       applied_event_ids: [],
       skipped_event_ids: [],
       conflict_event_ids: events.map((item) => item.event_id),
+      applied_doc_ids: [],
+      skipped_doc_ids: [],
+      conflict_doc_ids: [...new Set(events.map((item) => item.doc_id))],
     };
   }
 }
@@ -128,6 +134,26 @@ describe('sync client', () => {
     });
   });
 
+  it('resolves HTTP headers for each runtime sync request', async () => {
+    const seenAuth: string[] = [];
+    let token = 'token_1';
+    vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => {
+      seenAuth.push(String((init?.headers as Record<string, string>)?.authorization || ''));
+      return new Response(JSON.stringify({ acks: [{ event_id: 'evt_dynamic_headers', ok: true }] }), { status: 200 });
+    });
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: 'https://example.test/runtime-sync',
+      deviceId: 'device_http',
+      headers: () => ({ authorization: `Bearer ${token}` }),
+    });
+
+    await transport.send([event({ event_id: 'evt_dynamic_headers' })]);
+    token = 'token_2';
+    await transport.send([event({ event_id: 'evt_dynamic_headers' })]);
+
+    expect(seenAuth).toEqual(['Bearer token_1', 'Bearer token_2']);
+  });
+
   it('pulls remote events after the device cursor and stores the next cursor', async () => {
     const inbox = new MemoryInbox();
     await inbox.writeDeviceCursor({ device_id: 'device_a', cursor: 'cursor_1', updated_at: '2026-06-28T00:00:00.000Z' });
@@ -159,12 +185,45 @@ describe('sync client', () => {
       received: 1,
       applied: 1,
       skipped: 0,
+      applied_doc_ids: ['doc_sync_client'],
     });
     expect(inbox.events.map((item) => item.event_id)).toEqual(['evt_remote']);
     expect(inbox.cursors.get('device_a')).toEqual({
       device_id: 'device_a',
       cursor: 'cursor_2',
       updated_at: '2026-06-28T00:02:00.000Z',
+    });
+  });
+
+  it('can store pull cursors under a namespace-aware cursor key while sending the stable device id', async () => {
+    const inbox = new MemoryInbox();
+    await inbox.writeDeviceCursor({ device_id: 'tenant_a/user_a/device_a', cursor: 'cursor_namespace_a', updated_at: '2026-06-28T00:00:00.000Z' });
+    await inbox.writeDeviceCursor({ device_id: 'tenant_b/user_b/device_a', cursor: 'cursor_namespace_b', updated_at: '2026-06-28T00:00:00.000Z' });
+    const transport: RuntimeSyncTransportPort = {
+      async send() {
+        return [];
+      },
+      async pull(request) {
+        expect(request).toEqual({ device_id: 'device_a', cursor: 'cursor_namespace_b', limit: 100 });
+        return {
+          schema_version: 'inkloop.runtime_sync_pull.v1',
+          events: [],
+          next_cursor: 'cursor_namespace_b_next',
+        };
+      },
+    };
+
+    await new RuntimeSyncRunner(new MemoryOutbox(), transport, {
+      deviceId: 'device_a',
+      cursorKey: 'tenant_b/user_b/device_a',
+      inbox,
+      pullLimit: 100,
+    }).pullOnce();
+
+    expect(inbox.cursors.get('tenant_a/user_a/device_a')?.cursor).toBe('cursor_namespace_a');
+    expect(inbox.cursors.get('tenant_b/user_b/device_a')).toMatchObject({
+      device_id: 'tenant_b/user_b/device_a',
+      cursor: 'cursor_namespace_b_next',
     });
   });
 

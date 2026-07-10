@@ -1,0 +1,13 @@
+run_id,surface_id,surface_size,point_id,region,expected_x_mm,expected_y_mm,observed_x_mm,observed_y_mm,lighting,condition
+CAL-A2-001,surface_a2_sample,A2,A2-CENTER,center,210,297,211.4,296.2,office_500lux,new_surface
+CAL-A2-001,surface_a2_sample,A2,A2-TOP-EDGE,edge,210,10,211.8,12.1,office_500lux,new_surface
+CAL-A2-001,surface_a2_sample,A2,A2-BOTTOM-EDGE,edge,210,584,208.3,581.8,office_500lux,new_surface
+CAL-A2-001,surface_a2_sample,A2,A2-LEFT-CORNER,corner,10,10,12.8,11.9,office_500lux,new_surface
+CAL-A2-001,surface_a2_sample,A2,A2-RIGHT-CORNER,corner,410,584,407.1,581.4,office_500lux,new_surface
+CAL-A2-001,surface_a2_sample,A2,A2-FAST-LINE,edge,390,297,386.2,299.1,office_500lux,fast_writing
+CAL-A3-001,surface_a3_sample,A3,A3-CENTER,center,148.5,210,149.7,209.1,bright_800lux,wiped_surface
+CAL-A3-001,surface_a3_sample,A3,A3-TOP-EDGE,edge,148.5,10,150.4,12.2,bright_800lux,wiped_surface
+CAL-A3-001,surface_a3_sample,A3,A3-BOTTOM-EDGE,edge,148.5,410,146.1,407.2,bright_800lux,wiped_surface
+CAL-A3-001,surface_a3_sample,A3,A3-LEFT-CORNER,corner,10,10,12.4,12.6,bright_800lux,wiped_surface
+CAL-A3-001,surface_a3_sample,A3,A3-RIGHT-CORNER,corner,287,410,283.8,407.1,bright_800lux,wiped_surface
+CAL-A3-001,surface_a3_sample,A3,A3-SMALL-TEXT,center,148.5,120,150.2,121.8,bright_800lux,small_text

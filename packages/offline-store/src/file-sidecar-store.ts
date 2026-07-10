@@ -3,10 +3,12 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   AddRuntimeAnnotationInput,
+  RuntimeConflictRecord,
   RuntimeAnnotation,
   RuntimeCommitTarget,
   RuntimeDocumentRecord,
   RuntimeDocumentSnapshot,
+  RuntimeReadingProgress,
   RuntimeMutationResult,
   RuntimeSourceRef,
   RuntimeSurfaceBlock,
@@ -14,7 +16,8 @@ import type {
   UpdateRuntimeAnnotationInput,
   UpdateRuntimeBlockContentInput,
 } from '../../runtime-schema/src/index.js';
-import type { OfflineDocumentCacheRecord, OfflineRuntimeStorePort } from './index.js';
+import { assertRuntimeSyncEvent } from '../../runtime-schema/src/index.js';
+import type { OfflineDeviceCursor, OfflineDocumentCacheRecord, OfflineRemoteEventApplyResult, OfflineRuntimeStorePort } from './index.js';
 
 export interface SidecarRuntimeStoreConfig {
   vaultRoot: string;
@@ -99,8 +102,91 @@ function blockId(block: RuntimeSurfaceBlock): string {
   return block.projection?.block_id || block.object_id;
 }
 
+function mergeBootstrapSnapshot(existing: RuntimeDocumentSnapshot | null, incoming: RuntimeDocumentSnapshot): RuntimeDocumentSnapshot {
+  if (!existing) return incoming;
+  const existingBlocks = new Map(existing.blocks.map((block) => [blockId(block), block] as const));
+  const blocks = incoming.blocks.map((block) => {
+    const previous = existingBlocks.get(blockId(block));
+    const previousAnnotations = previous?.annotations ?? [];
+    if (!previousAnnotations.length) return block;
+    const incomingAnnotations = block.annotations ?? [];
+    if (!incomingAnnotations.length) return block;
+    const incomingIds = new Set(incomingAnnotations.map((annotation) => annotation.ko_id));
+    const carriedAnnotations = previousAnnotations.filter((annotation) => annotation.ko_id && !incomingIds.has(annotation.ko_id));
+    if (!carriedAnnotations.length) return block;
+    const carriedIds = carriedAnnotations.map((annotation) => annotation.ko_id);
+    return {
+      ...block,
+      annotations: [...incomingAnnotations, ...carriedAnnotations],
+      projection: {
+        ...(block.projection || {}),
+        knowledge_object_ids: [...new Set([...(block.projection?.knowledge_object_ids || []), ...carriedIds])],
+      },
+    };
+  });
+  return { ...incoming, blocks };
+}
+
 function cleanPatch(patch: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normBbox(value: unknown): [number, number, number, number] | undefined {
+  if (!Array.isArray(value) || value.length !== 4) return undefined;
+  const values = value.map((part) => Number(part));
+  return values.every(Number.isFinite) ? values as [number, number, number, number] : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function enrichedRemoteAnnotation(event: RuntimeSyncEvent, annotation: RuntimeAnnotation): RuntimeAnnotation {
+  const existingMeta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+  const bbox = normBbox(event.payload.bbox) ?? normBbox(existingMeta.bbox) ?? normBbox(annotation.visual_bbox);
+  const metaEntries = Object.entries({
+    mark_id: event.payload.mark_id,
+    marked_text: event.payload.marked_text,
+    kind: event.payload.kind,
+    feature_type: event.payload.feature_type,
+    tool: event.payload.tool,
+    origin: event.payload.origin,
+    scored_type: event.payload.scored_type,
+    hmp_action: event.payload.hmp_action,
+    page_id: event.payload.page_id,
+    page_index: event.payload.page_index,
+    bbox,
+    created_at: event.created_at,
+    updated_at: event.updated_at,
+    source_device_id: event.origin?.device_id,
+  }).filter(([, value]) => value !== undefined && value !== null && value !== '');
+  return {
+    ...annotation,
+    ...(bbox ? { visual_bbox: bbox } : {}),
+    inkloop_mark: {
+      ...existingMeta,
+      ...Object.fromEntries(metaEntries),
+    },
+  };
+}
+
+function runtimeAnnotationMarkId(annotation: RuntimeAnnotation): string {
+  const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+  return typeof meta.mark_id === 'string' ? meta.mark_id : '';
+}
+
+function fallbackAnnotationBlockIndex(blocks: RuntimeSurfaceBlock[], event: RuntimeSyncEvent): number {
+  const pageIndex = numberValue(event.payload.page_index)
+    ?? numberValue(isRecord(event.payload.annotation) && isRecord(event.payload.annotation.inkloop_mark) ? event.payload.annotation.inkloop_mark.page_index : undefined);
+  if (typeof pageIndex === 'number') {
+    const pageMatch = blocks.findIndex((block) => block.projection?.page_index === pageIndex);
+    if (pageMatch >= 0) return pageMatch;
+  }
+  return blocks.length ? 0 : -1;
 }
 
 function eventDedupeKey(event: Omit<RuntimeSyncEvent, 'dedupe_key'>): string {
@@ -156,6 +242,30 @@ export class SidecarRuntimeStore implements OfflineRuntimeStorePort {
     return path.join(this.docDir(docId), 'cache.json');
   }
 
+  appliedEventsPath(docId: string): string {
+    return path.join(this.docDir(docId), 'applied-events.jsonl');
+  }
+
+  progressPath(docId: string): string {
+    return path.join(this.docDir(docId), 'progress.json');
+  }
+
+  sourceRevisionPath(docId: string): string {
+    return path.join(this.docDir(docId), 'source-revision.json');
+  }
+
+  identityPath(docId: string): string {
+    return path.join(this.docDir(docId), 'identity.json');
+  }
+
+  cursorsPath(deviceId: string): string {
+    return this.sidecarPath('cursors', `${deviceId}.json`);
+  }
+
+  conflictsPath(): string {
+    return this.sidecarPath('conflicts', 'runtime-conflicts.jsonl');
+  }
+
   sourceAbsolutePath(source: RuntimeSourceRef): string | undefined {
     return source.vault_file?.path ? resolveVaultRelative(this.vaultRoot, source.vault_file.path) : undefined;
   }
@@ -174,10 +284,25 @@ export class SidecarRuntimeStore implements OfflineRuntimeStorePort {
       doc_id: docId,
       doc_dir: docDir,
       document,
+      identity: await readJsonFile(path.join(docDir, 'identity.json'), undefined),
       source,
+      source_revision: await readJsonFile(path.join(docDir, 'source-revision.json'), undefined),
+      reading_progress: await readJsonFile(path.join(docDir, 'progress.json'), undefined),
+      conflicts: (await this.listConflicts(docId)),
       blocks: await readJsonLines<RuntimeSurfaceBlock>(blocksPath),
       nodes: await readJsonLines<Record<string, unknown>>(path.join(docDir, 'canvas', 'nodes.jsonl')),
     };
+  }
+
+  async writeDocumentSnapshot(snapshot: RuntimeDocumentSnapshot): Promise<void> {
+    const docDir = this.docDir(snapshot.doc_id);
+    await writeJsonFile(path.join(docDir, 'document.json'), snapshot.document);
+    await writeJsonFile(path.join(docDir, 'source.json'), snapshot.source);
+    if (snapshot.identity) await writeJsonFile(this.identityPath(snapshot.doc_id), snapshot.identity);
+    if (snapshot.source_revision) await writeJsonFile(this.sourceRevisionPath(snapshot.doc_id), snapshot.source_revision);
+    if (snapshot.reading_progress) await writeJsonFile(this.progressPath(snapshot.doc_id), snapshot.reading_progress);
+    await this.writeRuntimeBlocks({ ...snapshot, doc_dir: docDir }, snapshot.blocks);
+    await writeJsonLines(path.join(docDir, 'canvas', 'nodes.jsonl'), snapshot.nodes ?? []);
   }
 
   async writeRuntimeBlocks(runtime: RuntimeDocumentSnapshot, blocks: RuntimeSurfaceBlock[]): Promise<void> {
@@ -210,6 +335,48 @@ export class SidecarRuntimeStore implements OfflineRuntimeStorePort {
 
   async listPendingEvents(docId?: string): Promise<RuntimeSyncEvent[]> {
     return (await this.listOutboxEvents()).filter((event) => event.status !== 'sent' && (!docId || event.doc_id === docId));
+  }
+
+  async listAppliedEventIds(docId?: string): Promise<string[]> {
+    if (docId) return (await readJsonLines<{ event_id: string }>(this.appliedEventsPath(docId))).map((item) => item.event_id);
+    const events = await readJsonLines<{ event_id: string; doc_id?: string }>(this.sidecarPath('applied-events.jsonl'));
+    return events.map((item) => item.event_id);
+  }
+
+  async getDeviceCursor(deviceId: string): Promise<OfflineDeviceCursor | null> {
+    return readJsonFile<OfflineDeviceCursor | null>(this.cursorsPath(deviceId), null);
+  }
+
+  async writeDeviceCursor(cursor: OfflineDeviceCursor): Promise<void> {
+    await writeJsonFile(this.cursorsPath(cursor.device_id), cursor);
+  }
+
+  async listConflicts(docId?: string): Promise<RuntimeConflictRecord[]> {
+    return (await readJsonLines<RuntimeConflictRecord>(this.conflictsPath())).filter((conflict) => !docId || conflict.doc_id === docId);
+  }
+
+  async recordConflict(conflict: RuntimeConflictRecord): Promise<void> {
+    await ensureDir(path.dirname(this.conflictsPath()));
+    await appendFile(this.conflictsPath(), `${JSON.stringify(conflict)}\n`, 'utf8');
+  }
+
+  async applyRemoteEvent(event: RuntimeSyncEvent): Promise<OfflineRemoteEventApplyResult> {
+    assertRuntimeSyncEvent(event);
+    const applied = new Set(await readJsonLines<{ event_id: string }>(this.appliedEventsPath(event.doc_id)).then((items) => items.map((item) => item.event_id)));
+    if (applied.has(event.event_id)) return { event_id: event.event_id, status: 'skipped' };
+    try {
+      await this.applyRemoteEventUnchecked(event);
+      const appliedRecord = { event_id: event.event_id, doc_id: event.doc_id, applied_at: nowIso() };
+      await ensureDir(path.dirname(this.appliedEventsPath(event.doc_id)));
+      await appendFile(this.appliedEventsPath(event.doc_id), `${JSON.stringify(appliedRecord)}\n`, 'utf8');
+      await ensureDir(path.dirname(this.sidecarPath('applied-events.jsonl')));
+      await appendFile(this.sidecarPath('applied-events.jsonl'), `${JSON.stringify(appliedRecord)}\n`, 'utf8');
+      return { event_id: event.event_id, status: 'applied' };
+    } catch (error) {
+      const conflict = this.conflictFromError(event, error);
+      await this.recordConflict(conflict);
+      return { event_id: event.event_id, status: 'conflicted', conflict };
+    }
   }
 
   async updateBlockContent(input: UpdateRuntimeBlockContentInput): Promise<RuntimeMutationResult> {
@@ -360,6 +527,145 @@ export class SidecarRuntimeStore implements OfflineRuntimeStorePort {
     const runtime = await this.loadDocument(docId);
     if (!runtime) throw new Error(`InkLoop runtime document is missing: ${docId}`);
     return runtime;
+  }
+
+  private async applyRemoteEventUnchecked(event: RuntimeSyncEvent): Promise<void> {
+    if (event.operation === 'runtime.bootstrap') {
+      const snapshot = event.payload.snapshot as RuntimeDocumentSnapshot | undefined;
+      if (!snapshot || snapshot.doc_id !== event.doc_id) throw new Error('Remote bootstrap snapshot is missing or mismatched.');
+      await this.writeDocumentSnapshot(mergeBootstrapSnapshot(await this.loadDocument(event.doc_id), snapshot));
+      return;
+    }
+
+    const runtime = await this.requireDocument(event.doc_id);
+    if (event.operation === 'block.update') {
+      const blockIdValue = String(event.payload.block_id || event.target.block_id || event.target.id || '');
+      const index = runtime.blocks.findIndex((block) => blockId(block) === blockIdValue);
+      if (index === -1) throw new Error(`Remote block was not found: ${blockIdValue}`);
+      const quote = normalizeMarkdownText(String(event.payload.content_md ?? event.payload.quote ?? ''));
+      const blocks = [...runtime.blocks];
+      const block = blocks[index];
+      blocks[index] = {
+        ...block,
+        text: quote,
+        source_anchor: { ...(block.source_anchor || {}), quote, ...(isRecord(event.payload.range) ? { range: event.payload.range as never } : {}) },
+      };
+      await this.writeRuntimeBlocks(runtime, blocks);
+      await this.touchDocument(runtime, nowIso());
+      return;
+    }
+
+    if (event.operation === 'annotation.add') {
+      const blockIdValue = String(event.payload.block_id || event.target.block_id || '');
+      const annotationPayload = event.payload.annotation as RuntimeAnnotation | undefined;
+      const annotation = annotationPayload?.ko_id ? enrichedRemoteAnnotation(event, annotationPayload) : undefined;
+      if (!annotation?.ko_id) throw new Error('Remote annotation.add is missing annotation payload.');
+      const index = blockIdValue
+        ? runtime.blocks.findIndex((block) => blockId(block) === blockIdValue)
+        : fallbackAnnotationBlockIndex(runtime.blocks, event);
+      if (index === -1) throw new Error(`Remote annotation block was not found: ${blockIdValue}`);
+      const blocks = [...runtime.blocks];
+      const block = blocks[index];
+      const incomingMarkId = runtimeAnnotationMarkId(annotation);
+      const annotations = (block.annotations || []).filter((item) => {
+        const existingMarkId = runtimeAnnotationMarkId(item);
+        if (incomingMarkId && existingMarkId) return existingMarkId !== incomingMarkId;
+        return item.ko_id !== annotation.ko_id;
+      });
+      blocks[index] = {
+        ...block,
+        annotations: [...annotations, annotation],
+        projection: {
+          ...(block.projection || {}),
+          knowledge_object_ids: [...new Set([...(block.projection?.knowledge_object_ids || []), annotation.ko_id])],
+        },
+      };
+      await this.writeRuntimeBlocks(runtime, blocks);
+      await this.touchDocument(runtime, nowIso());
+      return;
+    }
+
+    if (event.operation === 'annotation.update' || event.operation === 'annotation.delete') {
+      const ko = String(event.payload.ko_id || event.target.id || '');
+      if (!ko) throw new Error('Remote annotation event is missing ko_id.');
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).flatMap((annotation) => {
+          if (annotation.ko_id !== ko) return [annotation];
+          didUpdate = true;
+          if (event.operation === 'annotation.delete') return [{ ...annotation, status: 'deleted', deleted_at: event.updated_at }];
+          return [{ ...annotation, ...(event.payload.patch as Record<string, unknown> | undefined), updated_at: event.updated_at }];
+        });
+        return { ...block, annotations };
+      });
+      if (!didUpdate) throw new Error(`Remote annotation was not found: ${ko}`);
+      await this.writeRuntimeBlocks(runtime, blocks);
+      await this.touchDocument(runtime, nowIso());
+      return;
+    }
+
+    if (event.operation === 'knowledge.update') {
+      const ko = String(event.payload.ko_id || event.target.id || '');
+      if (!ko) throw new Error('Remote knowledge.update event is missing ko_id.');
+      const patch = isRecord(event.payload.patch) ? event.payload.patch : {};
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).map((annotation) => {
+          if (annotation.ko_id !== ko) return annotation;
+          didUpdate = true;
+          return {
+            ...annotation,
+            ...(typeof patch.status === 'string' ? { status: patch.status } : {}),
+            ...(Array.isArray(patch.tags) ? { tags: patch.tags } : {}),
+            controlled_fields: { ...(annotation.controlled_fields as Record<string, unknown> | undefined || {}), ...patch },
+            updated_at: event.updated_at,
+          };
+        });
+        return { ...block, annotations };
+      });
+      if (didUpdate) await this.writeRuntimeBlocks(runtime, blocks);
+      await this.touchDocument(runtime, nowIso());
+      return;
+    }
+
+    if (event.operation === 'progress.update') {
+      const progress = event.payload.progress as RuntimeReadingProgress | undefined;
+      if (!progress) throw new Error('Remote progress.update is missing progress payload.');
+      await writeJsonFile(this.progressPath(event.doc_id), progress);
+      return;
+    }
+
+    if (event.operation === 'source.rename') {
+      const sourcePath = String(event.payload.source_path || '');
+      if (!sourcePath) throw new Error('Remote source.rename is missing source_path.');
+      const source = {
+        ...runtime.source,
+        vault_file: runtime.source.vault_file ? { ...runtime.source.vault_file, path: sourcePath } : { path: sourcePath },
+        identity: { ...(runtime.source.identity || {}), source_path: sourcePath },
+      };
+      await writeJsonFile(path.join(runtime.doc_dir, 'source.json'), source);
+      await writeJsonFile(this.sourceRevisionPath(event.doc_id), { ...(runtime.source_revision || {}), source_path: sourcePath, updated_at: event.updated_at });
+      return;
+    }
+
+    if (event.operation === 'canvas.node.add' || event.operation === 'canvas.node.delete') {
+      const nodeId = String(event.payload.node_id || event.target.id || '');
+      const nodes = runtime.nodes.filter((node) => String(node.id || node.node_id || '') !== nodeId);
+      const nextNodes = event.operation === 'canvas.node.add' ? [...nodes, event.payload.node as Record<string, unknown>] : nodes;
+      await writeJsonLines(path.join(runtime.doc_dir, 'canvas', 'nodes.jsonl'), nextNodes.filter(Boolean));
+      return;
+    }
+  }
+
+  private conflictFromError(event: RuntimeSyncEvent, error: unknown): RuntimeConflictRecord {
+    return {
+      conflict_id: `conflict_${createHash('sha256').update(`${event.event_id}:${String((error as Error)?.message || error)}`).digest('hex').slice(0, 16)}`,
+      event_id: event.event_id,
+      doc_id: event.doc_id,
+      reason: String((error as Error)?.message || error),
+      created_at: nowIso(),
+      remote_revision: event.source_revision,
+    };
   }
 
   private async patchMarkdownSource(input: {

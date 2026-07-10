@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SidecarRuntimeStore } from './file-sidecar-store';
-import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../runtime-schema/src/index.js';
+import type { RuntimeDocumentSnapshot, RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../runtime-schema/src/index.js';
 
 const DOC_ID = 'doc_runtime';
 const SOURCE_PATH = 'InkLoop/Runtime Doc.md';
@@ -74,6 +74,49 @@ async function makeVault(): Promise<{ vaultRoot: string; store: SidecarRuntimeSt
   ]);
 
   return { vaultRoot, store: new SidecarRuntimeStore({ vaultRoot }), blocksPath, sourcePath };
+}
+
+function runtimeEvent(input: Partial<RuntimeSyncEvent> & { event_id: string; operation: RuntimeSyncEvent['operation'] }): RuntimeSyncEvent {
+  return {
+    schema_version: 'inkloop.runtime_sync_event.v1',
+    event_id: input.event_id,
+    source: input.source ?? 'cloud',
+    doc_id: input.doc_id ?? DOC_ID,
+    operation: input.operation,
+    target: input.target ?? { type: 'document', id: input.doc_id ?? DOC_ID },
+    payload: input.payload ?? {},
+    status: input.status ?? 'sent',
+    dedupe_key: input.dedupe_key ?? input.event_id,
+    created_at: input.created_at ?? '2026-06-28T00:00:00.000Z',
+    updated_at: input.updated_at ?? '2026-06-28T00:00:00.000Z',
+  };
+}
+
+function bootstrapSnapshot(): RuntimeDocumentSnapshot {
+  return {
+    doc_id: 'doc_bootstrap',
+    doc_dir: '.inkloop/docs/doc_bootstrap',
+    document: { doc_id: 'doc_bootstrap', title: 'Bootstrap', source_type: 'markdown' },
+    identity: {
+      schema_version: 'inkloop.runtime_document_identity.v1',
+      doc_id: 'doc_bootstrap',
+      source_kind: 'native_markdown',
+      stable_key: 'obsidian://vault/Bootstrap.md',
+      source_path: 'Bootstrap.md',
+      created_at: '2026-06-28T00:00:00.000Z',
+      updated_at: '2026-06-28T00:00:00.000Z',
+    },
+    source: { doc_id: 'doc_bootstrap', kind: 'obsidian_vault_file', vault_file: { path: 'Bootstrap.md' } },
+    blocks: [{
+      schema_version: 'inkloop.surface_object.v1',
+      object_id: 'blk_bootstrap',
+      doc_id: 'doc_bootstrap',
+      text: 'Bootstrapped text.',
+      projection: { block_id: 'blk_bootstrap', kind: 'paragraph', region: 'editable', knowledge_object_ids: [] },
+      annotations: [],
+    }],
+    nodes: [],
+  };
 }
 
 afterEach(async () => {
@@ -165,5 +208,132 @@ describe('SidecarRuntimeStore', () => {
     expect(blocks[1].projection?.knowledge_object_ids).toContain(result.annotation?.ko_id);
     const outbox = await store.listOutboxEvents();
     expect(outbox.map((event: RuntimeSyncEvent) => event.operation)).toEqual(['annotation.add']);
+  });
+
+  it('applies bootstrap snapshots and records applied remote events without touching outbox', async () => {
+    const vaultRoot = await mkdtemp(path.join(os.tmpdir(), 'inkloop-runtime-'));
+    tempRoots.push(vaultRoot);
+    const store = new SidecarRuntimeStore({ vaultRoot });
+    const snapshot = bootstrapSnapshot();
+
+    const result = await store.applyRemoteEvent(runtimeEvent({
+      event_id: 'evt_bootstrap',
+      doc_id: 'doc_bootstrap',
+      operation: 'runtime.bootstrap',
+      target: { type: 'document', id: 'doc_bootstrap' },
+      payload: { snapshot },
+    }));
+
+    expect(result.status).toBe('applied');
+    expect(await store.loadDocument('doc_bootstrap')).toMatchObject({ doc_id: 'doc_bootstrap', blocks: [{ object_id: 'blk_bootstrap' }] });
+    expect(await store.listAppliedEventIds('doc_bootstrap')).toEqual(['evt_bootstrap']);
+    expect(await store.listOutboxEvents()).toEqual([]);
+  });
+
+  it('drops stale sidecar annotations when a remote bootstrap snapshot has no marks', async () => {
+    const { store, blocksPath } = await makeVault();
+    const current = await store.loadDocument(DOC_ID);
+    if (!current) throw new Error('test setup missing runtime doc');
+    const emptyBootstrap: RuntimeDocumentSnapshot = {
+      ...current,
+      blocks: current.blocks.map((block) => ({
+        ...block,
+        annotations: [],
+        projection: { ...(block.projection || {}), knowledge_object_ids: [] },
+      })),
+    };
+
+    const result = await store.applyRemoteEvent(runtimeEvent({
+      event_id: 'evt_empty_bootstrap_drops_marks',
+      operation: 'runtime.bootstrap',
+      target: { type: 'document', id: DOC_ID },
+      payload: { snapshot: emptyBootstrap },
+    }));
+
+    expect(result.status).toBe('applied');
+    const blocks = await readJsonLines<RuntimeSurfaceBlock>(blocksPath);
+    expect(blocks[0].annotations).toEqual([]);
+    expect(blocks[0]?.projection?.knowledge_object_ids).toEqual([]);
+  });
+
+  it('applies and dedupes remote annotation events through the sidecar inbox', async () => {
+    const { store, blocksPath } = await makeVault();
+    const remote = runtimeEvent({
+      event_id: 'evt_remote_add',
+      operation: 'annotation.add',
+      target: { type: 'annotation', id: 'ko_remote', block_id: 'blk_second' },
+      payload: {
+        block_id: 'blk_second',
+        mark_id: 'mark_remote',
+        marked_text: 'Remote marked text',
+        page_id: 'pg_sidecar_1',
+        page_index: 1,
+        bbox: [0.1, 0.2, 0.3, 0.04],
+        annotation: { ko_id: 'ko_remote', title: 'Remote mark', render_mode: 'stroke_only', visual_bbox: [-4, -1, 9, 1.2], visual_strokes: [{ points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] }] },
+      },
+    });
+
+    expect((await store.applyRemoteEvent(remote)).status).toBe('applied');
+    expect((await store.applyRemoteEvent(remote)).status).toBe('skipped');
+
+    const blocks = await readJsonLines<RuntimeSurfaceBlock>(blocksPath);
+    expect(blocks[1].annotations?.find((annotation) => annotation.ko_id === 'ko_remote')).toMatchObject({
+      visual_bbox: [0.1, 0.2, 0.3, 0.04],
+      inkloop_mark: {
+        mark_id: 'mark_remote',
+        marked_text: 'Remote marked text',
+        page_id: 'pg_sidecar_1',
+        page_index: 1,
+        bbox: [0.1, 0.2, 0.3, 0.04],
+      },
+    });
+    expect(await store.listPendingEvents()).toEqual([]);
+  });
+
+  it('dedupes sidecar remote annotation adds by mark_id before falling back to ko_id', async () => {
+    const { store, blocksPath } = await makeVault();
+
+    for (const item of [
+      { event_id: 'evt_remote_same_ko_a', mark_id: 'mark_a', bbox: [0.1, 0.2, 0.3, 0.04] },
+      { event_id: 'evt_remote_same_ko_b', mark_id: 'mark_b', bbox: [0.2, 0.3, 0.3, 0.04] },
+    ] as const) {
+      expect((await store.applyRemoteEvent(runtimeEvent({
+        event_id: item.event_id,
+        operation: 'annotation.add',
+        target: { type: 'annotation', id: 'ko_shared', block_id: 'blk_first' },
+        payload: {
+          block_id: 'blk_first',
+          mark_id: item.mark_id,
+          page_id: 'pg_sidecar_0',
+          page_index: 0,
+          bbox: item.bbox,
+          annotation: { ko_id: 'ko_shared', title: item.mark_id, render_mode: 'stroke_only' },
+        },
+      }))).status).toBe('applied');
+    }
+
+    const blocks = await readJsonLines<RuntimeSurfaceBlock>(blocksPath);
+    const markIds = (blocks[0].annotations ?? [])
+      .map((annotation) => (annotation.inkloop_mark as { mark_id?: string } | undefined)?.mark_id)
+      .filter(Boolean)
+      .sort();
+    expect(markIds).toEqual(['mark_a', 'mark_b']);
+    expect(markIds).toHaveLength(2);
+  });
+
+  it('records conflicts and cursors in hidden sidecar files', async () => {
+    const { store } = await makeVault();
+
+    const result = await store.applyRemoteEvent(runtimeEvent({
+      event_id: 'evt_missing_remote',
+      operation: 'annotation.update',
+      target: { type: 'annotation', id: 'ko_missing' },
+      payload: { ko_id: 'ko_missing', patch: { title: 'Missing' } },
+    }));
+    await store.writeDeviceCursor({ device_id: 'obsidian_device', cursor: 'cursor_1', updated_at: '2026-06-28T00:00:00.000Z' });
+
+    expect(result.status).toBe('conflicted');
+    expect(await store.getDeviceCursor('obsidian_device')).toMatchObject({ cursor: 'cursor_1' });
+    expect((await store.listConflicts(DOC_ID))[0]).toMatchObject({ event_id: 'evt_missing_remote', doc_id: DOC_ID });
   });
 });

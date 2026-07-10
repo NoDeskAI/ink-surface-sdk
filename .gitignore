@@ -1,6 +1,8 @@
 node_modules/
 dist/
 examples/*/dist/
+test-results/
+.inkloop/
 .DS_Store
 *.log
 .idea/
@@ -19,3 +21,11 @@ examples/*/dist/
 # pdfjs CMap/字体资产：demo postinstall 自动从 node_modules 拷入，不入库。
 **/public/cmaps/
 **/public/standard_fonts/
+
+# 外部参考仓库/SDK 本地副本。代码里通过适配层接入，目录本身不要混入主仓库。
+examples/ai-annotation-demo/Lark-Meeting-Timeline-main/
+examples/ai-annotation-demo/Lark-Meeting-Timeline-main.backup-*/
+examples/ai-annotation-demo/jsoncanvas-main/
+examples/ai-annotation-demo/obsidian-importer-master/
+examples/ai-annotation-demo/obsidian-maps-master/
+examples/ai-annotation-demo/obsidian-plugin/

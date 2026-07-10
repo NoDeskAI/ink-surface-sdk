@@ -1,0 +1,864 @@
+import { IndexedDbOfflineRuntimeStore, type OfflineRuntimeStorePort } from 'ink-surface-sdk/offline-store';
+import { HttpRuntimeSyncTransport, RuntimeSyncRunner } from 'ink-surface-sdk/sync-client';
+import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeDocumentSourceKind, RuntimeStrokePoint, RuntimeSurfaceBlock, RuntimeVisualStroke } from 'ink-surface-sdk/runtime-schema';
+import { apiBase, apiUrlWithLocalHttpFallback } from '../../core/api';
+import { authHeaders, getSession, runtimeTenantId, runtimeUserId } from '../../core/auth';
+import { appendMarkEntry, getDoc, getFoldedMarks, getFoldedMarksByContext, getMeeting, setAiTurnAppendHook, setRuntimeLedgerAppendHook } from '../../local/store';
+import type { PersistedDoc, PersistedMark } from '../../core/store-format';
+import { bus, getActiveContext, state, strokeMarkIds, type Stroke, type Tool } from '../../app/state';
+import { pageIdFor } from '../../core/ids';
+import { restoreLedgerState } from '../../controllers/ledger-restore';
+import { redrawInk } from '../../capture/ink';
+import { buildL1Export } from './index';
+import { buildMeetingL1Export } from './meeting-export';
+import { meetingContextId, meetingIdFromRuntimeDocumentId, runtimeDocumentIdForLedgerMark, runtimeDocumentIdForSyncRequest } from './runtime-meeting-routing';
+import { buildRuntimeSnapshotFromProjection, bridgeRuntimeLedgerToStore, buildRuntimeSyncEventForMark, isRuntimeInvalidPageNormMark, localStorageRuntimeBridgeWatermarks } from './runtime-sync-bridge';
+import { requeueVisibleRuntimeMarksForCloudAlignment, visibleRuntimeMarkSignature } from './runtime-sync-alignment';
+import { RuntimeStoreInbox } from './runtime-inbox';
+import type { RuntimeSyncStatusDetail, RuntimeSyncUiState } from '../../components/runtime-sync-status';
+
+const MAGIC_SYNC_DEBOUNCE_MS = 120;
+const MAGIC_SYNC_POLL_MS = 500;
+const MAGIC_SYNC_RECONCILE_MS = 3_000;
+const MAGIC_SYNC_RECONCILE_STALE_MS = 15_000;
+
+export interface WebRuntimeSyncHostOptions {
+  deviceId?: string;
+  pushEndpoint?: string;
+  pullEndpoint?: string;
+  batchSize?: number;
+  debounceMs?: number;
+  pollMs?: number;
+  reconcileMs?: number;
+  reconcileStaleMs?: number;
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  runtimeStore?: OfflineRuntimeStorePort;
+  logger?: (event: string, details?: unknown) => void;
+  onRemoteApplied?: (input: { docIds: string[]; store: OfflineRuntimeStorePort }) => void | Promise<void>;
+}
+
+export interface WebRuntimeSyncHost {
+  deviceId: string;
+  store: OfflineRuntimeStorePort;
+  syncDocument(documentId: string, reason?: string): Promise<void>;
+  pullNow(reason?: string): Promise<void>;
+  reconcileNow(documentId?: string, reason?: string): Promise<void>;
+  dispose(): void;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function stableDeviceId(): string {
+  const key = 'inkloop.runtime-sync.device-id';
+  try {
+    const existing = localStorage.getItem(key);
+    if (existing) return existing;
+    const id = `web_${typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(key, id);
+    return id;
+  } catch {
+    return 'web_runtime';
+  }
+}
+
+function runtimeCursorKey(deviceId: string): string {
+  return `${runtimeTenantId()}/${runtimeUserId()}/${deviceId}`;
+}
+
+function runtimeSyncUrl(path: string): string {
+  return apiUrlWithLocalHttpFallback(path);
+}
+
+function sourceKindForDoc(doc: PersistedDoc | null): RuntimeDocumentSourceKind {
+  const name = doc?.filename || '';
+  if (/\.pdf$/i.test(name)) return 'imported_pdf';
+  if (/\.md$/i.test(name)) return 'native_markdown';
+  return 'inkloop_created';
+}
+
+export function runtimeSourceContentHash(projection: { body_hash?: string; content_hash?: string } | undefined): string | undefined {
+  return projection?.body_hash || projection?.content_hash;
+}
+
+const hydratedRuntimeStrokeKeys = new WeakMap<Stroke, string>();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function runtimeBbox(value: unknown): [number, number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const nums = value.map((part) => Number(part));
+  return nums.every(Number.isFinite) ? nums as [number, number, number, number] : null;
+}
+
+function isClearlyInvalidPageNormBbox(bbox: [number, number, number, number]): boolean {
+  const [x, y, w, h] = bbox;
+  if (w <= 0 || h <= 0) return true;
+  if (x < -0.05 || y < -0.05) return true;
+  if (w > 1.1 || h > 1.1) return true;
+  if (x + w > 1.05 || y + h > 1.05) return true;
+  return false;
+}
+
+function runtimeTool(tool: unknown): Tool {
+  if (tool === 'aipen' || tool === 'ai_pen') return 'aipen';
+  if (tool === 'underline') return 'underline';
+  return tool === 'highlighter' ? 'highlighter' : 'pen';
+}
+
+function runtimePersistedStrokeTool(tool: unknown): PersistedMark['strokes'][number]['tool'] {
+  if (tool === 'aipen' || tool === 'ai_pen') return 'aipen';
+  if (tool === 'underline') return 'underline';
+  return tool === 'highlighter' ? 'highlighter' : 'pen';
+}
+
+function runtimeOrigin(origin: string, tool: PersistedMark['tool'], isAiPen: boolean): PersistedMark['origin'] {
+  if (isAiPen) return 'ai_pen';
+  if (origin === 'pen' || origin === 'highlighter' || origin === 'underline' || origin === 'auto') return origin;
+  return tool;
+}
+
+function persistedStrokeToCanvasStroke(stroke: PersistedMark['strokes'][number]): Stroke | null {
+  const points = stroke.points
+    .map((point, index) => ({ x: Number(point.x), y: Number(point.y), t: typeof point.t === 'number' ? point.t : index, pressure: typeof point.pressure === 'number' ? point.pressure : 0.5 }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (!points.length) return null;
+  return { tool: runtimeTool(stroke.tool), points };
+}
+
+function runtimePointsToPersisted(points: RuntimeStrokePoint[] = []): PersistedMark['strokes'][number]['points'] {
+  return points
+    .map((point, index) => ({
+      x: Number(point.x),
+      y: Number(point.y),
+      t: typeof point.t === 'number' ? point.t : index,
+      pressure: typeof point.pressure === 'number' ? point.pressure : 0.5,
+    }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+}
+
+function visualStrokeBbox(strokes: RuntimeVisualStroke[] = []): [number, number, number, number] | null {
+  const points = strokes.flatMap((stroke) => stroke.points ?? []);
+  if (!points.length) return null;
+  const xs = points.map((point) => Number(point.x)).filter(Number.isFinite);
+  const ys = points.map((point) => Number(point.y)).filter(Number.isFinite);
+  if (!xs.length || !ys.length) return null;
+  const x0 = Math.min(...xs);
+  const x1 = Math.max(...xs);
+  const y0 = Math.min(...ys);
+  const y1 = Math.max(...ys);
+  return [x0, y0, Math.max(0.001, x1 - x0), Math.max(0.001, y1 - y0)];
+}
+
+function pointIsPageNorm(point: RuntimeStrokePoint | { x: number; y: number }): boolean {
+  const x = Number(point.x);
+  const y = Number(point.y);
+  return Number.isFinite(x) && Number.isFinite(y) && x >= -0.05 && y >= -0.05 && x <= 1.05 && y <= 1.05;
+}
+
+function visualStrokeIsPageNorm(stroke: RuntimeVisualStroke): boolean {
+  if (stroke.coord_space && stroke.coord_space !== 'page_norm' && stroke.coord_space !== 'page') return false;
+  const points = stroke.points ?? [];
+  return points.length > 0 && points.every(pointIsPageNorm);
+}
+
+function persistedStrokeIsPageNorm(stroke: PersistedMark['strokes'][number]): boolean {
+  const points = stroke.points ?? [];
+  return points.length > 0 && points.every(pointIsPageNorm);
+}
+
+function markHasDrawablePageNormStrokes(mark: PersistedMark): boolean {
+  return mark.strokes.some(persistedStrokeIsPageNorm);
+}
+
+function roundedCoord(value: unknown): string {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(4) : 'nan';
+}
+
+function bboxSignature(bbox: readonly number[] | undefined): string {
+  if (!Array.isArray(bbox)) return '';
+  return bbox.map(roundedCoord).join(',');
+}
+
+function hasMeaningfulPageNormBbox(mark: PersistedMark): boolean {
+  if (!Array.isArray(mark.bbox) || mark.bbox.length !== 4) return false;
+  const [, , width, height] = mark.bbox.map(Number);
+  return Number.isFinite(width) && Number.isFinite(height) && width > 0.002 && height > 0.002;
+}
+
+function markStrokeSignature(mark: PersistedMark): string {
+  return mark.strokes
+    .map((stroke) => {
+      const points = stroke.points ?? [];
+      const first = points[0];
+      const last = points[points.length - 1];
+      return [
+        stroke.tool,
+        stroke.coord_space ?? mark.coord_space ?? 'page_norm',
+        stroke.capture_surface ?? mark.capture_surface ?? 'page',
+        points.length,
+        first ? `${roundedCoord(first.x)},${roundedCoord(first.y)}` : '',
+        last ? `${roundedCoord(last.x)},${roundedCoord(last.y)}` : '',
+      ].join(':');
+    })
+    .join('|');
+}
+
+function syntheticStrokeForBbox(
+  bbox: [number, number, number, number],
+  tool: PersistedMark['strokes'][number]['tool'],
+): PersistedMark['strokes'][number] {
+  const [x, y, w, h] = bbox;
+  const yLine = Math.min(0.99, Math.max(0.01, y + Math.max(h * 0.75, 0.006)));
+  const x0 = Math.min(0.99, Math.max(0.01, x));
+  const x1 = Math.min(0.99, Math.max(0.01, x + w));
+  const mid = (x0 + x1) / 2;
+  const bend = tool === 'aipen' ? Math.min(0.008, Math.max(0.002, h * 0.35)) : 0;
+  return {
+    tool,
+    coord_space: 'page_norm',
+    capture_surface: 'page',
+    points: [
+      { x: x0, y: yLine, t: 0, pressure: 0.5 },
+      { x: mid, y: Math.min(0.99, yLine + bend), t: 16, pressure: 0.52 },
+      { x: x1, y: yLine, t: 32, pressure: 0.5 },
+    ],
+  };
+}
+
+function markIdFromRuntimeAnnotation(annotation: RuntimeAnnotation, meta: Record<string, unknown>): string {
+  const explicit = stringValue(meta.mark_id);
+  if (explicit) return explicit;
+  if (annotation.ko_id.startsWith('mark_')) return annotation.ko_id;
+  if (annotation.ko_id.startsWith('ko_mark_')) return annotation.ko_id.slice(3);
+  if (annotation.ko_id.startsWith('ko_')) return `mark_${annotation.ko_id.slice(3)}`;
+  return `mark_${annotation.ko_id}`;
+}
+
+export function runtimeAnnotationToMark(docId: string, block: RuntimeSurfaceBlock, annotation: RuntimeAnnotation): PersistedMark | null {
+  if (annotation.status === 'deleted') return null;
+  const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+  const pageIndex = finiteNumber(meta.page_index)
+    ?? finiteNumber(block.projection?.page_index)
+    ?? 0;
+  const pageId = stringValue(meta.page_id) || pageIdFor(docId, pageIndex);
+  const visualStrokes = annotation.visual_strokes ?? [];
+  const rawTool = stringValue(meta.tool) || visualStrokes.find((stroke) => stroke.tool)?.tool || '';
+  const rawOrigin = stringValue(meta.origin);
+  const isAiPen = rawOrigin === 'ai_pen' || rawTool === 'aipen' || rawTool === 'ai_pen';
+  const tool: PersistedMark['tool'] = rawTool === 'highlighter' ? 'highlighter' : rawTool === 'underline' ? 'underline' : 'pen';
+  const featureType: PersistedMark['feature_type'] =
+    meta.feature_type === 'markup' || tool === 'highlighter' || tool === 'underline'
+      ? 'markup'
+      : meta.feature_type === 'drawing'
+        ? 'drawing'
+        : 'handwriting';
+  const createdAt = stringValue(meta.created_at) || annotation.created_at || new Date().toISOString();
+  const markId = markIdFromRuntimeAnnotation(annotation, meta);
+  const bbox = runtimeBbox(meta.bbox) || runtimeBbox(annotation.visual_bbox) || visualStrokeBbox(visualStrokes) || [0, 0, 0.001, 0.001];
+  if (isClearlyInvalidPageNormBbox(bbox)) return null;
+  const strokeTool = isAiPen ? 'aipen' : runtimePersistedStrokeTool(rawTool || visualStrokes.find((stroke) => stroke.tool)?.tool);
+  const strokes: PersistedMark['strokes'] = visualStrokes
+    .filter(visualStrokeIsPageNorm)
+    .map((stroke) => ({
+      tool: isAiPen ? 'aipen' : runtimePersistedStrokeTool(stroke.tool),
+      points: runtimePointsToPersisted(stroke.points),
+      coord_space: 'page_norm' as const,
+      capture_surface: 'page' as const,
+    }))
+    .filter((stroke) => stroke.points.length > 0);
+  if (!strokes.length) strokes.push(syntheticStrokeForBbox(bbox, strokeTool));
+  const color = stringValue(visualStrokes[0]?.color) || (tool === 'highlighter' ? '#facc15' : '#111111');
+  return {
+    entry_id: `remote_${markId}`,
+    document_id: docId,
+    page_id: pageId,
+    page_index: pageIndex,
+    seq: Date.parse(createdAt) || 0,
+    created_at: createdAt,
+    mark_id: markId,
+    strokes,
+    bbox,
+    coord_space: 'page_norm',
+    capture_surface: 'page',
+    tool,
+    color,
+    pointer_type: 'remote',
+    device_id: stringValue(meta.source_device_id) || 'runtime-sync',
+    abs_timestamp: Date.parse(createdAt) || Date.now(),
+    feature_type: featureType,
+    feature_confidence: 1,
+    kind: stringValue(meta.kind) || annotation.kind || featureType,
+    kind_source: 'runtime-sync',
+    scored_type: stringValue(meta.scored_type) || featureType,
+    scored_score: 1,
+    hmp: null,
+    marked_text: stringValue(meta.marked_text) || stringValue(annotation.body_md) || stringValue(annotation.title) || '',
+    ai_eligible: false,
+    origin: runtimeOrigin(rawOrigin, tool, isAiPen),
+    is_tombstone: false,
+  };
+}
+
+export function shouldAdoptRemoteMarkRevision(local: PersistedMark | undefined, remote: PersistedMark | null): local is PersistedMark {
+  if (!local || !remote || local.is_tombstone || remote.is_tombstone) return false;
+  const remoteText = (remote.marked_text || '').trim();
+  if (remoteText && remoteText !== (local.marked_text || '').trim()) return true;
+  if (!markHasDrawablePageNormStrokes(local) && markHasDrawablePageNormStrokes(remote)) return true;
+  if (markHasDrawablePageNormStrokes(remote) && markStrokeSignature(local) !== markStrokeSignature(remote)) return true;
+  if (hasMeaningfulPageNormBbox(remote) && bboxSignature(local.bbox) !== bboxSignature(remote.bbox)) return true;
+  if ((local.origin || '') !== (remote.origin || '') && remote.origin === 'ai_pen') return true;
+  return false;
+}
+
+async function appendRemoteMarkRevision(local: PersistedMark, remote: PersistedMark): Promise<void> {
+  const { entry_id: _entryId, seq: _seq, created_at: _createdAt, ...rest } = local;
+  await appendMarkEntry({
+    ...rest,
+    strokes: remote.strokes.length ? remote.strokes : local.strokes,
+    coord_space: remote.coord_space ?? local.coord_space,
+    capture_surface: remote.capture_surface ?? local.capture_surface,
+    surface_bbox: remote.surface_bbox ?? local.surface_bbox,
+    surface_coord_space: remote.surface_coord_space ?? local.surface_coord_space,
+    reader_layout_id: remote.reader_layout_id ?? local.reader_layout_id,
+    tool: remote.tool || local.tool,
+    color: remote.color || local.color,
+    bbox: remote.bbox,
+    feature_type: remote.feature_type,
+    feature_confidence: Math.max(local.feature_confidence || 0, remote.feature_confidence || 0, 1),
+    kind: remote.kind || local.kind,
+    kind_source: 'runtime-sync',
+    scored_type: remote.scored_type || local.scored_type,
+    scored_score: Math.max(local.scored_score || 0, remote.scored_score || 0, 1),
+    hmp: local.hmp,
+    marked_text: remote.marked_text || local.marked_text,
+    ai_eligible: false,
+    origin: remote.origin || local.origin,
+    source_created_at: local.source_created_at ?? local.created_at,
+  }, { notifyRuntime: false });
+}
+
+function remoteMarkEntryDraft(mark: PersistedMark): Parameters<typeof appendMarkEntry>[0] {
+  const {
+    entry_id: _entryId,
+    seq: _seq,
+    created_at,
+    schema_version: _schemaVersion,
+    ...draft
+  } = mark;
+  return {
+    ...draft,
+    kind_source: draft.kind_source || 'runtime-sync',
+    source_created_at: draft.source_created_at ?? created_at,
+  };
+}
+
+function canonicalRuntimeMarkIds(runtime: RuntimeDocumentSnapshot): Set<string> {
+  const ids = new Set<string>();
+  for (const block of runtime.blocks) {
+    for (const annotation of block.annotations ?? []) {
+      if (annotation.status === 'deleted') continue;
+      const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+      ids.add(markIdFromRuntimeAnnotation(annotation, meta));
+    }
+  }
+  return ids;
+}
+
+function isRuntimeManagedLocalMark(mark: PersistedMark): boolean {
+  const kindSource = mark.kind_source || '';
+  return mark.pointer_type === 'remote'
+    || mark.device_id === 'runtime-sync'
+    || kindSource === 'runtime-sync'
+    || kindSource.startsWith('runtime-sync-');
+}
+
+export function staleRuntimeManagedMarksForCanonicalRemote(
+  localMarks: PersistedMark[],
+  canonicalMarkIds: Set<string>,
+): PersistedMark[] {
+  if (!canonicalMarkIds.size) return [];
+  return localMarks.filter((mark) => isRuntimeManagedLocalMark(mark) && !canonicalMarkIds.has(mark.mark_id));
+}
+
+export function outboundRuntimeMarksForCloudPush(
+  localMarks: PersistedMark[],
+  canonicalMarkIds: Set<string>,
+): PersistedMark[] {
+  return localMarks.filter((mark) => !isRuntimeManagedLocalMark(mark) && !canonicalMarkIds.has(mark.mark_id));
+}
+
+export function visibleRuntimeMarksForCloudAlignment(localMarks: PersistedMark[]): PersistedMark[] {
+  return localMarks.filter((mark) => !mark.is_tombstone);
+}
+
+function runtimeReconcileTombstoneDraft(mark: PersistedMark): Parameters<typeof appendMarkEntry>[0] {
+  const {
+    entry_id: _entryId,
+    seq: _seq,
+    created_at,
+    schema_version: _schemaVersion,
+    ...draft
+  } = mark;
+  return {
+    ...draft,
+    strokes: [],
+    hmp: null,
+    marked_text: '',
+    ai_eligible: false,
+    kind_source: 'runtime-sync-reconcile',
+    source_created_at: draft.source_created_at ?? created_at,
+    is_tombstone: true,
+  };
+}
+
+function clearHydratedRuntimeStrokes(docId: string): void {
+  const prefix = `${docId}:`;
+  const ctx = getActiveContext();
+  for (const [pageId, strokes] of ctx.strokesByPage.entries()) {
+    const kept = strokes.filter((stroke) => !hydratedRuntimeStrokeKeys.get(stroke)?.startsWith(prefix));
+    if (kept.length === strokes.length) continue;
+    ctx.strokesByPage.set(pageId, kept);
+  }
+}
+
+export async function hydrateRuntimeAnnotationsToActiveCanvas(store: OfflineRuntimeStorePort, docId: string): Promise<void> {
+  if (state.documentId !== docId) return;
+  const runtime = await store.loadDocument(docId);
+  if (!runtime) return;
+
+  await restoreLedgerState(docId);
+  clearHydratedRuntimeStrokes(docId);
+
+  let localMarks = (await getFoldedMarks(docId)).filter((mark) => !isRuntimeInvalidPageNormMark(mark));
+  const canonicalMarkIds = canonicalRuntimeMarkIds(runtime);
+  const staleRuntimeMarks = staleRuntimeManagedMarksForCanonicalRemote(localMarks, canonicalMarkIds);
+  if (staleRuntimeMarks.length) {
+    for (const staleMark of staleRuntimeMarks) {
+      await appendMarkEntry(runtimeReconcileTombstoneDraft(staleMark), { notifyRuntime: false });
+    }
+    const staleMarkIds = new Set(staleRuntimeMarks.map((mark) => mark.mark_id));
+    localMarks = localMarks.filter((mark) => !staleMarkIds.has(mark.mark_id));
+  }
+  const localMarkById = new Map(localMarks.map((mark) => [mark.mark_id, mark] as const));
+  const localAnnotationIds = new Set(localMarks.flatMap((mark) => [
+    mark.mark_id,
+    `ko_${mark.mark_id}`,
+    `ko_${mark.mark_id.replace(/^mark_/, '')}`,
+    mark.created_at ? `created:${mark.created_at}` : '',
+  ]));
+  const localMarkIds = new Set(localMarks.map((mark) => mark.mark_id));
+  const remoteMarks: PersistedMark[] = [];
+  const remoteRevisions: Array<{ local: PersistedMark; remote: PersistedMark }> = [];
+  const ctx = getActiveContext();
+  for (const block of runtime.blocks) {
+    const pageIndex = typeof block.projection?.page_index === 'number' ? block.projection.page_index : 0;
+    const pageId = pageIdFor(docId, pageIndex);
+    const pageStrokes = ctx.strokesByPage.get(pageId) ?? [];
+    for (const annotation of block.annotations ?? []) {
+      const remoteMark = runtimeAnnotationToMark(docId, block, annotation);
+      const isLocalAnnotation = localAnnotationIds.has(annotation.ko_id)
+        || (remoteMark ? localMarkIds.has(remoteMark.mark_id) : false)
+        || (annotation.created_at ? localAnnotationIds.has(`created:${annotation.created_at}`) : false);
+      const localMark = remoteMark ? localMarkById.get(remoteMark.mark_id) : undefined;
+      if (remoteMark && shouldAdoptRemoteMarkRevision(localMark, remoteMark)) remoteRevisions.push({ local: localMark, remote: remoteMark });
+      if (remoteMark && !isLocalAnnotation) remoteMarks.push(remoteMark);
+      if (!remoteMark?.strokes.length || isLocalAnnotation) continue;
+      remoteMark.strokes.forEach((stroke, index) => {
+        const canvasStroke = persistedStrokeToCanvasStroke(stroke);
+        if (!canvasStroke) return;
+        hydratedRuntimeStrokeKeys.set(canvasStroke, `${docId}:${annotation.ko_id}:${index}`);
+        strokeMarkIds.set(canvasStroke, annotation.ko_id);
+        pageStrokes.push(canvasStroke);
+      });
+    }
+    ctx.strokesByPage.set(pageId, pageStrokes);
+  }
+  if (remoteRevisions.length || remoteMarks.length || staleRuntimeMarks.length) {
+    for (const revision of remoteRevisions) await appendRemoteMarkRevision(revision.local, revision.remote);
+    for (const remoteMark of remoteMarks) await appendMarkEntry(remoteMarkEntryDraft(remoteMark), { notifyRuntime: false });
+    await restoreLedgerState(docId);
+    const restoredMarks = [...remoteRevisions.map((revision) => revision.remote), ...remoteMarks];
+    bus.emit('marks:restored', restoredMarks);
+    if (staleRuntimeMarks.length) {
+      bus.emit('runtime-sync:local-cache-reconciled', {
+        doc_id: docId,
+        tombstoned_mark_ids: staleRuntimeMarks.map((mark) => mark.mark_id),
+      });
+    }
+    redrawInk();
+    return;
+  }
+  redrawInk();
+}
+
+async function buildSnapshot(documentId: string, generatedAt = nowIso()): Promise<RuntimeDocumentSnapshot> {
+  const meetingId = meetingIdFromRuntimeDocumentId(documentId);
+  if (meetingId) return buildMeetingSnapshot(meetingId, generatedAt);
+  const doc = await getDoc(documentId);
+  const exported = await buildL1Export(documentId, { generatedAt });
+  const projection = exported.documentProjections.document_projections[0];
+  return buildRuntimeSnapshotFromProjection({
+    documentId,
+    documentTitle: doc?.filename || exported.visualModel.documentTitle || '(untitled)',
+    projectionBlocks: projection?.blocks ?? [],
+    knowledgeObjects: exported.knowledgeExport.objects,
+    sourceKind: sourceKindForDoc(doc),
+    sourcePath: doc?.filename,
+    fileHash: doc?.file_hash,
+    contentHash: runtimeSourceContentHash(projection),
+    updatedAt: generatedAt,
+  });
+}
+
+async function buildMeetingSnapshot(meetingId: string, generatedAt = nowIso()): Promise<RuntimeDocumentSnapshot> {
+  const exported = await buildMeetingL1Export(meetingId, { generatedAt });
+  const projection = exported.documentProjections.document_projections[0];
+  return buildRuntimeSnapshotFromProjection({
+    documentId: exported.documentId,
+    documentTitle: exported.documentTitle,
+    projectionBlocks: projection?.blocks ?? [],
+    knowledgeObjects: exported.knowledgeExport.objects,
+    sourceKind: 'inkloop_created',
+    sourcePath: `Meetings/${exported.documentTitle}.md`,
+    contentHash: runtimeSourceContentHash(projection),
+    updatedAt: generatedAt,
+  });
+}
+
+async function loadRuntimeMarks(documentId: string): Promise<PersistedMark[]> {
+  const meetingId = meetingIdFromRuntimeDocumentId(documentId);
+  return meetingId ? getFoldedMarksByContext(meetingContextId(meetingId)) : getFoldedMarks(documentId);
+}
+
+async function canonicalRuntimeMarkIdsFromStore(store: OfflineRuntimeStorePort, documentId: string): Promise<Set<string>> {
+  try {
+    const runtime = await store.loadDocument(documentId);
+    return runtime ? canonicalRuntimeMarkIds(runtime) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+async function runtimeDocumentTitle(documentId: string): Promise<string> {
+  const meetingId = meetingIdFromRuntimeDocumentId(documentId);
+  if (meetingId) return (await getMeeting(meetingId))?.title || '会议';
+  return (await getDoc(documentId))?.filename || '(untitled)';
+}
+
+export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {}): WebRuntimeSyncHost {
+  const deviceId = options.deviceId || getSession()?.deviceId || stableDeviceId();
+  const store = options.runtimeStore || new IndexedDbOfflineRuntimeStore({ dbName: 'inkloop-runtime-store' });
+  const createRunner = (): RuntimeSyncRunner => {
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: options.pushEndpoint || runtimeSyncUrl('/v1/runtime/events:push'),
+      pullEndpoint: options.pullEndpoint || runtimeSyncUrl('/v1/runtime/events:pull'),
+      deviceId,
+      headers: authHeaders,
+    });
+    return new RuntimeSyncRunner(store, transport, {
+      deviceId,
+      cursorKey: runtimeCursorKey(deviceId),
+      inbox: new RuntimeStoreInbox(store, { deviceId, advanceCursorOnRecoverableConflicts: true }),
+      batchSize: Math.max(1, options.batchSize ?? 25),
+      maxAttempts: Math.max(1, options.maxAttempts ?? 25),
+      retryDelayMs: Math.max(0, options.retryDelayMs ?? 2_000),
+      pullLimit: 100,
+    });
+  };
+  const watermarks = typeof window !== 'undefined'
+    ? localStorageRuntimeBridgeWatermarks(window.localStorage, `${runtimeTenantId()}/${runtimeUserId()}`)
+    : undefined;
+  const pendingDocs = new Set<string>();
+  const pendingReasons = new Map<string, string>();
+  const pendingBootstrapDocs = new Set<string>();
+  const bootstrappedDocs = new Set<string>();
+  const debounceMs = Math.max(100, options.debounceMs ?? MAGIC_SYNC_DEBOUNCE_MS);
+  const pollMs = Math.max(0, options.pollMs ?? MAGIC_SYNC_POLL_MS);
+  const reconcileMs = Math.max(0, options.reconcileMs ?? MAGIC_SYNC_RECONCILE_MS);
+  const reconcileStaleMs = Math.max(1_000, options.reconcileStaleMs ?? MAGIC_SYNC_RECONCILE_STALE_MS);
+  let timer: number | null = null;
+  let pollTimer: number | null = null;
+  let reconcileTimer: number | null = null;
+  let disposed = false;
+  let syncQueue: Promise<void> = Promise.resolve();
+  const visibleAlignmentChecks = new Map<string, { signature: string; checked_at: number }>();
+
+  const log = (event: string, details?: unknown): void => options.logger?.(event, details);
+
+  function errorMessage(error: unknown): string {
+    return String((error as Error)?.message || error || 'unknown error');
+  }
+
+  function publishStatus(detail: Omit<RuntimeSyncStatusDetail, 'at' | 'device_id'>): void {
+    const payload: RuntimeSyncStatusDetail = {
+      ...detail,
+      at: nowIso(),
+      device_id: deviceId,
+      api_base: apiBase() || (typeof location !== 'undefined' ? location.origin : ''),
+    };
+    bus.emit('runtime-sync:status', payload);
+    if (typeof document !== 'undefined') {
+      document.dispatchEvent(new CustomEvent('inkloop:runtime-sync-status', { detail: payload }));
+    }
+  }
+
+  async function pendingEventCount(docId?: string): Promise<number> {
+    try {
+      const events = await store.listPendingEvents(docId);
+      return events.filter((event) => event.status !== 'sent').length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function publishDocStatus(stateName: RuntimeSyncUiState, docId: string, reason: string, extra: Partial<RuntimeSyncStatusDetail> = {}): Promise<void> {
+    const pending = await pendingEventCount(docId);
+    publishStatus({
+      state: stateName,
+      reason,
+      doc_id: docId,
+      pending_event_count: pending,
+      ...extra,
+    });
+  }
+
+  async function latestOutboxError(docId: string, eventIds: string[]): Promise<string | undefined> {
+    try {
+      const ids = new Set(eventIds);
+      const failed = (await store.listPendingEvents(docId))
+        .filter((event) => event.status === 'failed' && (!ids.size || ids.has(event.event_id)))
+        .map((event) => String(event.last_error || '').trim())
+        .filter(Boolean);
+      return failed[0];
+    } catch {
+      return undefined;
+    }
+  }
+
+  function shouldAlignVisibleMarks(reason: string): boolean {
+    return reason.includes('visible')
+      || reason.includes('reconcile')
+      || reason === 'document-bootstrap'
+      || reason === 'manual-debug'
+      || reason === 'online';
+  }
+
+  async function applyPulledRemoteDocs(result: { applied_doc_ids?: string[] }, reason: string): Promise<void> {
+    const appliedDocIds = [...new Set(result.applied_doc_ids ?? [])];
+    if (!appliedDocIds.length) return;
+    if (options.onRemoteApplied) {
+      await options.onRemoteApplied({ docIds: appliedDocIds, store });
+    } else {
+      for (const docId of appliedDocIds) await hydrateRuntimeAnnotationsToActiveCanvas(store, docId);
+    }
+    bus.emit('runtime-sync:remote-applied', { doc_ids: appliedDocIds, reason, result });
+  }
+
+  async function syncDocumentNow(documentId: string, reason = 'mark-ledger'): Promise<void> {
+    if (disposed) return;
+    const runtimeDocumentId = runtimeDocumentIdForSyncRequest(documentId);
+    await publishDocStatus('syncing', runtimeDocumentId, reason);
+    const generatedAt = nowIso();
+    const runtimeMarks = await loadRuntimeMarks(runtimeDocumentId);
+    const canonicalMarkIds = await canonicalRuntimeMarkIdsFromStore(store, runtimeDocumentId);
+    const outboundRuntimeMarks = outboundRuntimeMarksForCloudPush(
+      runtimeMarks,
+      canonicalMarkIds,
+    );
+    const alignmentRuntimeMarks = visibleRuntimeMarksForCloudAlignment(runtimeMarks);
+    let snapshotPromise: Promise<RuntimeDocumentSnapshot> | null = null;
+    const snapshotForSync = (): Promise<RuntimeDocumentSnapshot> => {
+      snapshotPromise ||= buildSnapshot(runtimeDocumentId, generatedAt);
+      return snapshotPromise;
+    };
+    const result = await bridgeRuntimeLedgerToStore({
+      documentId: runtimeDocumentId,
+      documentTitle: await runtimeDocumentTitle(runtimeDocumentId),
+      runtimeStore: store,
+      watermarkStore: watermarks,
+      originDeviceId: deviceId,
+      loadMarks: async () => outboundRuntimeMarks,
+      buildSnapshot: snapshotForSync,
+      now: () => generatedAt,
+    });
+    const alignment = shouldAlignVisibleMarks(reason)
+      ? await requeueVisibleRuntimeMarksForCloudAlignment({
+          docId: runtimeDocumentId,
+          marks: alignmentRuntimeMarks,
+          runtimeStore: store,
+          buildEvents: async () => {
+            const snapshot = await snapshotForSync();
+            return alignmentRuntimeMarks.map((mark) => buildRuntimeSyncEventForMark(snapshot, mark, generatedAt, deviceId));
+          },
+          now: () => generatedAt,
+        })
+      : undefined;
+    const sync = await createRunner().syncOnce();
+    if (sync.pull) await applyPulledRemoteDocs(sync.pull, reason);
+    const pending = await pendingEventCount(result.doc_id);
+    const pushError = sync.push.failed > 0
+      ? await latestOutboxError(result.doc_id, sync.push.attempted_event_ids)
+      : undefined;
+    publishStatus({
+      state: sync.push.failed > 0 ? 'failed' : pending > 0 ? 'queued' : 'synced',
+      reason,
+      doc_id: result.doc_id,
+      pending_event_count: pending,
+      pushed: sync.push.sent,
+      pulled: sync.pull?.applied,
+      error: sync.push.failed > 0 ? pushError || `${sync.push.failed} event(s) failed` : undefined,
+    });
+    if (alignment && (alignment.requeued > 0 || alignment.missing_event_ids.length > 0)) {
+      bus.emit('runtime-sync:local-visible-aligned', { reason, alignment });
+      log('runtime-sync:local-visible-aligned', { reason, alignment });
+    }
+    log('runtime-sync:document', { reason, bridge: result, alignment, sync });
+  }
+
+  async function syncDocument(documentId: string, reason = 'mark-ledger'): Promise<void> {
+    const run = syncQueue.then(
+      () => syncDocumentNow(documentId, reason),
+      () => syncDocumentNow(documentId, reason),
+    );
+    syncQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  async function flush(reason = 'scheduled'): Promise<void> {
+    if (disposed) return;
+    const docs = [...pendingDocs];
+    pendingDocs.clear();
+    for (const docId of docs) {
+      try {
+        const docReason = pendingReasons.get(docId) || reason;
+        pendingReasons.delete(docId);
+        await syncDocument(docId, docReason);
+      } catch (error) {
+        const message = errorMessage(error);
+        publishStatus({ state: 'failed', reason, doc_id: docId, error: message });
+        log('runtime-sync:error', { reason, doc_id: docId, error: message });
+      }
+    }
+  }
+
+  function schedule(documentId: string, reason = 'mark-ledger'): void {
+    if (disposed) return;
+    pendingDocs.add(documentId);
+    pendingReasons.set(documentId, reason);
+    void publishDocStatus('queued', runtimeDocumentIdForSyncRequest(documentId), reason);
+    if (timer !== null) window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      timer = null;
+      void flush();
+    }, debounceMs);
+  }
+
+  async function pullNow(reason = 'poll'): Promise<void> {
+    if (disposed) return;
+    const visibleStatus = reason !== 'poll';
+    if (visibleStatus) publishStatus({ state: 'pulling', reason });
+    try {
+      const result = await createRunner().pullOnce();
+      await applyPulledRemoteDocs(result, reason);
+      if (visibleStatus || result.applied > 0) {
+        publishStatus({ state: 'synced', reason, pulled: result.applied });
+      }
+      if (result.received > 0 || result.applied > 0 || result.conflicted > 0) log('runtime-sync:pull', { reason, result });
+    } catch (error) {
+      const message = errorMessage(error);
+      publishStatus({ state: 'failed', reason, error: message });
+      log('runtime-sync:pull-error', { reason, error: message });
+    }
+  }
+
+  async function reconcileNow(documentId = state.documentId || '', reason = 'local-visible-reconcile'): Promise<void> {
+    if (disposed || !documentId) return;
+    try {
+      const runtimeDocumentId = runtimeDocumentIdForSyncRequest(documentId);
+      const runtimeMarks = await loadRuntimeMarks(runtimeDocumentId);
+      const outboundRuntimeMarks = outboundRuntimeMarksForCloudPush(
+        runtimeMarks,
+        await canonicalRuntimeMarkIdsFromStore(store, runtimeDocumentId),
+      );
+      const signature = visibleRuntimeMarkSignature(outboundRuntimeMarks);
+      const now = Date.now();
+      const previous = visibleAlignmentChecks.get(runtimeDocumentId);
+      if (previous && previous.signature === signature && now - previous.checked_at < reconcileStaleMs) return;
+      visibleAlignmentChecks.set(runtimeDocumentId, { signature, checked_at: now });
+      await syncDocument(documentId, reason);
+    } catch (error) {
+      const message = errorMessage(error);
+      publishStatus({ state: 'failed', reason, doc_id: documentId, error: message });
+      log('runtime-sync:reconcile-error', { reason, document_id: documentId, error: message });
+    }
+  }
+
+  setRuntimeLedgerAppendHook((mark) => schedule(runtimeDocumentIdForLedgerMark(mark), 'mark-ledger'));
+  setAiTurnAppendHook((turn) => schedule(turn.document_id, 'ai-turn-ledger'));
+  bus.on('aiturn:appended', (documentId) => {
+    if (typeof documentId === 'string' && documentId) schedule(documentId, 'ai-turn-ledger');
+  });
+  bus.on('document:loaded', () => {
+    if (!state.documentId || bootstrappedDocs.has(state.documentId)) return;
+    pendingBootstrapDocs.add(state.documentId);
+  });
+  bus.on('page:rendered', () => {
+    const docId = state.documentId;
+    if (!docId || !pendingBootstrapDocs.has(docId)) return;
+    pendingBootstrapDocs.delete(docId);
+    bootstrappedDocs.add(docId);
+    schedule(docId, 'document-bootstrap');
+    void reconcileNow(docId, 'document-visible-reconcile');
+  });
+  if (pollMs > 0 && typeof window !== 'undefined') {
+    pollTimer = window.setInterval(() => void pullNow(), pollMs);
+  }
+  if (reconcileMs > 0 && typeof window !== 'undefined') {
+    reconcileTimer = window.setInterval(() => void reconcileNow(), reconcileMs);
+  }
+  const onVisibilityChange = (): void => {
+    if (document.visibilityState === 'hidden') return;
+    void flush('visible');
+    void reconcileNow(state.documentId || '', 'visible-reconcile');
+    void pullNow('visible');
+  };
+  const onOnline = (): void => {
+    void flush('online');
+    void reconcileNow(state.documentId || '', 'online');
+    void pullNow('online');
+  };
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibilityChange);
+  if (typeof window !== 'undefined') window.addEventListener('online', onOnline);
+
+  return {
+    deviceId,
+    store,
+    syncDocument,
+    pullNow,
+    reconcileNow,
+    dispose() {
+      disposed = true;
+      setRuntimeLedgerAppendHook(null);
+      setAiTurnAppendHook(null);
+      if (timer !== null) window.clearTimeout(timer);
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      if (reconcileTimer !== null) window.clearInterval(reconcileTimer);
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (typeof window !== 'undefined') window.removeEventListener('online', onOnline);
+    },
+  };
+}

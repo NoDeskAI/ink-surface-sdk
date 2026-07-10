@@ -1,20 +1,109 @@
 # Architecture
 
-InkSurface SDK is the shared document-surface rendering layer for InkLoop. This repository also contains the runnable Obsidian Runtime MVP that proves the SDK, sidecar runtime, adapter contracts, and bidirectional sync flow against a real local vault.
+InkLoop is now organized around the AI Pen Kickstarter V1. InkSurface SDK is the shared document-surface rendering layer inside that system. This repository also contains the runnable Web/Obsidian/Android validation hosts that prove the SDK, sidecar runtime, adapter contracts, runtime sync flow, and AI Pen / InkGraph contract against local runtimes.
 
-The architecture has one central rule: user documents stay native to the host application, while InkLoop runtime state lives in hidden sidecar data. The SDK renders a document surface from that data; it does not own persistence, sync, AI, file watching, or host lifecycle.
+The product architecture has one central rule: **the event ledger is the source of truth**. Pen frames, strokes, InkEvents, BoardGraph / InkGraph objects, and traceable `source_refs` are canonical. UI, AI outputs, Obsidian Markdown, e-paper review screens, and exports are derived views.
+
+The document/runtime architecture has a second rule: user documents stay native to the host application, while InkLoop runtime state lives in hidden sidecar data. The SDK renders a document surface from that data; it does not own persistence, sync, AI, file watching, or host lifecycle.
+
+## AI Pen Kickstarter V1 Architecture
+
+```mermaid
+flowchart TB
+  subgraph PEN["Pen Hardware Layer"]
+    PENHW["AI whiteboard pen"]
+    TIP["Pen down/up + pressure"]
+    OPT["Encoded surface optical localization"]
+    IMU["IMU smoothing"]
+    BLE["BLE + local cache"]
+  end
+
+  subgraph CAPTURE["Surface Capture Layer"]
+    SURFACE["A3/A2 Capture Surface"]
+    HOST["Web/Desktop Capture Host"]
+    VIEWER["Live Board Viewer"]
+    REPLAY["Session Replay"]
+  end
+
+  subgraph RUNTIME["InkGraph Runtime"]
+    FRAME["RawPenFrame"]
+    STROKE["Stroke"]
+    EVENT["InkEvent"]
+    HMP["HMP / Evidence Builder"]
+    GRAPH["BoardGraph / InkGraph"]
+    SCENE["SceneView / InferenceView"]
+  end
+
+  subgraph AI["AI Scene Agents"]
+    LESSON["LessonGraph Agent"]
+    MEETING["MeetingGraph Agent"]
+    VALIDATOR["Result Validator"]
+  end
+
+  subgraph OUTPUT["Apps + Knowledge"]
+    STUDIO["InkLoop Studio"]
+    KO["KnowledgeObject"]
+    OBS["Obsidian Projection"]
+    PAPER["InkLoop Paper Runtime"]
+    EXPORT["Markdown / PDF / PNG / Mermaid"]
+  end
+
+  PENHW --> TIP --> FRAME
+  PENHW --> OPT --> FRAME
+  PENHW --> IMU --> FRAME
+  PENHW --> BLE --> HOST
+  SURFACE --> HOST
+  HOST --> VIEWER
+  HOST --> REPLAY
+  HOST --> FRAME
+  FRAME --> STROKE --> EVENT --> HMP --> GRAPH --> SCENE
+  SCENE --> LESSON
+  SCENE --> MEETING
+  LESSON --> VALIDATOR
+  MEETING --> VALIDATOR
+  VALIDATOR --> STUDIO
+  STUDIO --> KO
+  KO --> OBS
+  KO --> EXPORT
+  EVENT --> PAPER
+```
+
+### V1 Scope Boundaries
+
+- Web/Desktop Host is the primary Kickstarter demo runtime: AI Pen capture or simulation, Live Board, session recording, replay, Studio confirmation, and export.
+- Android/e-paper remains a runtime reuse and roadmap host for InkLoop Paper. It must not be described as the October 2026 Kickstarter hardware promise.
+- Obsidian receives knowledge projection and runtime sidecar state grouped by source file/session units. Visible Markdown carries `inkloop_document_id`, `inkloop_document_uri`, and `inkloop_projection_role`, but Obsidian does not reverse-parse arbitrary PDF annotations or arbitrary Markdown edits into canonical InkEvents.
+- Meeting audio, subtitles, agenda, speaker, and timeline data are optional context. The V1 meeting path starts from marked whiteboard events entering the evidence pipeline and aligning to the InkGraph schema.
+
+### Current Launch Boundary
+
+| Boundary | Current Status | Source |
+| --- | --- | --- |
+| Local V1 software chain | `local_demo_ready` | `test-results/ai-pen-demo-evidence/README.md` |
+| Browser AI Pen smoke | `browser.ok=true` | `test-results/ai-pen-browser-smoke/result.json` |
+| Launch operations queue | `86 P0 inputs` | `test-results/ai-pen-kickstarter-ops-refresh/README.md` |
+| Pre-launch page | `prelaunch_page_not_ready` | `test-results/ai-pen-kickstarter-prelaunch-page/prelaunch-page.json` |
+| Launch freeze | `launch_freeze_not_ready`, `0/13 gates ready` | `test-results/ai-pen-kickstarter-launch-freeze/launch-freeze.json` |
+
+The architecture is therefore demo-ready for the local V1 software chain, not Kickstarter launch-ready. Real AI Pen hardware logs, Capture Surface calibration, supplier quote artifacts, GTM proof, Kickstarter page/legal review, proof-shot evidence, and owner signoff remain outside the local software demo.
 
 ## Goals
 
+- Launch a credible AI Pen + Capture Surface Kickstarter campaign by the end of October 2026.
+- Prove education and business meeting end-to-end demos with real or hardware-faithful pen events.
+- Keep AI outputs editable, dismissible, and traceable through `source_refs`.
 - Render the same document surface in Web and Obsidian from one SDK.
-- Keep user-facing Markdown clean and editable.
+- Keep user-facing Markdown clean and locally editable without treating arbitrary Markdown changes as capture truth.
 - Store InkLoop annotations, AI notes, strokes, anchors, canvas state, and sync events in hidden sidecar files.
-- Pull external edits back as explicit records instead of silently overwriting InkLoop facts.
-- Keep Adapter Core portable for future Notion, Readwise, Zotero, or other host adapters.
+- Treat Obsidian-side changes as projection edits unless the plugin emits an explicit sidecar runtime event; never silently overwrite InkLoop facts.
+- Keep Knowledge Export contracts portable for future Notion, Readwise, Zotero, or other host adapters.
 - Preserve privacy boundaries around full-text export, raw evidence, PDF assets, OCR artifacts, and debug data.
 
 ## Non-Goals
 
+- The October 2026 Kickstarter base tier does not promise a full e-paper tablet.
+- The first version does not promise any ordinary whiteboard without Capture Surface setup.
+- The first version does not promise perfect multi-pen, multi-color, formula recognition, diagram recognition, or deep meeting-tool integrations.
 - Obsidian does not run InkLoop AI workflows.
 - The SDK does not parse PDFs, perform OCR, call models, watch files, or sync data.
 - Obsidian is not a full mirror of all InkLoop runtime internals.
@@ -24,36 +113,41 @@ The architecture has one central rule: user documents stay native to the host ap
 
 ```mermaid
 flowchart TB
-  PDF["PDF / Native Document"] --> WEB["InkLoop Web App"]
-  WEB --> KB["KnowledgeBuilder"]
-  WEB --> DPB["DocumentProjectionBuilder"]
+  RAW["RawPenFrame / fixture or hardware log"] --> HOST["Web/Desktop Capture Host"]
+  HOST --> INK["Stroke -> InkEvent ledger"]
+  INK --> HMP["HMP / Evidence Builder"]
+  HMP --> GRAPH["BoardGraph / InkGraph"]
+  GRAPH --> AIJOB["AI Graph Job"]
+  AIJOB --> LESSON["LessonGraph"]
+  AIJOB --> MEETING["MeetingGraph"]
+  LESSON --> REVIEW["User accept / edit / dismiss"]
+  MEETING --> REVIEW
+  REVIEW --> KO["KnowledgeObject"]
 
-  KB --> KO["KnowledgeObject"]
-  DPB --> DP["DocumentProjection"]
+  DOC["PDF / Native Document reading input"] --> DP["DocumentProjection"]
 
-  KO --> CORE["Adapter Core"]
-  DP --> CORE
-  CORE --> OBSFS["Obsidian FS Adapter"]
-  OBSFS --> VAULT["Obsidian Vault"]
+  KO --> EXPORT["Export Core"]
+  DP --> EXPORT
+  EXPORT --> OBADAPTER["Obsidian Projection Adapter"]
+  OBADAPTER --> VAULT["Obsidian Vault"]
 
   VAULT --> MD["Visible native Markdown"]
   VAULT --> SC["Hidden .inkloop Sidecar"]
 
+  INK --> RUNTIME["Sidecar Runtime Store"]
   SC --> SDKMODEL["InkLoop Visual Model"]
   MD --> SDKMODEL
   SDKMODEL --> SDK["InkSurface SDK"]
 
-  SDK --> WEBLAB["Web Lab Surface"]
+  SDK --> WEBHOST["Web Validation Surface"]
   SDK --> OBPLUGIN["Obsidian Plugin Preview"]
 
-  WEBLAB --> RUNTIME["Sidecar Runtime Store"]
   OBPLUGIN --> RUNTIME
   RUNTIME --> OUTBOX["Runtime Sync Outbox"]
   OUTBOX --> CLOUD["Future Cloud / Device Sync"]
 
-  VAULT --> WATCHER["Plugin / Watcher Events"]
-  WATCHER --> EXT["ExternalEdit / Metadata Override / Conflict"]
-  EXT --> CORE
+  OBPLUGIN --> SIDECAREVENT["Explicit sidecar runtime events"]
+  SIDECAREVENT --> RUNTIME
 ```
 
 ## Main Components
@@ -64,7 +158,7 @@ Location: `packages/runtime-schema/`
 
 Runtime Schema is the platform-neutral contract for document runtime records, surface blocks, annotations, strokes, local mutation inputs, and runtime sync events. It has no DOM, Node file API, Obsidian, PDF, or cloud dependency.
 
-The demo runtime keeps `examples/ai-annotation-demo/src/runtime/types.ts` as a compatibility re-export so existing Web Lab, sidecar store, and sync runner code can migrate incrementally.
+The demo runtime keeps compatibility re-exports so existing web validation, sidecar store, and sync runner code can migrate incrementally.
 
 ### InkSurface SDK
 
@@ -102,20 +196,23 @@ dist/packages/*/src/*.d.ts
 
 The compatibility bundle name remains `inkloop-surface-sdk` and the IIFE global remains `InkLoopSurfaceSDK`, while the public product/package name is `InkSurface SDK`.
 
-Public runtime modules ship as subpath exports of the root package, such as `ink-surface-sdk/runtime-schema`,
-`ink-surface-sdk/offline-store/indexeddb`, and `ink-surface-sdk/sync-client`. The `packages/*` names remain
-workspace source modules in this release, not separate public npm packages.
+Public runtime and export modules ship as subpath exports of the root package, such as
+`ink-surface-sdk/runtime-schema`, `ink-surface-sdk/offline-store/indexeddb`, `ink-surface-sdk/sync-client`,
+`ink-surface-sdk/knowledge-schema`, `ink-surface-sdk/export-core`, and `ink-surface-sdk/adapters/obsidian`.
+The `packages/*` names remain workspace source modules in this release, not separate public npm packages.
 
 ### Knowledge Layer
 
 Locations:
 
 ```text
+packages/knowledge-schema/src/
+packages/export-core/src/
 examples/ai-annotation-demo/src/knowledge/
-examples/ai-annotation-demo/src/knowledge-builder/
 ```
 
-`KnowledgeObject` represents discrete knowledge records such as annotations, AI notes, excerpts, Q&A, and tasks.
+`KnowledgeObject` represents reviewed knowledge records such as lesson notes, formula steps, meeting actions,
+meeting decisions, meeting risks, diagrams, reading notes, highlights, and tasks.
 
 `DocumentProjection` represents a full editable document envelope:
 
@@ -127,23 +224,35 @@ examples/ai-annotation-demo/src/knowledge-builder/
 - generated/editable region semantics
 - export policy and privacy gates
 
-`KnowledgeBuilder` folds InkLoop marks and AI turns into `KnowledgeObject` records. `DocumentProjectionBuilder` turns document text/reflow/OCR-like data into full document projections. Adapter implementations consume these contracts rather than raw InkLoop stroke, HMP, or inference internals.
+`packages/knowledge-schema` owns the public `KnowledgeObject`, `DocumentProjection`, entity membership,
+KO relation, export envelope, and content-hash helpers used by external adapters.
 
-### Adapter Core
+`packages/export-core` owns deterministic export helpers such as taxonomy tags, entity mode inference,
+concept layer assembly, and stored-membership relation projection.
 
-Location: `examples/ai-annotation-demo/src/adapters/core/`
+AI Pen V1 LessonGraph and MeetingGraph outputs are converted into reviewed `KnowledgeObject` records by
+`buildLessonGraphKnowledgeObjects` and `buildMeetingGraphKnowledgeObjects` in `packages/knowledge-schema`.
+The demo app still keeps a reader/annotation-oriented builder under `examples/ai-annotation-demo/src/knowledge/`
+for historical PDF/read-review flows, but it is not the Kickstarter V1 source-of-truth path. Adapters consume
+`KnowledgeObject` and `DocumentProjection` contracts rather than raw InkLoop stroke, HMP, or inference internals.
 
-Adapter Core defines the portable contract for external workspaces:
+### Knowledge Export Contracts
 
-- target identity
-- bindings between InkLoop ids and remote paths
-- sync events
-- conflicts
-- external edits
-- document sync behavior
-- in-memory storage used by tests and smoke flows
+Locations:
 
-Core concepts avoid Obsidian-specific paths so future adapters can reuse them.
+```text
+packages/knowledge-schema/
+packages/export-core/
+packages/adapter-obsidian/
+```
+
+Knowledge Export is the portable projection layer for external workspaces:
+
+- `packages/knowledge-schema` defines `KnowledgeObject`, `DocumentProjection`, concept layers, export envelopes, content hashes, and source-reference expectations.
+- `packages/export-core` owns deterministic export helpers such as taxonomy tags, entity mode inference, concept layer assembly, and relation projection.
+- `packages/adapter-obsidian` renders accepted V1 knowledge objects and document projections into deterministic vault-relative Markdown files.
+
+The export layer is intentionally separate from Runtime Sync. It does not own device cursors, event ordering, file watchers, production cloud jobs, or arbitrary reverse parsing of Obsidian edits into canonical AI Pen `InkEvent` records.
 
 ### Adapter Authority Contracts
 
@@ -153,53 +262,35 @@ Adapter authority contracts classify adapters as `client_local`, `cloud_api`, or
 
 Current examples:
 
-- `obsidian-fs` is `client_local`.
+- Obsidian runtime/plugin behavior is `client_local`.
 - Notion-style API adapters are `cloud_api`.
 - Drive-style adapters can be `hybrid` when metadata and file permissions split across cloud/client surfaces.
 
-### Markdown Adapter Layer
+### Obsidian Markdown Adapter
 
-Location: `examples/ai-annotation-demo/src/adapters/markdown/`
+Location: `packages/adapter-obsidian/`
 
-This layer renders adapter contracts into Markdown and parses external edits from Markdown. It owns:
+The Obsidian Markdown adapter renders canonical export artifacts into a clean Markdown vault release. It consumes
+`KnowledgeObject`, `DocumentProjection`, `ConceptLayer`, and `InkLoopVisualModel` inputs and emits deterministic
+vault-relative Markdown files. It does not watch files, write to disk, call the Obsidian API, or own sync.
 
-- frontmatter helpers
-- controlled section rendering
-- document projection rendering
-- source note rendering
-- knowledge object rendering
-- external edit parsing
+It is used by the updated demo export/release path for:
 
-Generated sections and editable regions are intentionally separated. Remote edits to generated sections become conflicts; remote edits to editable body regions become external edit records.
-
-### Obsidian FS Adapter
-
-Location: `examples/ai-annotation-demo/src/adapters/obsidian-fs/`
-
-The Obsidian FS adapter writes native Markdown and hidden sidecar files into an Obsidian vault. It owns:
-
-- vault validation
-- safe vault-relative path policy
-- atomic file writes
-- document projection export
-- knowledge object export
-- binding state
-- metadata pull
-- external edit pull
-- watcher scan fallback
-- conflict creation
-- CLI entrypoints
-
-The adapter enforces exportability gates before rendering full document projections. Non-exportable projections, such as `local_only` or `include_full_text=false`, are skipped before any Markdown file is written.
+- reading, diary, and meeting folders
+- document hub files
+- KO note files
+- concept hub files
+- same-entity, same-AI-turn, and same-context backlinks
+- embedded SVG ink replay
 
 ### Sidecar Runtime
 
 Locations:
 
 ```text
-examples/ai-annotation-demo/src/runtime/
-examples/ai-annotation-demo/src/adapters/obsidian-fs/sidecar-runtime.ts
 packages/offline-store/src/file-sidecar-store.ts
+plugins/obsidian/inkloop-sync/
+examples/ai-annotation-demo/server/runtime-sync-dev.ts
 ```
 
 The sidecar runtime is the hidden source of truth for runtime rendering and mutation state inside a host vault. It stores:
@@ -237,7 +328,7 @@ The HTTP transport requires a stable device id and sends it through the sync con
 are advanced only after inbox application succeeds without conflicts; conflicted pulls leave the previous cursor
 intact so hosts can persist conflict records or open a merge flow.
 
-The demo keeps `examples/ai-annotation-demo/src/runtime/sync-runner.ts` as a compatibility re-export while Web Lab and Obsidian migration continues.
+The demo validation host uses the same sync-client contract as WebView and Obsidian runtime hosts, so local JSONL smokes and future cloud transports exercise the same push/pull shape.
 
 ### Cloud Sync API Boundary
 
@@ -273,30 +364,28 @@ The plugin is a quiet InkLoop Runtime host inside Obsidian. It:
 
 The plugin is not the renderer source of truth. It consumes the SDK bundle when available and uses the sidecar runtime data as its document state.
 
-### Web Lab
+### Web Validation Surfaces
 
 Locations:
 
 ```text
-examples/ai-annotation-demo/obsidian-lab.html
-examples/ai-annotation-demo/src/obsidian-lab.ts
+examples/ai-annotation-demo/ai-pen-demo.html
+examples/ai-annotation-demo/src/ai-pen-demo.ts
+examples/ai-annotation-demo/mobile.html
 examples/ai-annotation-demo/vite.config.ts
 ```
 
-Web Lab is a local validation host for the same Obsidian runtime shape. It lets developers test:
+The AI Pen demo page is the current Kickstarter V1 validation host. It lets developers test:
 
-- preview and mark-thinking modes
-- text edits
-- annotation edits
-- freehand pen/highlighter strokes
-- reset
-- pull from Obsidian
-- runtime sync
-- latency and local roundtrip behavior
+- AI Pen capture simulation
+- Live Board rendering
+- InkEvent ledger display
+- LessonGraph and MeetingGraph candidate outputs
+- source_refs validation before user review
 
-Mutation endpoints are dev-only. They accept loopback requests, same-origin Web Lab requests, or requests with `x-inkloop-lab-token: $INKLOOP_LAB_WRITE_TOKEN`.
+The mobile page remains the Android/e-paper runtime reuse host. Runtime sync behavior is covered by deterministic tests and dev endpoints rather than a separate Obsidian lab page.
 
-### Local Store and Original Web Demo
+### Reading / PDF Validation Surface
 
 Locations:
 
@@ -308,9 +397,13 @@ examples/ai-annotation-demo/src/evidence/
 examples/ai-annotation-demo/src/main.ts
 ```
 
-The original InkLoop Web demo remains in this repository as the source application used to validate real annotation workflows. It owns PDF import, PDF.js rendering, pointer capture, mark classification, evidence extraction, reflow, AI call orchestration, IndexedDB persistence, and reading surface behavior.
+The original InkLoop Web reading surface remains in this repository as a validation host for document reading,
+PDF import, PDF.js rendering, pointer capture, mark classification, evidence extraction, reflow, AI call
+orchestration, IndexedDB persistence, and reading surface behavior.
 
-Those responsibilities stay outside the SDK.
+Those responsibilities stay outside the SDK and outside the October 2026 Kickstarter base hardware promise.
+They are retained because Reading Notes, Highlights, Tasks, and source file/session unit projections are still
+part of the broader InkLoop system and InkLoop Paper runtime reuse story.
 
 ## Data Ownership
 
@@ -321,9 +414,9 @@ Those responsibilities stay outside the SDK.
 | `KnowledgeObject` records | InkLoop | AI notes, annotations, Q&A, excerpts, tasks. |
 | `DocumentProjection` | InkLoop | Exportable document envelope with block anchors and privacy policy. |
 | Visible Markdown body in Obsidian | Obsidian/User | User-facing document under `InkLoop/`. |
-| Sidecar runtime state | InkLoop Runtime Host | Hidden `.inkloop/` data used by Web Lab and plugin. |
-| Obsidian text edits | Obsidian/User | Pulled back as `ExternalEdit`, not silent overwrites. |
-| Obsidian metadata edits | Obsidian/User | Pulled as metadata updates/overrides. |
+| Sidecar runtime state | InkLoop Runtime Host | Hidden `.inkloop/` data used by validation hosts and plugin. |
+| Obsidian text edits | Obsidian/User | Local projection edits in V1; not parsed into canonical InkEvents or KnowledgeObjects. |
+| Obsidian plugin settings | Obsidian/User | May emit explicit sidecar runtime events/settings; no arbitrary Markdown watcher is a truth source. |
 | Runtime sync events | Runtime Store | JSONL-shaped outbox for local and future cloud/device sync. |
 | Production cloud sync | Future Cloud Layer | Not implemented here; local sync shape is designed to map to it. |
 
@@ -364,26 +457,24 @@ Only the document under `InkLoop/` is intended as a normal knowledge-base file. 
 
 ```mermaid
 sequenceDiagram
-  participant Web as InkLoop Web / Fixture
-  participant KB as Knowledge Builders
-  participant Core as Adapter Core
-  participant Obs as Obsidian FS Adapter
+  participant Web as AI Pen Host / Reading Host
+  participant KB as Knowledge Schema
+  participant Export as Export Core
+  participant Obs as Obsidian Projection Adapter
   participant Vault as Obsidian Vault
 
-  Web->>KB: Build KnowledgeObject + DocumentProjection
-  KB->>Core: Adapter-neutral payloads
-  Core->>Obs: Plan export
+  Web->>KB: Build reviewed KnowledgeObject + optional DocumentProjection
+  KB->>Export: Build export envelope and relations
+  Export->>Obs: Render vault-relative Markdown files
   Obs->>Obs: Validate privacy/export policy
-  Obs->>Vault: Write native Markdown
-  Obs->>Vault: Write hidden sidecar runtime
-  Obs->>Core: Upsert bindings and sync events
+  Obs->>Vault: Write visible projection files
 ```
 
-### Edit in Web Lab or Obsidian
+### Edit Runtime State In Hosts
 
 ```mermaid
 sequenceDiagram
-  participant Host as Web Lab / Obsidian Plugin
+  participant Host as Web Host / InkLoop Paper / Obsidian Plugin
   participant SDK as InkSurface SDK
   participant Runtime as SidecarRuntimeStore
   participant Vault as Obsidian Vault
@@ -396,21 +487,23 @@ sequenceDiagram
   Runtime->>Outbox: Append runtime sync event
 ```
 
-### Pull External Changes
+In V1, visible Obsidian Markdown files are clean knowledge projections. Users can edit them as normal notes, but those edits do not become canonical AI Pen `InkEvent`, `BoardGraph`, `MeetingGraph`, `LessonGraph`, or `KnowledgeObject` records unless a future controlled adapter records an explicit reviewed sidecar event.
+
+### Sync Explicit Obsidian Sidecar Events
 
 ```mermaid
 sequenceDiagram
   participant Vault as Obsidian Vault
-  participant Watcher as Plugin / Watcher
-  participant Adapter as Obsidian FS Adapter
-  participant Store as Adapter Storage
+  participant Plugin as Obsidian Plugin
+  participant Runtime as SidecarRuntimeStore
+  participant Outbox as Runtime Outbox
 
-  Watcher->>Vault: Observe modify/rename/delete
-  Watcher->>Store: Append watch events
-  Adapter->>Vault: Read Markdown and metadata
-  Adapter->>Store: Persist ExternalEdit / Metadata update
-  Adapter->>Store: Persist conflicts when generated regions changed
+  Plugin->>Vault: Read hidden .inkloop sidecar state
+  Plugin->>Runtime: Push explicit plugin-origin runtime event
+  Runtime->>Outbox: Append reviewable runtime sync event
 ```
+
+The Obsidian V1 plugin can host runtime sidecar state and push/pull explicit runtime events. It does not watch arbitrary visible Markdown/PDF edits and infer new capture events from them.
 
 ### Runtime Sync
 
@@ -446,19 +539,18 @@ The current smoke transport writes to local JSONL files. The HTTP transport expe
 - Sidecar source paths are resolved with vault-boundary checks.
 - Adapter state writes use atomic writes where state corruption would break roundtrip behavior.
 - Runtime outbox writes preserve concurrent appends during sync status rewrites.
-- Web Lab mutation APIs are guarded for loopback, same-origin, or explicit token access.
+- Web validation mutation APIs are guarded for loopback, same-origin, or explicit token access.
 - SDK imports do not mutate host state or start background work.
 - Runtime schema validation is dependency-free and can run in Web, WebView, native bridge tests, or backend contract tests.
 
 ## Conflict Strategy
 
-The adapter treats external changes as explicit records:
+V1 avoids silent convergence by keeping projection edits and runtime truth separate:
 
-- Editable document body changes become `ExternalEdit`.
-- Metadata changes become metadata updates/overrides.
-- Generated/controlled section changes become conflicts.
-- Missing, renamed, or moved files are detected through bindings, frontmatter, and content hashes.
-- Conflicts are persisted so a host can later review, merge, reject, or re-export.
+- Visible Obsidian Markdown edits remain normal vault edits and are not reverse-parsed into InkLoop facts.
+- Plugin-origin sidecar events are explicit runtime sync events with device identity, event ids, and acknowledgements.
+- Generated/controlled projection sections can be overwritten by a later export, so campaign and demo copy must describe Obsidian as projection/output, not capture truth.
+- Future controlled-edit adapters may add reviewable conflict records for specific editable regions, but they must not infer arbitrary Markdown/PDF edits as canonical InkEvents.
 
 ## Extension Points
 
@@ -468,10 +560,10 @@ A future adapter should consume the same portable inputs:
 
 - `KnowledgeObject`
 - `DocumentProjection`
-- `ExternalEdit`
-- Adapter Core storage/contracts
+- `RuntimeSyncEvent`
+- `packages/knowledge-schema`, `packages/export-core`, and `packages/adapter-contracts` contracts
 
-It should implement planning, rendering, apply, pull, conflict, and binding behavior without depending on Obsidian-specific file paths.
+It should implement planning, rendering, apply, explicit runtime event handling, and binding behavior without depending on Obsidian-specific file paths.
 
 ### Production Cloud Sync
 
@@ -504,19 +596,22 @@ This runs:
 - Web build
 - SDK build
 
-Obsidian runtime smoke:
+AI Pen demo smoke:
 
 ```bash
-npm run obsidian:smoke -- --out-dir .inkloop-smoke-runs/obsidian-runtime-mvp --force-clean
-npm run build
-npm run obsidian:install-plugin -- --vault .inkloop-smoke-runs/obsidian-runtime-mvp/obsidian-vault
-INKLOOP_LAB_RUN_DIR=.inkloop-smoke-runs/obsidian-runtime-mvp npm run demo:dev -- --host 0.0.0.0
+npm run demo:dev -- --host 127.0.0.1
 ```
 
 Then open:
 
 ```text
-http://localhost:8765/obsidian-lab.html
+http://127.0.0.1:8765/ai-pen-demo.html
+```
+
+Obsidian runtime smoke:
+
+```bash
+npm run obsidian:smoke
 ```
 
 ## Repository Map
@@ -524,6 +619,9 @@ http://localhost:8765/obsidian-lab.html
 ```text
 apps/sync-api/                        Future cloud sync API contract fixtures
 packages/adapter-contracts/           Adapter execution authority and placement rules
+packages/adapter-obsidian/            Obsidian Markdown projection adapter
+packages/export-core/                 Export helpers and relation projection
+packages/knowledge-schema/            KnowledgeObject, DocumentProjection, and export envelopes
 packages/native-bridge/                Local WebView bridge message contract
 packages/offline-store/                Offline cache state and eviction policy contract
 packages/runtime-schema/               Platform-neutral runtime records and sync event contracts
@@ -533,13 +631,13 @@ packages/surface-web/                  DOM/SVG surface renderer and pure edit he
 src/                                   Root compatibility re-export for existing SDK consumers
 dist/                                  Generated SDK bundles and declarations
 plugins/obsidian/inkloop-sync/         Obsidian runtime host plugin source
-examples/ai-annotation-demo/src/       Web/PDF/adapter/runtime validation app
+examples/ai-annotation-demo/src/       Web/PDF/AI Pen/runtime validation app
 examples/ai-annotation-demo/server/    Demo AI proxy and dev-only handlers
 examples/ai-annotation-demo/scripts/   Demo smoke and fixture scripts
-examples/ai-annotation-demo/examples/ink-surface/ Minimal SDK example
+examples/ai-annotation-demo/ai-pen-demo.html AI Pen Kickstarter V1 demo page
 native/                                Native host integration notes
-packages/ko-schema/                    Protocol fixture data
-docs/                                  SDK architecture and usage docs
+packages/ko-schema/                    Legacy protocol fixture data
+docs/                                  Runtime, SDK, and product architecture docs
 ```
 
 ## Current Limits

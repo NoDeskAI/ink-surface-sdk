@@ -6,6 +6,20 @@ import type { Stroke } from './state';
 /** surface 实例的「所属模式」（谁拥有这个 context）。与 surfaceType（article/chat/whiteboard，渲染类型）正交。 */
 export type SurfaceRole = 'reader' | 'meeting' | 'diary';
 
+export interface SyntheticTextBlockSource {
+  text: string;
+  role: 'title' | 'heading' | 'paragraph';
+  sourceHref?: string;
+}
+
+export interface SyntheticSurfaceDocument {
+  kind: 'epub' | 'markdown';
+  title: string;
+  coverImageDataUrl?: string;
+  blocks: SyntheticTextBlockSource[];
+  pages: SyntheticTextBlockSource[][];
+}
+
 /**
  * 可标注 surface 的「实例上下文」—— 底座层（C1：从 ReaderContext 泛化而来）。
  *
@@ -24,6 +38,9 @@ export class SurfaceContext {
 
   /** 当前加载的 PDF 文档对象（从 renderer.ts 模块级变量搬入）。切回本 context 免重新 fetch/decode。 */
   pdf: PDFDocumentProxy | null = null;
+
+  /** 非 PDF 的可标注文档投影。当前用于 EPUB：原文件保持原生，阅读/标注走合成 article surface。 */
+  syntheticDoc: SyntheticSurfaceDocument | null = null;
 
   /** 本实例的持久化文档（store 的 PersistedDoc：页缓存/阅读位置/水位线）。renderer 载入后挂上，
    *  setActiveContext 切换时据此把 store.current 重指向本实例的文档——根除跨文档串写（P0-4）。白板=null。 */

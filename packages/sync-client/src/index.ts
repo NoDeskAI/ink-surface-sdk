@@ -17,6 +17,7 @@ export interface RuntimeSyncRunnerOptions {
   maxAttempts?: number;
   retryDelayMs?: number;
   deviceId?: string;
+  cursorKey?: string;
   pullLimit?: number;
   inbox?: RuntimeInboxPort;
   now?: () => string;
@@ -58,6 +59,9 @@ export interface RuntimeInboxApplyResult {
   applied_event_ids: string[];
   skipped_event_ids: string[];
   conflict_event_ids: string[];
+  applied_doc_ids?: string[];
+  skipped_doc_ids?: string[];
+  conflict_doc_ids?: string[];
 }
 
 export interface RuntimeInboxPort {
@@ -77,6 +81,9 @@ export interface RuntimeSyncPullRunResult {
   applied_event_ids: string[];
   skipped_event_ids: string[];
   conflict_event_ids: string[];
+  applied_doc_ids?: string[];
+  skipped_doc_ids?: string[];
+  conflict_doc_ids?: string[];
 }
 
 export class RuntimeSyncPullConflictError extends Error {
@@ -99,7 +106,7 @@ export interface HttpRuntimeSyncTransportConfig {
   endpoint: string;
   deviceId: string;
   pullEndpoint?: string;
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | (() => Record<string, string>);
   requestTimeoutMs?: number;
 }
 
@@ -172,6 +179,7 @@ export class RuntimeSyncRunner {
   private readonly maxAttempts: number;
   private readonly retryDelayMs: number;
   private readonly deviceId?: string;
+  private readonly cursorKey?: string;
   private readonly pullLimit?: number;
   private readonly inbox?: RuntimeInboxPort;
   private readonly now: () => string;
@@ -185,6 +193,7 @@ export class RuntimeSyncRunner {
     this.maxAttempts = Math.max(1, options.maxAttempts ?? 5);
     this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_000);
     this.deviceId = options.deviceId;
+    this.cursorKey = options.cursorKey ?? options.deviceId;
     this.pullLimit = options.pullLimit;
     this.inbox = options.inbox;
     this.now = options.now ?? nowIso;
@@ -257,7 +266,8 @@ export class RuntimeSyncRunner {
     if (!this.deviceId) throw new Error('Runtime sync deviceId is not configured.');
     if (!this.transport.pull) throw new Error('Runtime sync transport does not support pull.');
 
-    const cursor = await this.inbox.getDeviceCursor(this.deviceId);
+    const cursorKey = this.cursorKey ?? this.deviceId;
+    const cursor = await this.inbox.getDeviceCursor(cursorKey);
     const response = await this.transport.pull({
       device_id: this.deviceId,
       cursor: cursor?.cursor,
@@ -274,7 +284,7 @@ export class RuntimeSyncRunner {
       );
     }
     await this.inbox.writeDeviceCursor({
-      device_id: this.deviceId,
+      device_id: cursorKey,
       cursor: response.next_cursor,
       updated_at: this.now(),
     });
@@ -290,6 +300,9 @@ export class RuntimeSyncRunner {
       applied_event_ids: applyResult.applied_event_ids,
       skipped_event_ids: applyResult.skipped_event_ids,
       conflict_event_ids: applyResult.conflict_event_ids,
+      applied_doc_ids: applyResult.applied_doc_ids,
+      skipped_doc_ids: applyResult.skipped_doc_ids,
+      conflict_doc_ids: applyResult.conflict_doc_ids,
     };
   }
 
@@ -351,6 +364,10 @@ export class RuntimeSyncRunner {
 export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
   constructor(private readonly config: HttpRuntimeSyncTransportConfig) {}
 
+  private headers(): Record<string, string> {
+    return typeof this.config.headers === 'function' ? this.config.headers() : (this.config.headers ?? {});
+  }
+
   async send(events: RuntimeSyncEvent[]): Promise<RuntimeSyncAck[]> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.max(1, this.config.requestTimeoutMs ?? 15_000));
@@ -360,7 +377,7 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          ...(this.config.headers ?? {}),
+          ...this.headers(),
         },
         body: JSON.stringify({
           schema_version: 'inkloop.runtime_sync_batch.v1',
@@ -395,7 +412,7 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
     try {
       response = await fetch(endpoint, {
         method: 'GET',
-        headers: this.config.headers ?? {},
+        headers: this.headers(),
         signal: controller.signal,
       });
     } finally {
@@ -408,3 +425,6 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
     return payload;
   }
 }
+
+export { LocalEventLogTransport } from './local-event-log-transport.js';
+export type { LocalEventLogTransportConfig, LocalEventLogTransportStatus } from './local-event-log-transport.js';
