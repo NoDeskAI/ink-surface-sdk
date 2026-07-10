@@ -1,0 +1,27 @@
+FROM node:24-bookworm-slim
+
+WORKDIR /app
+ENV NODE_ENV=development
+
+COPY . .
+RUN npm ci --ignore-scripts
+
+WORKDIR /app/examples/ai-annotation-demo
+
+ENV HOST=0.0.0.0
+ENV PORT=8731
+ENV INKLOOP_LIBRARY_STORE=/data/library
+ENV INKLOOP_KNOWLEDGE_STORE=/data/knowledge
+ENV INKLOOP_RUNTIME_SYNC_STORE=/data/runtime-events.jsonl
+ENV INKLOOP_LOCAL_AUTH_STORE=/data/auth-sessions.json
+ENV INKLOOP_LOCAL_DEVICE_AUTH=1
+ENV INKLOOP_LIBRARY_REQUIRE_SESSION=1
+ENV INKLOOP_KNOWLEDGE_REQUIRE_SESSION=1
+ENV INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION=1
+ENV INKLOOP_TENANT_ID=local
+ENV INKLOOP_USER_ID=local_user
+
+EXPOSE 8731
+VOLUME ["/data"]
+
+CMD ["npm", "run", "serve"]

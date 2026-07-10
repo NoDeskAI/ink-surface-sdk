@@ -3,31 +3,43 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>InkLoop · AI 标注阅读</title>
+  <title>InkLoop · Source Reading Host</title>
 </head>
 <body>
   <header id="topbar">
-    <div class="brand">InkLoop</div>
     <div class="doc-meta">
-      <span id="doc-name">未打开文档</span>
+      <span id="doc-name"></span>
       <span id="page-ind"></span>
     </div>
     <div class="top-ctl">
-      <button id="prev" class="ghost" title="上一页 ←">‹</button>
-      <button id="next" class="ghost" title="下一页 →">›</button>
-      <span class="vsep"></span>
-      <button id="zoom-out" class="ghost" title="缩小">−</button>
-      <span id="zoom-ind" class="zoom-ind">100%</span>
-      <button id="zoom-in" class="ghost" title="放大">＋</button>
-      <span class="vsep"></span>
-      <label for="file-in" class="ghost import-label">导入 PDF</label>
-      <input type="file" id="file-in" accept="application/pdf" hidden />
-      <button id="recent-toggle" class="ghost" title="最近打开的书（持久存储 · 免重导）">最近</button>
-      <button id="load-chat" class="ghost" title="载入合成聊天 surface（验证 App-agnostic）">示例聊天</button>
-      <button id="view-toggle" class="ghost" title="重排（AI 结构重建 · 保 bbox 可圈画）">重排</button>
-      <button id="insight-toggle" class="ghost" title="本页洞察">洞察</button>
+      <input type="file" id="file-in" accept="application/pdf,application/epub+zip,text/markdown,.pdf,.epub,.md,.markdown" hidden />
+      <button id="home-btn" class="ghost doc-only back-btn" title="返回">‹ 返回</button>
+      <span class="vsep doc-only"></span>
+      <button id="prev" class="ghost doc-only" title="上一页 ←">‹</button>
+      <button id="next" class="ghost doc-only" title="下一页 →">›</button>
+      <span class="vsep doc-only"></span>
+      <div class="seg-control doc-only" role="group" aria-label="页面布局">
+        <button id="layout-single" type="button" class="seg-btn" aria-pressed="true" title="单页布局">单页</button>
+        <button id="layout-spread" type="button" class="seg-btn" aria-pressed="false" title="双页布局">双页</button>
+      </div>
+      <select id="zoom-mode" class="zoom-mode doc-only" aria-label="缩放方式">
+        <option value="fit-page">适应页面</option>
+        <option value="fit-width">适应宽度</option>
+        <option value="0.25">25%</option>
+        <option value="0.5">50%</option>
+        <option value="0.75">75%</option>
+        <option value="1">100%</option>
+        <option value="1.5">150%</option>
+        <option value="2">200%</option>
+        <option value="custom" hidden>自定义缩放</option>
+      </select>
+      <button id="zoom-out" class="ghost doc-only" title="缩小">−</button>
+      <span id="zoom-ind" class="zoom-ind doc-only">100%</span>
+      <button id="zoom-in" class="ghost doc-only" title="放大">＋</button>
+      <button id="view-toggle" class="ghost doc-only" title="切换原版 / 阅读视图">阅读</button>
+      <button id="insight-toggle" class="ghost doc-only" title="查看当前文档的标记与 AI 旁注记录">标记记录</button>
     </div>
-    <div id="recent-panel" class="recent-panel" hidden></div>
+    <div id="import-status" class="import-status" hidden aria-live="polite"></div>
   </header>
 
   <main>
@@ -38,10 +50,6 @@
           <canvas id="ink-layer"></canvas>
           <div id="whisper-layer"></div>
           <div id="empty-state">
-            <div class="es-mark">✎</div>
-            <p class="es-title">把 PDF 拖到这里，或点击导入</p>
-            <p class="es-sub">在原文上圈、划、写 —— 每一次标注，都是一次思考的起点</p>
-            <label for="file-in" class="primary-btn">导入 PDF</label>
             <div id="recent-books" class="recent-books"></div>
           </div>
         </div>
@@ -52,10 +60,10 @@
 
     <aside id="insight">
       <div class="panel-head">
-        <span class="panel-title">本页洞察</span>
+        <span class="panel-title">标记记录</span>
         <span id="insight-count" class="panel-count"></span>
       </div>
-      <div id="cards"><p class="empty-hint">标注后，洞察会先在原文旁低语，并在此留存回看</p></div>
+      <div id="cards"><p class="empty-hint">标注后，AI 旁注和标记记录会在这里留存回看</p></div>
       <div id="panel-foot"></div>
     </aside>
   </main>

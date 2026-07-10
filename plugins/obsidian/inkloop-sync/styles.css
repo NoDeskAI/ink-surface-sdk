@@ -259,6 +259,60 @@
   display: none !important;
 }
 
+.inkloop-v1-boundary-card {
+  margin: 12px 0 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.inkloop-v1-boundary-card h3 {
+  margin: 0 0 6px;
+  color: var(--text-normal);
+  font-size: 15px;
+}
+
+.inkloop-v1-boundary-card p {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.inkloop-v1-boundary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.inkloop-v1-boundary-row {
+  min-height: 54px;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+
+.inkloop-v1-boundary-row span,
+.inkloop-v1-boundary-row strong {
+  display: block;
+}
+
+.inkloop-v1-boundary-row span {
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.inkloop-v1-boundary-row strong {
+  color: var(--text-normal);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .inkloop-mark-layer {
   position: absolute;
   z-index: 1;
@@ -569,6 +623,160 @@
   color: var(--inkloop-muted);
 }
 
+.inkloop-snapshot-board {
+  margin: 14px 0 28px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.inkloop-snapshot-board-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 13px 0 10px;
+  color: var(--text-normal);
+}
+
+.inkloop-snapshot-board-head strong {
+  font-size: 15px;
+}
+
+.inkloop-snapshot-board-head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.inkloop-snapshot-card {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.inkloop-snapshot-card > summary {
+  list-style: none;
+}
+
+.inkloop-snapshot-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.inkloop-snapshot-summary {
+  display: block;
+  padding: 10px 0;
+  cursor: pointer;
+}
+
+.inkloop-snapshot-summary-text {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.inkloop-snapshot-summary-text strong,
+.inkloop-snapshot-summary-text em {
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inkloop-snapshot-summary-text strong {
+  color: var(--text-normal);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.inkloop-snapshot-summary-text em {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.inkloop-snapshot-markline {
+  display: -webkit-box;
+  margin-top: 5px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--text-normal);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.inkloop-snapshot-markline.is-highlight {
+  background: linear-gradient(to bottom, transparent 48%, color-mix(in srgb, #f1c84b 45%, transparent) 48%, color-mix(in srgb, #f1c84b 45%, transparent) 86%, transparent 86%);
+}
+
+.inkloop-snapshot-markline.is-underline {
+  text-decoration-line: underline;
+  text-decoration-color: rgba(194, 65, 47, .9);
+  text-decoration-thickness: 2px;
+  text-underline-offset: .18em;
+}
+
+.inkloop-snapshot-markline.is-pen,
+.inkloop-snapshot-markline.is-ai {
+  padding-left: 9px;
+}
+
+.inkloop-snapshot-markline.is-pen {
+  border-left: 3px solid var(--text-normal);
+}
+
+.inkloop-snapshot-markline.is-ai {
+  border-left: 3px dashed var(--interactive-accent);
+}
+
+.inkloop-snapshot-detail {
+  padding: 0 0 14px;
+}
+
+.inkloop-snapshot-ink-preview {
+  margin: 2px 0 10px;
+}
+
+.inkloop-snapshot-ink-preview .inkloop-cloud-mark-layer {
+  max-height: 160px;
+}
+
+.inkloop-snapshot-detail-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.inkloop-snapshot-field {
+  margin-bottom: 10px;
+}
+
+.inkloop-snapshot-field span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text-muted);
+  font: 11px/1.3 var(--font-interface);
+}
+
+.inkloop-snapshot-field p {
+  margin: 0;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.inkloop-snapshot-muted {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.inkloop-snapshot-open {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 2px;
+  color: var(--interactive-accent);
+  font-size: 12px;
+  text-decoration: none;
+}
+
 @media (max-width: 980px) {
   .inkloop-visual-block {
     grid-template-columns: minmax(0, 1fr);
@@ -595,5 +803,9 @@
 
   .inkloop-runtime-gutter {
     display: none;
+  }
+
+  .inkloop-snapshot-detail {
+    padding-left: 0;
   }
 }

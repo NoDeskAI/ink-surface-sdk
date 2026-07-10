@@ -4,8 +4,18 @@
  */
 
 export const pageCss = { w: 0, h: 0 };
+export interface PageViewportRegion {
+  pageId: string;
+  pageIndex: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
-/** 右侧留白（AI 输出落点）布局常量。stage 宽 = 页宽 + GUTTER_W。 */
+let pageRegions: PageViewportRegion[] = [];
+
+/** 右侧留白（AI 输出落点）布局常量。边注从页面右缘向外溢出，不参与页面居中。 */
 export const GUTTER_W = 300;   // 留白总宽（px）
 export const GUTTER_PAD = 20;  // 留白内容离页面右缘的左边距（px）
 
@@ -14,8 +24,35 @@ export function setPageSize(w: number, h: number): void {
   pageCss.h = h;
 }
 
-export const normToPx = (nx: number, ny: number) => ({ x: nx * pageCss.w, y: ny * pageCss.h });
-export const pxToNorm = (px: number, py: number) => ({ x: px / pageCss.w, y: py / pageCss.h });
+export function setPageRegions(regions: PageViewportRegion[]): void {
+  pageRegions = regions.filter((r) => r.w > 0 && r.h > 0);
+}
+
+export function activePageRegions(): PageViewportRegion[] {
+  return [...pageRegions];
+}
+
+export function pageRegionForId(pageId: string | null | undefined): PageViewportRegion | null {
+  if (!pageId) return null;
+  return pageRegions.find((r) => r.pageId === pageId) ?? null;
+}
+
+export function pageRegionAtPx(px: number, py: number): PageViewportRegion | null {
+  const hit = pageRegions.find((r) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h);
+  if (hit) return hit;
+  return pageRegions[0] ?? null;
+}
+
+export const normToPx = (nx: number, ny: number, pageId?: string | null) => {
+  const region = pageRegionForId(pageId) ?? pageRegions[0];
+  if (region) return { x: region.x + nx * region.w, y: region.y + ny * region.h };
+  return { x: nx * pageCss.w, y: ny * pageCss.h };
+};
+export const pxToNorm = (px: number, py: number, pageId?: string | null) => {
+  const region = pageRegionForId(pageId) ?? pageRegionAtPx(px, py);
+  if (region) return { x: (px - region.x) / region.w, y: (py - region.y) / region.h };
+  return { x: px / pageCss.w, y: py / pageCss.h };
+};
 
 export interface SelfTestResult {
   ok: boolean;

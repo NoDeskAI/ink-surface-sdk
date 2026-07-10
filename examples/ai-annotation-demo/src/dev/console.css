@@ -10,10 +10,14 @@
   .rail-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 9px 10px; border: 0; border-radius: 9px;
     background: transparent; color: var(--ink); font-size: 13.5px; cursor: pointer; font-family: var(--sans); }
   .rail-item:hover { background: var(--hl); }
-  .rail-item.active { background: var(--ink); color: var(--page); }
+  .rail-item.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
   .rail-item .rail-ico { width: 18px; text-align: center; }
   .rail-item .rail-soon { margin-left: auto; font-size: 10px; color: var(--hint); }
-  .rail-item.active .rail-soon { color: var(--hl); }
+  .rail-item.active .rail-soon { color: var(--accent); }
   .rail-spacer { flex: 1; }
   .rail-foot { border-top: 1px solid var(--line); padding-top: 8px; }
   #rail-reopen { position: fixed; left: 10px; top: 9px; z-index: 47; display: none; width: 32px; height: 32px; border: 1px solid var(--line);
@@ -217,3 +221,15 @@
   .rail-sub.open { display: block; }
   .rail-sub-item { font-size: 12.5px; padding: 7px 10px; }
 
+  @media (max-width: 1100px) {
+    body { --rail-w: 0px; padding-left: 0; }
+    #app-rail { transform: translateX(-220px); }
+    #rail-reopen { display: block; }
+    #app-pages { left: 0; }
+    #topbar { padding-left: 52px; }
+  }
+
+  @media (max-width: 720px) {
+    #rail-reopen { left: 8px; top: 8px; width: 30px; height: 30px; }
+    #topbar { padding-left: 48px; }
+  }

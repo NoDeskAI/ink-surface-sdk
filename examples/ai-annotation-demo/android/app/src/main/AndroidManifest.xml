@@ -1,25 +1,90 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 无线同步链路桥（InkLoopNetBridge）：dev 页读 WiFi 状态（IP/开关）。 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Wi-Fi 传文件运行期间保持无线链路，不让息屏/省电把局域网上传服务打断。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- WebView 内文件浏览器（InkLoopFilesBridge）枚举/读 /sdcard 下的书：Android 11+ 需「所有文件访问」，旧系统用 READ_EXTERNAL_STORAGE。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="false"
-        android:label="InkLoop"
+        android:label="InkLoop Paper"
         android:supportsRtl="true"
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="false"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:theme="@style/Theme.InkLoop">
+        android:theme="@style/Theme.InkLoop"
+        tools:replace="android:allowBackup,android:label">
 
         <activity
             android:name="com.inkloop.app.MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout">
+
+            <!-- 显示模式：auto=ONYX/BOOX 直显(WebView 填满+可横屏)、其余设备走 IT8951 PixelCopy 竖框。
+                 可改 direct / it8951 强制指定（见 MainActivity.resolveDisplayMode）。 -->
+            <meta-data android:name="com.inkloop.DISPLAY_MODE" android:value="auto" />
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- 电纸屏设备形态：可作为 HOME 启动器（应用即桌面）。开机自启 + 按 home 回到 InkLoop，
+                 别的 app 难以长期占前台。启用方式（主机侧，可逆）：
+                   cmd package set-home-activity com.inkloop.app/.MainActivity   # 设为默认桌面
+                   cmd package set-home-activity com.android.launcher3/.uioverrides.QuickstepLauncher  # 改回 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="inkloop"
+                    android:host="oauth"
+                    android:path="/lark/callback" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="localhost"
+                    android:port="8789"
+                    android:path="/api/auth/lark/callback" />
+            </intent-filter>
         </activity>
+
+        <service
+            android:name="com.inkloop.app.InkLoopKeepAliveService"
+            android:directBootAware="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name="com.inkloop.app.InkLoopBootReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

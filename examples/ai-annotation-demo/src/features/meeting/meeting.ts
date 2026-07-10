@@ -18,6 +18,7 @@ import { SurfaceContext } from '../../app/surface-context';
 import { icon } from '../../surface/icons';
 import { esc } from '../../core/escape';
 import type { MeetingStatus, PersistedDoc, PersistedMeeting } from '../../core/store-format';
+import { apiUrl } from '../../core/api';
 import './meeting.css';
 
 /** 会议 ↔ 导航壳的唯一桥。壳在 boot 时经 initMeeting 注入实现。 */
@@ -51,23 +52,26 @@ const MTG_STATUS: Record<MeetingStatus, { t: string; c: string; bg: string }> = 
   ended: { t: '已结束', c: '#5b5b66', bg: '#f0f0f2' },
 };
 
-// 独立飞书后端（feishu-service）。dev 默认 localhost:4321；服务不在就静默退回纯本地。
-const FEISHU_BASE = ((import.meta.env.VITE_FEISHU_BASE_URL as string | undefined) ?? 'http://localhost:4321').replace(/\/+$/, '');
-// 文档转换公共基础设施（convert-service）。任意可读文件 URL → 可标注 PDF。
-const CONVERT_BASE = ((import.meta.env.VITE_CONVERT_BASE_URL as string | undefined) ?? 'http://localhost:4330').replace(/\/+$/, '');
+// P0 安全止血：feishu-service/convert-service 之前零鉴权、前端直连裸端口（见项目记忆盲区扫描发现）。
+// 浏览器请求一律走同源代理（secret 服务端注入）；FEISHU_ABSOLUTE 只用于拼「喂给 convert-service 当抓取源」的地址
+// （convert-service 服务端 fetch，自己代填 secret，见 mobile/meeting.ts 同款注释）。
+const FEISHU_PROXY = '/api/feishu-svc';
+const CONVERT_PROXY = '/api/convert';
+const FEISHU_ABSOLUTE = ((import.meta.env.VITE_FEISHU_SERVICE_ABSOLUTE as string | undefined) ?? 'http://localhost:4321').replace(/\/+$/, '');
 /** 该群文件能不能直接转成可标注 PDF（v1 只 HTML）。 */
 const isConvertible = (f: FeishuMsg): boolean => f.msg_type === 'file' && /\.html?$/i.test(f.file_name || '');
-/** 群文件的飞书下载 URL（im:resource）。 */
-function feishuFileUrl(f: FeishuMsg): string {
+const feishuFilePath = (f: FeishuMsg): string => {
   const img = f.msg_type === 'image';
   const key = img ? f.image_key : f.file_key;
   const name = img ? '［图片］' : (f.file_name || '文件');
-  return `${FEISHU_BASE}/api/feishu/messages/${encodeURIComponent(f.message_id)}/file/${encodeURIComponent(key || '')}?type=${img ? 'image' : 'file'}&name=${encodeURIComponent(name)}`;
-}
-/** HTML 群文件 → convert-service 转出的可标注 PDF 的 URL。 */
-const convertedPdfUrl = (f: FeishuMsg): string => `${CONVERT_BASE}/convert/to-pdf?url=${encodeURIComponent(feishuFileUrl(f))}`;
+  return `/api/feishu/messages/${encodeURIComponent(f.message_id)}/file/${encodeURIComponent(key || '')}?type=${img ? 'image' : 'file'}&name=${encodeURIComponent(name)}`;
+};
+/** 群文件的飞书下载 URL（浏览器直接点开用·走同源代理）。apiUrl() 包一层：安卓静态包下要落到 VITE_API_BASE_URL。 */
+function feishuFileUrl(f: FeishuMsg): string { return apiUrl(`${FEISHU_PROXY}${feishuFilePath(f)}`); }
+/** HTML 群文件 → convert-service 转出的可标注 PDF 的 URL（内嵌的抓取源要用真绝对地址）。 */
+const convertedPdfUrl = (f: FeishuMsg): string => apiUrl(`${CONVERT_PROXY}/to-pdf?url=${encodeURIComponent(FEISHU_ABSOLUTE + feishuFilePath(f))}`);
 async function feishuGet<T>(path: string): Promise<T> {
-  const r = await fetch(FEISHU_BASE + path);
+  const r = await fetch(apiUrl(FEISHU_PROXY + path));
   if (!r.ok) throw new Error('feishu-service ' + r.status);
   return r.json() as Promise<T>;
 }
@@ -76,7 +80,8 @@ interface FeishuMsg { message_id: string; msg_type: string; sender_id?: string; 
 const fmtMs = (ms?: string): string => { const n = Number(ms); return Number.isFinite(n) && n > 0 ? fmtDateTime(new Date(n).toISOString()) : ''; };
 
 // 飞书日历日程（user OAuth 拉到的「我本人」日程；后端已展开循环会成每次 occurrence，只读源）
-interface FeishuEvent { event_id: string; summary?: string; start_time?: { timestamp?: string; date?: string }; event_organizer?: { display_name?: string }; recurring?: boolean }
+interface FeishuEvent { event_id: string; summary?: string; start_time?: { timestamp?: string; date?: string }; event_organizer?: { display_name?: string }; recurring?: boolean; source?: 'bot_calendar' | string; calendar_id?: string }
+interface FeishuCalendarEventsResponse { connected?: boolean; configured?: boolean; events?: FeishuEvent[]; error?: { code?: string; message?: string } }
 /** 日程开始墙钟（ms）：优先 timestamp(秒)，全天日程用 date。 */
 const fsEventWhen = (e: FeishuEvent): number => {
   const ts = e.start_time?.timestamp;
@@ -117,6 +122,22 @@ function feishuTimeline(events: FeishuEvent[], max = 6): string {
   const cols = items.map((e, i) => fsTlCol(e, i % 2 === 0)).join('');
   const more = events.length > max ? `<div class="mtl-more">还有 ${events.length - max} 场</div>` : '';
   return `<div class="mtl"><div class="mtl-line"></div><div class="mtl-cols">${origin}${cols}</div>${more}</div>`;
+}
+
+function mergeFeishuEvents(groups: FeishuEvent[][]): FeishuEvent[] {
+  const byId = new Map<string, FeishuEvent>();
+  for (const event of groups.flat()) {
+    if (!event.event_id) continue;
+    byId.set(`${event.source || 'calendar'}:${event.calendar_id || ''}:${event.event_id}`, event);
+  }
+  return [...byId.values()].sort((a, b) => fsEventWhen(a) - fsEventWhen(b));
+}
+
+function calendarIssueText(res: FeishuCalendarEventsResponse | null): string {
+  const code = res?.error?.code || '';
+  if (code === 'missing_calendar_scope') return '机器人日历权限未开通，请在飞书开放平台开通日历读取权限后刷新。';
+  if (code === 'not_configured') return '机器人日历源未配置。请在 Cloud Hub 配置飞书机器人 App ID / Secret。';
+  return res?.error?.message ? `飞书日历同步失败：${res.error.message}` : '';
 }
 
 /** 群消息 → 群动态 section（文件/图片标「资料」）。 */
@@ -323,16 +344,25 @@ async function renderMtgHome(c: HTMLDivElement): Promise<void> {
     for (const w of res.workspaces || []) if (w.chat_status === 'normal') await upsertFeishuWorkspace(w.chat_id, w.name);
   } catch { /* feishu-service 不可用 → 仅本地工作区 */ }
 
-  // 飞书日历(user OAuth) → 会议日程源:已连接就拉「我本人」近期日程
-  let fsConnected = false, fsEvents: FeishuEvent[] = [];
+  // 飞书日历(user OAuth + bot 应用身份) → 会议日程源。
+  let fsConnected = false, fsEvents: FeishuEvent[] = [], fsIssue = '';
+  const fsEventGroups: FeishuEvent[][] = [];
   try {
     const st = await feishuGet<{ connected: boolean }>('/api/feishu/oauth/status');
     fsConnected = !!st.connected;
     if (fsConnected) {
       const ev = await feishuGet<{ events: FeishuEvent[] }>('/api/feishu/my/events');
-      fsEvents = (ev.events || []).slice().sort((a, b) => fsEventWhen(a) - fsEventWhen(b));
+      if (ev.events?.length) fsEventGroups.push(ev.events);
     }
   } catch { /* feishu-service 不在 → 跳过日历 */ }
+  try {
+    const bot = await feishuGet<FeishuCalendarEventsResponse>('/api/feishu/bot/events?lookahead_days=14');
+    if (bot.connected) {
+      fsConnected = true;
+      if (bot.events?.length) fsEventGroups.push(bot.events);
+    } else if (!fsConnected) fsIssue = calendarIssueText(bot);
+  } catch { /* 本地 bot 日历源不可用 → 跳过 */ }
+  fsEvents = mergeFeishuEvents(fsEventGroups);
 
   const [workspaces, allMeetings] = await Promise.all([listWorkspaces(), listAllMeetings()]);
   const wsName = new Map(workspaces.map((w) => [w.workspace_id, w.name]));
@@ -349,7 +379,7 @@ async function renderMtgHome(c: HTMLDivElement): Promise<void> {
     ? feishuTimeline(fsEvents) + (localRows ? `<div class="mtl-local">${localRows}</div>` : '')
     : `<div class="mtg-sched"><p class="mtg-empty">${fsConnected
         ? '飞书日历近期没有日程，本地也还没有会议。'
-        : '还没接飞书日历。点右上「连接飞书日历」拉你的真实日程；或进群聊「新建会议」。'}</p></div>`;
+        : (fsIssue || '还没接飞书日历。点右上「连接飞书日历」拉你的真实日程；或进群聊「新建会议」。')}</p></div>`;
   const wsHtml = workspaces.length
     ? `<div class="mtg-ws-grid">` + workspaces.map((w) =>
         `<button class="mtg-ws" data-ws="${esc(w.workspace_id)}">${icon('users')}<span class="mtg-mat-body"><span class="mtg-mat-name">${esc(w.name)}${w.source === 'feishu' ? '<span class="mtg-fs-badge">飞书</span>' : ''}</span><span class="mtg-mat-meta">${count.get(w.workspace_id) ?? 0} 场会议</span></span></button>`
@@ -361,7 +391,7 @@ async function renderMtgHome(c: HTMLDivElement): Promise<void> {
   body.innerHTML =
     `<section class="mtg-sec"><div class="mtg-sec-h">${icon('calendar')} 会议日程 <span class="mtg-soon">飞书日历 + 本地 · 待开始 / 进行中</span>${connectCtl}</div>${schedHtml}</section>`
     + `<section class="mtg-sec"><div class="mtg-sec-h">${icon('library')} 群聊书架 <span class="mtg-soon">以群聊为单位</span></div>${wsHtml}</section>`;
-  body.querySelector('#mtg-fs-connect')?.addEventListener('click', () => { window.open(FEISHU_BASE + '/api/feishu/oauth/login', '_blank', 'noopener'); });
+  body.querySelector('#mtg-fs-connect')?.addEventListener('click', () => { window.open(apiUrl(FEISHU_PROXY + '/api/feishu/oauth/login'), '_blank', 'noopener'); });
   body.querySelectorAll<HTMLButtonElement>('.mtg-ws[data-ws]').forEach((b) => b.addEventListener('click', () => mtgGoWorkspace(b.dataset.ws!)));
   wireMeetingRows(body);
 }
@@ -472,9 +502,8 @@ async function renderMtgDetail(c: HTMLDivElement, mtgId: string): Promise<void> 
       groupHtml = files.length
         ? `<div class="mtg-shelf">` + files.map((f) => {
             const img = f.msg_type === 'image';
-            const key = img ? f.image_key : f.file_key;
             const name = img ? '［图片］' : (f.file_name || '文件');
-            const url = `${FEISHU_BASE}/api/feishu/messages/${encodeURIComponent(f.message_id)}/file/${encodeURIComponent(key || '')}?type=${img ? 'image' : 'file'}&name=${encodeURIComponent(name)}`;
+            const url = feishuFileUrl(f);
             return `<a class="mtg-mat" href="${esc(url)}" target="_blank" rel="noopener" title="从群下载查看（im:resource）">`
               + `${icon('file')}<span class="mtg-mat-body"><span class="mtg-mat-name">${esc(name)}</span>`
               + `<span class="mtg-mat-meta">群文件 · ${esc(fmtMs(f.create_time))}</span></span></a>`;

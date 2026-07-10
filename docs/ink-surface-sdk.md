@@ -1,6 +1,6 @@
 # InkSurface SDK
 
-InkSurface SDK is the shared document-surface renderer used by the InkLoop Web Lab and the Obsidian runtime host.
+InkSurface SDK is the shared document-surface renderer used by the InkLoop Web validation host, InkLoop Paper runtime host, and Obsidian runtime host.
 
 It renders native document text, anchored annotations, margin notes, highlights, boxes, and freehand pen/highlighter strokes from the same sidecar-friendly data model.
 
@@ -18,6 +18,9 @@ The compatibility names are intentionally kept for now so the Obsidian plugin ca
 ```text
 apps/sync-api/          Future cloud sync API contract fixtures
 packages/adapter-contracts/ Adapter execution authority and placement rules
+packages/adapter-obsidian/ Clean Obsidian Markdown vault renderer
+packages/export-core/   Deterministic export and concept/topology helpers
+packages/knowledge-schema/ KO, DocumentProjection, entity, relation, and hash contracts
 packages/native-bridge/  Local WebView bridge message contract
 packages/offline-store/  Offline document cache state and eviction policy contract
 packages/runtime-schema/ Runtime records and sync event contracts
@@ -34,6 +37,9 @@ with root subpath exports for runtime modules:
 ```text
 ink-surface-sdk
 ink-surface-sdk/adapter-contracts
+ink-surface-sdk/adapters/obsidian
+ink-surface-sdk/export-core
+ink-surface-sdk/knowledge-schema
 ink-surface-sdk/native-bridge
 ink-surface-sdk/offline-store
 ink-surface-sdk/offline-store/file-sidecar
@@ -57,6 +63,15 @@ ink-surface-sdk/sync-client
 `packages/native-bridge` defines the local WebView/native message protocol. It assumes the renderer bundle is shipped as local app assets, not loaded from a remote page.
 
 `packages/adapter-contracts` classifies adapters by execution authority so local vault/file adapters remain client-side and cloud API adapters run backend-side.
+
+`packages/knowledge-schema` exposes the stable KO, DocumentProjection, entity membership, KO relation, export
+envelope, and content-hash helpers consumed by adapters.
+
+`packages/export-core` exposes deterministic export helpers for taxonomy tags, entity mode inference, concept
+layers, and stored-membership topology.
+
+`packages/adapter-obsidian` renders canonical export artifacts into clean Obsidian Markdown vault files. It is a
+pure renderer: it does not watch files, write to disk, call Obsidian APIs, or start sync.
 
 `apps/sync-api` documents the future backend sync boundary. It provides contract docs and fixtures only; no production server is shipped in this SDK package.
 
@@ -242,13 +257,13 @@ npm run build
 npm run demo:dev -- --host 127.0.0.1
 ```
 
-Open:
+Open the current AI Pen V1 validation host:
 
 ```text
-http://127.0.0.1:8765/examples/ink-surface/basic.html
+http://127.0.0.1:8765/ai-pen-demo.html
 ```
 
-The example imports `ink-surface-sdk` through the demo host's local alias and renders a local in-memory model. It performs no network calls and does not write storage.
+The AI Pen page exercises the shared runtime schema, Capture Surface simulator, Live Board, LessonGraph/MeetingGraph candidates, and `source_refs` validator. For the legacy source-document renderer, open `http://127.0.0.1:8765/`.
 
 ## Host Responsibilities
 

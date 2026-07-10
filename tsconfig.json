@@ -8,6 +8,22 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "ink-surface-sdk": ["src/index.ts"],
+      "ink-surface-sdk/adapter-contracts": ["packages/adapter-contracts/src/index.ts"],
+      "ink-surface-sdk/adapters/obsidian": ["packages/adapter-obsidian/src/index.ts"],
+      "ink-surface-sdk/export-core": ["packages/export-core/src/index.ts"],
+      "ink-surface-sdk/knowledge-schema": ["packages/knowledge-schema/src/index.ts"],
+      "ink-surface-sdk/native-bridge": ["packages/native-bridge/src/index.ts"],
+      "ink-surface-sdk/offline-store": ["packages/offline-store/src/index.ts"],
+      "ink-surface-sdk/offline-store/file-sidecar": ["packages/offline-store/src/file-sidecar-store.ts"],
+      "ink-surface-sdk/offline-store/indexeddb": ["packages/offline-store/src/indexeddb-store.ts"],
+      "ink-surface-sdk/runtime-schema": ["packages/runtime-schema/src/index.ts"],
+      "ink-surface-sdk/surface-model": ["packages/surface-model/src/index.ts"],
+      "ink-surface-sdk/surface-web": ["packages/surface-web/src/index.ts"],
+      "ink-surface-sdk/sync-client": ["packages/sync-client/src/index.ts"]
+    },
     "types": ["vite/client", "node"]
   },
   "include": ["apps/**/*.ts", "src/**/*.ts", "packages/**/*.ts", "vite.config.ts", "vitest.config.ts"]

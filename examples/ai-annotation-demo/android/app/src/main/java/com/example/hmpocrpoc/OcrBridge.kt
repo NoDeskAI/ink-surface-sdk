@@ -30,7 +30,10 @@ import org.json.JSONObject
 object OcrBridge {
 
     private const val JS_OBJECT = "InkLoopOcr"
-    private val ALLOWED_ORIGINS = setOf("https://appassets.androidplatform.net")
+    private val ALLOWED_ORIGINS = setOf(
+        "https://appassets.androidplatform.net",
+        "http://appassets.androidplatform.net",
+    )
 
     /** 在 WebView 上注册 window.InkLoopOcr 通道。MainActivity 在 loadUrl 前调用。 */
     @JvmStatic

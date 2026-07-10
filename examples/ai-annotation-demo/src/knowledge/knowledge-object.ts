@@ -1,117 +1,87 @@
-import { z, type SafeParseReturnType } from 'zod';
+/**
+ * KnowledgeObject —— InkLoop ↔ 协作方（适配器）的**冻结接口**（契约 v0.1 §2）。
+ *
+ * 金线（来自对方方案 D2）：**适配器只吃 KnowledgeObject**，永不碰 Stroke/HMP/Mark/InferenceView/基岩。
+ * 故本文件**刻意零内部 import**——它是边界面，不依赖 InkLoop 内部任何类型，换契约版本也只动这一处。
+ * 由旧阅读投影 builder（builder.ts）从 Tier 2 账本（marks + ai_turns）折叠产出；协作方原样消费。
+ * 配套文档：~/Desktop/Nova_project/InkLoop对齐文档-KnowledgeObject契约-v0.1.md
+ */
 
 export type ISODateTime = string;
 export type Sha256 = `sha256:${string}`;
+/** 归一化 [0,1] 边界框 [x, y, w, h]。 */
 export type NormBBox = [number, number, number, number];
 
 export type KnowledgeKind =
   | 'source_document'
+  | 'reading_note'
+  | 'highlight'
   | 'excerpt'
   | 'annotation'
   | 'ai_note'
   | 'qa'
   | 'summary'
   | 'task'
+  | 'decision'
+  | 'risk'
+  | 'lesson_note'
+  | 'formula_step'
+  | 'meeting_action'
+  | 'meeting_decision'
+  | 'meeting_risk'
+  | 'diagram'
   | 'concept';
 
 export type KnowledgeStatus =
   | 'inbox'
   | 'accepted'
   | 'edited'
+  | 'follow_up'
   | 'dismissed'
   | 'export_ready'
   | 'exported'
   | 'archived';
 
+/** v1 只用这两档（团队/云后置）。 */
 export type Privacy = 'local_only' | 'export_allowed';
 
-export const KoIdSchema = z.string().regex(/^ko_[0-9A-HJKMNP-TV-Z]{26}$/);
-export const Sha256Schema = z.string().regex(/^sha256:[a-f0-9]{64}$/) as z.ZodType<Sha256>;
+export type MarkdownCallout = 'note' | 'quote' | 'question' | 'todo' | 'summary' | 'tip' | 'warning';
 
-export const KnowledgeKinds = [
-  'source_document',
-  'excerpt',
-  'annotation',
-  'ai_note',
-  'qa',
-  'summary',
-  'task',
-  'concept',
-] as const;
+export const KO_SCHEMA_VERSION = 'inkloop.knowledge_object.v1';
 
-export const KnowledgeStatuses = [
-  'inbox',
-  'accepted',
-  'edited',
-  'dismissed',
-  'export_ready',
-  'exported',
-  'archived',
-] as const;
+export interface KnowledgeObject {
+  schema_version: typeof KO_SCHEMA_VERSION;
+  ko_id: string; // 'ko_'+稳定派生（见 builder.koId）；跨端/跨重建稳定身份
+  kind: KnowledgeKind;
+  title: string;
+  body_md: string; // 渲染进受控区块的正文
 
-export const NormBBoxSchema = z
-  .tuple([z.number(), z.number(), z.number(), z.number()])
-  .refine(([x, y, w, h]) => x >= 0 && y >= 0 && w >= 0 && h >= 0 && x + w <= 1.000001 && y + h <= 1.000001, {
-    message: 'bbox must be normalized [x,y,w,h]',
-  });
-
-export const KnowledgeObjectSchema = z.object({
-  schema_version: z.literal('inkloop.knowledge_object.v1'),
-  ko_id: KoIdSchema,
-  kind: z.enum(KnowledgeKinds),
-  title: z.string().min(1).max(200),
-  body_md: z.string().max(100_000),
-  source: z.object({
-    document_id: z.string().min(1),
-    document_title: z.string().min(1),
-    page_id: z.string().optional(),
-    page_index: z.number().int().nonnegative().optional(),
-    object_refs: z.array(z.string()).default([]),
-    anchor_bbox: NormBBoxSchema.optional(),
-    quote: z.string().max(20_000).optional(),
-    inkloop_uri: z.string().regex(/^inkloop:\/\//),
-  }),
-  provenance: z.object({
-    created_from: z.enum(['mark', 'ai_turn', 'session', 'manual']),
-    mark_ids: z.array(z.string()).optional(),
-    ai_turn_ids: z.array(z.string()).optional(),
-  }),
-  tags: z.array(z.string()).default([]),
-  status: z.enum(KnowledgeStatuses),
-  privacy: z.enum(['local_only', 'export_allowed']),
-  render_hints: z
-    .object({
-      markdown_callout: z.enum(['note', 'quote', 'question', 'todo', 'summary', 'tip']).optional(),
-    })
-    .optional(),
-  content_hash: Sha256Schema,
-  created_at: z.string().datetime(),
-  updated_at: z.string().datetime(),
-});
-
-export type KnowledgeObject = z.infer<typeof KnowledgeObjectSchema>;
-export type KnowledgeObjectWithoutHash = Omit<KnowledgeObject, 'content_hash'>;
-
-export interface KnowledgeObjectExportEnvelope {
-  schema_version: 'inkloop.knowledge_export.v1';
-  export_id: string;
-  generated_at: string;
   source: {
-    app: 'inkloop';
-    app_version?: string;
-    document_id?: string;
+    document_id: string;
+    document_title: string;
+    page_id?: string; // 'pg_{hash8}_{idx}'
+    page_index?: number; // 0-based
+    object_refs: string[]; // 命中页面对象 id（字符级，如 'run3_12'）；可空
+    anchor_bbox?: NormBBox;
+    quote?: string; // 被标注的原文
+    inkloop_uri: string; // 见契约 §4
   };
-  objects: KnowledgeObject[];
-}
 
-export function parseKnowledgeObject(input: unknown): KnowledgeObject {
-  return KnowledgeObjectSchema.parse(input);
-}
+  provenance: {
+    created_from: 'mark' | 'ai_turn' | 'session' | 'manual';
+    mark_ids?: string[]; // = 我们的 mark_id
+    ai_turn_ids?: string[]; // = 我们的 ai_turn entry_id
+  };
 
-export function safeParseKnowledgeObject(input: unknown): SafeParseReturnType<unknown, KnowledgeObject> {
-  return KnowledgeObjectSchema.safeParse(input);
-}
+  tags: string[]; // 默认含 'inkloop' + 'inkloop/<kind>'
+  status: KnowledgeStatus;
+  privacy: Privacy;
 
-export function isExportableKnowledgeObject(ko: KnowledgeObject): boolean {
-  return ko.privacy === 'export_allowed' && ['export_ready', 'accepted', 'edited'].includes(ko.status) && ko.body_md.trim().length > 0;
+  render_hints?: {
+    markdown_callout?: MarkdownCallout;
+  };
+
+  content_hash: Sha256; // canonicalJson(KO 去掉本字段) 的 sha256；判重导出
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
 }

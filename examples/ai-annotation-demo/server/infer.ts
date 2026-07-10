@@ -19,10 +19,16 @@ import { SYSTEM_PROMPTS, type PromptRole } from './prompts';
 // 惰性读取：env 由 vite 插件在 configureServer 里注入 process.env，
 // 晚于本模块 import 求值，所以不能在模块顶层捕获。
 function cfg() {
+  const url = process.env.LLM_GATEWAY_URL
+    || process.env.LLM_GATEWAY_BASE
+    || 'https://llm-gateway-api.nodesk.tech/default/v1';
+  const transport = process.env.LLM_GATEWAY_TRANSPORT
+    || (url.includes('/passthrough') ? 'anthropic_passthrough' : 'openai_chat_completions');
   return {
-    url: process.env.LLM_GATEWAY_URL || 'https://llm-gateway-api.nodesk.tech/default/passthrough',
+    url,
     key: process.env.LLM_GATEWAY_KEY || '',
-    model: process.env.LLM_MODEL || 'kimi-k2.6',
+    model: process.env.LLM_MODEL || 'glm-5.2',
+    transport,
   };
 }
 
@@ -54,6 +60,91 @@ function thinkingFor(model: string): { thinking: any; minTokens: number } | null
 let aiCallSeq = 0;
 function logAiCall(meta: { requestId: string; model: string; provider: string; ms: number; ok: boolean; status: number }): void {
   console.log(`[ai] ${JSON.stringify(meta)}`);
+}
+
+function isOpenAiTransport(): boolean {
+  const transport = cfg().transport;
+  return transport === 'openai_chat_completions' || transport === 'chat_completions';
+}
+
+function chatCompletionsUrl(url: string): string {
+  const base = url.replace(/\/+$/, '');
+  return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
+}
+
+function openAiExtras(model: string): Record<string, unknown> {
+  if (/^glm[-_.]/i.test(model)) {
+    return {
+      thinking: { type: 'disabled' },
+      enable_thinking: false,
+      reasoning_effort: 'none',
+    };
+  }
+  return {};
+}
+
+function openAiContentPart(block: any): any | null {
+  if (!block || typeof block !== 'object') return null;
+  if (block.type === 'text') return { type: 'text', text: String(block.text || '') };
+  if (block.type === 'image') {
+    const source = block.source || {};
+    const data = String(source.data || '').replace(/^data:image\/[a-z]+;base64,/, '');
+    if (!data) return null;
+    const mediaType = String(source.media_type || 'image/png');
+    return { type: 'image_url', image_url: { url: `data:${mediaType};base64,${data}` } };
+  }
+  return null;
+}
+
+function openAiContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return String(content || '');
+  const parts = content.map(openAiContentPart).filter(Boolean);
+  return parts.length ? parts : '';
+}
+
+function openAiMessages(system: string, messages: any[]): any[] {
+  const out: any[] = [];
+  if (system) out.push({ role: 'system', content: system });
+  for (const message of messages) {
+    const role = message?.role === 'assistant' || message?.role === 'system' ? message.role : 'user';
+    out.push({ role, content: openAiContent(message?.content) });
+  }
+  return out;
+}
+
+function emptyTextError(model: string, data: any): Error {
+  const finish = data?.choices?.[0]?.finish_reason || data?.stop_reason || 'unknown';
+  const reasoning = data?.choices?.[0]?.message?.reasoning_content || '';
+  const usage = data?.usage ? ` usage=${JSON.stringify(data.usage)}` : '';
+  return new Error(`网关返回空正文 model=${model} finish=${finish}${reasoning ? ' reasoning_content_present=true' : ''}${usage}`);
+}
+
+async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTokens: number; model?: string }): Promise<{ text: string; thinking: string; data: any }> {
+  const { url, key } = cfg();
+  const model = opts.model || cfg().model;
+  if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
+  const body: any = {
+    model,
+    messages: openAiMessages(opts.system, opts.messages),
+    max_tokens: opts.maxTokens,
+    ...openAiExtras(model),
+  };
+  const requestId = `ai_${Date.now().toString(36)}_${++aiCallSeq}`;
+  const t0 = Date.now();
+  const resp = await fetch(chatCompletionsUrl(url), {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data: any = await resp.json().catch(() => ({}));
+  logAiCall({ requestId, model, provider: 'openai_chat_completions', ms: Date.now() - t0, ok: resp.ok, status: resp.status });
+  if (!resp.ok) throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
+  const message = data?.choices?.[0]?.message ?? {};
+  const text = String(Array.isArray(message.content)
+    ? message.content.map((part: any) => part?.text || '').join('')
+    : message.content || '').trim();
+  if (!text) throw emptyTextError(model, data);
+  return { text, thinking: String(message.reasoning_content || '').trim(), data };
 }
 
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
@@ -93,6 +184,13 @@ type GwEvent = { type: 'text' | 'thinking'; delta: string };
  *  · 网关不支持 SSE 时退化为一次性读出 content 块（text + 可能的 thinking 块）。
  */
 async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
+  if (isOpenAiTransport()) {
+    const result = await callOpenAiGateway({ system: opts.system, messages: opts.messages, maxTokens: opts.maxTokens, model: opts.model });
+    if (result.thinking && opts.thinking) yield { type: 'thinking', delta: result.thinking };
+    yield { type: 'text', delta: result.text };
+    return;
+  }
+
   const { url, key } = cfg();
   const model = opts.model || cfg().model;
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
@@ -112,15 +210,21 @@ async function* gatewayEventStream(opts: { system: string; messages: any[]; maxT
     // 网关没给 SSE（不支持流式/报错）→ 一次性读出 content 块（思考块 + 文本块）
     const data: any = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
+    let emittedText = false;
     for (const b of (data?.content || [])) {
       if (b?.type === 'thinking' && b.thinking) yield { type: 'thinking', delta: String(b.thinking) };
-      else if (b?.type === 'text' && b.text) yield { type: 'text', delta: String(b.text) };
+      else if (b?.type === 'text' && b.text) {
+        emittedText = true;
+        yield { type: 'text', delta: String(b.text) };
+      }
     }
+    if (!emittedText) throw emptyTextError(model, data);
     return;
   }
   const reader = (resp.body as any).getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  let emittedText = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -138,11 +242,15 @@ async function* gatewayEventStream(opts: { system: string; messages: any[]; maxT
         if (d?.type === 'thinking_delta' && typeof d.thinking === 'string' && d.thinking) yield { type: 'thinking', delta: d.thinking };
         else {
           const t = d?.text ?? (d?.type === 'text_delta' ? d.text : undefined);
-          if (typeof t === 'string' && t) yield { type: 'text', delta: t };
+          if (typeof t === 'string' && t) {
+            emittedText = true;
+            yield { type: 'text', delta: t };
+          }
         }
       } catch { /* 非 JSON 的 SSE 行（注释/心跳）跳过 */ }
     }
   }
+  if (!emittedText) throw emptyTextError(model, {});
 }
 
 /** 流式文字（兼容旧调用：只要正文，不请求思考）。供 reflowAiStream 等。 */
@@ -184,7 +292,12 @@ async function gateway(system: string, user: string, maxTokens: number, image?: 
     ? imageBlocks(image)
     : (image ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } }] : []);
   const content = blocks.length ? [...blocks, { type: 'text', text: user }] : user;
-  return textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model }));
+  if (isOpenAiTransport()) {
+    return (await callOpenAiGateway({ system, messages: [{ role: 'user', content }], maxTokens, model })).text;
+  }
+  const text = textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model }));
+  if (!text) throw emptyTextError(model || cfg().model, {});
+  return text;
 }
 
 
@@ -211,6 +324,11 @@ const interpretRawSchema = z.object({
 const classifyRawSchema = z.object({
   respond: z.boolean().catch(true), // 缺/非布尔 → true（等价旧 respond !== false）
   reason: z.string().catch(''),
+});
+const readingNoteRawSchema = z.object({
+  title: z.string().catch(''),
+  body_md: z.string().catch(''),
+  summary_md: z.string().catch(''),
 });
 
 
@@ -259,6 +377,42 @@ export async function runClassifyContext(payload: any): Promise<{ respond: boole
   const raw = await gateway(system, user, 200, undefined, payload?.model);
   const j = classifyRawSchema.parse(extractJson(raw));
   return { respond: j.respond, reason: j.reason.slice(0, 120) };
+}
+
+export async function runReadingNotePostprocess(payload: any): Promise<{ title: string; body_md: string; summary_md: string }> {
+  const docTitle = String(payload?.doc_title || '').trim();
+  const quote = String(payload?.quote || '').trim();
+  const userNote = String(payload?.user_note || '').trim();
+  const contextText = String(payload?.context_text || '').trim();
+  if (!quote && !userNote) return { title: '', body_md: '', summary_md: '' };
+
+  const system = `<task_context>
+你在为 InkLoop 生成一条 Obsidian Reading Note。输入来自读者在墨水屏上对原文的标记：可能包含原文摘录、手写边注、页内上下文。
+</task_context>
+<rules>
+- 不要复述整段原文，不要写空泛套话。
+- 把原文观点转成读者后续能检索、复盘、行动的笔记。
+- 如果有用户边注，优先围绕用户边注解释它为什么重要。
+- 输出要像正式阅读笔记，不像测试数据。
+- body_md 用 1-2 个短段落，中文，直接给洞察和产品启发。
+- summary_md 用一句话概括这条标记对当前文档/项目的意义。
+</rules>
+<output_format>
+只输出 JSON：{"title":"短标题","body_md":"正文","summary_md":"一句摘要"}。不要 markdown 代码块，不要额外解释。
+</output_format>`;
+  const user = [
+    docTitle ? `文档标题：${docTitle}` : '',
+    quote ? `原文摘录：${quote}` : '',
+    userNote ? `用户边注：${userNote}` : '',
+    contextText ? `页内上下文：${contextText.slice(0, 1200)}` : '',
+  ].filter(Boolean).join('\n');
+  const raw = await gateway(system, user, 600, undefined, payload?.model);
+  const parsed = readingNoteRawSchema.parse(extractJson(raw));
+  return {
+    title: parsed.title.trim().slice(0, 80),
+    body_md: parsed.body_md.trim(),
+    summary_md: parsed.summary_md.trim(),
+  };
 }
 
 
@@ -460,9 +614,10 @@ export async function* chatStream(payload: any): AsyncGenerator<string> {
   const system = SYSTEM_PROMPTS[role] ?? SYSTEM_PROMPTS.annotator;
   const model = payload?.model || cfg().model;
   const maxTokens = typeof payload?.maxTokens === 'number' ? payload.maxTokens : 800;
+  // thinking 默认开（保持 annotator 伴读行为不变）；调用方可显式 thinking:false 关掉（如概念抽取这类轻分类·省 token/不抬 maxTokens）。
+  const thinking = payload?.thinking !== false;
   // NDJSON 帧：每行 {"k":"t"|"r","d":"<增量>"}——t=回复正文、r=思考过程（reasoning）。客户端 chatTurn 分流。
-  for await (const e of gatewayEventStream({ system, messages, maxTokens, model, thinking: true })) {
+  for await (const e of gatewayEventStream({ system, messages, maxTokens, model, thinking })) {
     yield JSON.stringify({ k: e.type === 'thinking' ? 'r' : 't', d: e.delta }) + '\n';
   }
 }
-

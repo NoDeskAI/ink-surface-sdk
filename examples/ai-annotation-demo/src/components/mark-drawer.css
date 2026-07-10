@@ -1,0 +1,120 @@
+/*
+ * Shared mark drawer sizing.
+ * Desktop #insight, paper #m-insight, and reading mark summary all use the same
+ * width contract so web/e-paper stay visually aligned.
+ */
+:root {
+  --inkloop-mark-drawer-width: clamp(220px, 20vw, 320px);
+  --inkloop-mark-drawer-width-compact: min(300px, 86vw);
+}
+
+#insight.open {
+  width: var(--inkloop-mark-drawer-width) !important;
+}
+
+#insight #cards {
+  min-width: 0 !important;
+}
+
+#insight .hist {
+  display: block;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--page);
+  cursor: pointer;
+}
+
+#insight .hist:hover {
+  background: #f3f0e9;
+}
+
+#insight .hist.bound {
+  border-color: var(--ai-panel-line, var(--ai-line));
+  background: linear-gradient(to right, var(--ai-panel-bg, var(--ai-bg)), var(--page));
+}
+
+#insight .hist[data-state="dismissed"] {
+  opacity: 0.45;
+}
+
+#insight .hist.error {
+  border-color: var(--bad);
+}
+
+#insight .hist-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+#insight .hist-tag {
+  display: inline-block;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 10px var(--sans);
+  color: var(--mut);
+  background: var(--page);
+}
+
+#insight .hist.bound .hist-tag {
+  color: var(--ai-panel-line, var(--ai-line));
+  border-color: var(--ai-panel-line, var(--ai-line));
+  background: var(--ai-panel-soft, var(--ai-bg));
+}
+
+#insight .hist-page {
+  margin-left: auto;
+  font: 10px var(--mono);
+  color: var(--hint);
+}
+
+#insight .hist-anchor,
+#insight .hist-ai {
+  min-width: 0;
+}
+
+#insight .hist-ai {
+  margin-top: 8px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--ai-panel-line, var(--ai-line));
+  border-radius: 7px;
+  background: var(--ai-panel-bg, var(--ai-bg));
+}
+
+#insight .hist-line-label {
+  display: block;
+  margin-bottom: 3px;
+  font: 700 10px var(--sans);
+  color: var(--hint);
+}
+
+#insight .hist-ai .hist-line-label {
+  color: var(--ai-panel-line, var(--ai-line));
+}
+
+#insight .hist-body {
+  font: 13px/1.55 var(--sans);
+  color: var(--ink);
+}
+
+#m-insight,
+.mark-summary {
+  width: var(--inkloop-mark-drawer-width) !important;
+  max-width: 86vw !important;
+}
+
+@media (max-width: 599px) {
+  #insight.open,
+  #m-insight,
+  .mark-summary {
+    width: var(--inkloop-mark-drawer-width-compact) !important;
+  }
+}

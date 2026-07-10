@@ -25,6 +25,9 @@
       ]
     }
   },
+  "origin": {
+    "device_id": "fixture_device"
+  },
   "status": "pending",
   "dedupe_key": "doc_fixture:annotation.add:ko_fixture",
   "created_at": "2026-06-28T00:00:00.000Z",

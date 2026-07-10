@@ -10,7 +10,7 @@
  *   · 采集取证（感知层）：一页两段、深度联动——「HMP 取证（全书逐笔）」+「SurfaceIndex 对象（本页对象表）」；
  *     二者是同一批对象 id 的消费者/生产者（HMP.target_object_refs 指进对象表），命中 ref ↔ 对象行互跳。
  *     看"感知对不对"，是 AI 会话的姊妹镜。【已实现】
- *   · 设置：迁出旧 dev 抽屉的全部设置控件 + 「诊断」段（坐标自测/延迟指标/预处理进度/trace 导出）；
+ *   · 设置：迁出旧 dev 抽屉的全部设置控件 + 「诊断」段（坐标自测/延迟指标/PDF 优化缓存/trace 导出）；
  *     按代码审计**诚实标注每项可用性**（生效/调试叠层/弱效/失效）。【已实现】
  *
  * 旧 `#dev` 抽屉已整体退役（dev-drawer.ts 删除、index.html 标记移除）；dev-overlay（画布叠层）独立保留，
@@ -24,9 +24,10 @@ import { listBooks, getBookAiTurns, getFoldedMarks } from '../local/store';
 import { icon } from '../surface/icons';
 import { renderMeeting, rerenderMeeting, syncMtgChrome, initMeeting } from '../features/meeting/meeting';
 import { esc } from '../core/escape';
+import { pipelineSection, legacySection } from './pipeline-view'; // dev 流水线/旧轮渲染（web+mobile 共用·原 console.ts 抽出）
 import './console.css'; // 导航壳 + dev 页样式（会议样式已随 features/meeting/meeting.css 迁出）
 import type { PersistedAiTurn, PersistedMark } from '../core/store-format';
-import type { HMP, PipelineStage, PipelineStageIO, SurfaceObject } from '../core/contracts';
+import type { HMP, SurfaceObject } from '../core/contracts';
 import { downloadTrace, traceCount } from '../core/trace';
 import { snapshot } from '../core/metrics';
 import { selfTest } from '../core/transform';
@@ -236,80 +237,6 @@ async function renderConversation(): Promise<void> {
   }).sort((a, b) => b.latestSeq - a.latestSeq); // 最近活动的页在最上
   renderGroupList(inner, groups, '轮');
   if (thread) thread.scrollTop = 0; // 最新页在最上、默认展开 → 滚顶即见最新
-}
-
-const SHAPE_CN: Record<string, string> = { circle: '圈', underline: '划线', highlight: '高亮', arrow: '箭头', margin_note: '手写', stroke: '标记', tap_region: '点选' };
-/** 一个 mark 的"识别结果"标签：手写/画/markup + 识别出的文字（识别分类器的产物）。 */
-function featureLabel(m: PersistedMark): string {
-  const txt = (m.marked_text || '').replace(/\s+/g, ' ').slice(0, 18);
-  if (m.feature_type === 'handwriting') return `手写「${txt || '…'}」`;
-  if (m.feature_type === 'drawing') return `画${txt ? `「${txt}」` : '（无字）'}`;
-  return `${SHAPE_CN[m.scored_type] || '标记'}「${txt || '—'}」`;
-}
-
-/* ── 处理流水线渲染（逐组件「收到什么 → 产出什么」时间线）─────────────────────── */
-
-function ioRows(rows?: PipelineStageIO[]): string {
-  if (!rows?.length) return '';
-  return rows.map((r) => {
-    const val = r.v || '';
-    const long = val.length > 64 || val.includes('\n');
-    return `<div class="cns-pl-kv"><span class="k">${esc(r.k)}：</span><span class="v${long ? ' long' : ''}">${esc(val || '—')}</span></div>`;
-  }).join('');
-}
-function imgRow(imgs?: Array<{ role: string; thumb: string }>): string {
-  if (!imgs?.length) return '';
-  return `<div class="cns-pl-imgs">`
-    + imgs.map((im) => {
-      const safeThumb = /^data:image\//.test(im.thumb) ? esc(im.thumb) : ''; // 只放行本地截图 data:image/ URL + esc，杜绝 src 属性逃逸
-      return `<div class="cns-pl-img"><img class="cns-zoom" src="${safeThumb}" alt=""><span>${esc(im.role)}</span></div>`;
-    }).join('')
-    + `</div>`;
-}
-/** 一个组件阶段卡：summary（mark 标 + 名 + 状态 + note）+ body（收到 → 图 → 产出）。 */
-function stageCard(st: PipelineStage): string {
-  const open = (st.stage === 'model' || st.stage === 'inferview') ? ' open' : ''; // 末两步默认展开
-  const tag = st.status === 'skipped' ? '<span class="cns-pl-tag skipped">跳过</span>'
-    : st.status === 'error' ? '<span class="cns-pl-tag error">出错</span>' : '';
-  const markChip = st.mark_ord ? `<span class="cns-pl-mark">mark ${st.mark_ord}·${esc(st.mark_label || '')}</span>` : '';
-  return `<details class="cns-pl-stage ${st.status ?? ''}"${open}>`
-    + `<summary class="cns-pl-sum">${markChip}<span class="cns-pl-name">${esc(st.label)}</span>${tag}<span class="cns-pl-note">${esc(st.note || '')}</span></summary>`
-    + `<div class="cns-pl-body">`
-    + (st.input?.length ? `<div class="cns-pl-io"><div class="cns-pl-io-h">↓ 收到（输入）</div>${ioRows(st.input)}</div>` : '')
-    + imgRow(st.images)
-    + (st.output?.length ? `<div class="cns-pl-io"><div class="cns-pl-io-h out">↑ 产出（输出）</div>${ioRows(st.output)}</div>` : '')
-    + `</div></details>`;
-}
-function pipelineSection(stages: PipelineStage[]): string {
-  return `<div class="cns-sec">处理流水线（逐组件：收到什么 → 产出什么 · ${stages.length} 步）</div>`
-    + `<div class="cns-pl">` + stages.map(stageCard).join('') + `</div>`;
-}
-
-/** 旧轮（无 pipeline 快照）的兜底展示：保留分类器判定 + 蒸馏字段 + 正文/prompt 折叠块。 */
-function legacySection(t: PersistedAiTurn, markMap: Map<string, PersistedMark>): string {
-  const v = t.inference_view;
-  const diag = t.diag ?? {};
-  const classify = diag.classify
-    ? `<div class="cns-kv"><span class="k">上下文分类器：</span>${diag.classify.respond ? '<span class="cns-yes">回应 ✓</span>' : '<span class="cns-no">折叠 ✗</span>'} — ${esc(diag.classify.reason || '')}</div>`
-    : `<div class="cns-kv"><span class="k">上下文分类器：</span>未触发（长停顿综合走 idle，无需判定）</div>`;
-  const chips = (t.anchor?.mark_ids ?? []).map((id) => markMap.get(id)).filter((m): m is PersistedMark => !!m)
-    .map((m) => `<span class="cns-chip">${esc(featureLabel(m))}</span>`).join('');
-  const markRow = `<div class="cns-kv"><span class="k">识别（逐 mark）：</span>${chips || '<span class="cns-chip" style="color:var(--hint)">（无 mark 记录）</span>'}</div>`;
-  const q = v?.question ? `<div class="cns-kv"><span class="k">手写问：</span>${esc(v.question)}</div>` : '';
-  const sentImg = diag.sent_image ? '<span class="cns-yes">有</span>' : '无';
-  const ctx = v?.page_context || '';
-  const ctxBlock = ctx
-    ? `<details class="cns-ctx"><summary><span class="cns-ctx-h">📄 正文块（滑动窗 ${ctx.length} 字）</span><span class="cns-ctx-prev">${esc(ctx.slice(0, 150))}…</span></summary><div class="cns-ctx-body">${esc(ctx)}</div></details>`
-    : `<div class="cns-kv"><span class="k">正文块：</span>（无）</div>`;
-  const prompt = t.prompt_snapshot || '';
-  const promptBlock = `<details class="cns-ctx"><summary><span class="cns-ctx-h">🧾 完整 prompt（${prompt.length} 字）</span><span class="cns-ctx-prev">${esc(prompt.slice(0, 130))}…</span></summary><div class="cns-ctx-body">${esc(prompt || '—')}</div></details>`;
-  return `<div class="cns-sec">分类器判定</div>` + classify + markRow
-    + `<div class="cns-sec">蒸馏后喂入（inference-view）</div>`
-    + `<div class="cns-kv"><span class="k">关系叙事：</span>${esc(v?.narrative || '—')}</div>`
-    + `<div class="cns-kv"><span class="k">所标内容：</span>${esc(v?.marked || '—')}</div>`
-    + q
-    + `<div class="cns-kv"><span class="k">锚点：</span>${t.anchor?.object_refs?.length ?? 0} 对象 / ${t.anchor?.mark_ids?.length ?? 0} 笔 · 随发图：${sentImg}</div>`
-    + ctxBlock + promptBlock;
 }
 
 /**
@@ -550,7 +477,7 @@ function renderCapture(c: HTMLDivElement): void {
 /* ── 设置页（迁出旧 #dev 抽屉；按代码审计诚实标注每项是否真生效）─────────────────────
  * settings 落 localStorage（inkloop.prefs.v1 产品键 / inkloop.devflags.v1 dev 键）；多数项改完 effect='changed'（emit settings:changed
  * → main 取消在途计时 + 清当前 session），少数仅 saveSettings()。可用性徽标来自本会话审计：
- * 生效=v3 主路真读；调试叠层=只影响可视化；弱效=仅下次导入文档时生效（预排版预热）。 */
+ * 生效=v3 主路真读；调试叠层=只影响可视化；弱效=仅下次导入文档时生效（PDF 优化缓存）。 */
 
 type SetBadge = { t: string; c: 'live' | 'dev' | 'weak' | 'dead' };
 const B_LIVE: SetBadge = { t: '生效', c: 'live' };
@@ -567,6 +494,7 @@ function setSections(): SetSection[] {
   const g = settings.gesture, p = settings.preprocess;
   return [
     { title: '核心 · 影响真实行为', rows: [
+      { kind: 'select', label: 'AI 触发模式（笔触划分）', hint: 'AI 笔触=只有「AI 笔」进 AI 且直接回应、普通笔=纯内容（默认）；自动判意=每笔都判（实验）', badge: B_LIVE, opts: [['pen', 'AI 笔触（显式回应·默认）'], ['auto', '自动判意（实验）']], get: () => settings.aiTrigger, set: (v) => { settings.aiTrigger = v as typeof settings.aiTrigger; }, effect: 'changed' },
       { kind: 'select', label: '推理模型（答问 · 分类器默认）', badge: B_LIVE, opts: [['kimi-k2.6', 'kimi-k2.6（中文笔迹稳）'], ['claude-opus-4-8', 'claude-opus-4-8（最新·慢）'], ['claude-opus-4-7', 'claude-opus-4-7（质量·慢）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（快·能回思考）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（快）']], get: () => settings.inferModel, set: (v) => { settings.inferModel = v; }, effect: 'changed' },
       { kind: 'select', label: '识别分类器模型 · /api/interpret（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['__local_hwr__', '端侧手写·OpenVINO 英文(徐方案·走本地端点)'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.interpretModel, set: (v) => { settings.interpretModel = v; }, effect: 'changed' },
       { kind: 'select', label: '上下文分类器模型 · /api/classify-context（空=继承推理模型）', badge: B_LIVE, opts: [['', '继承推理模型'], ['__local_rules__', '端侧规则·徐 IntentClassifier（驱动 respond/fold·不调云）'], ['kimi-k2.6', 'kimi-k2.6'], ['claude-opus-4-8', 'claude-opus-4-8'], ['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']], get: () => settings.classifyModel, set: (v) => { settings.classifyModel = v; }, effect: 'changed' },
@@ -574,9 +502,10 @@ function setSections(): SetSection[] {
       { kind: 'select', label: '输出落点', badge: B_LIVE, opts: [['margin', '右侧留白'], ['inline', '贴正文浮动']], get: () => settings.placement, set: (v) => { settings.placement = v as Placement; }, effect: 'changed' },
       { kind: 'check', label: '手势响应（总开关）', hint: '关掉后停笔不再生成 HMP+旁注、不触发综合', badge: B_LIVE, get: () => g.enabled, set: (v) => { g.enabled = v; }, effect: 'changed' },
       { kind: 'number', label: '长停顿综合阈值', unit: '秒', min: 10, max: 600, hint: '停笔多少秒触发整段 session 综合（v3 主线，默认 90）；调小可冒烟测', badge: B_LIVE, get: () => g.idleSeconds ?? 90, set: (v) => { g.idleSeconds = v; }, effect: 'changed' },
-      { kind: 'select', label: '重排引擎', badge: B_LIVE, opts: [['ai', 'AI 结构重建（主线·保 bbox）'], ['local', '仅启发式'], ['hybrid', '启发式+模型精修'], ['vision', '启发式+视觉重排'], ['rewrite', 'VLM 看图重写']], get: () => settings.reflowProvider, set: (v) => { settings.reflowProvider = v; }, effect: 'changed' },
-      { kind: 'select', label: '重排模型', badge: B_LIVE, opts: [['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（默认·快）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['kimi-k2.6', 'kimi-k2.6（慢·对照）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（准·对照）']], get: () => settings.reflowModel, set: (v) => { settings.reflowModel = v; }, effect: 'changed' },
-      { kind: 'check', label: '重排前置（渲染即后台急算）', hint: '每次翻页后台预排当前页·烧 token；默认关', badge: B_LIVE, get: () => settings.reflowEager, set: (v) => { settings.reflowEager = v; }, effect: 'save' },
+      { kind: 'select', label: 'PDF 优化引擎', badge: B_LIVE, opts: [['local', '规则版面（保留原文）']], get: () => 'local', set: () => { settings.reflowProvider = 'local'; }, effect: 'changed' },
+      { kind: 'select', label: 'PDF 优化模型（legacy）', badge: B_LIVE, opts: [['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite（默认·快）'], ['gemini-3.5-flash', 'gemini-3.5-flash'], ['kimi-k2.6', 'kimi-k2.6（慢·对照）'], ['claude-sonnet-4-6', 'claude-sonnet-4-6（准·对照）']], get: () => settings.reflowModel, set: (v) => { settings.reflowModel = v; }, effect: 'changed' },
+      { kind: 'check', label: 'PDF 优化急算（翻页后台）', hint: '每次翻页后台生成当前页优化缓存；默认关，稳定原版阅读优先', badge: B_LIVE, get: () => settings.reflowEager, set: (v) => { settings.reflowEager = v; }, effect: 'save' },
+      { kind: 'check', label: '基岩录制（原始笔迹流 · 影子）', hint: '把死区前的原始运动逐帧录进独立库 ink_samples；影子运行·不碰标注/AI/老功能；默认关。开后画几笔即录，查 IndexedDB 的 ink_samples', badge: B_LIVE, get: () => settings.bedrock, set: (v) => { settings.bedrock = v; }, effect: 'save' },
     ] },
     { title: '调试叠层 · 只影响可视化、不碰推理', rows: [
       { kind: 'check', label: '显示 bbox 叠层（对象框+命中高亮+HMP 浮窗）', badge: B_DEV, get: () => settings.devOverlay, set: (v) => { settings.devOverlay = v; }, effect: 'changed' },
@@ -584,8 +513,8 @@ function setSections(): SetSection[] {
       { kind: 'check', label: '显示关联框（综合后紫色虚框）', badge: B_DEV, get: () => settings.showRelations, set: (v) => { settings.showRelations = v; }, effect: 'changed' },
     ] },
     { title: '历史 / 弱效 · 仅特定时机生效（按代码审计标注）', note: '保留可调，但仅下次导入文档时生效。', fold: true, rows: [
-      { kind: 'check', label: '预排版前 N 页', hint: '仅下次导入文档时生效', badge: B_WEAK, get: () => p.reflowEnabled, set: (v) => { p.reflowEnabled = v; }, effect: 'save' },
-      { kind: 'number', label: '预排版页数', unit: '页', min: 0, max: 100, badge: B_WEAK, get: () => p.reflowPages, set: (v) => { p.reflowPages = v; }, effect: 'save' },
+      { kind: 'check', label: '导入后生成 PDF 优化缓存', hint: '仅下次导入 PDF 时生效；默认关，不影响 EPUB/Markdown', badge: B_WEAK, get: () => p.reflowEnabled, set: (v) => { p.reflowEnabled = v; }, effect: 'save' },
+      { kind: 'number', label: 'PDF 优化缓存页数', unit: '页', min: 0, max: 100, badge: B_WEAK, get: () => p.reflowPages, set: (v) => { p.reflowPages = v; }, effect: 'save' },
     ] },
   ];
 }
@@ -605,12 +534,12 @@ function applySetEffect(effect: 'changed' | 'save'): void {
   saveSettings();
 }
 
-/* 诊断（迁自旧 #dev 抽屉的几个孤儿读数：坐标自测 / 延迟指标 / 预处理进度 / trace 导出）。 */
+/* 诊断（迁自旧 #dev 抽屉的几个孤儿读数：坐标自测 / 延迟指标 / PDF 优化缓存 / trace 导出）。 */
 function diagHtml(): string {
   return `<details class="cset-fold cset-sec" id="cset-diag"><summary>诊断 · 迁自旧 dev 面板</summary>`
-    + `<div class="cset-sec-note">坐标变换自测、各阶段延迟、预处理进度、trace 导出——旧 #dev 退役后搬到这里。</div>`
+    + `<div class="cset-sec-note">坐标变换自测、各阶段延迟、PDF 优化缓存、trace 导出——旧 #dev 退役后搬到这里。</div>`
     + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">坐标自测</span></div><div class="cset-hint" id="cset-selftest">…</div></div></div>`
-    + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">预处理进度</span></div><div class="cset-hint" id="cset-pp">未运行</div></div></div>`
+    + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">PDF 优化缓存</span></div><div class="cset-hint" id="cset-pp">未运行</div></div></div>`
     + `<div class="cset-row"><div class="cset-text" style="width:100%"><div class="cset-l"><span class="cset-label">延迟指标（last / P50）</span></div><table class="cap-tbl" id="cset-metrics" style="margin-top:7px"><tbody></tbody></table></div></div>`
     + `<div class="cset-row"><div class="cset-text"><div class="cset-l"><span class="cset-label">Trace 事件日志</span></div><div class="cset-hint" id="cset-tracecount">导出本会话所有 trace（NDJSON），离线核对采集/推理细节</div></div><div class="cset-control"><button class="cns-btn" id="cset-dl-trace">下载 JSONL</button></div></div>`
     + `</details>`;
@@ -719,12 +648,12 @@ export function initNavShell(): void {
   const liveHmp = () => { if (activePage === 'hmp') void renderCaptureContent(); };
   bus.on('hmp:updated', liveHmp);
   bus.on('surface:indexed', liveHmp);
-  // 设置页「诊断」读数实时刷新（迁自旧 #dev：延迟指标 / 坐标自测 / 预处理进度）
+  // 设置页「诊断」读数实时刷新（迁自旧 #dev：延迟指标 / 坐标自测 / PDF 优化缓存）
   const liveDiag = () => { if (activePage === 'settings') fillDiag(); };
   bus.on('metrics', liveDiag);
   bus.on('page:rendered', liveDiag);
-  bus.on('preprocess:progress', (i, n) => { const el = document.getElementById('cset-pp'); if (el) el.textContent = `预处理中 ${i as number}/${n as number} 页…`; });
-  bus.on('preprocess:done', () => { const el = document.getElementById('cset-pp'); if (el) el.textContent = '预处理完成'; });
+  bus.on('preprocess:progress', (i, n) => { const el = document.getElementById('cset-pp'); if (el) el.textContent = `生成 PDF 优化缓存 ${i as number}/${n as number} 页…`; });
+  bus.on('preprocess:done', () => { const el = document.getElementById('cset-pp'); if (el) el.textContent = 'PDF 优化缓存完成'; });
   // 切书后默认跟随当前书
   bus.on('document:loaded', () => {
     selectedBook = state.documentId ?? selectedBook;

@@ -1,0 +1,17 @@
+reward_sku,category,component,required,quantity_per_reward,unit_cost_usd,primary_supplier,backup_supplier,quote_status,confidence,lead_time_days,moq,risk
+educator_early_bird,Pen,MCU and optical sensor module,true,1,18.50,TBD primary,TBD backup,estimated,medium,30,500,Sensor module price not quoted
+educator_early_bird,Pen,Battery and charging module,true,1,4.20,TBD primary,TBD backup,estimated,medium,21,500,Battery certification path open
+educator_early_bird,Pen,Pen shell and dry-erase writing module,true,1,7.80,TBD primary,TBD backup,estimated,medium,35,500,Mechanical tolerance not validated
+educator_early_bird,Surface,A2 Capture Surface material,true,1,11.40,TBD primary,TBD backup,estimated,low,28,300,Material durability not validated
+educator_early_bird,Packaging,Starter Kit box,true,1,3.20,TBD primary,TBD backup,estimated,medium,21,500,Packaging dimensions not final
+educator_early_bird,Fulfillment,Shipping material,true,1,2.10,TBD primary,TBD backup,estimated,medium,14,500,Carrier cost excluded
+educator_early_bird,Assembly,Assembly and QA,true,1,9.00,TBD primary,TBD backup,estimated,low,30,500,Factory route not quoted
+educator_early_bird,Software,Included AI credits,true,1,5.00,Internal,Internal,estimated,medium,0,0,Usage cost can vary
+meeting_kit_beta,Pen,MCU and optical sensor module,true,2,18.50,TBD primary,TBD backup,estimated,medium,30,500,Sensor module price not quoted
+meeting_kit_beta,Pen,Battery and charging module,true,2,4.20,TBD primary,TBD backup,estimated,medium,21,500,Battery certification path open
+meeting_kit_beta,Pen,Pen shell and dry-erase writing module,true,2,7.80,TBD primary,TBD backup,estimated,medium,35,500,Mechanical tolerance not validated
+meeting_kit_beta,Surface,A3 Capture Surface material,true,1,17.60,TBD primary,TBD backup,estimated,low,28,300,Material durability not validated
+meeting_kit_beta,Packaging,Meeting Kit box,true,1,5.40,TBD primary,TBD backup,estimated,medium,21,500,Packaging dimensions not final
+meeting_kit_beta,Fulfillment,Shipping material,true,1,3.40,TBD primary,TBD backup,estimated,medium,14,500,Carrier cost excluded
+meeting_kit_beta,Assembly,Assembly and QA,true,2,9.00,TBD primary,TBD backup,estimated,low,30,500,Factory route not quoted
+meeting_kit_beta,Software,Included AI credits,true,1,12.00,Internal,Internal,estimated,medium,0,0,Usage cost can vary

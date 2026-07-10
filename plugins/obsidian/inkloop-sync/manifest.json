@@ -3,7 +3,7 @@
   "name": "InkLoop Sync",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "InkLoop runtime host and background sync for native Markdown/PDF files with hidden sidecar state.",
+  "description": "InkLoop runtime sidecar sync and AI Pen knowledge projection for native Markdown/PDF files.",
   "author": "InkLoop",
   "authorUrl": "https://inkloop.local",
   "isDesktopOnly": true

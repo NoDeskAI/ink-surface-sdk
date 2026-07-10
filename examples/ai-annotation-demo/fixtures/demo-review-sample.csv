@@ -1,0 +1,10 @@
+session_id,scenario,real_hardware,duration_min,candidate_id,kind,source_ref_valid,source_ref_type,reviewer_action,hallucination_severity,audio_only,diagram_was_drawn,final_use
+lesson_sample_001,education,false,6.2,edu-001,formula_step,true,ink_event,accept,none,false,false,lesson_note
+lesson_sample_001,education,false,6.2,edu-002,concept,true,board_object,edit,none,false,false,lesson_note
+lesson_sample_001,education,false,6.2,edu-003,lesson_note,true,ink_event,accept,none,false,false,lesson_note
+lesson_sample_001,education,false,6.2,edu-004,concept,false,unknown,dismiss,minor,false,false,none
+meeting_sample_001,meeting,false,7.1,mtg-001,meeting_decision,true,ink_event,accept,none,false,true,meeting_output
+meeting_sample_001,meeting,false,7.1,mtg-002,meeting_action,true,board_object,edit,none,false,true,meeting_output
+meeting_sample_001,meeting,false,7.1,mtg-003,meeting_risk,true,ink_event,accept,none,false,true,meeting_output
+meeting_sample_001,meeting,false,7.1,mtg-004,diagram,true,board_object,accept,none,false,true,meeting_output
+meeting_sample_001,meeting,false,7.1,mtg-005,meeting_decision,false,audio,dismiss,minor,true,true,none

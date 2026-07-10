@@ -9,7 +9,7 @@ export type ScenarioId = 'S1' | 'S2' | 'S3' | 'S4' | 'S5' | 'S6' | 'S7';
 
 export const SCENARIOS: Record<ScenarioId, string> = {
   S1: '标注即可搜（OCR+语义索引→自然语言查判断）',
-  S2: '写完即落地（清 Markdown→Notion/Obsidian）',
+  S2: '写完即落地（清 Markdown 导出）',
   S3: '判断 Brief（立场→依据→待验证，每条点回原页）',
   S4: '跨材料综合（多文档聚合→竞品矩阵/脉络图）',
   S5: '行动承接（抽 action items→Linear/Todo→遗忘曲线推送）',

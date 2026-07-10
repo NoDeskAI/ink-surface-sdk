@@ -1,34 +1,67 @@
+import './core/polyfills'; // 必须最先：老 WebView 补 Promise.withResolvers（pdf.js 用到）
 import './styles.css';
-import { recordEvent, captureMark, commitSessionDiscussion } from './core/pipeline';
-import { classifyScored, classifyStrokeFeature, bboxOf } from './capture/classify';
-import {
-  addMark, peekSession, clearSession, makeMark, removeMark,
-  IDLE_COMMIT_MS, type Mark,
-} from './capture/session';
-import { localCharHeight } from './evidence/target';
-import { trace } from './core/trace';
-import { devEmit } from './core/dev-telemetry';
-import { shortId, DEVICE_ID } from './core/ids';
-import { bus, state, settings, strokeMarkIds, getActiveContext, type Stroke } from './app/state';
+import './components/mark-drawer.css';
+import { installDoubleTapZoomGuard } from './core/viewport-guard';
+import { bus, state, settings, saveSettings, getActiveContext } from './app/state';
 import type { SurfaceContext } from './app/surface-context';
-import { appendMarkEntry, listBooks, setLastReadPage, updateOverlayState } from './local/store';
-import type { ScreenOverlay } from './core/contracts';
-import type { AnnotationEvent, NormBBox } from './core/contracts';
-import { initRenderer, loadFile, reopenBook, renderPage, gotoPage, setZoom, hasDocument } from './surface/renderer';
-import { renderChatSurface } from './surface/chat-surface';
-import { initInk, redrawInk } from './capture/ink';
+import type { NormBBox, ScreenOverlay } from './core/contracts';
+import { normToPx, pageCss, pageRegionForId } from './core/transform';
+import { listLibraryItems, loadPdfBlob, setDocCoverImageDataUrl, setLastReadPage, type LibraryShelfItem } from './local/store';
+import { extractDocumentCoverImageDataUrl, initRenderer, loadFile, reopenBook, renderPage, renderSyntheticSurface, gotoPage, setZoom, hasDocument } from './surface/renderer';
 import { initWhisper } from './surface/whisper';
-import { initReader } from './surface/reader';
+import { initReader, readerFocusOverlay } from './surface/reader';
 import { initAnchorLayer } from './surface/anchor-layer';
 import { initInsightPanel } from './surface/insight-panel';
 import { initToolbar } from './surface/toolbar';
 import { initDevOverlay } from './dev/dev-overlay';
-import { initNavShell } from './dev/console';
-import { initEinkMirror, signalInkArea } from './surface/eink';
+import { initEinkMirror } from './surface/eink';
 import { features } from './config/features';
 import { restoreLedgerState } from './controllers/ledger-restore';
+import { wireAnnotationLoop, flushRegion } from './app/annotation-loop';
+import { hydrateRuntimeAnnotationsToActiveCanvas, installWebRuntimeSyncHost } from './integration/inksurface/runtime-sync-host';
+import { initRuntimeSyncStatus } from './components/runtime-sync-status';
+import { deleteCloudLibraryItem, downloadCloudLibraryItem, hasCloudLibraryItem, libraryItemAction, recordLocalImportedSource, startLibrarySyncLoop, uploadLoadedDocumentSource, type LibraryImportProgress } from './integration/inksurface/library-sync';
+import { getSession, setSession } from './core/auth';
+import { renderLibraryShelf } from './components/library-shelf';
+import {
+  pageLayoutControlsAvailable,
+  pdfOriginalControlsAvailable,
+  readingControlsUnavailableHint,
+  readingExperienceForSource,
+  type ReadingExperience,
+} from './core/reading-experience';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
+
+const INSTALL_KEY = 'inkloop.install_id.v1';
+const LOCAL_DEMO_AUTH = import.meta.env.VITE_INKLOOP_LOCAL_DEMO_AUTH === '1'
+  || (import.meta.env.DEV && import.meta.env.VITE_INKLOOP_LOCAL_DEMO_AUTH !== '0');
+const LOCAL_DEMO_TENANT_ID = (import.meta.env.VITE_INKLOOP_LOCAL_DEMO_TENANT_ID as string | undefined) || 'local';
+const LOCAL_DEMO_USER_ID = (import.meta.env.VITE_INKLOOP_LOCAL_DEMO_USER_ID as string | undefined) || 'local_demo';
+
+function installId(): string {
+  let id = localStorage.getItem(INSTALL_KEY);
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(INSTALL_KEY, id);
+  }
+  return id;
+}
+
+function ensureLocalDemoSession(): void {
+  if (!LOCAL_DEMO_AUTH || getSession()) return;
+  setSession({
+    sessionId: 'local-demo-session',
+    sessionToken: 'local-demo-token',
+    tenantId: LOCAL_DEMO_TENANT_ID,
+    userId: LOCAL_DEMO_USER_ID,
+    deviceId: `web-${installId()}`,
+    expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 30,
+  });
+}
+
+ensureLocalDemoSession();
+installDoubleTapZoomGuard();
 
 initRenderer({
   pageLayer: $<HTMLCanvasElement>('page-layer'),
@@ -37,257 +70,16 @@ initRenderer({
   stageWrap: $('stage-wrap'),
 });
 
-// 区域组装（空间+时间连续）：同一小块区域里继续写的笔画并进一个 mark；附近无动作满 REGION_QUIET 才提交；
-// 笔落到远处=离开该区域 → 上一区域立刻收口。无书写时长上限——慢写整段保持静默、聚成一整团再识别（读得准、只回一条）。
-const REGION_QUIET_MS = 6000;     // 附近无动作多久 → 收口提交（dev 可调，按真实手速）
-const REGION_NEAR = 0.06;         // "附近"：笔中心在区域 bbox 外扩此值内算同区（归一化）
-
-let sessionTrace: string | null = null;
-let idleTimer: number | undefined;     // 长停顿(~1–2min) → 对整段 session 综合回复
-const lastSig = new Map<string, string>(); // 防重复提交（按 book）
-
-// 当前挂起的"区域"（单活跃区：写在一处会聚起来；落到远处则旧区先收口、此处另起）。
-let regEvents: AnnotationEvent[] = [];
-let regStrokes: Stroke[] = []; // 与 regEvents 对齐：组装时给每构成笔建 笔→mark 映射（擦/撤定位整 mark）
-let regBbox: NormBBox | null = null;
-let regFirstAt = 0;
-let regTimer: number | undefined;
-
-function unionBb(a: NormBBox, b: NormBBox): NormBBox {
-  const x0 = Math.min(a[0], b[0]), y0 = Math.min(a[1], b[1]);
-  const x1 = Math.max(a[0] + a[2], b[0] + b[2]), y1 = Math.max(a[1] + a[3], b[1] + b[3]);
-  return [x0, y0, x1 - x0, y1 - y0];
-}
-/** 笔中心是否落在当前区域（bbox 外扩 REGION_NEAR）内。 */
-function nearRegion(bb: NormBBox): boolean {
-  if (!regBbox) return false;
-  const cx = bb[0] + bb[2] / 2, cy = bb[1] + bb[3] / 2;
-  return cx >= regBbox[0] - REGION_NEAR && cx <= regBbox[0] + regBbox[2] + REGION_NEAR
-    && cy >= regBbox[1] - REGION_NEAR && cy <= regBbox[1] + regBbox[3] + REGION_NEAR;
-}
-/**
- * 诊断：远笔触发收口时，记下新笔中心相对"区域外扩框"的越界量（>0=越界多少，<0=其实还在框内）。
- * overX/overY 哪个为正就是被哪个轴甩出去的；越界量很小（如 0.01–0.03）= 阈值偏紧把连续书写切碎。
- */
-function nearDiag(bb: NormBBox): Record<string, number> {
-  if (!regBbox) return {};
-  const cx = bb[0] + bb[2] / 2, cy = bb[1] + bb[3] / 2;
-  const overR = cx - (regBbox[0] + regBbox[2] + REGION_NEAR), overL = (regBbox[0] - REGION_NEAR) - cx;
-  const overB = cy - (regBbox[1] + regBbox[3] + REGION_NEAR), overT = (regBbox[1] - REGION_NEAR) - cy;
-  return { cx: +cx.toFixed(4), cy: +cy.toFixed(4), overX: +Math.max(overL, overR).toFixed(4), overY: +Math.max(overT, overB).toFixed(4) };
-}
-
-/** 区域收口的原因（进 dev 通道，定位"连续书写被切到新区"）。 */
-type FlushReason = 'far-stroke' | 'quiet-6s' | 'manual' | 'view-switch';
-
-/** 收口当前区域 → 解析成一个 mark（异步识别在 resolveRegion 内）。reason/diag 镜像到遥测。 */
-function flushRegion(reason: FlushReason = 'manual', diag: Record<string, number> | null = null): void {
-  window.clearTimeout(regTimer);
-  const events = regEvents, strokes = regStrokes;
-  const heldMs = regFirstAt ? Math.round(performance.now() - regFirstAt) : 0;
-  const regAt = regBbox ? regBbox.map((n) => +n.toFixed(4)) : null;
-  regEvents = []; regStrokes = []; regBbox = null; regFirstAt = 0; sessionTrace = null;
-  bus.emit('region:clear'); // dev 可视：区域收口 → 清叠层
-  if (events.length) void resolveRegion(events, strokes, { reason, heldMs, regBbox: regAt, ...(diag ?? {}) });
-}
-
-/**
- * 进笔前段（**原版页与重排面共用**）：把一笔并进当前组装区域（空间连贯：挨着就并、走远先收口另起），
- * 重置 quiet-6s 收口定时器与 idle 综合定时器。两条进笔路径（initInk 回调 / reader:gesture）都走这里，
- * 重排面据此获得与原版页一致的「区域组装 + far-stroke + quiet-6s + idle」全套（此前重排面逐笔直冲后端、全跳过）。
- * 传入的 evt.geometry.bbox 须为该笔的紧 bbox（归一化）——nearRegion/unionBb 按笔粒度判近邻。
- */
-function ingestStroke(evt: AnnotationEvent, stroke: Stroke): void {
-  // 空间连贯：挨着当前区域就并进去（重置冷却）；落到远处 → 旧区先收口、此处另起一个区域。
-  if (regBbox && !nearRegion(evt.geometry.bbox)) flushRegion('far-stroke', nearDiag(evt.geometry.bbox));
-  regEvents.push(evt);
-  regStrokes.push(stroke); // 与 regEvents 对齐（落账本时取构成笔）
-  regBbox = regBbox ? unionBb(regBbox, evt.geometry.bbox) : evt.geometry.bbox;
-  if (!regFirstAt) regFirstAt = performance.now();
-  window.clearTimeout(regTimer);
-  // 收口只靠两个真实信号：走到别处(far-stroke) 或 停笔满 REGION_QUIET。不设书写时长上限——慢写整段保持静默。
-  regTimer = window.setTimeout(() => flushRegion('quiet-6s'), REGION_QUIET_MS);
-  bus.emit('region:update', { bbox: regBbox, near: REGION_NEAR }); // dev 可视：实时画当前组装区域
-
-  // 长停顿(~1–2min)无新笔 → 对整段 session 综合回复（连续标注期间界面静默）
-  if (settings.gesture.enabled) {
-    const bookId = state.documentId ?? 'book';
-    const idleMs = (settings.gesture.idleSeconds ?? IDLE_COMMIT_MS / 1000) * 1000;
-    window.clearTimeout(idleTimer);
-    idleTimer = window.setTimeout(() => { void commitSession(bookId, 'idle'); }, idleMs);
-  }
-}
-
-/** 翻页/缩放重渲：丢在途的笔（属旧页），但保留 session/idle（会话跨页、翻页不是边界事件）。 */
-function resetAssembly(): void {
-  window.clearTimeout(regTimer);
-  regEvents = []; regStrokes = []; regBbox = null; regFirstAt = 0; sessionTrace = null;
-  bus.emit('region:clear');
-}
-
-/** 设置变更/换书：清计时 + 丢当前书 session（硬复位）。 */
-function cancelTimers(): void {
-  window.clearTimeout(regTimer);
-  window.clearTimeout(idleTimer);
-  regEvents = []; regStrokes = []; regBbox = null; regFirstAt = 0; sessionTrace = null;
-  bus.emit('region:clear');
-  if (state.documentId) clearSession(state.documentId);
-}
-
-/** 手势决策 = trace + 镜像到 dev 通道（让"圈了几次/每笔判成什么/有没有被并/被丢"在通道里可见）。 */
-function gtrace(o: Record<string, unknown>): void {
-  trace('GestureSession', o);
-  devEmit('gesture', () => ({ strokeCount: Array.isArray(o.strokes) ? (o.strokes as unknown[]).length : undefined, ...o }));
-}
-
-const diagOf = (scored: ReturnType<typeof classifyScored>[]) => scored.map((s) => ({ type: s.type, score: Number(s.score.toFixed(2)) }));
-
-/**
- * 收口一个区域：把这团笔合成一个 mark → 落笔当时取证(captureMark) → 累积进 session。
- * 关键：**每笔单独几何分类**后再判特征（不在合并乱线上重判——圈+划合并会毁掉干净的单笔模板信号）。
- * 连续标注期间界面静默；语义全交模型；手写区域收口即走唯一早提交边界（区域冷却本身已是落定）。
- */
-async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushInfo: Record<string, unknown> = {}): Promise<void> {
-  const pid = batch[0].page_id;
-  const bookId = state.documentId ?? 'book';
-
-  // 每笔单独分类。点按滤除要克制：**多笔且含实笔的区域里，短笔是真笔画的一部分**（汉字的点/小撇/钩、
-  // 标点，行程常 <13px 或 ≤3 点 → 被 classifyScored 判 tap_region）——一律滤掉就是"手写丢笔画"的病根
-  // （那些笔留在屏上、却不进 mark、不落账本，reload 后凭空消失，也不进识别图）。故只在「孤立单笔点按」
-  // 或「整团都是点按」时才丢（真·误触/掌触）；其余全保留，绝不丢用户落下的笔。
-  const scoredAll = batch.map((e) => classifyScored(e.stroke_points, e.geometry.bbox));
-  const cand = batch.map((e, i) => ({ e, s: scoredAll[i], st: strokes[i] }));
-  const realCount = scoredAll.filter((s) => s.type !== 'tap_region').length;
-  const keepShortStrokes = batch.length >= 2 && realCount >= 1; // 多笔实质区域 → 短笔也留
-  const keep = keepShortStrokes ? cand : cand.filter((x) => x.s.type !== 'tap_region');
-  if (!keep.length) {
-    gtrace({ page_id: pid, strokes: diagOf(scoredAll), resolved: '— 点按/误触，不计入', flush: flushInfo });
-    return;
-  }
-  const droppedTaps = batch.length - keep.length; // 被滤掉的点按数（>0 即有笔未进 mark，补观测缺口）
-  const realEvents = keep.map((x) => x.e);
-  const realScored = keep.map((x) => x.s);
-  const realStrokes = keep.map((x) => x.st);
-  const strokeBboxes = realEvents.map((e) => e.geometry.bbox);
-  const points = realEvents.flatMap((e) => e.stroke_points);
-  const bbox = bboxOf(points);
-  // 几何：判 markup（模板笔够大、跨内容），或给 freeform 标 ocrWorthy；handwriting/drawing 由 captureMark 识别定型。
-  const geom = classifyStrokeFeature(realScored, strokeBboxes, points, bbox, localCharHeight(state.surfaceIndex));
-  // 代表 event 的形状：markup 取最强模板笔（圈/划/箭头，带箭头方向）；否则按合并笔（自由笔=stroke）
-  const domScored = geom.type === 'markup' ? realScored.find((s) => s.type === geom.raw.templateType) : undefined;
-  const markScored = domScored ?? classifyScored(points, bbox);
-  const repr: AnnotationEvent = { ...realEvents[realEvents.length - 1], geometry: { bbox }, stroke_points: points, event_type: markScored.type };
-  const cap = await captureMark(repr, geom, markScored.score); // 识别定型 → cap.feature 是最终类型
-  const feature = cap.feature;
-  const mark = makeMark(repr, feature, markScored, cap.hmp, cap.markedText);
-  mark.trace = cap.trace; // 落笔当时这笔经手的组件阶段（识别/OCR兜底/取证）→ 提交时拼进整轮流水线
-  addMark(bookId, mark);
-  // 落账本（页账本 mark 条目）+ 建 笔→mark 映射（擦/撤时给整 mark 落 tombstone）
-  for (const s of realStrokes) strokeMarkIds.set(s, mark.id);
-  const tool: 'pen' | 'highlighter' = realStrokes.some((s) => s.tool === 'highlighter') ? 'highlighter' : 'pen';
-  void appendMarkEntry({
-    document_id: bookId, page_id: pid, page_index: pageIdxOf(pid), mark_id: mark.id,
-    strokes: realStrokes.map((s) => ({ tool: s.tool, points: s.points })),
-    bbox, tool, color: tool === 'highlighter' ? 'rgba(212,207,202,0.85)' : '#1A1A1A',
-    pointer_type: repr.pointer_type, device_id: repr.device_id, abs_timestamp: Date.now(),
-    context_id: getActiveContext().id,
-    feature_type: feature.type, feature_confidence: feature.confidence,
-    kind: cap.kind, kind_source: cap.kindSource,
-    scored_type: markScored.type, scored_score: markScored.score,
-    hmp: cap.hmp ? { ...cap.hmp, crop_ref: undefined, vector_ref: undefined } : null,
-    marked_text: cap.markedText, is_tombstone: false,
-  });
-  gtrace({ page_id: pid, strokes: diagOf(realScored), ...(droppedTaps ? { droppedTaps } : {}), feature: feature.type, conf: Number(feature.confidence.toFixed(2)), shape: markScored.type, marked: cap.markedText.slice(0, 40), resolved: `mark·${feature.type}（累积静默）`, flush: flushInfo });
-
-  // 手写 = 唯一早提交边界事件（区域冷却已落定 + 识别已可靠定型，无需再额外等）
-  if (feature.type === 'handwriting') void commitSession(bookId, 'handwriting', mark);
-}
-
-/** 提交一段 session：建图 + 蒸馏 + 回应。committed 才清空 session（fold 不清、留作下次综合）。 */
-async function commitSession(bookId: string, reason: 'idle' | 'handwriting', triggerMark?: Mark): Promise<void> {
-  const session = peekSession(bookId);
-  if (!session) return;
-  // idle 综合要有实质：至少一笔手写、锚到真实正文的标记、或被识别成某物的画（带描述）。
-  // 纯散笔/乱涂（none、无描述）不触发，避免无关回复——但识别出的草图（笑脸/箭头…）= 用户有意为之，停笔后交模型解读。
-  if (reason === 'idle') {
-    const substantial = session.marks.some((m) =>
-      m.feature.type === 'handwriting'
-      || ((m.hmp?.mode === 'anchored' || m.hmp?.mode === 'mixed') && !!m.markedText.trim())
-      || (m.feature.type === 'drawing' && !!m.hmp?.text_hint?.trim()));
-    if (!substantial) { clearSession(bookId); lastSig.delete('sess_' + bookId); return; }
-  }
-  const sig = session.marks.map((m) => m.id).join(',') + ':' + reason + ':' + (triggerMark?.id ?? '');
-  if (lastSig.get('sess_' + bookId) === sig) return;
-  lastSig.set('sess_' + bookId, sig);
-  const committedIds = session.marks.map((m) => m.id); // 本批要综合的笔（综合期间新写的不在内、不被连带清掉）
-  const discId = 'disc_' + (triggerMark?.id ?? committedIds[committedIds.length - 1]);
-  const outcome = await commitSessionDiscussion(session, reason, triggerMark, discId);
-  if (outcome === 'committed') {
-    for (const id of committedIds) removeMark(bookId, id); // 只摘走已综合这批；综合期间新写的笔留作下一段（B1）
-    lastSig.delete('sess_' + bookId);
-  } else if (outcome === 'failed') {
-    lastSig.delete('sess_' + bookId); // AI 失败：marks 保留（没摘），清 sig 让下次 idle 能就同一批重试（B2）
-  }
-  // folded：marks 保留 + sig 保留（不重复触发；新笔改变 sig 时再连带综合）
-}
-
-initInk($<HTMLCanvasElement>('ink-layer'), (stroke, pointerType, penUpAt) => {
-  signalInkArea(bboxOf(stroke.points)); // 电纸屏：该笔局部 A2 快刷（先于事件判定即刷；web/dev 无桥 no-op）
-  if (!sessionTrace) sessionTrace = shortId('trc'); // 一段区域的笔共享 trace（recordEvent 要打点/计延迟，原版页专属）
-  const evt = recordEvent(stroke, sessionTrace, pointerType, penUpAt);
-  if (!evt) return;
-  ingestStroke(evt, stroke); // 进共用组装前段：far-stroke / quiet-6s / idle
+// 标注会话编排（区域组装→收口→综合→旁注）抽到 app/annotation-loop，桌面与移动版共用同一份、传各自的 #ink 画布。
+wireAnnotationLoop($<HTMLCanvasElement>('ink-layer'));
+const runtimeSyncHost = installWebRuntimeSyncHost({
+  logger: (event, details) => console.debug(`[${event}]`, details),
 });
+initRuntimeSyncStatus();
 
-// 设置变化时取消在途计时（避免旧设置下的延迟触发）
-bus.on('settings:changed', cancelTimers);
-
-// 重排面手势 = 正常 page-ledger mark：reader 把命中块的 PDF-norm 事件发来，走与原版页**同一条进笔前段**
-// （ingestStroke：区域组装 + far-stroke + quiet-6s + idle 综合），不再逐笔直冲后端 resolveRegion。
-// 坐标已在 reader 侧映回原页归一化空间；evt.geometry.bbox 为该笔紧 bbox（reader.makeEvent 已改）。
-bus.on('reader:gesture', (p) => {
-  const { event, stroke } = p as { event: AnnotationEvent; stroke: Stroke };
-  // 笔迹即时进 PDF 页 strokesByPage（原版页 redraw 用它）→ 切回原版立刻可见；reload 由 mark 账本重建。
-  const arr = state.strokesByPage.get(event.page_id) ?? [];
-  arr.push(stroke);
-  state.strokesByPage.set(event.page_id, arr);
-  // 关键：把笔同步重绘到 #ink-layer。识别图(grabLayers)是从 #ink-layer 裁的，而重排面的笔只画在自己的
-  // #reader-ink 画布上 → 不重绘 #ink-layer 就会裁到**空白**、识别恒返 none、手写永远采集不到。
-  // #ink-layer 在重排模式下 display:none 但 canvas 位图照常可画（已验证）。redrawInk 读 strokesByPage[当前页]。
-  redrawInk();
-  // 注：reader 的 trace_id 是逐笔的（reader.makeEvent 自带），不共享 sessionTrace——mark 身份是 repr.event_id，无下游影响。
-  ingestStroke(event, stroke); // 与原版页同一前段 → 多笔组装、quiet-6s 收口、idle 综合全接通
-});
-
-// page_id 形如 pg_{hash8}_{idx} → 取末段为页号
-function pageIdxOf(pageId: string): number {
-  const m = pageId.match(/_(\d+)$/);
-  return m ? Number(m[1]) : state.pageIndex;
-}
-// AI 旁注持久化在书日志：新轮由 pipeline 提交时 append ai_turn；替换由同 overlay_id 的新条目折叠覆盖。
-// 这里只处理用户对卡片的状态变化（接受/编辑/忽略）→ 追加 supersedes 的新 ai_turn 记新状态/改写文本。
-bus.on('overlay:state', (o) => {
-  const ov = o as ScreenOverlay;
-  if (state.documentId) void updateOverlayState(state.documentId, ov);
-});
-// 擦/撤一笔 → 给整 mark 落 tombstone（append-only）+ 从 pending session 移除（别再进下次综合）
-bus.on('mark:erase', (mid) => {
-  const markId = mid as string;
-  const bookId = state.documentId ?? 'book';
-  removeMark(bookId, markId);
-  void appendMarkEntry({
-    document_id: bookId, page_id: state.pageId ?? '', page_index: state.pageIndex, mark_id: markId,
-    strokes: [], bbox: [0, 0, 0, 0], tool: 'pen', color: '',
-    pointer_type: 'unknown', device_id: DEVICE_ID, abs_timestamp: Date.now(),
-    context_id: getActiveContext().id,
-    feature_type: 'drawing', feature_confidence: 0, scored_type: 'stroke', scored_score: 0,
-    hmp: null, marked_text: '', is_tombstone: true,
-  });
-});
-
-initWhisper($('whisper-layer'));
+initWhisper($('whisper-layer'), { fold: true });
 initAnchorLayer($('stage'));
-initReader($('reader'));
+initReader($('reader'), { replyMode: true });
 initToolbar($('toolbar'));
 initInsightPanel({
   cards: $('cards'),
@@ -295,81 +87,346 @@ initInsightPanel({
   count: $('insight-count'),
 });
 initDevOverlay(); // 画布叠层（独立于旧 dev 抽屉，由设置页 devOverlay/showRegion/showRelations 控）
-initNavShell();   // 全局导航壳：阅读 / AI 会话 / 采集取证 / 设置（旧 #dev 抽屉已退役）
-// 窄屏(电纸屏竖向 / 手机)：导航栏默认收起为抽屉，避免在 ~405px 宽挤占正文（点 ☰ 以浮层拉出）
-if (window.matchMedia('(max-width: 640px)').matches) document.body.classList.add('rail-collapsed');
+// 桌面 dev 导航壳不属于 V1 阅读主线。需要调试页时显式打开：
+//   http://localhost:5173/?devnav=1
+// 或 localStorage.setItem('inkloop.devnav','1')
+function devNavEnabled(): boolean {
+  if (new URLSearchParams(location.search).get('devnav') === '1') return true;
+  try { return localStorage.getItem('inkloop.devnav') === '1'; } catch { return false; }
+}
+if (devNavEnabled()) {
+  void import('./dev/console').then(({ initNavShell }) => {
+    initNavShell();
+    // 窄屏(电纸屏竖向 / 手机)：导航栏默认收起为抽屉，避免在 ~405px 宽挤占正文。
+    if (window.matchMedia('(max-width: 640px)').matches) document.body.classList.add('rail-collapsed');
+  });
+}
 if (features.einkBridge) initEinkMirror(); // 电纸屏镜像：套壳内容变化 → 推 IT8951（web/dev 无桥则 no-op；D1 flag 可关）
 
 const fileIn = $<HTMLInputElement>('file-in');
 fileIn.addEventListener('change', () => {
   const file = fileIn.files?.[0];
-  if (file) void loadFile(file);
+  fileIn.value = '';
+  if (file) void importAndSyncFile(file);
 });
+
+const importStatus = $('import-status');
+let importRunSeq = 0;
+const activeLibraryActionIds = new Set<string>();
+
+function importPhaseLabel(phase: LibraryImportProgress['phase']): string {
+  if (phase === 'hashing') return '准备导入';
+  if (phase === 'queued') return '已入队';
+  if (phase === 'encoding') return '读取文件';
+  if (phase === 'uploading') return '上传中';
+  if (phase === 'cloud_ready') return '云端已保存';
+  if (phase === 'downloading') return '下载中';
+  if (phase === 'waiting') return '等待同步';
+  if (phase === 'local_opening') return '本机打开';
+  if (phase === 'local_ready') return '完成';
+  return '导入失败';
+}
+
+function showImportStatus(progress: LibraryImportProgress): void {
+  importStatus.hidden = false;
+  importStatus.classList.toggle('error', progress.phase === 'failed');
+  importStatus.classList.toggle('done', progress.phase === 'local_ready' || progress.phase === 'cloud_ready');
+  importStatus.classList.toggle('indeterminate', !!progress.indeterminate);
+  const percent = Math.max(0, Math.min(100, Math.round(progress.percent)));
+  importStatus.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'import-status-head';
+  const title = document.createElement('span');
+  title.textContent = `${importPhaseLabel(progress.phase)} · ${progress.filename}`;
+  const value = document.createElement('b');
+  value.textContent = progress.indeterminate ? '...' : `${percent}%`;
+  head.append(title, value);
+  const bar = document.createElement('div');
+  bar.className = 'import-status-bar';
+  const fill = document.createElement('span');
+  fill.style.width = progress.indeterminate ? '0%' : `${percent}%`;
+  bar.appendChild(fill);
+  const detail = document.createElement('div');
+  detail.className = 'import-status-detail';
+  detail.textContent = progress.detail || '';
+  importStatus.append(head, bar, detail);
+}
+
+function hideImportStatusLater(seq: number): void {
+  window.setTimeout(() => {
+    if (seq === importRunSeq) importStatus.hidden = true;
+  }, 2200);
+}
+
+function hideCurrentStatusLater(): void {
+  const seq = importRunSeq;
+  hideImportStatusLater(seq);
+}
+
+function showLibraryHome(): void {
+  importStatus.hidden = true;
+  document.body.classList.remove('doc-loaded');
+  $('empty-state').style.display = '';
+  $('reading').classList.remove('reader');
+  ($('reader') as HTMLElement).hidden = true;
+  ($('stage-wrap') as HTMLElement).style.display = '';
+  $('doc-name').textContent = '';
+  $('page-ind').textContent = '';
+  insight.classList.remove('open');
+  void refreshLibrary();
+}
+
+async function refreshLibrary(): Promise<void> {
+  await renderRecent(recentBooks, { withCap: true });
+}
+
+async function importAndSyncFile(file: File): Promise<void> {
+  const seq = ++importRunSeq;
+  const onProgress = (progress: LibraryImportProgress): void => {
+    if (seq !== importRunSeq) return;
+    showImportStatus(progress);
+    if (progress.phase !== 'hashing' && progress.phase !== 'encoding') void refreshLibrary();
+  };
+
+  try {
+    onProgress({ phase: 'local_opening', filename: file.name || 'untitled', percent: 15, detail: '本机解析并打开文档' });
+    const loaded = await loadFile(file);
+    if (!loaded) throw new Error('document_not_loaded');
+    await recordLocalImportedSource(file, loaded, 'web');
+    onProgress({ phase: 'local_ready', filename: loaded.filename, documentId: loaded.documentId, percent: 55, detail: '本机已可读，后台同步 Cloud Hub' });
+    void refreshLibrary();
+    void uploadLoadedDocumentSource(file, loaded, 'web', { onProgress }).then((ok) => {
+      if (ok) hideImportStatusLater(seq);
+    });
+  } catch (error) {
+    onProgress({ phase: 'failed', filename: file.name || 'untitled', percent: 100, detail: `本机导入失败：${String((error as Error)?.message || error)}` });
+    void refreshLibrary();
+  }
+}
 
 // ── 书架：列出已持久存储的书，点击免重导打开（阶段一）──
 const recentBooks = $('recent-books');
-const recentPanel = $('recent-panel');
-const recentToggle = $<HTMLButtonElement>('recent-toggle');
+const shelfCoverHydrationIds = new Set<string>();
 
-function fmtWhen(iso: string): string {
-  const d = iso ? new Date(iso) : null;
-  if (!d || isNaN(d.getTime())) return '';
-  const p = (n: number) => `${n}`.padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+async function hydrateShelfCoverIfNeeded(item: LibraryShelfItem): Promise<void> {
+  if (item.doc?.cover_image_data_url || item.cover_image_data_url || !item.local_available) return;
+  if (shelfCoverHydrationIds.has(item.document_id)) return;
+  shelfCoverHydrationIds.add(item.document_id);
+  try {
+    const blob = await loadPdfBlob(item.document_id);
+    if (!blob) return;
+    const cover = await extractDocumentCoverImageDataUrl(await blob.arrayBuffer(), item.filename, item.mime_type || blob.type);
+    if (!cover) return;
+    await setDocCoverImageDataUrl(item.document_id, cover);
+    await refreshLibrary();
+  } catch {
+    // 封面是可再生缓存，失败不影响导入、阅读或同步。
+  } finally {
+    shelfCoverHydrationIds.delete(item.document_id);
+  }
 }
 
 async function renderRecent(container: HTMLElement, opts?: { withCap?: boolean; emptyHint?: boolean }): Promise<void> {
-  const books = await listBooks();
-  container.innerHTML = '';
-  if (!books.length) {
-    if (opts?.emptyHint) {
-      const e = document.createElement('div');
-      e.className = 'recent-empty';
-      e.textContent = '还没有已保存的书';
-      container.appendChild(e);
+  const books = await listLibraryItems();
+  renderLibraryShelf(container, books, {
+    mode: 'web',
+    title: undefined,
+    caption: undefined,
+    emptyHint: opts?.emptyHint ? '还没有已保存的书' : undefined,
+    activeDocumentIds: activeLibraryActionIds,
+    showMeta: false,
+    showStatus: true,
+    showAction: true,
+    onOpen: openLibraryItem,
+    onDelete: deleteLibraryBook,
+    onCoverHydrateNeeded: (item) => void hydrateShelfCoverIfNeeded(item),
+    onImport: () => fileIn.click(),
+  });
+}
+
+interface DeleteLibraryBookChoice {
+  confirmed: boolean;
+  deleteCloud: boolean;
+}
+
+function libraryDeleteDetail(result: Awaited<ReturnType<typeof deleteCloudLibraryItem>>, deleteCloud: boolean, hadCloudCopy: boolean): string {
+  if (result.cloudError) return `已从本机删除；Cloud Hub 删除未完成：${result.cloudError}`;
+  if (deleteCloud && hadCloudCopy) return '已从本机和 Cloud Hub 删除';
+  if (hadCloudCopy) return '已删除本机副本，Cloud Hub 书架保留';
+  return '已从本机书架删除';
+}
+
+function askDeleteLibraryBook(item: LibraryShelfItem): Promise<DeleteLibraryBookChoice> {
+  const title = item.filename.replace(/\.(pdf|epub|md|markdown)$/i, '') || item.filename;
+  const hadCloudCopy = hasCloudLibraryItem(item);
+  return new Promise((resolve) => {
+    let settled = false;
+    const scrim = document.createElement('div');
+    scrim.className = 'app-dialog-scrim';
+    scrim.setAttribute('role', 'presentation');
+
+    const dialog = document.createElement('section');
+    dialog.className = 'app-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'delete-book-dialog-title');
+
+    const heading = document.createElement('h2');
+    heading.id = 'delete-book-dialog-title';
+    heading.textContent = '删除书籍';
+
+    const message = document.createElement('p');
+    message.className = 'app-dialog-message';
+    message.textContent = hadCloudCopy
+      ? `删除《${title}》的本机副本？会移除本机源文件、阅读进度、标记和 AI 记录。Cloud Hub 默认保留，之后可从书架重新下载。`
+      : `删除《${title}》？这本书没有 Cloud Hub 副本，会从本机书架移除源文件、阅读进度、标记和 AI 记录。`;
+
+    let cloudInput: HTMLInputElement | undefined;
+    if (hadCloudCopy) {
+      const label = document.createElement('label');
+      label.className = 'app-dialog-check';
+      cloudInput = document.createElement('input');
+      cloudInput.type = 'checkbox';
+      const box = document.createElement('span');
+      box.className = 'app-dialog-check-box';
+      box.setAttribute('aria-hidden', 'true');
+      const copy = document.createElement('span');
+      copy.className = 'app-dialog-check-copy';
+      const labelText = document.createElement('span');
+      labelText.className = 'app-dialog-check-title';
+      labelText.textContent = '同时从书架删除';
+      const hint = document.createElement('span');
+      hint.className = 'app-dialog-check-hint';
+      hint.textContent = '勾选后会同时删除 Cloud Hub 源文件，其他设备的书架也会移除。';
+      copy.append(labelText, hint);
+      label.append(cloudInput, box, copy);
+      dialog.append(heading, message, label);
+    } else {
+      dialog.append(heading, message);
     }
+
+    const actions = document.createElement('div');
+    actions.className = 'app-dialog-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'app-dialog-button';
+    cancel.textContent = '取消';
+    const confirm = document.createElement('button');
+    confirm.type = 'button';
+    confirm.className = 'app-dialog-button app-dialog-button-danger';
+    const updateConfirmText = (): void => {
+      confirm.textContent = cloudInput?.checked ? '删除本机和云端' : '删除本机副本';
+    };
+    if (cloudInput) {
+      updateConfirmText();
+      cloudInput.addEventListener('change', updateConfirmText);
+    } else {
+      confirm.textContent = '删除';
+    }
+    actions.append(cancel, confirm);
+    dialog.appendChild(actions);
+    scrim.appendChild(dialog);
+    document.body.appendChild(scrim);
+
+    const close = (choice: DeleteLibraryBookChoice): void => {
+      if (settled) return;
+      settled = true;
+      scrim.classList.remove('open');
+      document.removeEventListener('keydown', onKey);
+      window.setTimeout(() => scrim.remove(), 140);
+      resolve(choice);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') close({ confirmed: false, deleteCloud: false });
+    };
+    cancel.addEventListener('click', () => close({ confirmed: false, deleteCloud: false }));
+    confirm.addEventListener('click', () => close({ confirmed: true, deleteCloud: !!cloudInput?.checked }));
+    scrim.addEventListener('mousedown', (event) => {
+      if (event.target === scrim) close({ confirmed: false, deleteCloud: false });
+    });
+    document.addEventListener('keydown', onKey);
+    requestAnimationFrame(() => {
+      scrim.classList.add('open');
+      cancel.focus();
+    });
+  });
+}
+
+async function deleteLibraryBook(item: LibraryShelfItem): Promise<void> {
+  if (activeLibraryActionIds.has(item.document_id)) return;
+  const hadCloudCopy = hasCloudLibraryItem(item);
+  const choice = await askDeleteLibraryBook(item);
+  if (!choice.confirmed) return;
+  activeLibraryActionIds.add(item.document_id);
+  void refreshLibrary();
+  const seq = ++importRunSeq;
+  try {
+    const result = await deleteCloudLibraryItem(item, { deleteCloud: choice.deleteCloud });
+    const detail = libraryDeleteDetail(result, choice.deleteCloud, hadCloudCopy);
+    showImportStatus({ phase: 'local_ready', filename: item.filename, documentId: item.document_id, percent: 100, detail });
+    if (state.documentId === item.document_id) showLibraryHome();
+    await refreshLibrary();
+    hideImportStatusLater(seq);
+  } catch (error) {
+    showImportStatus({ phase: 'failed', filename: item.filename, documentId: item.document_id, percent: 100, detail: `删除失败：${String((error as Error)?.message || error)}` });
+  } finally {
+    activeLibraryActionIds.delete(item.document_id);
+    void refreshLibrary();
+  }
+}
+
+async function openLibraryItem(item: LibraryShelfItem): Promise<void> {
+  if (activeLibraryActionIds.has(item.document_id)) return;
+  const action = libraryItemAction(item);
+  if (action.kind === 'wait' || action.kind === 'reimport') {
+    showImportStatus({
+      phase: action.kind === 'wait' ? 'waiting' : 'failed',
+      filename: item.filename || '(未命名)',
+      documentId: item.document_id,
+      percent: action.kind === 'wait' ? 15 : 100,
+      detail: action.hint,
+    });
+    hideCurrentStatusLater();
     return;
   }
-  if (opts?.withCap) {
-    const cap = document.createElement('p');
-    cap.className = 'recent-cap';
-    cap.textContent = '最近打开（已保存，免重导）';
-    container.appendChild(cap);
-  }
-  for (const b of books) {
-    const item = document.createElement('div');
-    item.className = 'recent-item';
-    item.title = `${b.filename}（${b.page_count} 页）`;
-    const name = document.createElement('span');
-    name.className = 'ri-name';
-    name.textContent = b.filename || '(未命名)';
-    const meta = document.createElement('span');
-    meta.className = 'ri-meta';
-    meta.textContent = `${b.page_count}页 · ${fmtWhen(b.saved_at)}`;
-    item.append(name, meta);
-    item.addEventListener('click', () => { recentPanel.hidden = true; void reopenBook(b.document_id, b.filename); });
-    container.appendChild(item);
+  activeLibraryActionIds.add(item.document_id);
+  void refreshLibrary();
+  const seq = ++importRunSeq;
+  const onProgress = (progress: LibraryImportProgress): void => {
+    if (seq === importRunSeq) showImportStatus(progress);
+    if (progress.phase === 'downloading' || progress.phase === 'local_ready' || progress.phase === 'failed') void refreshLibrary();
+  };
+  try {
+    if (action.kind === 'open') {
+      importStatus.hidden = true;
+      await reopenBook(item.document_id, item.filename);
+      return;
+    }
+    onProgress({ phase: 'downloading', filename: item.filename, documentId: item.document_id, percent: 0, indeterminate: true, detail: '正在从 Cloud Hub 下载到本机' });
+    await downloadCloudLibraryItem(item, { onProgress });
+    onProgress({ phase: 'local_ready', filename: item.filename, documentId: item.document_id, percent: 100, detail: '已下载到本机 Library' });
+    hideCurrentStatusLater();
+  } catch (error) {
+    onProgress({ phase: 'failed', filename: item.filename, documentId: item.document_id, percent: 100, detail: `操作失败：${String((error as Error)?.message || error)}` });
+  } finally {
+    activeLibraryActionIds.delete(item.document_id);
+    void renderRecent(recentBooks, { withCap: true });
   }
 }
 
 void renderRecent(recentBooks, { withCap: true }); // 启动即在空状态屏列出
-
-recentToggle.addEventListener('click', (e) => {
-  e.stopPropagation();
-  if (recentPanel.hidden) { void renderRecent(recentPanel, { emptyHint: true }); recentPanel.hidden = false; }
-  else recentPanel.hidden = true;
-});
-document.addEventListener('click', (e) => {
-  if (!recentPanel.hidden && !recentPanel.contains(e.target as Node) && e.target !== recentToggle) recentPanel.hidden = true;
-});
-
-// 载入合成聊天 surface（徐智强 step① App-agnostic 验证：原生吐 SurfaceIndex）
-$('load-chat').addEventListener('click', () => renderChatSurface());
+startLibrarySyncLoop(() => { void renderRecent(recentBooks, { withCap: true }); });
+$('home-btn').addEventListener('click', showLibraryHome);
 
 // 拖拽上传：拖到整个阅读区任意位置即可
 const reading = $('reading');
-const pickPdf = (list: FileList | undefined): File | undefined =>
-  list ? [...list].find((f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) : undefined;
+const isSupportedDocument = (file: File): boolean =>
+  file.type === 'application/pdf' ||
+  file.type === 'application/epub+zip' ||
+  file.type === 'text/markdown' ||
+  /\.(pdf|epub|md|markdown)$/i.test(file.name);
+const pickDocument = (list: FileList | undefined): File | undefined =>
+  list ? [...list].find(isSupportedDocument) : undefined;
 
 let dragDepth = 0;
 const setDragging = (on: boolean) => reading.classList.toggle('dragover', on);
@@ -390,11 +447,106 @@ reading.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0;
   setDragging(false);
-  const file = pickPdf(e.dataTransfer?.files);
-  if (file) void loadFile(file);
+  const file = pickDocument(e.dataTransfer?.files);
+  if (file) void importAndSyncFile(file);
 });
 
 bus.on('document:loaded', () => { void restoreFromLedger(); });
+
+interface MarkFocusPayload {
+  markId?: string;
+  documentId?: string;
+  pageId?: string;
+  pageIndex?: number | null;
+  bbox?: NormBBox;
+}
+
+function pageIndexFromPageId(pageId?: string): number | undefined {
+  const m = String(pageId || '').match(/_(\d+)$/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function safePageNormBbox(bbox?: NormBBox): NormBBox | null {
+  if (!bbox || bbox.length !== 4) return null;
+  const [x, y, w, h] = bbox.map((value) => Number(value)) as NormBBox;
+  if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) return null;
+  if (x < -0.05 || y < -0.05 || w > 1.1 || h > 1.1 || x + w > 1.05 || y + h > 1.05) return null;
+  const x0 = Math.max(0, x);
+  const y0 = Math.max(0, y);
+  const x1 = Math.min(1, x + w);
+  const y1 = Math.min(1, y + h);
+  if (x1 <= x0 || y1 <= y0) return null;
+  return [x0, y0, x1 - x0, y1 - y0];
+}
+
+function flashOriginalBbox(bbox?: NormBBox, pageId?: string): void {
+  const safeBbox = safePageNormBbox(bbox);
+  if (!safeBbox) return;
+  const region = pageRegionForId(pageId);
+  const w = region?.w ?? pageCss.w;
+  const h = region?.h ?? pageCss.h;
+  if (!w || !h) return;
+  const stage = $('stage');
+  stage.querySelectorAll('.page-source-flash').forEach((node) => node.remove());
+  const pos = normToPx(safeBbox[0], safeBbox[1], pageId);
+  const flash = document.createElement('div');
+  flash.className = 'page-source-flash';
+  flash.style.cssText = [
+    'position:absolute',
+    'z-index:8',
+    'pointer-events:none',
+    'box-sizing:border-box',
+    'border:2px dashed #2563eb',
+    'background:rgba(37,99,235,.08)',
+    'border-radius:3px',
+    `left:${Math.max(0, pos.x - 4)}px`,
+    `top:${Math.max(0, pos.y - 4)}px`,
+    `width:${Math.max(10, safeBbox[2] * w + 8)}px`,
+    `height:${Math.max(10, safeBbox[3] * h + 8)}px`,
+  ].join(';');
+  stage.appendChild(flash);
+  window.setTimeout(() => flash.remove(), 1800);
+}
+
+async function focusMarkRecord(payload: MarkFocusPayload): Promise<void> {
+  const documentId = payload.documentId || state.documentId;
+  if (!documentId) return;
+  if (state.documentId !== documentId) {
+    const item = (await listLibraryItems()).find((entry) => entry.document_id === documentId);
+    if (!item) return;
+    const opened = item.local_available ? await reopenBook(item.document_id, item.filename) : false;
+    if (!opened) {
+      await openLibraryItem(item);
+      if (state.documentId !== documentId) return;
+    }
+  }
+  settings.viewMode = 'page';
+  saveSettings();
+  applyViewMode();
+  const rawPage = typeof payload.pageIndex === 'number' ? payload.pageIndex : pageIndexFromPageId(payload.pageId);
+  const targetPage = Math.max(0, Math.min(Math.max(0, state.pageCount - 1), rawPage ?? state.pageIndex));
+  if (targetPage !== state.pageIndex) state.pageIndex = targetPage;
+  if (getActiveContext().pdf) await renderPage();
+  else if (getActiveContext().syntheticDoc) renderSyntheticSurface();
+  flashOriginalBbox(payload.bbox, payload.pageId);
+}
+
+async function focusOverlaySource(overlay: ScreenOverlay): Promise<void> {
+  if (settings.viewMode === 'reader' && overlay.page_id === state.pageId && readerFocusOverlay(overlay)) return;
+  settings.viewMode = 'page';
+  saveSettings();
+  applyViewMode();
+  const rawPage = pageIndexFromPageId(overlay.page_id);
+  const targetPage = Math.max(0, Math.min(Math.max(0, state.pageCount - 1), rawPage ?? state.pageIndex));
+  if (targetPage !== state.pageIndex) state.pageIndex = targetPage;
+  if (getActiveContext().pdf) await renderPage();
+  else if (getActiveContext().syntheticDoc) renderSyntheticSurface();
+  flashOriginalBbox(overlay.geometry.anchor_bbox, overlay.page_id);
+}
+
+bus.on('reader:source-focus', (overlay) => { void focusOverlaySource(overlay as ScreenOverlay); });
 
 // 方案 B Stage 1：切换激活实例（进/退会议）后的重绘。
 // 切回已加载的 PDF 实例（如退会议回主阅读）→ 重渲当前页 + 复原 chrome/墨迹/旁注，全程不重新 fetch/decode。
@@ -403,6 +555,9 @@ bus.on('context:switched', (ctx) => {
   const c = ctx as SurfaceContext;
   if (c.pdf && c.surfaceType === 'article') {
     void renderPage().then(() => { if (getActiveContext() === c) void restoreFromLedger(); }); // 渲染期间又切走则不再恢复（P0-5）
+  } else if (c.syntheticDoc && c.surfaceType === 'article') {
+    renderSyntheticSurface();
+    void restoreFromLedger();
   } else if (!c.documentId) {
     document.body.classList.remove('doc-loaded');
     $('empty-state').style.display = '';
@@ -418,25 +573,143 @@ async function restoreFromLedger(): Promise<void> {
   const docId = state.documentId;
   if (!docId) return;
   await restoreLedgerState(docId); // 账本→state 重建（笔迹/旁注/buffer/pending），见 controllers/ledger-restore
+  await hydrateRuntimeAnnotationsToActiveCanvas(runtimeSyncHost.store, docId);
 }
 
 let lastPageId: string | null = null;
+const zoomModeSelect = $<HTMLSelectElement>('zoom-mode');
+const layoutSingle = $('layout-single');
+const layoutSpread = $('layout-spread');
+const layoutControl = layoutSingle.closest<HTMLElement>('.seg-control');
+const zoomIndicator = $('zoom-ind');
+const zoomOutButton = $('zoom-out') as HTMLButtonElement;
+const zoomInButton = $('zoom-in') as HTMLButtonElement;
+
+function isSpreadPageMode(): boolean {
+  const ctx = getActiveContext();
+  return settings.viewMode === 'page' && settings.pageLayout === 'spread' && !!(ctx.pdf || ctx.syntheticDoc);
+}
+
+function currentReadingExperience(): ReadingExperience | null {
+  const ctx = getActiveContext();
+  if (ctx.pdf) return readingExperienceForSource('pdf');
+  if (ctx.syntheticDoc) return readingExperienceForSource(ctx.syntheticDoc.kind === 'epub' ? 'epub' : 'markdown');
+  return null;
+}
+
+function isPdfLoaded(): boolean {
+  return pdfOriginalControlsAvailable(currentReadingExperience());
+}
+
+function isPageLayoutAvailable(): boolean {
+  return pageLayoutControlsAvailable(currentReadingExperience());
+}
+
+function isTextReaderAvailable(): boolean {
+  return !!currentReadingExperience()?.controls.textReader;
+}
+
+function renderActivePage(): void {
+  const ctx = getActiveContext();
+  if (ctx.pdf) void renderPage();
+  else if (ctx.syntheticDoc) renderSyntheticSurface();
+}
+
+function syncReadingControls(): void {
+  layoutSingle.setAttribute('aria-pressed', settings.pageLayout === 'single' ? 'true' : 'false');
+  layoutSpread.setAttribute('aria-pressed', settings.pageLayout === 'spread' ? 'true' : 'false');
+  const experience = currentReadingExperience();
+  const layoutLoaded = pageLayoutControlsAvailable(experience);
+  const pdfLoaded = pdfOriginalControlsAvailable(experience);
+  const pdfOnlyHint = readingControlsUnavailableHint(experience);
+  const zoomHint = pdfLoaded ? '' : (experience ? '缩放只作用于 PDF 原版页' : '先打开一本书');
+  if (layoutControl) layoutControl.hidden = !layoutLoaded;
+  zoomModeSelect.hidden = !pdfLoaded;
+  zoomOutButton.hidden = !pdfLoaded;
+  zoomIndicator.hidden = !pdfLoaded;
+  zoomInButton.hidden = !pdfLoaded;
+  layoutSingle.toggleAttribute('disabled', !layoutLoaded);
+  layoutSpread.toggleAttribute('disabled', !layoutLoaded);
+  zoomModeSelect.disabled = !pdfLoaded;
+  zoomOutButton.disabled = !pdfLoaded;
+  zoomInButton.disabled = !pdfLoaded;
+  layoutSingle.title = pdfOnlyHint || '单页布局';
+  layoutSpread.title = pdfOnlyHint || '双页布局';
+  zoomModeSelect.title = zoomHint || '缩放方式';
+  zoomOutButton.title = zoomHint || '缩小';
+  zoomInButton.title = zoomHint || '放大';
+  if (settings.zoomMode === 'percent') {
+    const value = String(settings.zoomPercent / 100);
+    const exists = [...zoomModeSelect.options].some((o) => o.value === value);
+    if (exists) {
+      zoomModeSelect.value = value;
+    } else {
+      const custom = [...zoomModeSelect.options].find((o) => o.value === 'custom');
+      if (custom) custom.textContent = `${settings.zoomPercent}%`;
+      zoomModeSelect.value = 'custom';
+    }
+  } else {
+    zoomModeSelect.value = settings.zoomMode;
+  }
+}
+
+function pageIndicatorText(): string {
+  if (isSpreadPageMode() && state.pageIndex + 1 < state.pageCount) {
+    return `第 ${state.pageIndex + 1}-${state.pageIndex + 2} / ${state.pageCount} 页`;
+  }
+  return `第 ${state.pageIndex + 1} / ${state.pageCount} 页`;
+}
+
 bus.on('page:rendered', () => {
-  $('page-ind').textContent = `第 ${state.pageIndex + 1} / ${state.pageCount} 页`;
+  $('page-ind').textContent = pageIndicatorText();
   $('zoom-ind').textContent = `${Math.round(state.zoom * 100)}%`;
-  // 翻页（非缩放重渲）：丢在途的笔，但 session/idle 跨页保留（翻页不是边界事件）
+  syncReadingControls();
+  // 翻页（非缩放重渲）：记阅读位置。在途笔的复位由 annotation-loop 的 page:rendered 监听负责。
   if (state.pageId !== lastPageId) {
     lastPageId = state.pageId;
-    resetAssembly();
     setLastReadPage(state.pageIndex); // 记阅读位置（去抖落盘），重开跳回
   }
 });
 
 $('prev').addEventListener('click', () => gotoPage(-1));
 $('next').addEventListener('click', () => gotoPage(1));
+layoutSingle.addEventListener('click', () => {
+  if (!isPageLayoutAvailable()) { syncReadingControls(); return; }
+  settings.pageLayout = 'single';
+  settings.viewMode = 'page';
+  saveSettings();
+  applyViewMode();
+  syncReadingControls();
+  renderActivePage();
+});
+layoutSpread.addEventListener('click', () => {
+  if (!isPageLayoutAvailable()) { syncReadingControls(); return; }
+  settings.pageLayout = 'spread';
+  settings.viewMode = 'page';
+  saveSettings();
+  applyViewMode();
+  syncReadingControls();
+  renderActivePage();
+});
+zoomModeSelect.addEventListener('change', () => {
+  if (!isPdfLoaded()) { syncReadingControls(); return; }
+  const value = zoomModeSelect.value;
+  if (value === 'fit-page' || value === 'fit-width') {
+    settings.zoomMode = value;
+  } else if (value !== 'custom') {
+    settings.zoomMode = 'percent';
+    settings.zoomPercent = Math.round(Number(value) * 100);
+  }
+  settings.viewMode = 'page';
+  saveSettings();
+  applyViewMode();
+  syncReadingControls();
+  void renderPage();
+});
 
 // 翻页手势：笔/手指分流后，手指横滑（或 hand 工具拖动）→ ink.ts 发 nav:flip
 bus.on('nav:flip', (dir) => gotoPage(Number(dir) || 0));
+bus.on('mark:focus', (payload) => void focusMarkRecord(payload as MarkFocusPayload));
 
 // 触控板两指横滑 → 翻页（最贴近真机手指翻页）。横向为主才拦，竖向滚动放行；一次滑一翻、加锁防连翻。
 let wheelAccum = 0;
@@ -454,23 +727,56 @@ $('stage-wrap').addEventListener('wheel', (e) => {
     window.setTimeout(() => { wheelLock = false; }, 450);
   }
 }, { passive: false });
-$('zoom-in').addEventListener('click', () => setZoom(state.zoom + 0.25));
-$('zoom-out').addEventListener('click', () => setZoom(state.zoom - 0.25));
+zoomInButton.addEventListener('click', () => {
+  if (!isPdfLoaded()) { syncReadingControls(); return; }
+  settings.viewMode = 'page';
+  applyViewMode();
+  setZoom(state.zoom + 0.25);
+  saveSettings();
+  syncReadingControls();
+});
+zoomOutButton.addEventListener('click', () => {
+  if (!isPdfLoaded()) { syncReadingControls(); return; }
+  settings.viewMode = 'page';
+  applyViewMode();
+  setZoom(state.zoom - 0.25);
+  saveSettings();
+  syncReadingControls();
+});
 
 const insight = $('insight');
-$('insight-toggle').addEventListener('click', () => insight.classList.toggle('open'));
+$('insight-toggle').addEventListener('click', () => {
+  const open = insight.classList.toggle('open');
+  bus.emit('insight:visibility', open);
+});
 
-// 原版 PDF ⇄ 重排阅读
+function readerToggleLabel(isReader: boolean): string {
+  return isReader ? '页面' : '阅读';
+}
+
+// 原版 PDF / EPUB 文本阅读器 ⇄ 可标记阅读面
 function applyViewMode(): void {
-  const isReader = settings.viewMode === 'reader';
+  const canUseReader = isTextReaderAvailable();
+  if (!canUseReader && settings.viewMode === 'reader') {
+    settings.viewMode = 'page';
+    saveSettings();
+  }
+  const isReader = canUseReader && settings.viewMode === 'reader';
   $('reading').classList.toggle('reader', isReader);
   ($('reader') as HTMLElement).hidden = !isReader;
   ($('stage-wrap') as HTMLElement).style.display = isReader ? 'none' : '';
   const btn = $('view-toggle');
-  btn.textContent = isReader ? '原版' : '重排';
+  btn.hidden = !canUseReader;
+  btn.textContent = readerToggleLabel(isReader);
   btn.classList.toggle('active', isReader);
+  syncReadingControls();
 }
 $('view-toggle').addEventListener('click', () => {
+  if (!isTextReaderAvailable()) {
+    settings.viewMode = 'page';
+    applyViewMode();
+    return;
+  }
   // 切面前先收口在途区域：此刻 pageId/surfaceIndex 仍是当前面，能正确落成 mark；否则 regBbox 跨面存活，
   // 切过去第一笔会与旧面在途区域误并（跨面污染）。空区域时 flushRegion 有 events.length 守卫、是 no-op。
   flushRegion('view-switch');
@@ -487,7 +793,9 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('resize', () => {
-  if (hasDocument()) setZoom(state.zoom); // 触发自适应重渲
+  if (!hasDocument()) return;
+  if (getActiveContext().pdf) void renderPage();
+  else if (getActiveContext().syntheticDoc) renderSyntheticSurface();
 });
 
 declare global {

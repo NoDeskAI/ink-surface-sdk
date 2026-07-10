@@ -1,0 +1,16 @@
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+**/coverage
+test-results
+**/test-results
+examples/ai-annotation-demo/.inkloop
+examples/ai-annotation-demo/android/app/build
+examples/ai-annotation-demo/android/.gradle
+examples/ai-annotation-demo/Lark-Meeting-Timeline-main/node_modules
+examples/ai-annotation-demo/obsidian-importer-master/node_modules
+examples/ai-annotation-demo/obsidian-maps-master/node_modules
+*.log

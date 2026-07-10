@@ -1,0 +1,40 @@
+name: inkloop-local
+
+services:
+  cloud-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloud-hub
+    container_name: inkloop-cloud-hub
+    restart: unless-stopped
+    ports:
+      - "${INKLOOP_CLOUD_HUB_PORT:-8731}:8731"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8731"
+      INKLOOP_LIBRARY_STORE: "/data/library"
+      INKLOOP_KNOWLEDGE_STORE: "/data/knowledge"
+      INKLOOP_RUNTIME_SYNC_STORE: "/data/runtime-events.jsonl"
+      INKLOOP_LOCAL_AUTH_STORE: "/data/auth-sessions.json"
+      INKLOOP_LOCAL_DEVICE_AUTH: "${INKLOOP_LOCAL_DEVICE_AUTH:-1}"
+      INKLOOP_LIBRARY_REQUIRE_SESSION: "${INKLOOP_LIBRARY_REQUIRE_SESSION:-1}"
+      INKLOOP_KNOWLEDGE_REQUIRE_SESSION: "${INKLOOP_KNOWLEDGE_REQUIRE_SESSION:-1}"
+      INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION: "${INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION:-1}"
+      INKLOOP_TENANT_ID: "${INKLOOP_TENANT_ID:-local}"
+      INKLOOP_USER_ID: "${INKLOOP_USER_ID:-local_user}"
+      INKLOOP_RUNTIME_SYNC_TOKEN: "${INKLOOP_RUNTIME_SYNC_TOKEN:-}"
+      LLM_GATEWAY_URL: "${LLM_GATEWAY_URL:-https://llm-gateway-api.nodesk.tech/default/v1}"
+      LLM_GATEWAY_TRANSPORT: "${LLM_GATEWAY_TRANSPORT:-openai_chat_completions}"
+      LLM_GATEWAY_KEY: "${LLM_GATEWAY_KEY:-${NODESK_API_KEY:-}}"
+      LLM_MODEL: "${LLM_MODEL:-glm-5.2}"
+      PANEL_FEISHU_BASE: "${PANEL_FEISHU_BASE:-}"
+      PANEL_AUTH_BASE: "${PANEL_AUTH_BASE:-}"
+      PANEL_VAULT_BASE: "${PANEL_VAULT_BASE:-}"
+      INKLOOP_SHARED_SECRET: "${INKLOOP_SHARED_SECRET:-}"
+    volumes:
+      - ./examples/ai-annotation-demo/.inkloop:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8731/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6

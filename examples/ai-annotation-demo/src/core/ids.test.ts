@@ -1,7 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { pageIdFor } from './ids';
+import { pageIdFor, sha256HexFallback, uuid } from './ids';
 
 describe('pageIdFor 页 ID 唯一性（B5：消会议资料截断碰撞）', () => {
+  it('uuid 在非 secure context 缺少 crypto.randomUUID 时仍可生成合法 v4 ID', () => {
+    const id = uuid();
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it('sha256HexFallback 可在 crypto.subtle 不可用的局域网 HTTP 环境下保持稳定 digest', () => {
+    const input = new TextEncoder().encode('InkLoop LAN PDF import').buffer;
+    expect(sha256HexFallback(input)).toBe('2fc23ebc2a524efae8c89a59d178c900696f6348c7003258dce7dd1aba1d90f0');
+  });
+
   it('同一会议、不同资料、相同页号 → 不碰撞（旧 slice(4,12) 会撞）', () => {
     // 旧实现 documentId.slice(4,12) 对这两个都取到 "oc_mtg_a" → 同 pageId；新哈希全 id 后必不同。
     const a = pageIdFor('mtgdoc_mtg_abc123_msg1', 0);

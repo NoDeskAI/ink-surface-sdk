@@ -35,6 +35,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+
+    packaging {
+        jniLibs {
+            pickFirsts += "lib/*/libc++_shared.so"
+        }
+    }
 }
 
 dependencies {
@@ -42,6 +48,13 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-ktx:1.9.2")
     implementation("androidx.webkit:webkit:1.11.0")
+
+    // ── ONYX/BOOX 电纸屏低延迟手写：T10C Plus 等 Wacom 设备用 TouchHelper 进原生 scribble 通道 ──
+    implementation("com.onyx.android.sdk:onyxsdk-device:1.3.5")
+    implementation("com.onyx.android.sdk:onyxsdk-pen:1.5.4") {
+        exclude(group = "pub.devrel", module = "easypermissions")
+        exclude(group = "com.android.support")
+    }
 
     // ── 端侧印刷区域 OCR（ocrRegion = ML Kit text 优先 + PP-OCR 兜底；手写仍走云，见 OcrBridge.kt）──
     implementation(project(":ppocr-sdk"))                                // 徐 PaddleOCR SDK（com.paddle.ocr）

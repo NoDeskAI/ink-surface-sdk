@@ -31,13 +31,22 @@ class Bus {
  */
 export const bus = new Bus();
 
-export type Tool = 'pen' | 'highlighter' | 'eraser' | 'hand';
+export type Tool = 'pen' | 'aipen' | 'highlighter' | 'underline' | 'eraser' | 'hand';
 
 /** AI 输出落点：右侧留白 / 贴正文浮动。 */
 export type Placement = 'margin' | 'inline';
 
-/** 阅读面：原版 PDF / 重排 reader。 */
+/**
+ * AI 触发模式（笔触划分 = AI 门控）：
+ *  · 'pen'  —— AI 笔触（显式·默认）：只有「AI 笔」画的笔进 AI 管线；普通笔/荧光 = 纯内容（不识别/不答问/不生叠层）。
+ *  · 'auto' —— 自动判意（实验）：每笔都进管线（旧行为：手写定向 + 长停顿综合 + 分类阈值）。降级成 dev 开关、代码全留。
+ */
+export type AiTrigger = 'pen' | 'auto';
+
+/** 阅读面：原版 PDF / 文本阅读器。 */
 export type ViewMode = 'page' | 'reader';
+export type PageLayoutMode = 'single' | 'spread';
+export type ZoomMode = 'fit-width' | 'fit-page' | 'percent';
 
 /**
  * 开放式行为设置 —— 每条行为独立可启停，可任意组合（非二选一模式）。
@@ -45,17 +54,29 @@ export type ViewMode = 'page' | 'reader';
  */
 export interface Settings {
   placement: Placement;
-  viewMode: ViewMode;                            // 阅读面：原版 PDF / 重排
-  reflowProvider: string;                        // 重排引擎：local / llm
-  reflowModel: string;                           // 重排专用模型（快·结构任务）：默认 gemini-3.1-flash-lite，独立于 inferModel
-  reflowEager: boolean;                          // 急算开关(默认关·留给端侧)：渲染即后台 AI 重排缓存 → AI 上下文用真实阅读序("重排前置")
-  // 预处理：导入后台预排版前 reflowPages 页（封顶；reflowEnabled 默认关，需 dev 面板手动开）
+  viewMode: ViewMode;                            // 阅读面：原版 PDF / 文本阅读器
+  pageLayout: PageLayoutMode;                    // 原版 PDF 页面布局：单页 / 双页
+  zoomMode: ZoomMode;                            // 原版 PDF 缩放策略：适应宽度 / 适应页面 / 固定比例
+  zoomPercent: number;                           // zoomMode='percent' 时使用的百分比
+  reflowProvider: string;                        // PDF 可选优化引擎：V1 产品态固定 local，避免模型改写原文
+  reflowModel: string;                           // legacy/dev 字段：不进入默认阅读路径
+  reflowEager: boolean;                          // PDF 优化急算开关。默认关，稳定原版阅读优先。
+  // PDF 可选优化缓存：导入后台处理前 reflowPages 页（封顶；reflowEnabled 默认关，需 dev 面板手动开）
   preprocess: { reflowEnabled: boolean; reflowPages: number };
   //   enabled: 手势响应总开关；idleSeconds: 长停顿(无新笔)多少秒触发整段 session 综合回复
   //   （v3 主线，默认 90=~1.5min；可在 __inkloop.settings 调小做冒烟测试）
   gesture: { enabled: boolean; idleSeconds?: number };
+  // AI 触发模式（笔触划分）：'pen'=只 AI 笔进 AI（默认·普通笔=纯内容）；'auto'=每笔都判（旧自动判意·实验）。
+  // 默认 'pen'：AI 笔=激活意图识别的开关（选中它写→走 recognize+fold/respond 分类器）；普通笔不进 AI。
+  aiTrigger: AiTrigger;
+  // 手写收口等待（ms）：停笔多久把这团笔收口送识别/AI。调短=反馈快，但句中思考停顿会把一段字拆成多个标注
+  //（session 图会把它们串回一段叙事，语义不丢，只是账本条目变碎+分类调用变多）。dev 页可调。
+  regionQuietMs: number;
+  // AI 笔"原功能"（圈选 P2 识别被圈内容 + 它画的必回应·跳分类器）。默认 false=停用·AI 笔走普通意图识别即可；
+  // dev 开 → 恢复原显式行为（待把文本阅读器圈选锚定重做后再启用）。
+  aiPenExplicit: boolean;
   // 推理模型：按前缀路由渠道——kimi*→moonshot；claude/gpt/gemini*→DMX。默认 sonnet-4-6。
-  // （无状态端点：识别/答问/重排走各 /api/* 端点；跨标注连贯交 chat/ 每本书 buffer。）
+  // （无状态端点：识别/答问/PDF 优化走各 /api/* 端点；跨标注连贯交 chat/ 每本书 buffer。）
   inferModel: string;
   // 识别分类器(/api/interpret)、上下文分类器(/api/classify-context)可各自单独选模型(A/B 评估用)；
   // 空字符串 = 继承 inferModel。
@@ -70,29 +91,49 @@ export interface Settings {
   showRegion: boolean;
   // dev：会话提交后，把"内容关联的标注"（标注图里空间/语义相连的一组）用紫色虚框圈起来。看哪些标注被当成一组。
   showRelations: boolean;
+  // dev：基岩录制（Tier 1 原始笔迹流·影子）。开后死区前的运动逐帧录进 ink_samples；不碰标注/AI。默认关。
+  bedrock: boolean;
+  // dev：记录整轮 AI pipeline 快照进 ai_turn.pipeline（dev 页逐组件复盘）。原仅 import.meta.env.DEV（preview）
+  // 才记 → 板上生产构建永远空。本运行时旋钮让板上也能开（默认关·开后每轮多存缩略图/阶段）。
+  recordPipeline: boolean;
+  // dev：设备遥测（板上）。开后 devEmit 把每条事实流事件推进 window.__devtel 环形缓冲 + console.log('[devtel] …')，
+  // 让开发者侧（我）经 CDP 直读板上 gesture/recognize/classify/inference/reflow 全套事实流。默认关。
+  devtel: boolean;
+  // 产品态：「思考中…」占位锚（抬笔后、回答流式前在锚点显示占位）。V1 演示默认开，避免用户画完后没有任何反馈。
+  thinkingTag: boolean;
 }
 
 export const settings: Settings = {
   placement: 'margin',
   viewMode: 'page',
-  reflowProvider: 'ai', // 主线：AI 结构重建（文本驱动·保 bbox）
-  reflowModel: 'gemini-3.1-flash-lite', // 重排走快模型（结构任务·延迟敏感·质量门槛低）。新字段→所有人即时生效。
-  reflowEager: false,   // 默认关：现在不为 AI 上下文烧 token；端侧重排模型上了再默认开 = 真"重排前置"。
+  pageLayout: 'single',
+  zoomMode: 'fit-width',
+  zoomPercent: 100,
+  reflowProvider: 'local', // PDF 可选阅读优化：规则版面缓存，不能让模型改写原文。
+  reflowModel: 'gemini-3.1-flash-lite', // legacy/dev 字段：保留给旧实验，不进入 V1 默认阅读路径。
+  reflowEager: false,   // 默认关：稳定阅读优先，不在翻页时后台生成 PDF 优化版面。
   preprocess: { reflowEnabled: false, reflowPages: 5 },
   gesture: { enabled: true, idleSeconds: 90 },
+  aiTrigger: 'pen', // 默认：只有选中 AI 笔写的才进 AI，且 AI 笔是显式命令会直接回应；普通笔=纯内容。dev 可切 'auto'=每笔都判（实验）。
+  regionQuietMs: 1000, // 手写收口等待默认 1s（用户拍板·原 6s 反馈太慢）；写长句常被句中停顿拆碎的话在 dev 调回 2-3s。
+  aiPenExplicit: false, // legacy/dev：保留旧圈选识别开关位；V1 产品态下 AI 笔本身已经默认必回应。
   inferModel: 'claude-sonnet-4-6', // 默认推理+识别模型：sonnet-4.6（DMX，中文手写实测准）。recognizeInk/chat 都随它。
   //   注：旧用户 localStorage 里存了别的会覆盖此默认——要用 sonnet 需在 dev 面板「推理模型」选一次或清 inkloop.settings.v1。
   interpretModel: '', // 识别分类器(/api/interpret)模型；空=继承 inferModel。
   classifyModel: '',  // 上下文分类器(/api/classify-context)模型；空=继承 inferModel。
   sendMarkImage: false, // 默认不送合成图：纯验证徐智强的取证路线（AI 只吃 HMP 事实+整页上下文）。
   devOverlay: false,    // dev bbox 叠层默认关。
-  showRegion: true,     // dev 组装区域实时可视：默认开（手写时看受影响区域）。
-  showRelations: true,  // dev 关联框：默认开（提交后看哪些标注被判为内容关联的一组）。
+  showRegion: false,    // dev 组装区域实时可视：**默认关**（开着会在手写时画 #region-overlay 调试框、被电纸屏 MutationObserver 抓成整屏 GC16；要看就 dev 里开）。
+  showRelations: false, // dev 关联框：**默认关**（同上·调试用）。
+  bedrock: false,       // 基岩录制默认关（影子·实验）。
+  recordPipeline: false, // pipeline 快照默认关；板上要看 dev 页逐组件复盘时手动开。
+  devtel: false,         // 设备遥测默认关；板上要让我直读事实流时手动开。
+  thinkingTag: true,     // V1 产品演示默认开：抬笔后立刻显示处理中，占位会在真实回答到达后清掉。
 };
 
 /**
  * 设置持久化（C4）：拆「产品设置」与「dev/AB 旋钮」两键，各带 schema 版本 + 类型守卫。
- *  · 产品键 inkloop.prefs.v1    —— 用户偏好（落点/阅读面/手势/重排引擎）。
+ *  · 产品键 inkloop.prefs.v1    —— 用户偏好（落点/阅读面/手势/PDF 优化引擎）。
  *  · dev 键 inkloop.devflags.v1 —— 模型/AB/调试旋钮。**这半即将来 remote manifest 可覆盖的接缝**
  *    （远程只动 dev 子集，不踩用户偏好；D1 复用 applyKnownSettings + DEV_FIELDS）。
  * 旧扁平键 inkloop.settings.v1 首次升级时一次性导入，不丢已存设置。settings 在内存仍是统一对象，消费方零改。
@@ -101,8 +142,8 @@ const SETTINGS_SCHEMA = 1;
 const PRODUCT_KEY = 'inkloop.prefs.v1';
 const DEV_KEY = 'inkloop.devflags.v1';
 const LEGACY_KEY = 'inkloop.settings.v1';
-const PRODUCT_FIELDS = ['placement', 'viewMode', 'reflowProvider', 'gesture'] as const;
-export const DEV_FIELDS = ['reflowModel', 'reflowEager', 'preprocess', 'inferModel', 'interpretModel', 'classifyModel', 'sendMarkImage', 'devOverlay', 'showRegion', 'showRelations'] as const;
+const PRODUCT_FIELDS = ['placement', 'viewMode', 'pageLayout', 'zoomMode', 'zoomPercent', 'reflowProvider', 'gesture'] as const;
+export const DEV_FIELDS = ['aiTrigger', 'aiPenExplicit', 'regionQuietMs', 'reflowModel', 'reflowEager', 'preprocess', 'inferModel', 'interpretModel', 'classifyModel', 'sendMarkImage', 'devOverlay', 'showRegion', 'showRelations', 'bedrock', 'recordPipeline', 'devtel', 'thinkingTag'] as const;
 
 type SettingsRec = Record<string, unknown>;
 
@@ -181,11 +222,11 @@ export const state = {
   pageIndex: 0,
   pageId: null as string | null,
   pageRecord: null as PDFPageRecord | null,
-  // PDF 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录(章节树)。喂重排/AI 排版。
+  // PDF 文档级元信息：Info 字典(Title/Author/Producer/CreationDate…) + 大纲目录(章节树)。喂阅读优化/AI 上下文。
   docMeta: null as Record<string, unknown> | null,
   outline: null as unknown[] | null,
   textBlocks: [] as OcrTextBlock[],
-  imageRegions: [] as NormBBox[],   // 本页原 PDF 中的图像区域（归一化 bbox），重排时保留
+  imageRegions: [] as NormBBox[],   // 本页原 PDF 中的图像区域（归一化 bbox），文本阅读/优化视图中保留
 
   // 徐智强「序列语义方案」：显式 SurfaceIndex（step①）+ HMP 取证记录（step④）
   surfaceIndex: null as SurfaceIndex | null, // 当前 surface 的轻量对象表（PDF 路径由 textBlocks/imageRegions 构建）
@@ -196,6 +237,14 @@ export const state = {
   overlays: [] as ScreenOverlay[],
   inferProvider: 'cloud',
 };
+
+export function withoutOverlay(overlays: ScreenOverlay[], overlayId: string): ScreenOverlay[] {
+  return overlays.filter((overlay) => overlay.overlay_id !== overlayId);
+}
+
+export function dropOverlay(overlayId: string): void {
+  state.overlays = withoutOverlay(state.overlays, overlayId);
+}
 
 /**
  * 方案 B 解耦 Stage 1：`state` 的 17 个「随文档/surface 走」字段委托到「当前激活的 SurfaceContext」。

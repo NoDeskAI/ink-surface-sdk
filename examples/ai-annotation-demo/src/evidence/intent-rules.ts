@@ -19,7 +19,7 @@ const firstHit = (t: string, ...needles: string[]): string | undefined => needle
 export function classifyIntentExplained(action: string, text: string): { intent: IntentLabel; hit: string } {
   const t = (text ?? '').trim();
   let h: string | undefined;
-  if ((h = firstHit(t, '?', '？', '为什么', '怎么办', '如何', '怎么'))) return { intent: 'question', hit: `命中问号/问词「${h}」` };
+  if ((h = firstHit(t, '?', '？', '为什么', '怎么办', '如何', '怎么', '翻译', '译成', '译为', 'translate', 'translation', '英文', '中文'))) return { intent: 'question', hit: `命中问号/问词「${h}」` };
   if ((h = firstHit(t, 'TODO', 'todo', '待办', '记得', '要做', '试试', '确认'))) return { intent: 'todo', hit: `命中待办词「${h}」` };
   if (action === 'cross') return { intent: 'reject', hit: '动作=叉' };
   if ((h = firstHit(t, '错', '不对', '不要', '否定'))) return { intent: 'reject', hit: `命中否定词「${h}」` };

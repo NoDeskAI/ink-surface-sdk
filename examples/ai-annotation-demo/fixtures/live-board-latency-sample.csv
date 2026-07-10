@@ -1,0 +1,13 @@
+run_id,scenario,transport,pen_id,session_id,event_id,raw_frame_timestamp_ms,host_receive_timestamp_ms,ink_event_timestamp_ms,render_commit_timestamp_ms,dropped
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-001,0,12,24,82,false
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-002,40,54,71,125,false
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-003,80,96,116,196,false
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-004,120,139,162,238,false
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-005,160,176,203,274,false
+LAT-EDU-001,education,simulator,pen_sample_001,sess_live_education,edu-006,200,220,252,340,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-001,0,18,37,128,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-002,50,68,92,178,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-003,100,121,146,254,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-004,150,169,202,305,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-005,200,225,252,390,false
+LAT-MEET-001,meeting,simulator,pen_sample_002,sess_live_meeting,meet-006,250,270,300,438,false

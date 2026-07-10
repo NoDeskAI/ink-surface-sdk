@@ -9,6 +9,10 @@ export interface InkLoopAnnotation {
   page_index?: number;
   visual_bbox?: [number, number, number, number];
   visual_strokes?: InkLoopVisualStroke[];
+  surface_strokes?: InkLoopVisualStroke[];
+  capture_surface?: string;
+  surface_coord_space?: string;
+  surface_bbox?: readonly number[];
 }
 
 export interface InkLoopStrokePoint {
@@ -19,10 +23,29 @@ export interface InkLoopStrokePoint {
 }
 
 export interface InkLoopVisualStroke {
-  tool?: 'pen' | 'highlighter';
+  tool?: 'pen' | 'aipen' | 'highlighter' | 'underline';
   color?: string;
   opacity?: number;
+  coord_space?: string;
+  capture_surface?: string;
+  layout_id?: string;
+  bbox?: readonly number[];
   points: InkLoopStrokePoint[];
+}
+
+export interface InkLoopReaderTextRun {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  font_size?: number;
+}
+
+export interface InkLoopReaderLayout {
+  width: number;
+  height: number;
+  text_runs: InkLoopReaderTextRun[];
 }
 
 export interface InkLoopVisualBlock {
@@ -38,6 +61,7 @@ export interface InkLoopVisualBlock {
 export interface InkLoopVisualModel {
   documentTitle: string;
   blocks: InkLoopVisualBlock[];
+  reader_layouts?: Record<string, InkLoopReaderLayout>;
 }
 
 export type InkLoopAnnotationPatch = Partial<Pick<InkLoopAnnotation, 'kind' | 'title' | 'body_md' | 'status'>>;

@@ -10,6 +10,8 @@
  */
 import type { NormBBox, OcrTextBlock } from '../core/contracts';
 
+export const LOCAL_REFLOW_ENGINE = 'local@v5';
+
 /** 确定性块 id：同页同引擎重排出同样的 id → 缩放/重渲后行内注不丢锚。 */
 export function blockId(text: string, index: number): string {
   let h = 0;
@@ -33,8 +35,22 @@ export interface ReflowBlock {
   anchorUnsafe?: boolean; // true=bbox 系模型估算(VLM 重写)，非文本层，跨视图映射不可靠
 }
 
+function isPageChromeText(text: string, bbox: NormBBox): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  const yc = bbox[1] + bbox[3] / 2;
+  const short = t.length <= 8;
+  const pageNumber = /^\d{1,4}$/.test(t) || /^[-–—]?\s*\d{1,4}\s*[-–—]?$/.test(t);
+  return (yc < 0.055 && short) || (yc > 0.9 && (short || pageNumber));
+}
+
+export function isPageChromeReflowBlock(block: Pick<ReflowBlock, 'text' | 'source'>): boolean {
+  return isPageChromeText(block.text, block.source);
+}
+
 /** 列表项前缀：项目符号 / 数字 / 圆圈数字 / 中文数字（行首 + 其后空白）。 */
 const LIST_RE = /^\s*([•·‣▪◦●○]|[-–—*]|\(?\d{1,2}[.)、]|[①-⑳]|[一二三四五六七八九十]{1,3}[、.])\s+/;
+const MAX_LINES_PER_READER_PARAGRAPH = 6;
 
 interface Line {
   runs: OcrTextBlock[];
@@ -51,6 +67,17 @@ const median = (xs: number[]): number => {
 };
 
 const isCJK = (c: string): boolean => /[　-鿿＀-￯]/.test(c);
+const isAsciiWordChar = (c: string): boolean => /[A-Za-z0-9]/.test(c);
+
+function shouldJoinAdjacentRuns(prev: OcrTextBlock, next: OcrTextBlock): boolean {
+  if (/\s$/.test(prev.text) || /^\s/.test(next.text)) return false;
+  const a = prev.text.trim().slice(-1);
+  const b = next.text.trim()[0] ?? '';
+  if (!isAsciiWordChar(a) || !isAsciiWordChar(b)) return false;
+  const prevRight = prev.bbox[0] + prev.bbox[2];
+  const gap = next.bbox[0] - prevRight;
+  return gap >= -0.001 && gap <= 0.0035;
+}
 
 /** 同一行内多个 run 按 x 拼接：中日韩之间不加空格，西文之间补空格。 */
 function joinRuns(texts: string[]): string {
@@ -61,6 +88,23 @@ function joinRuns(texts: string[]): string {
     if (!out) { out = t; continue; }
     const a = out[out.length - 1], b = t[0];
     out += (isCJK(a) || isCJK(b)) ? t : ' ' + t;
+  }
+  return out;
+}
+
+function joinLineRuns(runs: OcrTextBlock[]): string {
+  let out = '';
+  let prev: OcrTextBlock | null = null;
+  for (const run of runs) {
+    const t = run.text.trim();
+    if (!t) continue;
+    if (!out) {
+      out = t;
+    } else {
+      const a = out[out.length - 1], b = t[0];
+      out += isCJK(a) || isCJK(b) || (prev && shouldJoinAdjacentRuns(prev, run)) ? t : ` ${t}`;
+    }
+    prev = run;
   }
   return out;
 }
@@ -86,10 +130,7 @@ export function groupLines(blocks: OcrTextBlock[]): ReflowLine[] {
   const runs = blocks.filter((b) => b.text && b.text.trim());
   if (!runs.length) return [];
   const medH = median(runs.map((r) => r.bbox[3])) || 0.012;
-  const body = runs.filter((r) => {
-    const yc = r.bbox[1] + r.bbox[3] / 2;
-    return !((yc < 0.06 || yc > 0.94) && r.text.trim().length <= 6);
-  });
+  const body = runs.filter((r) => !isPageChromeText(r.text, r.bbox));
   body.sort((a, b) => (a.bbox[1] - b.bbox[1]) || (a.bbox[0] - b.bbox[0]));
   const lineGap = 0.6 * medH;
   const groups: OcrTextBlock[][] = [];
@@ -101,7 +142,7 @@ export function groupLines(blocks: OcrTextBlock[]): ReflowLine[] {
   }
   return groups.map((g, i) => {
     g.sort((a, b) => a.bbox[0] - b.bbox[0]);
-    return { id: 'ln_' + i, text: joinRuns(g.map((r) => r.text)), size: median(g.map((r) => r.bbox[3])), bbox: unionBBox(g), runIds: g.map((r) => r.id) };
+    return { id: 'ln_' + i, text: joinLineRuns(g), size: median(g.map((r) => r.bbox[3])), bbox: unionBBox(g), runIds: g.map((r) => r.id) };
   });
 }
 
@@ -111,12 +152,8 @@ export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {
 
   const medH = median(runs.map((r) => r.bbox[3])) || 0.012;
 
-  // 剥页眉/页脚/页码：贴顶(<0.06)或贴底(>0.94)且很短的 run
-  const body = runs.filter((r) => {
-    const yc = r.bbox[1] + r.bbox[3] / 2;
-    const short = r.text.trim().length <= 6;
-    return !((yc < 0.06 || yc > 0.94) && short);
-  });
+  // 剥页眉/页脚/页码：页脚页码常在 0.90–0.94 之间，不能只用 >0.94。
+  const body = runs.filter((r) => !isPageChromeText(r.text, r.bbox));
 
   // 单栏阅读顺序：先 y 后 x（多栏是已知缺口，留给模型版）
   body.sort((a, b) => (a.bbox[1] - b.bbox[1]) || (a.bbox[0] - b.bbox[0]));
@@ -150,11 +187,25 @@ export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {
   let listOrdered = false;
   let listMarkerX = 0;
 
+  const pushParaBlock = (linesForBlock: Line[]) => {
+    if (!linesForBlock.length) return;
+    const text = joinRuns(linesForBlock.map((l) => joinLineRuns(l.runs)));
+    const runs = linesForBlock.flatMap((l) => l.runs);
+    out.push({ id: blockId(text, out.length), type: 'para', level: 0, text, source: unionBBox(runs), sourceRunIds: runs.map((r) => r.id) });
+  };
   const flushPara = () => {
     if (!para.length) return;
-    const text = joinRuns(para.map((l) => joinRuns(l.runs.map((r) => r.text))));
-    const runs = para.flatMap((l) => l.runs);
-    out.push({ id: blockId(text, out.length), type: 'para', level: 0, text, source: unionBBox(runs), sourceRunIds: runs.map((r) => r.id) });
+    for (let start = 0; start < para.length;) {
+      let end = Math.min(para.length, start + MAX_LINES_PER_READER_PARAGRAPH);
+      for (let i = end - 1; i > start + 1; i--) {
+        if (/[。！？；.!?;]\s*$/.test(joinLineRuns(para[i].runs))) {
+          end = i + 1;
+          break;
+        }
+      }
+      pushParaBlock(para.slice(start, end));
+      start = end;
+    }
     para = [];
   };
   const flushList = () => {
@@ -168,7 +219,7 @@ export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {
 
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
-    const lineText = joinRuns(ln.runs.map((r) => r.text));
+    const lineText = joinLineRuns(ln.runs);
     const ratio = ln.size / bodyFont;
     const isHeading = ratio >= 1.22 && ln.runs.length > 0;
     if (isHeading) {
@@ -178,13 +229,13 @@ export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {
       continue;
     }
     // 列表项：行首是项目符号/编号
-    const m = lineText.match(LIST_RE);
+    const m = /^\s*\d{1,2}\.\s*\d/.test(lineText) ? null : lineText.match(LIST_RE);
     if (m) {
       flushPara();
       const ordered = /[\d①-⑳一二三四五六七八九十]/.test(m[1]);
       if (listItems.length && ordered !== listOrdered) flushList(); // 有序/无序切换 → 断开
       if (!listItems.length) { listOrdered = ordered; listMarkerX = ln.runs[0].bbox[0]; }
-      listItems.push(lineText.slice(m[0].length).trim());
+      listItems.push(lineText.trim());
       listLines.push(ln);
       continue;
     }
@@ -204,5 +255,12 @@ export function reflowLocal(blocks: OcrTextBlock[]): ReflowBlock[] {
     para.push(ln);
   }
   flushAll();
+  if (!out.length && lines.length) {
+    const text = joinRuns(lines.map((l) => joinLineRuns(l.runs)));
+    const fallbackRuns = lines.flatMap((l) => l.runs);
+    if (text.trim() && fallbackRuns.length) {
+      out.push({ id: blockId(text, 0), type: 'para', level: 0, text, source: unionBBox(fallbackRuns), sourceRunIds: fallbackRuns.map((r) => r.id) });
+    }
+  }
   return out;
 }

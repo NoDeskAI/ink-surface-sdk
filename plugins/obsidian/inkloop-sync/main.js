@@ -5,9 +5,18 @@ const INKLOOP_VIEW_TYPE = "inkloop-runtime-view";
 const DEFAULT_SETTINGS = {
   baseDir: ".inkloop",
   documentsDir: "InkLoop",
-  syncEndpoint: "http://127.0.0.1:8765/api/obsidian-lab/pull",
+  syncEndpoint: "",
+  runtimePushEndpoint: "http://127.0.0.1:8731/v1/runtime/events:push",
+  runtimePullEndpoint: "http://127.0.0.1:8731/v1/runtime/events:pull",
+  knowledgeBaseEndpoint: "http://127.0.0.1:8731/v1/knowledge",
+  deviceCommandEndpoint: "http://127.0.0.1:8731/v1/devices/commands",
+  tenantId: "local",
+  userId: "local_demo",
+  sessionToken: "",
+  deviceId: "obsidian-plugin",
   autoSyncOnChange: true,
-  debounceMs: 750,
+  debounceMs: 120,
+  runtimePollMs: 500,
   notifyManualSync: true,
   visualEnhancement: true,
   previewEditing: false,
@@ -19,12 +28,61 @@ const DEFAULT_SETTINGS = {
   },
 };
 
+function randomRuntimeDeviceId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  return `${prefix}_${String(random).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+}
+
+function normalizeRuntimeDeviceId(input, prefix) {
+  const value = String(input || "").trim();
+  if (!value || value === DEFAULT_SETTINGS.deviceId) return randomRuntimeDeviceId(prefix);
+  return value;
+}
+
+function cleanRuntimeNamespaceSegment(input, fallback) {
+  const value = String(input || "").trim();
+  if (!value || value === "." || value === ".." || /[\\/]/.test(value)) return fallback;
+  return value;
+}
+
+function runtimeNamespaceHeaders(settings) {
+  const headers = {
+    "x-inkloop-tenant-id": settings.tenantId || DEFAULT_SETTINGS.tenantId,
+    "x-inkloop-user-id": settings.userId || DEFAULT_SETTINGS.userId,
+  };
+  const token = String(settings.sessionToken || "").trim();
+  if (token) headers.authorization = `Bearer ${token}`;
+  return headers;
+}
+
+function cleanEndpoint(input) {
+  return String(input || "").trim().replace(/\/+$/, "");
+}
+
+function appendPath(base, path) {
+  const cleanBase = cleanEndpoint(base);
+  if (!cleanBase) return "";
+  return `${cleanBase}/${String(path || "").replace(/^\/+/, "")}`;
+}
+
+function deriveDeviceCommandEndpoint(settings) {
+  const explicit = cleanEndpoint(settings.deviceCommandEndpoint);
+  if (explicit) return explicit;
+  const knowledge = cleanEndpoint(settings.knowledgeBaseEndpoint);
+  const suffix = "/v1/knowledge";
+  if (knowledge.endsWith(suffix)) return `${knowledge.slice(0, -suffix.length)}/v1/devices/commands`;
+  return DEFAULT_SETTINGS.deviceCommandEndpoint;
+}
+
 const DEFAULT_INK_OPACITY = {
   pen: 0.92,
   highlighter: 0.56,
 };
 
 const INK_SWATCHES = ["#38bdf8", "#f8fafc", "#111827", "#facc15", "#fb7185", "#34d399"];
+const CONTROLLED_FIELDS_MARKER = "<!-- inkloop:controlled-fields v1 -->";
+const KNOWLEDGE_STATUSES = new Set(["inbox", "accepted", "edited", "follow_up", "dismissed", "export_ready", "exported", "archived"]);
+const RISK_STATUSES = new Set(["open", "watching", "mitigated", "closed"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -38,6 +96,11 @@ function cleanDir(input, fallback) {
   return parts.join("/");
 }
 
+function cleanLegacySyncEndpoint(input) {
+  const value = String(input || "").trim();
+  return value === "http://127.0.0.1:8765/api/obsidian-lab/pull" ? "" : value;
+}
+
 function normalizeText(input) {
   return String(input || "")
     .replace(/^#{1,6}\s+/gm, "")
@@ -46,6 +109,153 @@ function normalizeText(input) {
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function unquoteYamlScalar(input) {
+  const value = String(input || "").trim();
+  if (!value) return "";
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value.replace(/^['"]|['"]$/g, "");
+  }
+}
+
+function parseProjectionFrontmatter(markdown) {
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---\n")) return {};
+  const end = normalized.indexOf("\n---", 4);
+  if (end === -1) return {};
+  const out = {};
+  let listKey = null;
+  for (const line of normalized.slice(4, end).split("\n")) {
+    const list = line.match(/^\s*-\s*(.+?)\s*$/);
+    if (listKey && list) {
+      out[listKey] = Array.isArray(out[listKey]) ? out[listKey] : [];
+      out[listKey].push(unquoteYamlScalar(list[1]));
+      continue;
+    }
+    const entry = line.match(/^([A-Za-z0-9_-]+):(?:\s*(.*))?$/);
+    if (!entry) {
+      listKey = null;
+      continue;
+    }
+    const key = entry[1];
+    const raw = entry[2] || "";
+    if (!raw.trim()) {
+      out[key] = [];
+      listKey = key;
+    } else {
+      out[key] = unquoteYamlScalar(raw);
+      listKey = null;
+    }
+  }
+  return out;
+}
+
+function controlledSection(markdown) {
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  const markerIndex = normalized.indexOf(CONTROLLED_FIELDS_MARKER);
+  if (markerIndex === -1) return "";
+  const afterMarker = normalized.slice(markerIndex + CONTROLLED_FIELDS_MARKER.length);
+  const nextHeading = afterMarker.search(/\n##\s+/);
+  return (nextHeading === -1 ? afterMarker : afterMarker.slice(0, nextHeading)).trim();
+}
+
+function controlledLineValue(section, label) {
+  const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = section.match(new RegExp(`^\\s*-\\s*${escaped}:\\s*(.*)$`, "im"));
+  return match ? match[1].trim() : undefined;
+}
+
+function controlledTaskDone(section) {
+  const match = section.match(/^\s*-\s*\[([ xX])\]\s*Task done\s*$/im);
+  return match ? match[1].toLowerCase() === "x" : undefined;
+}
+
+function parseTagsLine(input) {
+  if (input === undefined) return undefined;
+  return String(input).split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function controlledPatchFromSection(section) {
+  if (!section) return null;
+  const patch = {};
+  const status = controlledLineValue(section, "Status");
+  const tags = parseTagsLine(controlledLineValue(section, "Tags"));
+  const taskDone = controlledTaskDone(section);
+  const riskStatus = controlledLineValue(section, "Risk status");
+  const riskNote = controlledLineValue(section, "Risk note");
+  const comment = controlledLineValue(section, "Comment");
+  if (KNOWLEDGE_STATUSES.has(status)) patch.status = status;
+  if (tags?.length) patch.tags = tags;
+  if (taskDone !== undefined) patch.task_done = taskDone;
+  if (RISK_STATUSES.has(riskStatus)) patch.risk_status = riskStatus;
+  if (riskNote !== undefined) patch.risk_note = riskNote.trim();
+  if (comment !== undefined) patch.comment_md = comment.trim();
+  return Object.keys(patch).length ? patch : null;
+}
+
+function buildControlledKnowledgeEdit({ documentId, documentUri, koId, kind, section }) {
+  if (!documentId || !koId || !kind) return null;
+  const patch = controlledPatchFromSection(section);
+  if (!patch) return null;
+  return {
+    schema_version: "inkloop.obsidian_controlled_knowledge_edit.v1",
+    document_id: documentId,
+    document_uri: documentUri,
+    ko_id: koId,
+    kind,
+    patch,
+    source: "obsidian_controlled_fields",
+  };
+}
+
+function inlineKoAttributes(input) {
+  const attrs = {};
+  for (const match of String(input || "").matchAll(/([a-zA-Z_][a-zA-Z0-9_-]*)="([^"]*)"/g)) {
+    attrs[match[1]] = unescapeHtml(match[2]);
+  }
+  return attrs;
+}
+
+function parseControlledKnowledgeEdit(markdown) {
+  const front = parseProjectionFrontmatter(markdown);
+  const section = controlledSection(markdown);
+  return buildControlledKnowledgeEdit({
+    documentId: typeof front.inkloop_document_id === "string" ? front.inkloop_document_id : "",
+    documentUri: typeof front.inkloop_document_uri === "string" ? front.inkloop_document_uri : undefined,
+    koId: typeof front.inkloop_knowledge_object_id === "string" ? front.inkloop_knowledge_object_id : "",
+    kind: typeof front.inkloop_knowledge_kind === "string" ? front.inkloop_knowledge_kind : "",
+    section,
+  });
+}
+
+function parseControlledKnowledgeEdits(markdown) {
+  const edits = [];
+  const frontEdit = parseControlledKnowledgeEdit(markdown);
+  if (frontEdit) edits.push(frontEdit);
+  const front = parseProjectionFrontmatter(markdown);
+  const fallbackDocumentId = typeof front.inkloop_document_id === "string" ? front.inkloop_document_id : "";
+  const fallbackDocumentUri = typeof front.inkloop_document_uri === "string" ? front.inkloop_document_uri : undefined;
+  const seen = new Set(edits.map((edit) => `${edit.document_id}::${edit.ko_id}`));
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  for (const match of normalized.matchAll(/<!--\s*inkloop:begin-ko\s+([^>]*)-->([\s\S]*?)<!--\s*inkloop:end-ko\s*-->/g)) {
+    const attrs = inlineKoAttributes(match[1]);
+    const edit = buildControlledKnowledgeEdit({
+      documentId: attrs.document_id || fallbackDocumentId,
+      documentUri: attrs.document_uri || fallbackDocumentUri,
+      koId: attrs.ko_id || "",
+      kind: attrs.kind || "",
+      section: controlledSection(match[2]),
+    });
+    if (!edit) continue;
+    const key = `${edit.document_id}::${edit.ko_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edits.push(edit);
+  }
+  return edits;
 }
 
 async function sha256Tagged(input) {
@@ -65,6 +275,68 @@ function sourceRefId(docId) {
 
 function jsonLine(value) {
   return `${JSON.stringify(value)}\n`;
+}
+
+function appendQuery(endpoint, params) {
+  const [withoutHash, hash] = String(endpoint || "").split("#", 2);
+  const [base, query] = withoutHash.split("?", 2);
+  const search = new URLSearchParams(query || "");
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+  }
+  const nextQuery = search.toString();
+  return `${base}${nextQuery ? `?${nextQuery}` : ""}${hash ? `#${hash}` : ""}`;
+}
+
+function parseRuntimeTime(input) {
+  const value = Date.parse(String(input || ""));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function nextRuntimeRetryAt(now, retryDelayMs = 2000) {
+  return new Date(parseRuntimeTime(now) + retryDelayMs).toISOString();
+}
+
+function shouldAttemptRuntimeEvent(event, now, maxAttempts = 5) {
+  if (event.status === "sent") return false;
+  if ((event.attempt_count || 0) >= maxAttempts) return false;
+  if (event.status === "failed" && event.next_retry_at && parseRuntimeTime(event.next_retry_at) > parseRuntimeTime(now)) return false;
+  return event.status === "pending" || event.status === "failed" || !event.status;
+}
+
+function normalizeRuntimePollMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_SETTINGS.runtimePollMs;
+  return Math.max(0, Math.round(parsed));
+}
+
+function isRuntimeAck(value) {
+  return !!value && typeof value === "object" && typeof value.event_id === "string" && typeof value.ok === "boolean";
+}
+
+function mergeRuntimeOutboxEvents(latestEvents, updatedEvents) {
+  const updatedById = new Map(updatedEvents.map((event) => [event.event_id, event]));
+  const seen = new Set();
+  const merged = latestEvents.map((event) => {
+    seen.add(event.event_id);
+    return updatedById.get(event.event_id) || event;
+  });
+  for (const event of updatedEvents) {
+    if (!seen.has(event.event_id)) merged.push(event);
+  }
+  return merged;
+}
+
+function assertRuntimePullPayload(payload) {
+  if (!payload || typeof payload !== "object") throw new Error("Runtime sync pull response must be an object.");
+  if (payload.schema_version !== "inkloop.runtime_sync_pull.v1") throw new Error("Runtime sync pull response has an unsupported schema_version.");
+  if (!Array.isArray(payload.events)) throw new Error("Runtime sync pull response must include events.");
+  if (typeof payload.next_cursor !== "string") throw new Error("Runtime sync pull response must include next_cursor.");
+  for (const event of payload.events) {
+    if (!event || typeof event !== "object" || typeof event.event_id !== "string" || typeof event.doc_id !== "string" || event.schema_version !== "inkloop.runtime_sync_event.v1") {
+      throw new Error("Runtime sync pull response contains a malformed event.");
+    }
+  }
 }
 
 function localId(prefix) {
@@ -94,6 +366,21 @@ function markdownChunks(markdown) {
 function titleFromMarkdown(markdown, fallback) {
   const heading = String(markdown || "").match(/^#\s+(.+)$/m);
   return heading?.[1]?.trim() || fallback || "Untitled";
+}
+
+function safeFileSegment(input, fallback = "InkLoop Document") {
+  const value = String(input || fallback)
+    .normalize("NFKC")
+    .trim()
+    .replace(/[\\/:*?"<>|#^[\]\n\r\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .slice(0, 96)
+    .trim();
+  return value || fallback;
+}
+
+function escapeHtmlComment(input) {
+  return String(input || "").replace(/--/g, "- -");
 }
 
 function markdownKind(chunk) {
@@ -373,6 +660,1152 @@ function cleanMarkdownFromVisualModel(model) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function compactMarkdownText(input, fallback = "") {
+  return normalizeText(input || fallback).replace(/\|/g, "\\|");
+}
+
+function annotationText(annotation, fallback = "Ink mark") {
+  return compactMarkdownText(annotation.body_md || annotation.text || annotation.title || annotation.description || fallback);
+}
+
+function blockQuoteText(block) {
+  return compactMarkdownText(block.source_anchor?.quote || block.text || "");
+}
+
+const READING_RUNTIME_SECTIONS = ["阅读摘要", "阅读笔记"];
+const MEETING_RUNTIME_SECTIONS = ["飞书智能纪要", "原始文字记录", "InkLoop 手写记录", "后处理结果"];
+const MEETING_ONLY_KINDS = new Set(["task", "decision", "risk", "meeting_action", "meeting_decision", "meeting_risk"]);
+
+function cloudKind(value) {
+  return String(value || "").toLowerCase();
+}
+
+function isMeetingOnlyKnowledgeObject(ko) {
+  return MEETING_ONLY_KINDS.has(cloudKind(ko?.kind));
+}
+
+function knowledgeObjectsForProjectionMode(entity) {
+  const objects = Array.isArray(entity?.knowledgeObjects) ? entity.knowledgeObjects : [];
+  if (entity?.mode !== "reading") return objects;
+  return objects.filter((ko) => !isMeetingOnlyKnowledgeObject(ko));
+}
+
+function runtimeProjectionMode(snapshot) {
+  const docId = String(snapshot.doc_id || "").toLowerCase();
+  const title = String(snapshot.document?.title || snapshot.identity?.title || "").toLowerCase();
+  const sourceKind = String(snapshot.identity?.source_kind || snapshot.source?.kind || "").toLowerCase();
+  return docId.startsWith("mtg") || sourceKind.includes("meeting") || title.includes("会议") ? "meeting" : "reading";
+}
+
+function meetingAnnotationGroup(annotation) {
+  const kind = String(annotation.kind || "").toLowerCase();
+  if (kind === "summary" || kind === "meeting_summary") return "飞书智能纪要";
+  if (kind === "ai_note" || kind === "postprocess" || kind === "meeting_postprocess") return "后处理结果";
+  return "InkLoop 手写记录";
+}
+
+function readingAnnotationGroup(annotation) {
+  const kind = String(annotation.kind || "").toLowerCase();
+  const tool = String(annotation.tool || annotation.ink_tool || "").toLowerCase();
+  if (kind === "summary" || kind === "reading_summary") return "阅读摘要";
+  return "阅读笔记";
+}
+
+function annotationGroup(annotation, mode = "reading") {
+  return mode === "meeting" ? meetingAnnotationGroup(annotation) : readingAnnotationGroup(annotation);
+}
+
+function annotationLabel(annotation, mode = "reading") {
+  const kind = String(annotation.kind || "").toLowerCase();
+  const tool = String(annotation.tool || annotation.ink_tool || "").toLowerCase();
+  if (mode === "meeting") {
+    if (kind === "meeting_action" || kind === "task" || kind === "todo" || kind === "action") return "任务";
+    if (kind === "meeting_decision" || kind === "decision") return "决策";
+    if (kind === "meeting_risk" || kind === "risk") return "风险";
+    if (kind === "meeting_summary" || kind === "summary") return "摘要";
+    return "会议标记";
+  }
+  if (kind === "ai_note" || kind.includes("ai") || tool === "aipen") return "AI 回应";
+  if (kind === "excerpt" || kind === "quote") return "摘录";
+  if (kind === "highlight" || tool === "highlighter") return "高亮";
+  if (kind === "review_later") return "待回看";
+  if (isStrokeOnlyAnnotation(annotation)) return "手写标记";
+  return "阅读标记";
+}
+
+function annotationLine(docId, block, annotation, mode = "reading") {
+  const label = annotationLabel(annotation, mode);
+  const text = annotationText(annotation, label);
+  const quote = blockQuoteText(block);
+  const uri = cloudSourceUri(docId, {
+    anchor: annotation.mark_id || annotation.entry_id || annotation.event_id,
+    koId: annotation.ko_id,
+  });
+  const suffix = quote && quote !== text ? ` — ${quote.slice(0, 160)}` : "";
+  return `- **${label}**：${text}${suffix} ([回到原文](${uri}))`;
+}
+
+function annotationProjectionScore(annotation) {
+  let score = 0;
+  if (annotation.render_mode !== "stroke_only") score += 2;
+  if (normalizeText(annotation.body_md || annotation.text || annotation.description)) score += 4;
+  if (annotation.kind === "ai_note") score += 1;
+  return score;
+}
+
+function groupedRuntimeAnnotations(snapshot, mode = "reading") {
+  const sections = mode === "meeting" ? MEETING_RUNTIME_SECTIONS : READING_RUNTIME_SECTIONS;
+  const groupMaps = Object.fromEntries(sections.map((section) => [section, new Map()]));
+  const put = (group, key, entry) => {
+    const previous = groupMaps[group].get(key);
+    if (!previous || entry.score > previous.score || (entry.score === previous.score && entry.line.length > previous.line.length)) {
+      groupMaps[group].set(key, entry);
+    }
+  };
+  for (const block of snapshot.blocks || []) {
+    for (const annotation of block.annotations || []) {
+      if (annotation.status === "deleted") continue;
+      if (mode === "reading" && MEETING_ONLY_KINDS.has(String(annotation.kind || "").toLowerCase())) continue;
+      const group = annotationGroup(annotation, mode);
+      const key = annotation.ko_id || `${group}:${annotationText(annotation)}`;
+      const entry = {
+        score: annotationProjectionScore(annotation),
+        line: annotationLine(snapshot.doc_id, block, annotation, mode),
+      };
+      put(group, key, entry);
+    }
+  }
+  return Object.fromEntries(Object.entries(groupMaps).map(([group, map]) => [group, [...map.values()].map((entry) => entry.line)]));
+}
+
+function renderRuntimeWrapperMarkdown(snapshot) {
+  const docId = snapshot.doc_id;
+  const title = snapshot.document?.title || docId;
+  const sourceKind = snapshot.identity?.source_kind || snapshot.source?.kind || "";
+  const mode = runtimeProjectionMode(snapshot);
+  const sections = mode === "meeting" ? MEETING_RUNTIME_SECTIONS : READING_RUNTIME_SECTIONS;
+  const groups = groupedRuntimeAnnotations(snapshot, mode);
+  const lines = [
+    `# ${title}`,
+    "",
+    `<!-- inkloop:runtime-doc doc_id="${escapeHtmlComment(docId)}" source_kind="${escapeHtmlComment(sourceKind)}" mode="${mode}" -->`,
+    "",
+    `原文： [inkloop://doc/${docId}](inkloop://doc/${encodeURIComponent(docId)})`,
+    "",
+  ];
+  for (const section of sections) {
+    lines.push(`## ${section}`, "");
+    const items = groups[section];
+    lines.push(items.length ? items.join("\n") : "暂无");
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function isPlaceholderRuntimeTitle(title) {
+  const value = normalizeText(title || "");
+  return !value || value === "(未命名)" || value === "未命名" || value.toLowerCase() === "untitled";
+}
+
+function runtimeSnapshotHasProjectionContent(snapshot) {
+  for (const block of snapshot?.blocks || []) {
+    if (normalizeText(block.text || block.text_md || block.content)) return true;
+    const annotations = Array.isArray(block.annotations) ? block.annotations : [];
+    if (annotations.some((annotation) => annotation?.status !== "deleted")) return true;
+  }
+  return false;
+}
+
+function shouldSkipRuntimeWrapperSnapshot(snapshot) {
+  const title = snapshot?.document?.title || "";
+  const sourceKind = String(snapshot?.identity?.source_kind || snapshot?.source?.kind || "").toLowerCase();
+  const hasContent = runtimeSnapshotHasProjectionContent(snapshot);
+  if (isPlaceholderRuntimeTitle(title) && !hasContent) return true;
+  return sourceKind === "inkloop_created" && !hasContent;
+}
+
+function yamlValue(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return undefined;
+  return JSON.stringify(String(value));
+}
+
+function yamlFrontmatter(entries) {
+  const lines = ["---"];
+  for (const [key, raw] of Object.entries(entries)) {
+    const value = yamlValue(raw);
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      lines.push(`${key}:`);
+      for (const item of value) lines.push(`  - ${JSON.stringify(String(item))}`);
+    } else {
+      lines.push(`${key}: ${value}`);
+    }
+  }
+  lines.push("---");
+  return lines.join("\n");
+}
+
+function cloudDocumentUri(docId) {
+  return `inkloop://doc/${encodeURIComponent(docId)}`;
+}
+
+function cloudSourceUri(docId, options = {}) {
+  const id = String(docId || "").trim();
+  if (!id) return "";
+  const anchor = String(options.anchor || "").trim();
+  const koId = String(options.koId || "").trim();
+  const pageIndex = Number.isFinite(Number(options.pageIndex)) ? Math.max(0, Number(options.pageIndex)) : null;
+  const suffix = pageIndex === null ? "" : `/page/${pageIndex + 1}`;
+  const params = [];
+  if (anchor) params.push(["anchor", anchor]);
+  else if (koId) params.push(["ko", koId]);
+  const query = params.length ? `?${params.map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join("&")}` : "";
+  return `${cloudDocumentUri(id)}${suffix}${query}`;
+}
+
+function firstCloudKoAnchor(ko) {
+  const anchors = [
+    ko?.provenance?.mark_ids?.[0],
+    ko?.source?.event_id,
+    ko?.source?.object_refs?.[0],
+    ko?.source?.mark_id,
+    ko?.mark_id,
+    ko?.event_id,
+  ];
+  return String(anchors.find((value) => String(value || "").trim()) || "").trim();
+}
+
+function cloudKoSourceUri(entity, ko) {
+  const existing = String(ko?.source?.inkloop_uri || "").trim();
+  if (/^inkloop:\/\/doc\//i.test(existing) && /[?&](anchor|mark)=/i.test(existing)) return existing;
+  const docId = ko?.source?.document_id || ko?.document_id || entity?.documentId || "";
+  const pageIndex = Number.isFinite(Number(ko?.source?.page_index)) ? Number(ko.source.page_index) : undefined;
+  return cloudSourceUri(docId, { pageIndex, anchor: firstCloudKoAnchor(ko), koId: ko?.ko_id });
+}
+
+function cleanCloudDocumentTitle(input, fallback = "InkLoop Document") {
+  return safeFileSegment(String(input || fallback).replace(/\s*\.(?:md|markdown|pdf|epub)$/i, ""), fallback);
+}
+
+function cloudKnowledgeFolder(settings, documentTitle, mode = "reading") {
+  const section = mode === "meeting" ? "Meetings" : "Reading";
+  return `${settings.documentsDir}/${section}/${cleanCloudDocumentTitle(documentTitle)}`;
+}
+
+function shortKoId(koId) {
+  return String(koId || "ko").replace(/^ko_/, "").slice(0, 8);
+}
+
+function cloudNoteBaseName(ko) {
+  return `${safeFileSegment(ko.title || ko.ko_id || "Ink mark")} - ${shortKoId(ko.ko_id)}`;
+}
+
+function cloudCallout(kind) {
+  if (kind === "task" || kind === "meeting_action") return "todo";
+  if (kind === "decision" || kind === "meeting_decision") return "tip";
+  if (kind === "risk" || kind === "meeting_risk") return "warning";
+  if (kind === "qa") return "question";
+  if (kind === "highlight" || kind === "excerpt") return "quote";
+  if (kind === "annotation" || kind === "reading_note" || kind === "ai_note" || kind === "ai_response") return "note";
+  return "summary";
+}
+
+function projectionBlockHasMeetingOnlyAnnotation(block) {
+  if (Array.isArray(block?.annotations)) {
+    return block.annotations.some((annotation) => MEETING_ONLY_KINDS.has(String(annotation?.kind || "").toLowerCase()));
+  }
+  return false;
+}
+
+function renderCloudProjectionBlocks(projections, mode = "reading") {
+  const seen = new Set();
+  const lines = [];
+  for (const projection of projections || []) {
+    for (const block of projection.blocks || []) {
+      if (mode === "reading" && projectionBlockHasMeetingOnlyAnnotation(block)) continue;
+      const text = String(block.text_md || block.text || "").trim();
+      if (!text) continue;
+      const key = normalizeText(text);
+      if (!key || seen.has(key) || isCloudNoiseText(key, projection.document_title)) continue;
+      seen.add(key);
+      if (lines.length && lines[lines.length - 1] !== "") lines.push("");
+      lines.push(text);
+    }
+  }
+  return lines.join("\n");
+}
+
+function isCloudNoiseText(text, documentTitle = "") {
+  const value = normalizeText(text);
+  if (!value) return true;
+  if (value === "稍后处理") return true;
+  const title = normalizeText(documentTitle).replace(/\.(pdf|epub|md|markdown)$/i, "");
+  if (title && value === title) return true;
+  if (/\.pdf\s*·\s*p\d+$/i.test(value)) return true;
+  return false;
+}
+
+function isCloudPlaceholderMarkText(text) {
+  const value = normalizeText(stripCloudMachineTrail(text || ""));
+  if (!value) return true;
+  const compact = value.replace(/[\s()（）/／·.。:：-]/g, "").toLowerCase();
+  if (["inkmark", "mark", "手写笔划标记", "图形标注圈画", "图形标注待识别", "待补充的ux范式标注"].includes(compact)) return true;
+  return /未识别出文本摘录|仅有图形|只有图形|仅包含图形|图形圈画|图形标注|缺少文本内容|需补充文字|暂无法提取|暂时无法提炼|无法提炼具体洞察|待补充|原文摘录与边注均显示为墨水标记|尚未形成文字注解|待二次回顾|后续补充/.test(value);
+}
+
+function isCloudDocumentMetadataFragment(text) {
+  const value = normalizeText(text || "");
+  return value.length < 96 && /中图分类号|文献标识码|文章编号|收稿日期|作者简介|基金项目/.test(value);
+}
+
+function isReferenceLikeCloudText(text) {
+  const value = normalizeText(text);
+  if (value.length < 80) return false;
+  const citationSignals = [
+    /\b[A-Z][a-z]+,\s+[A-Z]\./,
+    /\(\s*(19|20)\d{2}[a-z]?\s*\)/i,
+    /\b(pp\.|doi|isbn|arxiv|proceedings|conference|journal|ergonomics|interactions)\b/i,
+    /https?:\/\//i,
+  ].filter((pattern) => pattern.test(value)).length;
+  return citationSignals >= 2;
+}
+
+function isMeaningfulCloudSnapshotAnchor(text, documentTitle = "") {
+  const value = normalizeText(text);
+  return Boolean(value)
+    && !isCloudNoiseText(value, documentTitle)
+    && !isCloudDocumentMetadataFragment(value)
+    && !isReferenceLikeCloudText(value)
+    && !isCloudPlaceholderMarkText(value);
+}
+
+function isCloudLowSignalKo(ko, documentTitle = "") {
+  const title = normalizeText(ko.title || "");
+  const quote = normalizeText(ko.source?.quote || "");
+  const body = normalizeText(ko.body_md || "");
+  if (!isMeaningfulCloudSnapshotAnchor(title, documentTitle)
+    && !isMeaningfulCloudSnapshotAnchor(quote, documentTitle)
+    && !isMeaningfulCloudSnapshotAnchor(body, documentTitle)) return true;
+  if (title && isCloudNoiseText(title, documentTitle)) return true;
+  if (quote && isCloudNoiseText(quote, documentTitle)) return true;
+  if (String(ko.kind || "") === "excerpt" && isReferenceLikeCloudText(`${title} ${quote || body}`)) return true;
+  if (/^只是|并非向\s*AI|不是对\s*AI|属于读者/.test(body) && /\.pdf\s*·\s*p\d+$/i.test(title || quote)) return true;
+  return false;
+}
+
+function cloudProjectionAnnotationForKo(entity, koId) {
+  if (!koId) return null;
+  for (const projection of entity.documentProjections || []) {
+    for (const block of projection.blocks || []) {
+      for (const annotation of block.annotations || []) {
+        if (annotation?.ko_id === koId) return annotation;
+      }
+    }
+  }
+  return null;
+}
+
+function stripCloudMachineTrail(value) {
+  return String(value || "")
+    .replace(/\s+Marked evidence:\s*[\s\S]*?(?=\s+Backlink:|$)/gi, "")
+    .replace(/\s+Backlink:\s*\S+/gi, "")
+    .split("\n")
+    .filter((line) => !/^\s*(Marked evidence|Backlink):/i.test(line))
+    .join("\n")
+    .trim();
+}
+
+function cleanCloudAnnotationBody(annotation) {
+  return normalizeText(stripCloudMachineTrail(annotation?.body_md || annotation?.text || annotation?.title || ""));
+}
+
+function cloudDisplayKoTitle(ko, annotation, documentTitle = "") {
+  const title = normalizeText(ko.title || "");
+  if (title && !isCloudNoiseText(title, documentTitle)) return title;
+  const annotationBody = cleanCloudAnnotationBody(annotation);
+  if (annotationBody && !isCloudNoiseText(annotationBody, documentTitle)) return annotationBody.slice(0, 48);
+  return normalizeText(ko.kind || "标记") || "标记";
+}
+
+function isCloudLowSignalKoForEntity(entity, ko) {
+  if (String(ko.kind || "") === "excerpt" && isReferenceLikeCloudText(`${ko.title || ""} ${ko.source?.quote || ""} ${ko.body_md || ""}`)) return true;
+  const annotation = cloudProjectionAnnotationForKo(entity, ko.ko_id);
+  const annotationBody = cleanCloudAnnotationBody(annotation);
+  if (entity?.mode === "reading" && ![ko.source?.quote, annotationBody].some((text) => isMeaningfulCloudSnapshotAnchor(text, entity.documentTitle))) return true;
+  if (annotationBody && isMeaningfulCloudSnapshotAnchor(annotationBody, entity.documentTitle)) return false;
+  return isCloudLowSignalKo(ko, entity.documentTitle);
+}
+
+function cleanCloudKoBody(ko) {
+  return stripCloudMachineTrail(ko.body_md || "");
+}
+
+function cleanCloudTurnText(value) {
+  return normalizeText(value || "").replace(/\s+/g, " ").trim();
+}
+
+function cleanCloudAiAnswer(turn) {
+  return cleanCloudTurnText(turn.ai_reply || turn.response_md || turn.overlay?.display_text || turn.result?.content || "");
+}
+
+function cleanCloudAiQuestion(turn) {
+  const view = turn.inference_view || {};
+  const metadata = turn.metadata || {};
+  return cleanCloudTurnText(view.question || turn.question || metadata.user_note || view.marked || turn.marked_text || metadata.marked_text || "");
+}
+
+function cleanCloudAiReferent(turn) {
+  const view = turn.inference_view || {};
+  const metadata = turn.metadata || {};
+  return cleanCloudTurnText(view.referent_lines || metadata.quote_text || view.marked || turn.marked_text || metadata.marked_text || turn.anchor?.quote || "");
+}
+
+function shouldRenderCloudAiTurn(turn) {
+  return turn?.metadata?.classifier_respond !== false;
+}
+
+function cloudTurnUri(entity, turn) {
+  const docId = turn.document_id || entity.documentId;
+  const pageIndex = Number.isFinite(Number(turn.page_index)) ? Number(turn.page_index) : undefined;
+  return cloudSourceUri(docId, { pageIndex, anchor: turn.overlay_id || turn.mark_ids?.[0] });
+}
+
+function renderCloudAiTurnSections(entity) {
+  const seen = new Set();
+  const sections = [];
+  for (const turn of entity.aiTurns || []) {
+    if (!shouldRenderCloudAiTurn(turn)) continue;
+    const answer = cleanCloudAiAnswer(turn);
+    const question = cleanCloudAiQuestion(turn);
+    const referent = cleanCloudAiReferent(turn);
+    if (!answer || isCloudNoiseText(answer, entity.documentTitle)) continue;
+    if (isCloudNoiseText(question, entity.documentTitle) && isCloudNoiseText(referent, entity.documentTitle)) continue;
+    const key = `${question}|${referent}|${answer}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const lines = [];
+    if (referent && !isCloudNoiseText(referent, entity.documentTitle)) lines.push(`> 原文：${referent}`);
+    if (question && !isCloudNoiseText(question, entity.documentTitle)) lines.push(`> 手写：${question}`);
+    lines.push(`> AI：${answer}`);
+    lines.push(`[回到原文](${cloudTurnUri(entity, turn)})`);
+    sections.push(lines.join("\n"));
+  }
+  return sections;
+}
+
+function cloudSnapshotTime(input) {
+  const value = Date.parse(String(input || ""));
+  if (!Number.isFinite(value)) return "";
+  try {
+    return new Date(value).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch {
+    return String(input || "");
+  }
+}
+
+function cloudSnapshotLabel(kind, source = "mark") {
+  const value = cloudKind(kind);
+  if (source === "ai_turn" || value === "ai_note" || value === "ai_response" || value.includes("ai")) return "AI 旁注";
+  if (value === "highlight" || value === "excerpt" || value === "quote") return "高亮摘录";
+  if (value === "review_later") return "稍后回看";
+  if (value === "reading_summary" || value === "summary") return "阅读摘要";
+  if (value === "reading_note" || value === "note") return "阅读笔记";
+  return "手写标记";
+}
+
+function normalizeSnapshotBBox(input) {
+  const raw = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? input.split(",")
+      : input && typeof input === "object"
+        ? [input.x ?? input.left, input.y ?? input.top, input.w ?? input.width, input.h ?? input.height]
+        : [];
+  if (raw.length < 4) return null;
+  const nums = raw.slice(0, 4).map((value) => Number(value));
+  if (!nums.every(Number.isFinite)) return null;
+  const x = Math.min(1, Math.max(0, nums[0]));
+  const y = Math.min(1, Math.max(0, nums[1]));
+  const w = Math.min(1 - x, Math.max(0.006, nums[2]));
+  const h = Math.min(1 - y, Math.max(0.006, nums[3]));
+  return [x, y, w, h];
+}
+
+function snapshotAnnotationForKo(entity, ko) {
+  const projectionAnnotation = cloudProjectionAnnotationForKo(entity, ko.ko_id);
+  const koAnnotation = cloudAnnotationForKo(ko);
+  if (projectionAnnotation && koAnnotation && !snapshotHasInk(projectionAnnotation) && snapshotHasInk(koAnnotation)) {
+    return {
+      ...projectionAnnotation,
+      visual_strokes: koAnnotation.visual_strokes,
+      surface_strokes: koAnnotation.surface_strokes,
+    };
+  }
+  return projectionAnnotation || koAnnotation;
+}
+
+function snapshotTextLine(label, value) {
+  const text = normalizeText(value || "");
+  return text ? `<div class="inkloop-snapshot-field"><span>${escapeHtml(label)}</span><p>${escapeHtml(text)}</p></div>` : "";
+}
+
+function snapshotPageLabel(pageIndex) {
+  return Number.isFinite(Number(pageIndex)) ? `原文第 ${Number(pageIndex) + 1} 页` : "原文";
+}
+
+function snapshotStrokeTools(annotation) {
+  return [...(annotation?.visual_strokes || []), ...(annotation?.surface_strokes || [])]
+    .map((stroke) => String(stroke?.tool || "").toLowerCase())
+    .filter(Boolean);
+}
+
+function snapshotHasStrokeTool(annotation, tools) {
+  const wanted = new Set(tools);
+  return snapshotStrokeTools(annotation).some((tool) => wanted.has(tool));
+}
+
+function snapshotHasInk(annotation) {
+  return Boolean((annotation?.visual_strokes || []).length || (annotation?.surface_strokes || []).length);
+}
+
+function snapshotInkStrokeCount(annotation) {
+  return [...(annotation?.visual_strokes || []), ...(annotation?.surface_strokes || [])]
+    .filter((stroke) => Array.isArray(stroke?.points) && stroke.points.length > 1)
+    .length;
+}
+
+function isPlainInkSnapshot(snapshot) {
+  if (!snapshotHasInk(snapshot?.annotation)) return false;
+  if (snapshot.source === "ai_turn") return false;
+  const label = normalizeText(snapshot.label || "").toLowerCase();
+  const tools = snapshotStrokeTools(snapshot.annotation);
+  if (tools.some((tool) => tool === "highlighter" || tool === "underline" || tool === "aipen" || tool === "ai_pen")) return false;
+  return !/高亮|highlight|摘录|quote|excerpt|下划线|underline|ai|旁注/.test(label);
+}
+
+function cloudSnapshotLabelForKo(kind, annotation) {
+  if (snapshotHasStrokeTool(annotation, ["highlighter"])) return "高亮摘录";
+  if (snapshotHasStrokeTool(annotation, ["underline"])) return "下划线";
+  if (snapshotHasStrokeTool(annotation, ["aipen", "ai_pen"])) return "AI 笔";
+  return cloudSnapshotLabel(kind);
+}
+
+function snapshotTone(snapshot) {
+  const label = normalizeText(snapshot.label || snapshot.title || "").toLowerCase();
+  const strokes = snapshotStrokeTools(snapshot.annotation);
+  if (snapshot.source === "ai_turn" || /ai|旁注/.test(label)) return "ai";
+  if (/下划线|underline/.test(label)) return "underline";
+  if (/高亮|highlight|摘录|quote|excerpt/.test(label) || strokes.some((tool) => tool === "highlighter")) return "highlight";
+  return "pen";
+}
+
+function snapshotPrimaryText(snapshot) {
+  if (isPlainInkSnapshot(snapshot)) {
+    const count = snapshotInkStrokeCount(snapshot.annotation);
+    return count > 1 ? `手写快照 · ${count} 笔` : "手写快照";
+  }
+  const text = normalizeText(snapshot.quote || snapshot.handwriting || snapshot.body || snapshot.title || snapshot.label || "标记");
+  return isCloudPlaceholderMarkText(text) ? "手写/圈画" : text;
+}
+
+function sameSnapshotText(a, b) {
+  return normalizeText(a || "") === normalizeText(b || "");
+}
+
+function snapshotDetailLine(label, value, primary) {
+  if (!value || sameSnapshotText(value, primary)) return "";
+  if (isCloudPlaceholderMarkText(value)) return "";
+  return snapshotTextLine(label, value);
+}
+
+function readingSnapshotForAiTurn(entity, turn) {
+  const answer = cleanCloudAiAnswer(turn);
+  const question = cleanCloudAiQuestion(turn);
+  const referent = cleanCloudAiReferent(turn);
+  if (!answer || isCloudNoiseText(answer, entity.documentTitle)) return null;
+  if (isCloudNoiseText(question, entity.documentTitle) && isCloudNoiseText(referent, entity.documentTitle)) return null;
+  const pageIndex = Number.isFinite(Number(turn.page_index)) ? Number(turn.page_index) : undefined;
+  return {
+    id: turn.ai_turn_id || turn.turn_id || turn.overlay_id || localId("ai"),
+    label: "AI 旁注",
+    title: question && !isCloudNoiseText(question, entity.documentTitle) ? question.slice(0, 56) : "AI 旁注",
+    body: answer,
+    quote: isCloudNoiseText(referent, entity.documentTitle) ? "" : referent,
+    handwriting: isCloudNoiseText(question, entity.documentTitle) ? "" : question,
+    uri: cloudTurnUri(entity, turn),
+    pageIndex,
+    bbox: normalizeSnapshotBBox(turn.inference_view?.anchor_bbox || turn.anchor?.anchor_bbox || turn.overlay?.geometry?.anchor_bbox),
+    annotation: null,
+    createdAt: turn.created_at || turn.updated_at,
+    source: "ai_turn",
+  };
+}
+
+function readingSnapshotForKo(entity, ko) {
+  if (entity?.mode === "reading" && ko.provenance?.created_from === "ai_turn") return null;
+  const annotation = snapshotAnnotationForKo(entity, ko);
+  const plainInk = snapshotHasInk(annotation)
+    && !snapshotHasStrokeTool(annotation, ["highlighter", "underline", "aipen", "ai_pen"])
+    && !["highlight", "excerpt", "quote"].includes(cloudKind(ko.kind));
+  const annotationBody = cleanCloudAnnotationBody(annotation);
+  const body = plainInk ? "" : annotationBody && !isCloudNoiseText(annotationBody, entity.documentTitle) ? annotationBody : cleanCloudKoBody(ko);
+  const rawQuote = normalizeText(ko.source?.quote || "");
+  const quote = plainInk || isReferenceLikeCloudText(rawQuote) || isCloudNoiseText(rawQuote, entity.documentTitle) ? "" : rawQuote;
+  const uri = cloudKoSourceUri(entity, ko);
+  const bbox = normalizeSnapshotBBox(annotation?.visual_bbox || annotation?.anchor_bbox || ko.source?.anchor_bbox || ko.visual_bbox);
+  const hasSnapshotSignal = Boolean(body || quote || snapshotHasInk(annotation) || bbox);
+  if (!hasSnapshotSignal) return null;
+  const displayTitle = cloudDisplayKoTitle(ko, annotation, entity.documentTitle);
+  const title = /^(reading_note|annotation|excerpt|highlight|note|标记|阅读笔记)$/i.test(displayTitle) && body
+    ? body.slice(0, 56)
+    : displayTitle;
+  return {
+    id: ko.ko_id || localId("ko"),
+    title,
+    body,
+    quote,
+    handwriting: annotationBody && annotationBody !== body ? annotationBody : "",
+    uri,
+    pageIndex: Number.isFinite(Number(ko.source?.page_index)) ? Number(ko.source.page_index) : annotation?.page_index,
+    bbox,
+    annotation,
+    createdAt: ko.created_at || ko.updated_at,
+    source: "knowledge_object",
+    label: plainInk ? "手写快照" : cloudSnapshotLabelForKo(ko.kind, annotation),
+  };
+}
+
+function readingSnapshots(entity) {
+  const snapshots = [];
+  const seen = new Set();
+  const add = (snapshot) => {
+    if (!snapshot) return;
+    const key = normalizeText(`${snapshot.source}:${snapshot.uri}:${snapshot.title}:${snapshot.body}:${snapshot.quote}`);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    snapshots.push(snapshot);
+  };
+  for (const ko of knowledgeObjectsForProjectionMode(entity)) {
+    if (cloudReadingKoSection(ko) === "summary") continue;
+    add(readingSnapshotForKo(entity, ko));
+  }
+  return snapshots.sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+}
+
+function koForAiTurn(entity, turn) {
+  const markIds = new Set(Array.isArray(turn.mark_ids) ? turn.mark_ids.map(String) : []);
+  if (!markIds.size) return null;
+  return (entity.knowledgeObjects || []).find((ko) =>
+    (ko.provenance?.mark_ids || ko.source?.object_refs || []).some((markId) => markIds.has(String(markId))),
+  ) || null;
+}
+
+function readingAiSnapshots(entity) {
+  const snapshots = [];
+  const seen = new Set();
+  for (const turn of entity.aiTurns || []) {
+    if (!shouldRenderCloudAiTurn(turn)) continue;
+    const answer = cleanCloudAiAnswer(turn);
+    if (!answer || isCloudNoiseText(answer, entity.documentTitle) || isCloudPlaceholderMarkText(answer)) continue;
+    const ko = koForAiTurn(entity, turn);
+    const kind = cloudKind(ko?.kind);
+    const question = cleanCloudAiQuestion(turn);
+    const referent = cleanCloudAiReferent(turn);
+    const hasExplicitPrompt = isMeaningfulCloudSnapshotAnchor(question, entity.documentTitle) || isMeaningfulCloudSnapshotAnchor(referent, entity.documentTitle);
+    const linkedToHighlightedText = kind === "highlight" || kind === "excerpt" || kind === "quote";
+    if (!hasExplicitPrompt && !linkedToHighlightedText) continue;
+    const pageIndex = Number.isFinite(Number(turn.page_index))
+      ? Number(turn.page_index)
+      : Number.isFinite(Number(ko?.source?.page_index))
+        ? Number(ko.source.page_index)
+        : undefined;
+    const quote = isMeaningfulCloudSnapshotAnchor(referent, entity.documentTitle)
+      ? referent
+      : isMeaningfulCloudSnapshotAnchor(ko?.source?.quote, entity.documentTitle)
+        ? normalizeText(ko.source.quote)
+        : "";
+    const id = turn.ai_turn_id || turn.turn_id || turn.overlay_id || localId("ai");
+    const key = normalizeText(`${id}:${quote}:${answer}`);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    snapshots.push({
+      id,
+      label: "AI 旁注",
+      title: question && !isCloudNoiseText(question, entity.documentTitle) ? question.slice(0, 56) : "AI 旁注",
+      body: answer,
+      quote,
+      handwriting: question && !isCloudNoiseText(question, entity.documentTitle) ? question : "",
+      uri: ko ? cloudKoSourceUri(entity, ko) : cloudTurnUri(entity, turn),
+      pageIndex,
+      bbox: normalizeSnapshotBBox(turn.inference_view?.anchor_bbox || turn.anchor?.anchor_bbox || turn.overlay?.geometry?.anchor_bbox || ko?.source?.anchor_bbox),
+      annotation: null,
+      createdAt: turn.created_at || turn.updated_at || ko?.created_at,
+      source: "ai_turn",
+    });
+  }
+  return snapshots.sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+}
+
+function renderReadingSnapshotBoard(snapshots, options = {}) {
+  const title = options.title || "原文标记";
+  const empty = options.empty || `暂无${title}。`;
+  if (!snapshots.length) return empty;
+  const items = snapshots.map((snapshot, index) => {
+    const detailId = `inkloop-snapshot-${escapeHtml(String(snapshot.id || index)).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const primary = snapshotPrimaryText(snapshot);
+    const tone = snapshotTone(snapshot);
+    const meta = [
+      snapshotPageLabel(snapshot.pageIndex),
+      cloudSnapshotTime(snapshot.createdAt),
+    ].filter(Boolean).join(" · ");
+    const details = [
+      snapshotDetailLine("原文摘录", snapshot.quote, primary),
+      snapshotDetailLine(snapshot.source === "ai_turn" ? "手写问题" : "手写内容", snapshot.handwriting, primary),
+      snapshot.source === "ai_turn" ? snapshotDetailLine("AI 旁注", snapshot.body, primary) : "",
+    ].filter(Boolean).join("");
+    const inkPreview = svgForAnnotation(snapshot.annotation);
+    return [
+      `<details class="inkloop-snapshot-card"${index === 0 ? " open" : ""} id="${detailId}">`,
+      `<summary class="inkloop-snapshot-summary">`,
+      `<span class="inkloop-snapshot-summary-text"><strong>${escapeHtml(snapshot.label || "标记")}</strong><em>${escapeHtml(meta)}</em></span>`,
+      `<span class="inkloop-snapshot-markline is-${escapeHtml(tone)}">${escapeHtml(primary)}</span>`,
+      `</summary>`,
+      `<div class="inkloop-snapshot-detail">`,
+      inkPreview ? `<div class="inkloop-snapshot-ink-preview">${inkPreview}</div>` : "",
+      `<div class="inkloop-snapshot-detail-copy">`,
+      details || `<p class="inkloop-snapshot-muted">已保留原文位置；这是一条原始标记快照。</p>`,
+      `<a class="inkloop-snapshot-open" href="${escapeHtml(snapshot.uri)}">回到原文</a>`,
+      `</div>`,
+      `</div>`,
+      `</details>`,
+    ].join("");
+  }).join("\n");
+  return [
+    `<section class="inkloop-snapshot-board" data-count="${snapshots.length}">`,
+    `<div class="inkloop-snapshot-board-head"><strong>${escapeHtml(title)}</strong><span>${snapshots.length} 项</span></div>`,
+    items,
+    `</section>`,
+  ].join("\n");
+}
+
+function renderedCloudAiTurnDedupeKeys(entity) {
+  const keys = new Set();
+  for (const turn of entity.aiTurns || []) {
+    if (!shouldRenderCloudAiTurn(turn)) continue;
+    const answer = cleanCloudAiAnswer(turn);
+    const question = cleanCloudAiQuestion(turn);
+    const referent = cleanCloudAiReferent(turn);
+    if (!answer || isCloudNoiseText(answer, entity.documentTitle)) continue;
+    if (isCloudNoiseText(question, entity.documentTitle) && isCloudNoiseText(referent, entity.documentTitle)) continue;
+    const contentKey = normalizeText(`${referent}|${answer}`);
+    if (contentKey) keys.add(`content:${contentKey}`);
+    if (turn.overlay_id) keys.add(`anchor:${turn.overlay_id}`);
+    for (const markId of turn.mark_ids || []) keys.add(`anchor:${markId}`);
+  }
+  return keys;
+}
+
+function cloudKoDedupeKeys(ko) {
+  const keys = new Set();
+  const quote = normalizeText(ko.source?.quote || "");
+  const body = normalizeText(cleanCloudKoBody(ko));
+  const contentKey = normalizeText(`${quote}|${body}`);
+  if (contentKey) keys.add(`content:${contentKey}`);
+  const bodyKey = normalizeText(`${ko.kind || ""}|${ko.title || ""}|${body}`);
+  if (bodyKey) keys.add(`body:${bodyKey}`);
+  for (const ref of ko.source?.object_refs || []) keys.add(`anchor:${ref}`);
+  for (const markId of ko.provenance?.mark_ids || []) keys.add(`anchor:${markId}`);
+  const uriAnchor = String(ko.source?.inkloop_uri || "").match(/[?&]anchor=([^&]+)/)?.[1];
+  if (uriAnchor) {
+    try {
+      keys.add(`anchor:${decodeURIComponent(uriAnchor)}`);
+    } catch {
+      keys.add(`anchor:${uriAnchor}`);
+    }
+  }
+  return keys;
+}
+
+function renderCloudKoSections(entity, aiTurnDedupeKeys = new Set(), includeKo = null) {
+  const seen = new Set();
+  const sections = [];
+  for (const ko of knowledgeObjectsForProjectionMode(entity)) {
+    if (includeKo && !includeKo(ko)) continue;
+    if (isCloudLowSignalKoForEntity(entity, ko)) continue;
+    const annotation = cloudProjectionAnnotationForKo(entity, ko.ko_id);
+    const annotationBody = cleanCloudAnnotationBody(annotation);
+    const body = annotationBody && !isCloudNoiseText(annotationBody, entity.documentTitle) ? annotationBody : cleanCloudKoBody(ko);
+    const title = cloudDisplayKoTitle(ko, annotation, entity.documentTitle);
+    const rawQuote = normalizeText(ko.source?.quote || "");
+    const quote = isReferenceLikeCloudText(rawQuote) ? "" : rawQuote;
+    const key = normalizeText(`${ko.kind || ""}|${title}|${body || quote}`);
+    if (seen.has(key)) continue;
+    const dedupeKeys = cloudKoDedupeKeys(ko);
+    if ([...dedupeKeys].some((dedupeKey) => aiTurnDedupeKeys.has(dedupeKey))) continue;
+    seen.add(key);
+    const uri = cloudKoSourceUri(entity, ko);
+    const lines = [`### ${title}`];
+    if (quote && !isCloudNoiseText(quote, entity.documentTitle)) lines.push(`> 原文：${quote}`);
+    if (body) lines.push(body);
+    if (uri) lines.push(`[回到原文](${uri})`);
+    const svg = svgForAnnotation(cloudAnnotationForKo(ko));
+    if (svg) lines.push(svg);
+    sections.push(lines.join("\n\n"));
+  }
+  return sections;
+}
+
+function isMeetingSummaryKo(ko) {
+  const kind = cloudKind(ko?.kind);
+  return kind === "summary" || kind === "meeting_summary";
+}
+
+function isFeishuMeetingSummaryKo(ko) {
+  if (!isMeetingSummaryKo(ko)) return false;
+  return /飞书智能纪要|智能纪要|feishu|lark/i.test(`${ko?.title || ""}\n${ko?.body_md || ""}`);
+}
+
+function isMeetingPostprocessKo(ko) {
+  const kind = cloudKind(ko?.kind);
+  if (ko?.provenance?.created_from === "ai_turn") return true;
+  return ["meeting_action", "meeting_decision", "meeting_risk", "qa", "task", "decision", "risk"].includes(kind)
+    && Array.isArray(ko?.source_refs)
+    && ko.source_refs.some((ref) => ref?.ref_type === "meeting_mark");
+}
+
+function isMeetingHandwritingKo(ko) {
+  if (isMeetingSummaryKo(ko) || isMeetingPostprocessKo(ko)) return false;
+  if (ko?.provenance?.created_from === "mark") return true;
+  return !!cloudAnnotationForKo(ko);
+}
+
+function cloudReadingKoSection(ko) {
+  if (isMeetingOnlyKnowledgeObject(ko)) return null;
+  const kind = cloudKind(ko?.kind);
+  const titleAndBody = `${ko?.title || ""} ${ko?.body_md || ""}`;
+  const title = String(ko?.title || "");
+  if (kind === "summary" || kind === "reading_summary") return "summary";
+  if (kind === "highlight" || kind === "excerpt" || kind === "markup" || kind === "quote") return "highlight";
+  if (kind === "ai_note" || kind === "ai_response") return "ai";
+  if (kind === "review_later" || /待回看|稍后回看|review later/i.test(titleAndBody)) return "review";
+  if (/^阅读笔记[:：]/.test(title) || /^读后笔记[:：]/.test(title)) return "note";
+  if (cloudAnnotationForKo(ko) || /手写|边注|普通笔刷|笔迹|划线|圈出|验收项|freehand|hand/i.test(titleAndBody)) return "thought";
+  if (kind === "annotation" || kind === "note") return "thought";
+  if (kind === "reading_note") return "note";
+  return "thought";
+}
+
+function renderCloudControlledFields(ko) {
+  const lines = [
+    "## Controlled Fields",
+    CONTROLLED_FIELDS_MARKER,
+    `- Status: ${ko.status || "inbox"}`,
+    `- Tags: ${(ko.tags || []).join(", ")}`,
+  ];
+  if (ko.kind === "task" || ko.kind === "meeting_action") lines.push(`- [${ko.controlled_fields?.task_done ? "x" : " "}] Task done`);
+  if (ko.kind === "risk" || ko.kind === "meeting_risk") {
+    lines.push(`- Risk status: ${ko.controlled_fields?.risk_status || "open"}`);
+    lines.push(`- Risk note: ${ko.controlled_fields?.risk_note || ""}`);
+  }
+  if (ko.kind === "highlight" || ko.kind === "excerpt" || ko.kind === "annotation") {
+    lines.push(`- Comment: ${ko.controlled_fields?.comment_md || ""}`);
+  }
+  return lines.join("\n");
+}
+
+function cloudAnnotationForKo(ko) {
+  const visualStrokes = Array.isArray(ko.visual_strokes)
+    ? ko.visual_strokes
+    : Array.isArray(ko.source?.visual_strokes)
+      ? ko.source.visual_strokes
+      : [];
+  const surfaceStrokes = Array.isArray(ko.surface_strokes)
+    ? ko.surface_strokes
+    : Array.isArray(ko.source?.surface_strokes)
+      ? ko.source.surface_strokes
+      : [];
+  const strokes = visualStrokes.length ? visualStrokes : surfaceStrokes;
+  if (!strokes.length) return null;
+  return {
+    ko_id: ko.ko_id,
+    kind: ko.kind,
+    title: ko.title,
+    body_md: ko.body_md,
+    render_mode: "stroke_only",
+    visual_strokes: strokes,
+    surface_strokes: surfaceStrokes,
+  };
+}
+
+function svgNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function svgPoint(point) {
+  if (Array.isArray(point)) return { x: svgNumber(point[0]), y: svgNumber(point[1]) };
+  return { x: svgNumber(point?.x), y: svgNumber(point?.y) };
+}
+
+function svgPointValue(value, normalized) {
+  const number = normalized ? value * 100 : value;
+  return Math.round(number * 100) / 100;
+}
+
+function svgStrokePath(points, normalized) {
+  return points
+    .map((point, index) => `${index === 0 ? "M" : "L"}${svgPointValue(point.x, normalized)},${svgPointValue(point.y, normalized)}`)
+    .join(" ");
+}
+
+function svgForAnnotation(annotation) {
+  const rawStrokes = (annotation?.visual_strokes?.length ? annotation.visual_strokes : annotation?.surface_strokes) || [];
+  if (!rawStrokes.length) return "";
+  const strokes = rawStrokes
+    .map((stroke) => ({
+      ...stroke,
+      points: Array.isArray(stroke?.points) ? stroke.points.map(svgPoint).filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)) : [],
+    }))
+    .filter((stroke) => stroke.points.length > 1);
+  if (!strokes.length) return "";
+
+  const allPoints = strokes.flatMap((stroke) => stroke.points);
+  const normalized = allPoints.every((point) => point.x >= -0.05 && point.x <= 1.05 && point.y >= -0.05 && point.y <= 1.05);
+  const xs = allPoints.map((point) => svgPointValue(point.x, normalized));
+  const ys = allPoints.map((point) => svgPointValue(point.y, normalized));
+  const minX = normalized ? 0 : Math.min(...xs);
+  const minY = normalized ? 0 : Math.min(...ys);
+  const maxX = normalized ? 100 : Math.max(...xs);
+  const maxY = normalized ? 100 : Math.max(...ys);
+  const pad = normalized ? 0 : 12;
+  const viewBox = [
+    Math.round((minX - pad) * 100) / 100,
+    Math.round((minY - pad) * 100) / 100,
+    Math.max(1, Math.round((maxX - minX + pad * 2) * 100) / 100),
+    Math.max(1, Math.round((maxY - minY + pad * 2) * 100) / 100),
+  ].join(" ");
+  const paths = strokes.map((stroke) => {
+    const tool = String(stroke.tool || "pen").replace(/[^a-zA-Z0-9_-]/g, "");
+    const color = /^#[0-9a-fA-F]{6}$/.test(String(stroke.color || "")) ? String(stroke.color) : "#38bdf8";
+    const opacity = Math.min(1, Math.max(0.08, Number(stroke.opacity) || (tool === "highlighter" ? 0.48 : 0.92)));
+    const width = tool === "highlighter" ? 4.8 : 2.4;
+    return `<path class="inkloop-cloud-mark-freehand is-${escapeHtml(tool)}" d="${escapeHtml(svgStrokePath(stroke.points, normalized))}" fill="none" stroke="${escapeHtml(color)}" stroke-opacity="${opacity}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
+  }).join("");
+  const aspectStyle = normalized
+    ? "aspect-ratio:3/4;height:auto;min-height:120px;max-height:260px;"
+    : "height:120px;";
+  const preserve = normalized ? "none" : "xMidYMid meet";
+  return [
+    `<svg class="inkloop-cloud-mark-layer" data-inkloop-knowledge-object="${escapeHtml(annotation.ko_id || "")}" viewBox="${escapeHtml(viewBox)}" preserveAspectRatio="${preserve}" role="img" aria-label="InkLoop mark" style="display:block;width:100%;${aspectStyle}margin:12px 0;border:1px solid rgba(148,163,184,0.35);border-radius:8px;background:rgba(248,250,252,0.72)">`,
+    paths,
+    "</svg>",
+  ].join("");
+}
+
+function renderCloudSourceHub(settings, entity, noteNames) {
+  const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
+  const title = cleanCloudDocumentTitle(entity.documentTitle, entity.documentId);
+  const uri = cloudDocumentUri(entity.documentId);
+  const aiTurnSections = renderCloudAiTurnSections(entity);
+  const aiTurnDedupeKeys = renderedCloudAiTurnDedupeKeys(entity);
+  const summarySections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => cloudReadingKoSection(ko) === "summary");
+  const readingNoteSections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => {
+    const section = cloudReadingKoSection(ko);
+    return section && section !== "summary";
+  });
+  const projectionBody = renderCloudProjectionBlocks(entity.documentProjections, entity.mode);
+  const lines = [
+    `[在 InkLoop 打开原文](${uri})`,
+  ];
+  const noteBlocks = [...aiTurnSections, ...renderCloudKoSections(entity, aiTurnDedupeKeys)];
+  if (entity.mode === "meeting") {
+    const feishuSummarySections = renderCloudKoSections(entity, aiTurnDedupeKeys, isFeishuMeetingSummaryKo);
+    const handwritingSections = renderCloudKoSections(entity, aiTurnDedupeKeys, isMeetingHandwritingKo);
+    const postprocessSections = renderCloudKoSections(entity, aiTurnDedupeKeys, isMeetingPostprocessKo);
+    lines.push("## 飞书智能纪要", feishuSummarySections.length ? feishuSummarySections.join("\n\n---\n\n") : "暂无飞书智能纪要。");
+    if (projectionBody) lines.push("## 原始文字记录", projectionBody);
+    lines.push("## InkLoop 手写记录", handwritingSections.length ? handwritingSections.join("\n\n---\n\n") : "暂无手写记录。");
+    lines.push("## 后处理结果", postprocessSections.length ? postprocessSections.join("\n\n---\n\n") : (noteBlocks.length ? noteBlocks.join("\n\n---\n\n") : "暂无后处理结果。"));
+  } else {
+    lines.push("## 阅读摘要", summarySections.length ? summarySections.join("\n\n---\n\n") : "暂无阅读摘要。");
+    const snapshots = readingSnapshots(entity);
+    const aiSnapshots = readingAiSnapshots(entity);
+    lines.push("## 阅读标记", renderReadingSnapshotBoard(snapshots, { title: "原文标记", empty: "暂无原文标记。" }));
+    if (aiSnapshots.length) lines.push("## AI 旁注", renderReadingSnapshotBoard(aiSnapshots, { title: "AI 旁注", empty: "暂无 AI 旁注。" }));
+  }
+  return { path: `${folder}/${title}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
+}
+
+function renderCloudKoNote(settings, entity, ko, noteNames) {
+  const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
+  const base = noteNames.get(ko.ko_id);
+  const uri = cloudKoSourceUri(entity, ko);
+  const lines = [
+    yamlFrontmatter({
+      inkloop_document_id: ko.source?.document_id || entity.documentId,
+      inkloop_document_uri: uri,
+      inkloop_knowledge_object_id: ko.ko_id,
+      inkloop_knowledge_kind: ko.kind,
+      inkloop_projection_role: "knowledge_projection",
+      inkloop_projection_scope: "reviewed_knowledge_only",
+      inkloop_status: ko.status,
+      tags: ko.tags || [],
+    }),
+    `# ${ko.title || ko.ko_id}`,
+    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
+  ];
+  const body = String(ko.body_md || "").trim();
+  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
+  lines.push(renderCloudControlledFields(ko));
+  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
+  if (svg) lines.push(svg);
+  return { path: `${folder}/${base}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
+}
+
+function renderCloudInlineKoSection(ko) {
+  const uri = cloudKoSourceUri({ documentId: ko.source?.document_id || ko.document_id || "" }, ko);
+  const documentId = ko.source?.document_id || ko.document_id || "";
+  const lines = [
+    `<!-- inkloop:begin-ko document_id="${escapeHtml(documentId)}" document_uri="${escapeHtml(uri)}" ko_id="${escapeHtml(ko.ko_id)}" kind="${escapeHtml(ko.kind)}" -->`,
+    `### ${ko.title || ko.ko_id}`,
+    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
+  ];
+  const body = String(ko.body_md || "").trim();
+  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
+  if (uri) lines.push(`[回到原文](${uri})`);
+  lines.push(renderCloudControlledFields(ko).replace(/^## Controlled Fields/u, "#### Controlled Fields"));
+  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
+  if (svg) lines.push(svg);
+  lines.push("<!-- inkloop:end-ko -->");
+  return lines.join("\n\n");
+}
+
+function renderCloudKnowledgeMarkdown(settings, objects, projections, aiTurns = []) {
+  const byDoc = new Map();
+  const ensure = (docId, title) => {
+    const id = String(docId || "").trim();
+    if (!id) return null;
+    const current = byDoc.get(id) || {
+      documentId: id,
+      documentTitle: title || id,
+      mode: id.startsWith("mtgdoc_") ? "meeting" : "reading",
+      knowledgeObjects: [],
+      documentProjections: [],
+      aiTurns: [],
+    };
+    if (title && current.documentTitle === id) current.documentTitle = title;
+    byDoc.set(id, current);
+    return current;
+  };
+  for (const projection of projections || []) {
+    ensure(projection.document_id, projection.document_title)?.documentProjections.push(projection);
+  }
+  for (const ko of objects || []) {
+    const docId = ko.source?.document_id || ko.document_id;
+    ensure(docId, ko.source?.document_title)?.knowledgeObjects.push(ko);
+  }
+  for (const turn of aiTurns || []) {
+    ensure(turn.document_id, turn.document_title || turn.inference_view?.document_title)?.aiTurns.push(turn);
+  }
+  const noteNames = new Map();
+  for (const entity of byDoc.values()) {
+    for (const ko of knowledgeObjectsForProjectionMode(entity)) noteNames.set(ko.ko_id, cloudNoteBaseName(ko));
+  }
+  const files = [];
+  for (const entity of [...byDoc.values()].sort((a, b) => a.documentTitle.localeCompare(b.documentTitle))) {
+    entity.knowledgeObjects.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+    entity.documentProjections.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+    entity.aiTurns.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+    files.push(renderCloudSourceHub(settings, entity, noteNames));
+  }
+  return files;
+}
+
+function isCloudKnowledgeTestRun(item) {
+  const metadata = item?.metadata || {};
+  return metadata.inkloop_test_run === true || metadata.test_run === true;
+}
+
+function isCloudKnowledgeHiddenDoc(docId, title = "") {
+  const id = String(docId || "").toLowerCase();
+  const name = String(title || "").toLowerCase();
+  if (/inkloop v1 demo|product e2e|v1 product e2e|last verify|verify|测试文档|\be2e\b|\btest\b|\bsmoke\b/.test(name)) return true;
+  if (/^doc_v1_/.test(id)) return true;
+  return id.includes("test") || id.includes("e2e");
+}
+
+function filterCloudKnowledgeForObsidian(objects, projections) {
+  const testDocIds = new Set();
+  for (const projection of projections || []) {
+    if (isCloudKnowledgeTestRun(projection) && projection.document_id) testDocIds.add(projection.document_id);
+    if (isCloudKnowledgeHiddenDoc(projection.document_id, projection.document_title) && projection.document_id) testDocIds.add(projection.document_id);
+  }
+  for (const ko of objects || []) {
+    const docId = ko.source?.document_id || ko.document_id;
+    const title = ko.source?.document_title || ko.document_title || ko.title;
+    if ((isCloudKnowledgeTestRun(ko) || isCloudKnowledgeHiddenDoc(docId, title)) && docId) testDocIds.add(docId);
+  }
+  const visibleObjects = (objects || []).filter((ko) => {
+    const docId = ko.source?.document_id || ko.document_id;
+    return !isCloudKnowledgeTestRun(ko) && !testDocIds.has(docId);
+  });
+  const visibleProjections = (projections || []).filter((projection) => {
+    const docId = projection.document_id;
+    return !isCloudKnowledgeTestRun(projection) && !testDocIds.has(docId);
+  });
+  return {
+    objects: visibleObjects,
+    projections: visibleProjections,
+    skipped_objects: (objects || []).length - visibleObjects.length,
+    skipped_projections: (projections || []).length - visibleProjections.length,
+    skipped_document_ids: [...testDocIds].sort(),
+  };
+}
+
+function cloudProjectionIdentityFromMarkdown(markdown) {
+  const comment = markdown.match(/<!--\s*inkloop:cloud-note\s+([^>]*)-->/);
+  if (comment) {
+    const attrs = parseAttrs(comment[1]);
+    const documentId = attrs.document_id || "";
+    const role = attrs.role || "";
+    if (documentId && (role === "reading_note" || role === "meeting_note")) {
+      return { document_id: documentId, ko_id: "", key: `${documentId}::source` };
+    }
+  }
+  const front = parseProjectionFrontmatter(markdown);
+  const role = front.inkloop_projection_role;
+  const documentId = typeof front.inkloop_document_id === "string" ? front.inkloop_document_id : "";
+  if (!documentId) return null;
+  if (role === "reading_note" || role === "meeting_note" || role === "source_file_unit") {
+    return { document_id: documentId, ko_id: "", key: `${documentId}::source` };
+  }
+  if (role !== "knowledge_projection") return null;
+  const koId = typeof front.inkloop_knowledge_object_id === "string" ? front.inkloop_knowledge_object_id : "";
+  if (!koId) return null;
+  return { document_id: documentId, ko_id: koId, key: `${documentId}::${koId}` };
+}
+
+function archiveStamp() {
+  return nowIso().replace(/[:.]/g, "-");
+}
+
+function stablePathHash(input) {
+  let hash = 5381;
+  for (const char of String(input || "")) hash = ((hash << 5) + hash + char.charCodeAt(0)) >>> 0;
+  return hash.toString(36);
+}
+
+function archiveFileNameForPath(path) {
+  const cleaned = String(path || "projection.md")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .join("__")
+    .replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]+/g, "_");
+  return `${stablePathHash(path)}__${cleaned}`;
+}
+
 function escapeRegExp(input) {
   return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -383,6 +1816,14 @@ function escapeHtml(input) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function unescapeHtml(input) {
+  return String(input)
+    .replace(/&quot;/g, "\"")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&");
 }
 
 function encodeAnnotationComment(annotation) {
@@ -485,9 +1926,13 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     await this.loadSettings();
     await this.loadSurfaceSdk();
     this.pendingTimer = null;
+    this.runtimePollTimer = null;
+    this.runtimePollInFlight = false;
+    this.lastRuntimePollError = null;
     this.lastChange = null;
     this.nativeEditTimers = new Map();
     this.previewSignatures = new Map();
+    this.controlledKnowledgeSignatures = new Map();
     this.appendQueues = new Map();
     this.refreshPreviewsRunning = false;
     this.statusPath = `${this.settings.baseDir}/.obsidian-plugin-status.json`;
@@ -508,17 +1953,24 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => void this.onVaultChanged("delete", file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.onVaultChanged("rename", file, oldPath)));
     this.registerMarkdownPostProcessor((el, ctx) => this.enhancePreview(el, ctx), 100);
+    this.registerDomEvent(document, "click", (event) => this.onInkLoopSourceLinkClick(event), true);
     this.previewRefreshTimer = window.setInterval(() => void this.refreshOpenInkLoopPreviews(), 1500);
     this.registerInterval?.(this.previewRefreshTimer);
-    void this.writeStatus({ loaded_at: new Date().toISOString(), status: "loaded" });
+    this.startRuntimePolling();
+    void this.ensureRemoteRuntimeWrappersForSidecars()
+      .then((repaired) => repaired ? this.writeStatus({ status: "runtime_wrappers_repaired", repaired }) : null)
+      .catch((error) => this.writeStatus({ status: "runtime_wrapper_repair_failed", error: String(error?.message || error) }));
+    void this.writeStatus({ loaded_at: new Date().toISOString(), status: "loaded", error: null });
   }
 
   onunload() {
     if (this.pendingTimer) window.clearTimeout(this.pendingTimer);
+    if (this.runtimePollTimer) window.clearInterval(this.runtimePollTimer);
     if (this.previewRefreshTimer) window.clearInterval(this.previewRefreshTimer);
     for (const timer of this.nativeEditTimers?.values?.() || []) window.clearTimeout(timer);
     this.nativeEditTimers?.clear?.();
     this.previewSignatures?.clear?.();
+    this.controlledKnowledgeSignatures?.clear?.();
     this.app.workspace.detachLeavesOfType(INKLOOP_VIEW_TYPE);
   }
 
@@ -541,6 +1993,192 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   async writeJson(path, value) {
     await this.app.vault.adapter.mkdir(path.split("/").slice(0, -1).join("/")).catch(() => {});
     await this.app.vault.adapter.write(path, `${JSON.stringify(value, null, 2)}\n`);
+  }
+
+  async requestCloudKnowledge(path, params = {}) {
+    const base = this.settings.knowledgeBaseEndpoint || "";
+    if (!base) return null;
+    const response = await requestUrl({
+      url: appendQuery(appendPath(base, path), params),
+      method: "GET",
+      headers: runtimeNamespaceHeaders(this.settings),
+    });
+    return typeof response.json === "object" ? response.json : JSON.parse(response.text || "{}");
+  }
+
+  inkLoopSourceHrefFromEvent(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) return "";
+    const link = target.closest("a[href^=\"inkloop://doc/\"]");
+    if (!link) return "";
+    return link.getAttribute("href") || "";
+  }
+
+  onInkLoopSourceLinkClick(event) {
+    const href = this.inkLoopSourceHrefFromEvent(event);
+    if (!href) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void this.openSourceOnInkLoopDevice(href);
+  }
+
+  async openSourceOnInkLoopDevice(uri) {
+    const endpoint = deriveDeviceCommandEndpoint(this.settings);
+    if (!endpoint) {
+      new Notice("InkLoop device command endpoint is not configured");
+      return;
+    }
+    try {
+      const response = await requestUrl({
+        url: endpoint,
+        method: "POST",
+        contentType: "application/json",
+        headers: runtimeNamespaceHeaders(this.settings),
+        body: JSON.stringify({
+          type: "open_source",
+          source_device_id: this.settings.deviceId,
+          requested_by: this.settings.deviceId,
+          payload: {
+            uri,
+            source: "obsidian-plugin",
+          },
+        }),
+      });
+      const payload = typeof response.json === "object" ? response.json : JSON.parse(response.text || "{}");
+      const target = payload?.command?.target_device_id || "InkLoop Paper";
+      new Notice(`已发送到 ${target}`);
+      await this.writeStatus({ status: "open_source_command_sent", uri, target_device_id: payload?.command?.target_device_id || null });
+    } catch (error) {
+      new Notice(`回到原文失败：${String(error?.message || error)}`);
+      await this.writeStatus({ status: "open_source_command_failed", uri, error: String(error?.message || error) });
+    }
+  }
+
+  async writeRenderedMarkdownFile(file) {
+    await this.app.vault.adapter.mkdir(file.path.split("/").slice(0, -1).join("/")).catch(() => {});
+    const existing = await this.app.vault.adapter.read(file.path).catch(() => null);
+    if (existing === file.markdown) return false;
+    await this.app.vault.adapter.write(file.path, file.markdown);
+    return true;
+  }
+
+  async removePath(path) {
+    const abstract = this.app.vault.getAbstractFileByPath(path);
+    if (abstract && typeof this.app.vault.delete === "function") {
+      await this.app.vault.delete(abstract);
+      return;
+    }
+    if (typeof this.app.vault.adapter.remove === "function") {
+      await this.app.vault.adapter.remove(path);
+      return;
+    }
+    throw new Error("Obsidian adapter cannot remove archived stale projection.");
+  }
+
+  async archivePath(sourcePath, archivePath) {
+    await this.app.vault.adapter.mkdir(archivePath.split("/").slice(0, -1).join("/")).catch(() => {});
+    if (typeof this.app.vault.adapter.rename === "function") {
+      await this.app.vault.adapter.rename(sourcePath, archivePath);
+      return;
+    }
+    const content = await this.app.vault.adapter.read(sourcePath);
+    await this.app.vault.adapter.write(archivePath, content);
+    await this.removePath(sourcePath);
+  }
+
+  async archiveStaleCloudKnowledgeProjections(files) {
+    const canonicalByIdentity = new Map();
+    const folders = new Set();
+    for (const file of files) {
+      const identity = cloudProjectionIdentityFromMarkdown(file.markdown);
+      if (!identity) continue;
+      canonicalByIdentity.set(identity.key, file.path);
+      folders.add(file.path.split("/").slice(0, -1).join("/"));
+    }
+    if (!canonicalByIdentity.size) return { archived: 0, files: [] };
+
+    const archivedAt = nowIso();
+    const archiveRoot = this.sidecarPath("archived-projections", archiveStamp());
+    const archived = [];
+    for (const folder of folders) {
+      const listing = await this.app.vault.adapter.list(folder).catch(() => null);
+      const folderFiles = Array.isArray(listing?.files) ? listing.files : [];
+      for (const path of folderFiles) {
+        if (!/\.md$/i.test(path)) continue;
+        const markdown = await this.app.vault.adapter.read(path).catch(() => null);
+        if (!markdown) continue;
+        const identity = cloudProjectionIdentityFromMarkdown(markdown);
+        if (!identity) continue;
+        const canonicalPath = canonicalByIdentity.get(identity.key);
+        if (!canonicalPath || path === canonicalPath) continue;
+        const archivedPath = `${archiveRoot}/${archiveFileNameForPath(path)}`;
+        await this.archivePath(path, archivedPath);
+        const record = {
+          schema_version: "inkloop.archived_stale_projection.v1",
+          reason: "stale_cloud_knowledge_projection_path",
+          archived_at: archivedAt,
+          original_path: path,
+          archived_path: archivedPath,
+          canonical_path: canonicalPath,
+          document_id: identity.document_id,
+          knowledge_object_id: identity.ko_id,
+        };
+        await this.writeJson(`${archivedPath}.json`, record);
+        archived.push(record);
+      }
+    }
+    if (archived.length) {
+      await this.writeJson(this.sidecarPath("archived-projections", "latest.json"), {
+        schema_version: "inkloop.archived_stale_projection_manifest.v1",
+        archived_at: archivedAt,
+        archive_root: archiveRoot,
+        archived_count: archived.length,
+        files: archived,
+      });
+    }
+    return { archived: archived.length, archive_root: archived.length ? archiveRoot : undefined, files: archived };
+  }
+
+  async pullCloudKnowledgeProjections(reason = "manual") {
+    if (!this.settings.knowledgeBaseEndpoint) {
+      return { rendered: 0, changed: 0, skipped_reason: "knowledge_endpoint_missing" };
+    }
+    const [objectsPayload, projectionsPayload, aiTurnsPayload] = await Promise.all([
+      this.requestCloudKnowledge("objects"),
+      this.requestCloudKnowledge("document-projections"),
+      this.requestCloudKnowledge("ai-turns"),
+    ]);
+    const objects = Array.isArray(objectsPayload?.objects) ? objectsPayload.objects : [];
+    const projections = Array.isArray(projectionsPayload?.document_projections) ? projectionsPayload.document_projections : [];
+    const aiTurns = Array.isArray(aiTurnsPayload?.ai_turns) ? aiTurnsPayload.ai_turns : [];
+    const filtered = filterCloudKnowledgeForObsidian(objects, projections);
+    const hiddenDocIds = new Set(filtered.skipped_document_ids || []);
+    const visibleAiTurns = aiTurns.filter((turn) =>
+      !hiddenDocIds.has(turn.document_id) && !isCloudKnowledgeHiddenDoc(turn.document_id, turn.document_title || turn.inference_view?.document_title),
+    );
+    const files = renderCloudKnowledgeMarkdown(this.settings, filtered.objects, filtered.projections, visibleAiTurns);
+    let changed = 0;
+    for (const file of files) if (await this.writeRenderedMarkdownFile(file)) changed += 1;
+    const staleProjectionArchive = await this.archiveStaleCloudKnowledgeProjections(files);
+    const result = {
+      schema_version: "inkloop.obsidian_cloud_knowledge_pull.v1",
+      reason,
+      endpoint: this.settings.knowledgeBaseEndpoint,
+      namespace: `${this.runtimeNamespaceSegments().tenantId}/${this.runtimeNamespaceSegments().userId}`,
+      ai_turns: visibleAiTurns.length,
+      knowledge_objects: objects.length,
+      document_projections: projections.length,
+      skipped_test_run_objects: filtered.skipped_objects,
+      skipped_test_run_document_projections: filtered.skipped_projections,
+      skipped_test_run_document_ids: filtered.skipped_document_ids,
+      rendered: files.length,
+      changed,
+      stale_projection_archive: staleProjectionArchive,
+      rendered_paths: files.map((file) => file.path).slice(0, 50),
+      synced_at: nowIso(),
+    };
+    await this.writeJson(this.sidecarPath("cloud-knowledge-pull.json"), result);
+    return result;
   }
 
   async appendJsonLine(path, value) {
@@ -574,6 +2212,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       operation: input.operation,
       target: input.target,
       payload: input.payload || {},
+      origin: { device_id: this.settings.deviceId || DEFAULT_SETTINGS.deviceId },
       status: "pending",
       created_at: now,
       updated_at: now,
@@ -600,6 +2239,104 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   async writeJsonLines(path, values) {
     await this.app.vault.adapter.mkdir(path.split("/").slice(0, -1).join("/")).catch(() => {});
     await this.app.vault.adapter.write(path, values.map(jsonLine).join(""));
+  }
+
+  async writeRuntimeOutboxEventsPreservingAppends(updatedEvents) {
+    const path = this.runtimeOutboxPath();
+    const operation = (this.appendQueues.get(path) || Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        const latestEvents = await this.readJsonLines(path);
+        await this.writeJsonLines(path, mergeRuntimeOutboxEvents(latestEvents, updatedEvents));
+      });
+    this.appendQueues.set(path, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.appendQueues.get(path) === operation) this.appendQueues.delete(path);
+    }
+  }
+
+  appliedEventsPath(docId) {
+    return this.sidecarPath("docs", docId, "applied-events.jsonl");
+  }
+
+  runtimeNamespaceSegments() {
+    return {
+      tenantId: cleanRuntimeNamespaceSegment(this.settings?.tenantId, DEFAULT_SETTINGS.tenantId),
+      userId: cleanRuntimeNamespaceSegment(this.settings?.userId, DEFAULT_SETTINGS.userId),
+    };
+  }
+
+  legacyCursorPath(deviceId = this.settings.deviceId) {
+    const safeDeviceId = cleanRuntimeNamespaceSegment(deviceId, DEFAULT_SETTINGS.deviceId);
+    return this.sidecarPath("cursors", `${safeDeviceId}.json`);
+  }
+
+  cursorPath(deviceId = this.settings.deviceId) {
+    const { tenantId, userId } = this.runtimeNamespaceSegments();
+    const safeDeviceId = cleanRuntimeNamespaceSegment(deviceId, DEFAULT_SETTINGS.deviceId);
+    return this.sidecarPath("cursors", tenantId, userId, `${safeDeviceId}.json`);
+  }
+
+  conflictsPath() {
+    return this.sidecarPath("conflicts", "runtime-conflicts.jsonl");
+  }
+
+  async readDeviceCursor(deviceId = this.settings.deviceId) {
+    const current = await this.readJson(this.cursorPath(deviceId), null);
+    if (current) return current;
+    const legacy = await this.readJson(this.legacyCursorPath(deviceId), null);
+    if (legacy?.cursor !== undefined) {
+      const migrated = {
+        ...legacy,
+        device_id: cleanRuntimeNamespaceSegment(legacy.device_id || deviceId, DEFAULT_SETTINGS.deviceId),
+        migrated_from_legacy_cursor: true,
+        migrated_at: nowIso(),
+      };
+      await this.writeJson(this.cursorPath(deviceId), migrated);
+      return migrated;
+    }
+    return null;
+  }
+
+  async writeDeviceCursor(cursor) {
+    await this.writeJson(this.cursorPath(cursor.device_id), cursor);
+  }
+
+  async hasAppliedRuntimeEvent(event) {
+    const applied = await this.readJsonLines(this.appliedEventsPath(event.doc_id));
+    return applied.some((item) => item.event_id === event.event_id);
+  }
+
+  async markAppliedRuntimeEvent(event, extra = {}) {
+    const record = { event_id: event.event_id, doc_id: event.doc_id, applied_at: nowIso(), ...extra };
+    await this.appendJsonLine(this.appliedEventsPath(event.doc_id), record);
+    await this.appendJsonLine(this.sidecarPath("applied-events.jsonl"), record);
+  }
+
+  async recordRuntimeConflict(event, error) {
+    const conflict = {
+      conflict_id: `conflict_${event.event_id}_${Date.now().toString(36)}`,
+      event_id: event.event_id,
+      doc_id: event.doc_id,
+      reason: String(error?.message || error),
+      created_at: nowIso(),
+      remote_revision: event.source_revision,
+    };
+    await this.appendJsonLine(this.conflictsPath(), conflict);
+    return conflict;
+  }
+
+  shouldSkipCloudOnlyAnnotationEvent(event, error) {
+    if (!this.settings.knowledgeBaseEndpoint) return false;
+    const message = String(error?.message || error);
+    if (message === `InkLoop runtime document is missing: ${event.doc_id}`) {
+      return event.operation === "annotation.add" || event.operation === "knowledge.update";
+    }
+    if (event.operation !== "annotation.add") return false;
+    const blockId = String(event.payload?.block_id || event.target?.block_id || "");
+    return !blockId && message === "Remote annotation block was not found: ";
   }
 
   async ensureVaultManifest() {
@@ -834,15 +2571,289 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     const documentRecord = await this.readJson(`${docDir}/document.json`, null);
     const source = await this.readJson(`${docDir}/source.json`, null);
     if (!documentRecord || !source) return null;
-    const blocks = documentRecord.source_type === "markdown"
-      ? await this.readJsonLines(`${docDir}/surfaces/markdown.blocks.jsonl`)
-      : [];
+    const blocksPath = documentRecord.source_type === "markdown" ? "markdown.blocks.jsonl" : "pdf.pages.jsonl";
+    const blocks = await this.readJsonLines(`${docDir}/surfaces/${blocksPath}`);
     const nodes = await this.readJsonLines(`${docDir}/canvas/nodes.jsonl`);
-    return { docDir, document: documentRecord, source, blocks, nodes };
+    const readingProgress = await this.readJson(`${docDir}/progress.json`, null);
+    const sourceRevision = await this.readJson(`${docDir}/source-revision.json`, null);
+    return { doc_id: docId, docDir, document: documentRecord, source, source_revision: sourceRevision, reading_progress: readingProgress, blocks, nodes };
+  }
+
+  async pathExists(path) {
+    if (!path) return false;
+    if (this.app.vault.getAbstractFileByPath(path)) return true;
+    try {
+      if (typeof this.app.vault.adapter.stat === "function") return Boolean(await this.app.vault.adapter.stat(path));
+      await this.app.vault.adapter.read(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  remoteRuntimeWrapperPath(snapshot) {
+    const title = cleanCloudDocumentTitle(snapshot.document?.title || snapshot.doc_id, snapshot.doc_id);
+    const mode = runtimeProjectionMode(snapshot);
+    return `${cloudKnowledgeFolder(this.settings, title, mode)}/${title}.md`;
+  }
+
+  async ensureRemoteRuntimeWrapper(snapshot) {
+    const currentPath = snapshot.source?.vault_file?.path;
+    const docId = snapshot.doc_id;
+    const documentTitle = snapshot.document?.title || currentPath || "";
+    if (shouldSkipRuntimeWrapperSnapshot(snapshot)) return snapshot;
+    if (isCloudKnowledgeHiddenDoc(docId, documentTitle)) return snapshot;
+    const managedCurrentPath = currentPath && currentPath.startsWith(`${this.settings.documentsDir}/`) ? currentPath : "";
+    if (currentPath && !managedCurrentPath && await this.pathExists(currentPath)) return snapshot;
+
+    const path = managedCurrentPath || this.remoteRuntimeWrapperPath(snapshot);
+    await this.app.vault.adapter.mkdir(path.split("/").slice(0, -1).join("/")).catch(() => {});
+    const markdown = renderRuntimeWrapperMarkdown(snapshot);
+    const existing = await this.app.vault.adapter.read(path).catch(() => null);
+    const existingProjection = existing ? parseProjectionFrontmatter(existing) : {};
+    if (existingProjection.inkloop_projection_role === "source_file_unit") {
+      return {
+        ...snapshot,
+        source: {
+          ...(snapshot.source || {}),
+          vault_file: {
+            ...(snapshot.source?.vault_file || {}),
+            path,
+          },
+        },
+      };
+    }
+    if (existing !== markdown) {
+      await this.app.vault.adapter.write(path, markdown);
+    }
+
+    return {
+      ...snapshot,
+      source: {
+        ...(snapshot.source || {}),
+        vault_file: {
+          ...(snapshot.source?.vault_file || {}),
+          path,
+          extension: ".md",
+        },
+      },
+    };
+  }
+
+  async ensureRemoteRuntimeWrappersForSidecars() {
+    const docsRoot = this.sidecarPath("docs");
+    const listing = await this.app.vault.adapter.list(docsRoot).catch(() => null);
+    const folders = Array.isArray(listing?.folders) ? listing.folders : [];
+    let repaired = 0;
+    for (const docDir of folders) {
+      const docId = String(docDir || "").split("/").filter(Boolean).at(-1);
+      if (!docId) continue;
+      const runtime = await this.loadRuntimeDocument(docId);
+      if (!runtime?.document || !runtime.source) continue;
+      const currentPath = runtime.source?.vault_file?.path || "";
+      const documentTitle = runtime.document?.title || currentPath;
+      if (isCloudKnowledgeHiddenDoc(docId, documentTitle)) continue;
+      const remoteRuntime = runtime.source?.kind !== "obsidian_vault_file" || currentPath.startsWith(`${this.settings.documentsDir}/`);
+      if (!remoteRuntime) continue;
+      const beforePath = currentPath;
+      const beforeExists = beforePath ? await this.pathExists(beforePath) : false;
+      const snapshot = await this.ensureRemoteRuntimeWrapper({
+        doc_id: docId,
+        document: runtime.document,
+        source: runtime.source,
+        source_revision: runtime.source_revision,
+        reading_progress: runtime.reading_progress,
+        blocks: runtime.blocks,
+        nodes: runtime.nodes,
+      });
+      const nextPath = snapshot.source?.vault_file?.path;
+      if (!nextPath) continue;
+      await this.writeJson(`${runtime.docDir}/source.json`, snapshot.source);
+      if (nextPath !== beforePath || !beforeExists) repaired += 1;
+      await this.upsertPathIndex(nextPath, {
+        path: nextPath,
+        doc_id: docId,
+        source_ref_id: snapshot.source.source_ref_id,
+        last_seen_content_hash: snapshot.source_revision?.content_hash,
+        last_seen_at: nowIso(),
+      });
+      await this.upsertDocIndex({
+        doc_id: docId,
+        title: snapshot.document?.title,
+        source_type: snapshot.document?.source_type,
+        source_ref_id: snapshot.source.source_ref_id,
+        current_path: nextPath,
+        updated_at: nowIso(),
+      });
+    }
+    return repaired;
+  }
+
+  async writeRuntimeSnapshot(snapshot) {
+    snapshot = await this.ensureRemoteRuntimeWrapper(snapshot);
+    const docId = snapshot.doc_id;
+    const docDir = this.sidecarPath("docs", docId);
+    await Promise.all([
+      this.app.vault.adapter.mkdir(`${docDir}/surfaces`).catch(() => {}),
+      this.app.vault.adapter.mkdir(`${docDir}/canvas`).catch(() => {}),
+    ]);
+    await this.writeJson(`${docDir}/document.json`, snapshot.document || { doc_id: docId });
+    await this.writeJson(`${docDir}/source.json`, snapshot.source || { doc_id: docId });
+    if (snapshot.identity) await this.writeJson(`${docDir}/identity.json`, snapshot.identity);
+    if (snapshot.source_revision) await this.writeJson(`${docDir}/source-revision.json`, snapshot.source_revision);
+    if (snapshot.reading_progress) await this.writeJson(`${docDir}/progress.json`, snapshot.reading_progress);
+    const sourceType = snapshot.document?.source_type === "markdown" ? "markdown" : "pdf";
+    await this.writeJsonLines(`${docDir}/surfaces/${sourceType === "markdown" ? "markdown.blocks" : "pdf.pages"}.jsonl`, snapshot.blocks || []);
+    await this.writeJsonLines(`${docDir}/canvas/nodes.jsonl`, snapshot.nodes || []);
+    const path = snapshot.source?.vault_file?.path;
+    if (path) {
+      await this.upsertPathIndex(path, { path, doc_id: docId, source_ref_id: snapshot.source.source_ref_id, last_seen_content_hash: snapshot.source_revision?.content_hash, last_seen_at: nowIso() });
+      await this.upsertDocIndex({ doc_id: docId, title: snapshot.document?.title, source_type: snapshot.document?.source_type, source_ref_id: snapshot.source.source_ref_id, current_path: path, updated_at: nowIso() });
+    }
   }
 
   async writeRuntimeBlocks(runtime, blocks) {
-    await this.writeJsonLines(`${runtime.docDir}/surfaces/markdown.blocks.jsonl`, blocks);
+    const blocksPath = runtime.document?.source_type === "markdown" ? "markdown.blocks.jsonl" : "pdf.pages.jsonl";
+    await this.writeJsonLines(`${runtime.docDir}/surfaces/${blocksPath}`, blocks);
+  }
+
+  async applyRemoteRuntimeEvent(event) {
+    if (event.origin?.device_id && event.origin.device_id === this.settings.deviceId) {
+      return { status: "skipped", event_id: event.event_id, echo: true };
+    }
+    if (await this.hasAppliedRuntimeEvent(event)) return { status: "skipped", event_id: event.event_id };
+    try {
+      await this.applyRemoteRuntimeEventUnchecked(event);
+      await this.markAppliedRuntimeEvent(event);
+      return { status: "applied", event_id: event.event_id, doc_id: event.doc_id };
+    } catch (error) {
+      if (this.shouldSkipCloudOnlyAnnotationEvent(event, error)) {
+        const skippedReason = "cloud_knowledge_projection_only";
+        await this.markAppliedRuntimeEvent(event, { status: "skipped", skipped_reason: skippedReason });
+        return { status: "skipped", event_id: event.event_id, doc_id: event.doc_id, skipped_reason: skippedReason };
+      }
+      const conflict = await this.recordRuntimeConflict(event, error);
+      return { status: "conflicted", event_id: event.event_id, doc_id: event.doc_id, conflict };
+    }
+  }
+
+  async applyRemoteRuntimeEventUnchecked(event) {
+    if (event.schema_version !== "inkloop.runtime_sync_event.v1") throw new Error("Unsupported runtime event schema.");
+    if (event.operation === "runtime.bootstrap") {
+      const snapshot = event.payload?.snapshot;
+      if (!snapshot || snapshot.doc_id !== event.doc_id) throw new Error("Remote bootstrap snapshot is missing or mismatched.");
+      await this.writeRuntimeSnapshot(snapshot);
+      return;
+    }
+
+    const runtime = await this.loadRuntimeDocument(event.doc_id);
+    if (!runtime) throw new Error(`InkLoop runtime document is missing: ${event.doc_id}`);
+    const blockIdOf = (block) => block.projection?.block_id || block.object_id;
+
+    if (event.operation === "block.update") {
+      const blockId = String(event.payload?.block_id || event.target?.block_id || event.target?.id || "");
+      const index = runtime.blocks.findIndex((block) => blockIdOf(block) === blockId);
+      if (index === -1) throw new Error(`Remote block was not found: ${blockId}`);
+      const quote = normalizeText(event.payload?.content_md ?? event.payload?.quote ?? "");
+      const blocks = [...runtime.blocks];
+      blocks[index] = {
+        ...blocks[index],
+        text: quote,
+        source_anchor: { ...(blocks[index].source_anchor || {}), quote, ...(event.payload?.range ? { range: event.payload.range } : {}) },
+      };
+      await this.writeRuntimeBlocks(runtime, blocks);
+      return;
+    }
+
+    if (event.operation === "annotation.add") {
+      const blockId = String(event.payload?.block_id || event.target?.block_id || "");
+      const annotation = event.payload?.annotation;
+      if (!annotation?.ko_id) throw new Error("Remote annotation.add is missing annotation payload.");
+      const index = runtime.blocks.findIndex((block) => blockIdOf(block) === blockId);
+      if (index === -1) throw new Error(`Remote annotation block was not found: ${blockId}`);
+      const blocks = [...runtime.blocks];
+      const block = blocks[index];
+      const annotations = (block.annotations || []).filter((item) => item.ko_id !== annotation.ko_id);
+      blocks[index] = {
+        ...block,
+        annotations: [...annotations, annotation],
+        projection: {
+          ...(block.projection || {}),
+          knowledge_object_ids: [...new Set([...(block.projection?.knowledge_object_ids || []), annotation.ko_id])],
+        },
+      };
+      await this.writeRuntimeBlocks(runtime, blocks);
+      return;
+    }
+
+    if (event.operation === "annotation.update" || event.operation === "annotation.delete") {
+      const koId = String(event.payload?.ko_id || event.target?.id || "");
+      if (!koId) throw new Error("Remote annotation event is missing ko_id.");
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).map((annotation) => {
+          if (annotation.ko_id !== koId) return annotation;
+          didUpdate = true;
+          if (event.operation === "annotation.delete") return { ...annotation, status: "deleted", deleted_at: event.updated_at };
+          return { ...annotation, ...(event.payload?.patch || {}), updated_at: event.updated_at };
+        });
+        return { ...block, annotations };
+      });
+      if (!didUpdate) throw new Error(`Remote annotation was not found: ${koId}`);
+      await this.writeRuntimeBlocks(runtime, blocks);
+      return;
+    }
+
+    if (event.operation === "knowledge.update") {
+      const koId = String(event.payload?.ko_id || event.target?.id || "");
+      if (!koId) throw new Error("Remote knowledge.update event is missing ko_id.");
+      const patch = event.payload?.patch && typeof event.payload.patch === "object" ? event.payload.patch : {};
+      let didUpdate = false;
+      const blocks = runtime.blocks.map((block) => {
+        const annotations = (block.annotations || []).map((annotation) => {
+          if (annotation.ko_id !== koId) return annotation;
+          didUpdate = true;
+          return {
+            ...annotation,
+            ...(typeof patch.status === "string" ? { status: patch.status } : {}),
+            ...(Array.isArray(patch.tags) ? { tags: patch.tags } : {}),
+            controlled_fields: { ...(annotation.controlled_fields || {}), ...patch },
+            updated_at: event.updated_at,
+          };
+        });
+        return { ...block, annotations };
+      });
+      if (didUpdate) await this.writeRuntimeBlocks(runtime, blocks);
+      return;
+    }
+
+    if (event.operation === "progress.update") {
+      if (!event.payload?.progress) throw new Error("Remote progress.update is missing progress payload.");
+      await this.writeJson(`${runtime.docDir}/progress.json`, event.payload.progress);
+      return;
+    }
+
+    if (event.operation === "source.rename") {
+      const sourcePath = String(event.payload?.source_path || "");
+      if (!sourcePath) throw new Error("Remote source.rename is missing source_path.");
+      const source = {
+        ...runtime.source,
+        vault_file: runtime.source.vault_file ? { ...runtime.source.vault_file, path: sourcePath } : { path: sourcePath },
+        identity: { ...(runtime.source.identity || {}), source_path: sourcePath, current_path: sourcePath },
+      };
+      await this.writeJson(`${runtime.docDir}/source.json`, source);
+      await this.writeJson(`${runtime.docDir}/source-revision.json`, { ...(runtime.source_revision || {}), source_path: sourcePath, updated_at: event.updated_at });
+      return;
+    }
+
+    if (event.operation === "canvas.node.add" || event.operation === "canvas.node.delete") {
+      const nodeId = String(event.payload?.node_id || event.target?.id || "");
+      const nodes = (runtime.nodes || []).filter((node) => String(node.id || node.node_id || "") !== nodeId);
+      await this.writeJsonLines(`${runtime.docDir}/canvas/nodes.jsonl`, event.operation === "canvas.node.add" ? [...nodes, event.payload.node].filter(Boolean) : nodes);
+      return;
+    }
+
+    throw new Error(`Unsupported runtime operation: ${event.operation}`);
   }
 
   async updateMarkdownBlockContent(docId, blockId, nextContent) {
@@ -946,6 +2957,43 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.lastChange = { event_type: "inkloop_annotation_edit", doc_id: docId, runtime_event_id: event.event_id, observed_at: nowIso() };
     this.scheduleSync("inkloop_annotation_edit");
     void this.rememberDocPreviewSignature(docId, { ...runtime, blocks });
+  }
+
+  async updateControlledKnowledgeProjection(file) {
+    if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return null;
+    const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
+    const edits = parseControlledKnowledgeEdits(markdown);
+    if (!edits.length) return null;
+    const events = [];
+    for (const edit of edits) {
+      const signatureKey = `${file.path}::${edit.document_id}::${edit.ko_id}`;
+      const signature = JSON.stringify({ document_id: edit.document_id, ko_id: edit.ko_id, patch: edit.patch });
+      if (this.controlledKnowledgeSignatures.get(signatureKey) === signature) continue;
+      this.controlledKnowledgeSignatures.set(signatureKey, signature);
+      const event = await this.appendRuntimeSyncEvent({
+        doc_id: edit.document_id,
+        operation: "knowledge.update",
+        target: { type: "knowledge_object", id: edit.ko_id },
+        payload: {
+          ko_id: edit.ko_id,
+          kind: edit.kind,
+          patch: edit.patch,
+          projection_path: file.path,
+          source: "obsidian_controlled_fields",
+          controlled_schema_version: edit.schema_version,
+        },
+      });
+      events.push(event);
+      this.lastChange = {
+        event_type: "inkloop_controlled_knowledge_edit",
+        path: file.path,
+        doc_id: edit.document_id,
+        ko_id: edit.ko_id,
+        runtime_event_id: event.event_id,
+        observed_at: nowIso(),
+      };
+    }
+    return events.at(-1) || null;
   }
 
   async addSidecarAnnotation(docId, blockId, annotation) {
@@ -1165,10 +3213,25 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
     this.settings.baseDir = cleanDir(this.settings.baseDir, DEFAULT_SETTINGS.baseDir);
     this.settings.documentsDir = cleanDir(this.settings.documentsDir, DEFAULT_SETTINGS.documentsDir);
+    this.settings.syncEndpoint = cleanLegacySyncEndpoint(this.settings.syncEndpoint);
+    this.settings.runtimePushEndpoint = String(this.settings.runtimePushEndpoint || "").trim();
+    this.settings.runtimePullEndpoint = String(this.settings.runtimePullEndpoint || "").trim();
+    this.settings.knowledgeBaseEndpoint = cleanEndpoint(this.settings.knowledgeBaseEndpoint);
+    this.settings.deviceCommandEndpoint = deriveDeviceCommandEndpoint(this.settings);
+    this.settings.tenantId = cleanRuntimeNamespaceSegment(this.settings.tenantId, DEFAULT_SETTINGS.tenantId);
+    this.settings.userId = cleanRuntimeNamespaceSegment(this.settings.userId, DEFAULT_SETTINGS.userId);
+    this.settings.sessionToken = String(this.settings.sessionToken || "").trim();
+    const loadedDeviceId = String(loaded?.deviceId || "").trim();
+    this.settings.deviceId = normalizeRuntimeDeviceId(loadedDeviceId, "obsidian");
+    this.settings.autoSyncOnChange = this.settings.autoSyncOnChange !== false;
+    this.settings.notifyManualSync = this.settings.notifyManualSync !== false;
+    this.settings.visualEnhancement = this.settings.visualEnhancement !== false;
     this.settings.debounceMs = Math.max(100, Number(this.settings.debounceMs) || DEFAULT_SETTINGS.debounceMs);
+    this.settings.runtimePollMs = normalizeRuntimePollMs(this.settings.runtimePollMs);
     this.settings.previewEditing = false;
     this.settings.surfaceMode = this.settings.surfaceMode === "focus" ? "focus" : "thinking";
     this.settings.inkTool = normalizeInkTool(this.settings.inkTool);
@@ -1176,12 +3239,26 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       pen: normalizeHexColor(this.settings.inkColors?.pen, DEFAULT_SETTINGS.inkColors.pen),
       highlighter: normalizeHexColor(this.settings.inkColors?.highlighter, DEFAULT_SETTINGS.inkColors.highlighter),
     };
+    if (this.settings.deviceId !== loadedDeviceId) await this.saveData(this.settings);
   }
 
   async saveSettings() {
     this.settings.baseDir = cleanDir(this.settings.baseDir, DEFAULT_SETTINGS.baseDir);
     this.settings.documentsDir = cleanDir(this.settings.documentsDir, DEFAULT_SETTINGS.documentsDir);
+    this.settings.syncEndpoint = cleanLegacySyncEndpoint(this.settings.syncEndpoint);
+    this.settings.runtimePushEndpoint = String(this.settings.runtimePushEndpoint || "").trim();
+    this.settings.runtimePullEndpoint = String(this.settings.runtimePullEndpoint || "").trim();
+    this.settings.knowledgeBaseEndpoint = cleanEndpoint(this.settings.knowledgeBaseEndpoint);
+    this.settings.deviceCommandEndpoint = deriveDeviceCommandEndpoint(this.settings);
+    this.settings.tenantId = cleanRuntimeNamespaceSegment(this.settings.tenantId, DEFAULT_SETTINGS.tenantId);
+    this.settings.userId = cleanRuntimeNamespaceSegment(this.settings.userId, DEFAULT_SETTINGS.userId);
+    this.settings.sessionToken = String(this.settings.sessionToken || "").trim();
+    this.settings.deviceId = normalizeRuntimeDeviceId(this.settings.deviceId, "obsidian");
+    this.settings.autoSyncOnChange = this.settings.autoSyncOnChange !== false;
+    this.settings.notifyManualSync = this.settings.notifyManualSync !== false;
+    this.settings.visualEnhancement = this.settings.visualEnhancement !== false;
     this.settings.debounceMs = Math.max(100, Number(this.settings.debounceMs) || DEFAULT_SETTINGS.debounceMs);
+    this.settings.runtimePollMs = normalizeRuntimePollMs(this.settings.runtimePollMs);
     this.settings.surfaceMode = this.settings.surfaceMode === "focus" ? "focus" : "thinking";
     this.settings.inkTool = normalizeInkTool(this.settings.inkTool);
     this.settings.inkColors = {
@@ -1190,6 +3267,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     };
     this.statusPath = `${this.settings.baseDir}/.obsidian-plugin-status.json`;
     await this.saveData(this.settings);
+    this.startRuntimePolling?.();
   }
 
   async loadSurfaceSdk() {
@@ -1233,12 +3311,14 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     const isTracked = this.isInkLoopPath(file.path) || trackedDocId || (oldPath && (this.isInkLoopPath(oldPath) || oldTrackedDocId));
     if (!isTracked) return;
     if (eventType === "rename" && oldPath && oldTrackedDocId) await this.updateTrackedSourcePath(file, oldPath);
-    const refreshDocId = trackedDocId || oldTrackedDocId || sidecarDocId || oldSidecarDocId;
+    const controlledEvent = eventType === "modify" ? await this.updateControlledKnowledgeProjection(file) : null;
+    const refreshDocId = trackedDocId || oldTrackedDocId || sidecarDocId || oldSidecarDocId || controlledEvent?.doc_id;
     this.lastChange = {
-      event_type: eventType,
+      event_type: controlledEvent ? "inkloop_controlled_knowledge_edit" : eventType,
       path: file.path,
       old_path: oldPath,
       doc_id: refreshDocId || undefined,
+      runtime_event_id: controlledEvent?.event_id,
       observed_at: new Date().toISOString(),
     };
     void this.writeStatus({ status: "event_observed", last_change: this.lastChange });
@@ -1254,9 +3334,206 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     }, this.settings.debounceMs);
   }
 
+  startRuntimePolling() {
+    if (this.runtimePollTimer) window.clearInterval(this.runtimePollTimer);
+    this.runtimePollTimer = null;
+    const pollMs = normalizeRuntimePollMs(this.settings.runtimePollMs);
+    if (pollMs <= 0 || !this.settings.runtimePullEndpoint) return;
+    this.runtimePollTimer = window.setInterval(() => {
+      void this.pollRuntimeInbox();
+    }, pollMs);
+    this.registerInterval?.(this.runtimePollTimer);
+  }
+
+  async pollRuntimeInbox() {
+    if (this.runtimePollInFlight || !this.settings.runtimePullEndpoint) return;
+    this.runtimePollInFlight = true;
+    try {
+      const previousError = this.lastRuntimePollError;
+      const pull = await this.pullRuntimeInbox();
+      const cloudKnowledge = await this.pullCloudKnowledgeProjections("runtime_poll");
+      this.lastRuntimePollError = null;
+      if (pull.received > 0 || pull.applied > 0 || pull.conflicted > 0 || cloudKnowledge.changed > 0 || previousError) {
+        await this.writeStatus({
+          status: pull.conflicted > 0 ? "sync_completed_with_conflicts" : "sync_completed",
+          reason: "runtime_poll",
+          error: null,
+          pull,
+          cloudKnowledge,
+          synced_at: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (message !== this.lastRuntimePollError) {
+        this.lastRuntimePollError = message;
+        await this.writeStatus({
+          status: "sync_failed",
+          reason: "runtime_poll",
+          error: message,
+          synced_at: new Date().toISOString(),
+        });
+      }
+    } finally {
+      this.runtimePollInFlight = false;
+    }
+  }
+
+  runtimeOutboxPath() {
+    return this.sidecarPath("outbox", "runtime-events.jsonl");
+  }
+
+  async pushRuntimeOutbox(reason) {
+    if (!this.settings.runtimePushEndpoint) {
+      return { scanned: 0, eligible: 0, sent: 0, failed: 0, skipped: 0, attempted_event_ids: [], skipped_reason: "push_endpoint_missing" };
+    }
+    const now = nowIso();
+    const events = await this.readJsonLines(this.runtimeOutboxPath());
+    const eligibleIndexes = events
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => shouldAttemptRuntimeEvent(event, now));
+    if (!eligibleIndexes.length) {
+      return { scanned: events.length, eligible: 0, sent: 0, failed: 0, skipped: events.length, attempted_event_ids: [] };
+    }
+
+    let payload = null;
+    let requestError = null;
+    try {
+      const response = await requestUrl({
+        url: this.settings.runtimePushEndpoint,
+        method: "POST",
+        contentType: "application/json",
+        headers: runtimeNamespaceHeaders(this.settings),
+        body: JSON.stringify({
+          schema_version: "inkloop.runtime_sync_batch.v1",
+          device_id: this.settings.deviceId,
+          reason,
+          events: eligibleIndexes.map(({ event }) => event),
+        }),
+      });
+      payload = typeof response.json === "object" ? response.json : JSON.parse(response.text || "{}");
+      if (!Array.isArray(payload.acks) || !payload.acks.every(isRuntimeAck)) throw new Error("Runtime sync push response must include valid acks.");
+    } catch (error) {
+      requestError = String(error?.message || error);
+      payload = { acks: eligibleIndexes.map(({ event }) => ({ event_id: event.event_id, ok: false, error: requestError })) };
+    }
+
+    const ackById = new Map(payload.acks.map((ack) => [ack.event_id, ack]));
+    let sent = 0;
+    let failed = 0;
+    const nextEvents = events.map((event, index) => {
+      const selected = eligibleIndexes.some((item) => item.index === index);
+      if (!selected) return event;
+      const ack = ackById.get(event.event_id) || { ok: false, error: "missing runtime sync ack" };
+      if (ack.ok) {
+        sent += 1;
+        return {
+          ...event,
+          status: "sent",
+          attempt_count: (event.attempt_count || 0) + 1,
+          sent_at: now,
+          updated_at: now,
+          ack_id: ack.ack_id,
+          server_sequence: ack.server_sequence,
+          last_error: undefined,
+          next_retry_at: undefined,
+        };
+      }
+      failed += 1;
+      return {
+        ...event,
+        status: "failed",
+        attempt_count: (event.attempt_count || 0) + 1,
+        last_error: String(ack.error || requestError || "runtime sync push failed"),
+        next_retry_at: nextRuntimeRetryAt(now),
+        updated_at: now,
+      };
+    });
+    await this.writeRuntimeOutboxEventsPreservingAppends(nextEvents);
+    return {
+      scanned: events.length,
+      eligible: eligibleIndexes.length,
+      sent,
+      failed,
+      skipped: events.length - eligibleIndexes.length,
+      attempted_event_ids: eligibleIndexes.map(({ event }) => event.event_id),
+    };
+  }
+
+  async pullRuntimeInbox() {
+    const deviceId = this.settings.deviceId || DEFAULT_SETTINGS.deviceId;
+    if (!this.settings.runtimePullEndpoint) {
+      return { device_id: deviceId, received: 0, applied: 0, skipped: 0, conflicted: 0, skipped_reason: "pull_endpoint_missing" };
+    }
+    const cursor = await this.readDeviceCursor(deviceId);
+    const response = await requestUrl({
+      url: appendQuery(this.settings.runtimePullEndpoint, { device_id: deviceId, cursor: cursor?.cursor, limit: 100 }),
+      method: "GET",
+      headers: runtimeNamespaceHeaders(this.settings),
+    });
+    const payload = typeof response.json === "object" ? response.json : JSON.parse(response.text || "{}");
+    assertRuntimePullPayload(payload);
+
+    const result = {
+      device_id: deviceId,
+      previous_cursor: cursor?.cursor,
+      next_cursor: payload.next_cursor,
+      received: payload.events.length,
+      applied: 0,
+      skipped: 0,
+      conflicted: 0,
+      applied_event_ids: [],
+      skipped_event_ids: [],
+      conflict_event_ids: [],
+    };
+    const changedDocIds = new Set();
+    for (const event of payload.events) {
+      const applied = await this.applyRemoteRuntimeEvent(event);
+      if (applied.status === "applied") {
+        result.applied += 1;
+        result.applied_event_ids.push(event.event_id);
+        changedDocIds.add(event.doc_id);
+      } else if (applied.status === "skipped") {
+        result.skipped += 1;
+        result.skipped_event_ids.push(event.event_id);
+      } else {
+        result.conflicted += 1;
+        result.conflict_event_ids.push(event.event_id);
+      }
+    }
+    if (result.conflicted === 0) {
+      await this.writeDeviceCursor({ device_id: deviceId, cursor: payload.next_cursor, updated_at: nowIso() });
+      result.next_cursor = payload.next_cursor;
+      result.cursor_advanced = cursor?.cursor !== payload.next_cursor;
+      result.cursor_blocked_by_conflicts = false;
+    } else {
+      result.next_cursor = cursor?.cursor || "0";
+      result.server_next_cursor = payload.next_cursor;
+      result.cursor_advanced = false;
+      result.cursor_blocked_by_conflicts = true;
+    }
+    for (const docId of changedDocIds) await this.refreshDocPreview(docId);
+    return result;
+  }
+
+  async legacyWakeSync(reason) {
+    if (!this.settings.syncEndpoint) return null;
+    const response = await requestUrl({
+      url: this.settings.syncEndpoint,
+      method: "POST",
+      contentType: "application/json",
+      body: JSON.stringify({
+        reason,
+        source: "obsidian-plugin",
+        changed: this.lastChange,
+      }),
+    });
+    return typeof response.json === "object" ? response.json : {};
+  }
+
   async syncNow(reason, options = {}) {
-    if (!this.settings.syncEndpoint) {
-      if (options.notify ?? this.settings.notifyManualSync) new Notice("InkLoop sync endpoint is not configured");
+    if (!this.settings.runtimePushEndpoint && !this.settings.runtimePullEndpoint && !this.settings.syncEndpoint) {
+      if (options.notify ?? this.settings.notifyManualSync) new Notice("InkLoop runtime sync endpoint is not configured");
       await this.writeStatus({ status: "sync_skipped", reason, last_change: this.lastChange });
       return;
     }
@@ -1264,31 +3541,30 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     const started = performance.now();
     await this.writeStatus({ status: "sync_started", reason, last_change: this.lastChange, sync_started_at: new Date().toISOString() });
     try {
-      const response = await requestUrl({
-        url: this.settings.syncEndpoint,
-        method: "POST",
-        contentType: "application/json",
-        body: JSON.stringify({
-          reason,
-          source: "obsidian-plugin",
-          changed: this.lastChange,
-        }),
-      });
+      const push = await this.pushRuntimeOutbox(reason);
+      const pull = await this.pullRuntimeInbox();
+      const cloudKnowledge = await this.pullCloudKnowledgeProjections(reason);
+      const legacy = (!this.settings.runtimePushEndpoint && !this.settings.runtimePullEndpoint) ? await this.legacyWakeSync(reason) : null;
       const latency = Math.round(performance.now() - started);
-      const payload = typeof response.json === "object" ? response.json : {};
-      const failed = payload.ok === false;
-      if (failed || (options.notify ?? this.settings.notifyManualSync)) {
-        const message = failed
-          ? `InkLoop sync failed in ${latency}ms`
-          : `InkLoop sync completed in ${payload.latency_ms ?? latency}ms`;
+      const hardFailed = push.failed > 0 || legacy?.ok === false;
+      const hasConflicts = pull.conflicted > 0;
+      if (hardFailed || hasConflicts || (options.notify ?? this.settings.notifyManualSync)) {
+        const message = hardFailed
+          ? `InkLoop runtime sync needs attention (${latency}ms)`
+          : hasConflicts
+            ? `InkLoop runtime sync completed with conflicts (${latency}ms)`
+            : `InkLoop runtime sync completed in ${latency}ms`;
         new Notice(message);
       }
       await this.writeStatus({
-        status: failed ? "sync_failed" : "sync_completed",
+        status: hardFailed ? "sync_failed" : hasConflicts ? "sync_completed_with_conflicts" : "sync_completed",
         reason,
         last_change: this.lastChange,
-        latency_ms: payload.latency_ms ?? latency,
-        response: payload,
+        latency_ms: latency,
+        push,
+        pull,
+        cloudKnowledge,
+        legacy,
         synced_at: new Date().toISOString(),
       });
     } catch (error) {
@@ -1309,8 +3585,14 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       documents_dir: this.settings.documentsDir,
       base_dir: this.settings.baseDir,
       sync_endpoint: this.settings.syncEndpoint,
+      runtime_push_endpoint: this.settings.runtimePushEndpoint,
+      runtime_pull_endpoint: this.settings.runtimePullEndpoint,
+      knowledge_base_endpoint: this.settings.knowledgeBaseEndpoint,
+      runtime_cursor_namespace: `${this.runtimeNamespaceSegments().tenantId}/${this.runtimeNamespaceSegments().userId}/${this.settings.deviceId || DEFAULT_SETTINGS.deviceId}`,
+      device_id: this.settings.deviceId,
       auto_sync_on_change: this.settings.autoSyncOnChange,
       debounce_ms: this.settings.debounceMs,
+      runtime_poll_ms: this.settings.runtimePollMs,
       visual_enhancement: this.settings.visualEnhancement,
       preview_editing: false,
       surface_mode: this.surfaceMode(),
@@ -1341,7 +3623,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       if (docId) {
         const runtime = await this.loadRuntimeDocument(docId);
         previewRuntime = runtime;
-        if (runtime?.document?.source_type === "markdown") {
+        if (runtime?.blocks?.length) {
           model = {
             documentTitle: runtime.document.title,
             blocks: runtime.blocks.map((block) => this.sidecarBlockToVisualBlock(block)),
@@ -2132,10 +4414,38 @@ class InkLoopSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  renderV1BoundaryPanel(containerEl) {
+    const panel = containerEl.createDiv({ cls: "inkloop-v1-boundary-card" });
+    panel.createEl("h3", { text: "InkLoop AI Pen V1 boundary" });
+    panel.createEl("p", {
+      text: "Obsidian is a projection surface. Reading documents show source-linked highlights, handwritten thoughts, AI brush responses, and review-later items. Meeting documents use a separate folder and show meeting marks, tasks, decisions, and risks only when the source document is a meeting session.",
+    });
+
+    const rows = panel.createDiv({ cls: "inkloop-v1-boundary-grid" });
+    for (const item of [
+      ["Product role", "Source-linked knowledge projection"],
+      ["Reading output", "Highlights / reading notes / handwritten thoughts / AI brush responses"],
+      ["Meeting output", "Meeting marks / tasks / decisions / risks, only under InkLoop/Meetings"],
+      ["Source unit", "Reading documents and meeting sessions stay grouped separately by inkloop://doc/..."],
+      ["Runtime state", "Hidden sidecar runtime sync"],
+      ["Backlinks", "inkloop://doc/... keeps jump-back to the InkLoop source"],
+      ["Preview editing", `previewEditing=${this.plugin.settings.previewEditing === true ? "true" : "false"}`],
+      ["Runtime push", this.plugin.settings.runtimePushEndpoint || "not configured"],
+      ["Runtime pull", this.plugin.settings.runtimePullEndpoint || "not configured"],
+      ["Cloud Knowledge", this.plugin.settings.knowledgeBaseEndpoint || "not configured"],
+      ["Runtime namespace", `${this.plugin.settings.tenantId || DEFAULT_SETTINGS.tenantId}/${this.plugin.settings.userId || DEFAULT_SETTINGS.userId}`],
+    ]) {
+      const row = rows.createDiv({ cls: "inkloop-v1-boundary-row" });
+      row.createEl("span", { text: item[0] });
+      row.createEl("strong", { text: item[1] });
+    }
+  }
+
   display() {
     const { containerEl } = this;
     containerEl.replaceChildren();
     containerEl.createEl("h2", { text: "InkLoop Sync" });
+    this.renderV1BoundaryPanel(containerEl);
 
     new Setting(containerEl)
       .setName("Documents directory")
@@ -2160,10 +4470,87 @@ class InkLoopSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Sync endpoint")
-      .setDesc("Local or cloud endpoint called when InkLoop documents change.")
+      .setName("Runtime device id")
+      .setDesc("Stable local device id used for runtime sync echo suppression and cursor tracking.")
       .addText((text) => text
-        .setPlaceholder("http://127.0.0.1:8765/api/obsidian-lab/pull")
+        .setPlaceholder("auto-generated")
+        .setValue(this.plugin.settings.deviceId)
+        .onChange(async (value) => {
+          this.plugin.settings.deviceId = value.trim();
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Runtime tenant")
+      .setDesc("Tenant namespace used by Runtime Sync and Cloud Hub.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.tenantId)
+        .setValue(this.plugin.settings.tenantId)
+        .onChange(async (value) => {
+          this.plugin.settings.tenantId = cleanRuntimeNamespaceSegment(value, DEFAULT_SETTINGS.tenantId);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Runtime user")
+      .setDesc("User namespace used by Runtime Sync and Cloud Hub.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.userId)
+        .setValue(this.plugin.settings.userId)
+        .onChange(async (value) => {
+          this.plugin.settings.userId = cleanRuntimeNamespaceSegment(value, DEFAULT_SETTINGS.userId);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Runtime push endpoint")
+      .setDesc("Canonical runtime sync endpoint for pushing local Obsidian sidecar events.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.runtimePushEndpoint)
+        .setValue(this.plugin.settings.runtimePushEndpoint)
+        .onChange(async (value) => {
+          this.plugin.settings.runtimePushEndpoint = value.trim();
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Runtime pull endpoint")
+      .setDesc("Canonical runtime sync endpoint for pulling remote Web/WebView/InkLoop Paper events into hidden sidecars.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.runtimePullEndpoint)
+        .setValue(this.plugin.settings.runtimePullEndpoint)
+        .onChange(async (value) => {
+          this.plugin.settings.runtimePullEndpoint = value.trim();
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Cloud Knowledge endpoint")
+      .setDesc("Cloud Hub endpoint for rendering reviewed ai_turn, KnowledgeObject, and DocumentProjection Markdown into Obsidian.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.knowledgeBaseEndpoint)
+        .setValue(this.plugin.settings.knowledgeBaseEndpoint)
+        .onChange(async (value) => {
+          this.plugin.settings.knowledgeBaseEndpoint = cleanEndpoint(value);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Device command endpoint")
+      .setDesc("Cloud Hub endpoint used by inkloop://doc links to open the source on the bound InkLoop Paper device.")
+      .addText((text) => text
+        .setPlaceholder(DEFAULT_SETTINGS.deviceCommandEndpoint)
+        .setValue(this.plugin.settings.deviceCommandEndpoint)
+        .onChange(async (value) => {
+          this.plugin.settings.deviceCommandEndpoint = cleanEndpoint(value);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Legacy wake endpoint")
+      .setDesc("Compatibility endpoint only. Runtime sync uses push/pull above; leave this empty unless a legacy lab flow needs it.")
+      .addText((text) => text
+        .setPlaceholder("leave empty")
         .setValue(this.plugin.settings.syncEndpoint)
         .onChange(async (value) => {
           this.plugin.settings.syncEndpoint = value.trim();
@@ -2172,7 +4559,7 @@ class InkLoopSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auto-sync on change")
-      .setDesc("Call the sync endpoint after Obsidian saves, renames, or deletes InkLoop files.")
+      .setDesc("Run runtime push/pull after Obsidian saves, renames, or deletes InkLoop files.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.autoSyncOnChange)
         .onChange(async (value) => {
@@ -2194,10 +4581,21 @@ class InkLoopSettingTab extends PluginSettingTab {
       .setName("Debounce")
       .setDesc("Milliseconds to wait after a file event before syncing.")
       .addText((text) => text
-        .setPlaceholder("750")
+        .setPlaceholder(String(DEFAULT_SETTINGS.debounceMs))
         .setValue(String(this.plugin.settings.debounceMs))
         .onChange(async (value) => {
           this.plugin.settings.debounceMs = Math.max(100, Number(value) || DEFAULT_SETTINGS.debounceMs);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Runtime pull interval")
+      .setDesc("Milliseconds between background runtime pulls. Set to 0 to disable polling.")
+      .addText((text) => text
+        .setPlaceholder(String(DEFAULT_SETTINGS.runtimePollMs))
+        .setValue(String(this.plugin.settings.runtimePollMs))
+        .onChange(async (value) => {
+          this.plugin.settings.runtimePollMs = normalizeRuntimePollMs(value);
           await this.plugin.saveSettings();
         }));
 

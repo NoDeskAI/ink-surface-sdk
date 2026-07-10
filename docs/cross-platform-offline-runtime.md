@@ -26,6 +26,8 @@ Pending local mutations are protected data. Cache cleanup must not evict documen
 - File sidecar store for Obsidian vaults and desktop filesystem hosts.
 - IndexedDB store for Web and WebView hosts that need local document snapshots, cache records, and outbox persistence.
 
+Both stores can now act as Runtime Sync inbox targets. They persist applied event ids, device cursors, and conflict records separately from local outbox events so duplicate delivery, echo suppression, and cursor-safe retries can be tested without a production backend.
+
 ## Local WebView Bundle
 
 Mobile and desktop WebView hosts should load HTML, JS, CSS, and renderer assets from the app bundle or a verified local cache. Network is used for sync and asset download only.
@@ -38,4 +40,12 @@ Clients apply local mutations immediately and append outbox events. The sync cli
 
 If the host inbox reports conflicts, the cursor must not advance. The host keeps the previous cursor, records or surfaces the conflict, and retries after merge or resolution.
 
+Cold start uses `runtime.bootstrap` snapshots followed by incremental events. Exported Markdown releases are not required for normal runtime sync.
+
+The local/dev transport in `packages/sync-client` is a validation transport for the MVP. It is token/origin guarded, idempotent by event id, pullable by cursor, and logs only ids/counts/latency by default.
+
 The future cloud backend still owns authenticated device identity, global event ordering, conflict records, asset authorization, and cloud API adapter jobs.
+
+## Knowledge Export Boundary
+
+Clean Markdown releases remain an explicit Knowledge Export path for Obsidian Markdown, backups, and future Notion/MCP/CLI/OpenAPI targets. Exporters consume canonical artifacts and must not write runtime outbox, inbox, cursors, conflicts, or sidecar truth. Runtime Sync remains the canonical path for live reading, writing, marks, progress, and host convergence through explicit runtime events. In V1, Obsidian visible Markdown edits stay local to the projection unless a future controlled adapter records a reviewed sidecar event; they are not reverse-parsed into AI Pen capture truth.

@@ -85,6 +85,26 @@ export function renderPageBackground(items?: Array<{ marked: string; reply: stri
   return `【本页已有批注】（背景，帮你理解整页脉络；别逐条复述，回应只针对下面"当前聚焦"处）：\n${lines}\n\n`;
 }
 
+function compactForPrompt(text?: string): string {
+  return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+function isTranslateRequest(text: string): boolean {
+  return /翻译|译成|译为|translate|translation|英文|中文/i.test(text || '');
+}
+
+function translationSource(view: InferenceView, question: string): string {
+  const q = compactForPrompt(question);
+  const candidates = [
+    view.referent_lines,
+    view.marked,
+    ...(view.recall || []).map((r) => r.text),
+  ]
+    .map(compactForPrompt)
+    .filter((text) => text && text !== q && !isTranslateRequest(text));
+  return candidates.sort((a, b) => b.length - a.length)[0] || '';
+}
+
 /**
  * 把 inference-view 渲染成喂模型的 user turn：idle=整段综合 / handwriting=定向答问。
  * v3：前置「本页已有批注」动态背景段，用「当前聚焦」与之区隔。
@@ -95,7 +115,14 @@ export function renderUserTurn(view: InferenceView): string {
   const themes = view.thematic?.length ? `\n\n【全书别处你也提过】：${view.thematic.map((t) => `「${t.text}」`).join('、')}` : '';
   if (view.trigger === 'handwriting') {
     const ref = view.referent_lines ? `读者在这句旁边写道：「${view.referent_lines}」。` : '';
-    return `${bg}【当前聚焦】读者刚在本页这一处写下问题——手写问：「${view.question || view.marked}」。${ref}相关标注脉络：${view.narrative}。${themes}${ctx}`;
+    const q = view.question || view.marked;
+    const source = isTranslateRequest(q || '') ? translationSource(view, q || '') : '';
+    const translateHint = source
+      ? `这是翻译指令。请把下面这段原文准确翻译成中文；只翻译这段原文，必要时补一句术语说明，不要改答其他问题。\n【待翻译原文】${source}\n`
+      : isTranslateRequest(q || '')
+        ? '这是翻译指令，但系统没有拿到可翻译原文；请直接说明缺少原文，不要泛泛解释。'
+      : '';
+    return `${bg}【当前聚焦】读者刚在本页这一处写下问题——手写问：「${q}」。${translateHint}${ref}相关标注脉络：${view.narrative}。${themes}${ctx}`;
   }
   return `${bg}【当前聚焦】读者刚在本页这一处连续标注——脉络：${view.narrative}。所标内容：「${view.marked || '（未提取到文字）'}」。${themes}${ctx}`;
 }

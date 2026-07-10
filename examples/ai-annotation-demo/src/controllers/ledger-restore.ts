@@ -20,6 +20,8 @@ function persistedToMark(pm: PersistedMark, baseT: number, wall: number): Mark {
     event_type: pm.scored_type as EventType, geometry: { bbox: pm.bbox }, stroke_points: points,
     text_note: null, created_at: pm.created_at, device_id: pm.device_id, session_id: '',
     pointer_type: pm.pointer_type, version: SCHEMA_VERSION,
+    capture_surface: pm.capture_surface,
+    coord_space: pm.coord_space,
   };
   const feature: StrokeFeature = {
     type: pm.feature_type, confidence: pm.feature_confidence, scaleRatio: NaN,
@@ -52,6 +54,7 @@ export async function restoreLedgerState(docId: string): Promise<void> {
     }
     ctx.strokesByPage.set(m.page_id, arr);
   }
+  bus.emit('marks:restored', marks);
 
   // 2) AI 旁注 + 对话 buffer：书日志折叠（每 overlay_id 取最新；dismissed/folded 不显示）
   const turns = await getBookAiTurns(docId);

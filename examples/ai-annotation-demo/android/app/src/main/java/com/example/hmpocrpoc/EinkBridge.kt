@@ -41,7 +41,10 @@ import java.nio.ByteOrder
 object EinkBridge {
 
     private const val JS_OBJECT = "InkLoopEink"
-    private val ALLOWED_ORIGINS = setOf("https://appassets.androidplatform.net")
+    private val ALLOWED_ORIGINS = setOf(
+        "https://appassets.androidplatform.net",
+        "http://appassets.androidplatform.net",
+    )
     private const val SOCK_NAME = "inkloop_eink"   // abstract namespace
     private const val MAGIC = 0xE19C51AA.toInt()
     private const val EINK_W = 1872          // IT8951 帧缓冲原生尺寸（横向）

@@ -1,4 +1,9 @@
-import type { RuntimeStorePort, RuntimeSyncEvent } from '../../runtime-schema/src/index.js';
+import type {
+  RuntimeConflictRecord,
+  RuntimeDocumentSnapshot,
+  RuntimeStorePort,
+  RuntimeSyncEvent,
+} from '../../runtime-schema/src/index.js';
 
 export const OFFLINE_STORE_SCHEMA_VERSION = 'inksurface.offline_store.v1' as const;
 
@@ -57,10 +62,29 @@ export interface OfflineEvictionCandidate {
   last_accessed_at?: string;
 }
 
+export interface OfflineDeviceCursor {
+  device_id: string;
+  cursor: string;
+  updated_at: string;
+}
+
+export interface OfflineRemoteEventApplyResult {
+  event_id: string;
+  status: 'applied' | 'skipped' | 'conflicted';
+  conflict?: RuntimeConflictRecord;
+}
+
 export interface OfflineRuntimeStorePort extends RuntimeStorePort {
+  writeDocumentSnapshot(snapshot: RuntimeDocumentSnapshot): Promise<void>;
   getCacheRecord(docId: string): Promise<OfflineDocumentCacheRecord | null>;
   writeCacheRecord(record: OfflineDocumentCacheRecord): Promise<void>;
   listPendingEvents(docId?: string): Promise<RuntimeSyncEvent[]>;
+  listAppliedEventIds(docId?: string): Promise<string[]>;
+  applyRemoteEvent(event: RuntimeSyncEvent): Promise<OfflineRemoteEventApplyResult>;
+  getDeviceCursor(deviceId: string): Promise<OfflineDeviceCursor | null>;
+  writeDeviceCursor(cursor: OfflineDeviceCursor): Promise<void>;
+  listConflicts(docId?: string): Promise<RuntimeConflictRecord[]>;
+  recordConflict(conflict: RuntimeConflictRecord): Promise<void>;
 }
 
 export function resolveOfflineOpenState(

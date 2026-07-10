@@ -1,0 +1,39 @@
+{
+  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "organizeImports": { "enabled": false },
+  "formatter": { "enabled": false },
+  "json": { "parser": { "allowComments": true } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noUnusedVariables": "warn",
+        "noUnusedImports": "warn"
+      },
+      "suspicious": {
+        "noDoubleEquals": "warn",
+        "noDebugger": "error"
+      }
+    }
+  },
+  "files": {
+    "ignore": [
+      "dist",
+      "test-results",
+      ".inkloop",
+      ".inkloop-smoke-runs",
+      "node_modules",
+      "android",
+      "Lark-Meeting-Timeline-main",
+      "jsoncanvas-main",
+      "legacy",
+      "obsidian-importer-master",
+      "obsidian-maps-master",
+      "obsidian-plugin",
+      "public",
+      "**/*.mjs",
+      "mobile.html"
+    ]
+  }
+}
