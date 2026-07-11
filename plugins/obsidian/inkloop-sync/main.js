@@ -258,6 +258,44 @@ function parseControlledKnowledgeEdits(markdown) {
   return edits;
 }
 
+function isCloudKnowledgeProjectionMarkdown(markdown) {
+  const front = parseProjectionFrontmatter(markdown);
+  const hasDocumentId = typeof front.inkloop_document_id === "string" && front.inkloop_document_id.length > 0;
+  return hasDocumentId && (
+    front.inkloop_projection_role === "source_file_unit"
+    || typeof front.inkloop_knowledge_object_id === "string"
+    || String(markdown || "").includes("<!-- inkloop:begin-ko ")
+  );
+}
+
+function controlledKnowledgeSignatureKey(filePath, edit) {
+  return `${filePath}::${edit.document_id}::${edit.ko_id}`;
+}
+
+function controlledKnowledgeSignature(edit) {
+  return JSON.stringify({ document_id: edit.document_id, ko_id: edit.ko_id, patch: edit.patch });
+}
+
+function rememberControlledKnowledgeSignatures(signatures, filePath, markdown) {
+  const edits = parseControlledKnowledgeEdits(markdown);
+  for (const edit of edits) {
+    signatures.set(controlledKnowledgeSignatureKey(filePath, edit), controlledKnowledgeSignature(edit));
+  }
+  return edits.length;
+}
+
+function controlledKnowledgeEditsSinceBaseline(signatures, filePath, markdown) {
+  const changed = [];
+  for (const edit of parseControlledKnowledgeEdits(markdown)) {
+    const key = controlledKnowledgeSignatureKey(filePath, edit);
+    const signature = controlledKnowledgeSignature(edit);
+    if (signatures.get(key) === signature) continue;
+    signatures.set(key, signature);
+    changed.push(edit);
+  }
+  return changed;
+}
+
 async function sha256Tagged(input) {
   const bytes = new TextEncoder().encode(String(input || ""));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -1933,9 +1971,11 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.nativeEditTimers = new Map();
     this.previewSignatures = new Map();
     this.controlledKnowledgeSignatures = new Map();
+    this.cloudProjectionPaths = new Set();
     this.appendQueues = new Map();
     this.refreshPreviewsRunning = false;
     this.statusPath = `${this.settings.baseDir}/.obsidian-plugin-status.json`;
+    await this.seedControlledKnowledgeSignaturesFromVault();
 
     this.addCommand({ id: "sync-inkloop-now", name: "Sync InkLoop now", callback: () => this.syncNow("command", { notify: true }) });
     this.addCommand({ id: "open-current-file-in-inkloop", name: "Open current file with InkLoop sidecar", callback: () => this.openCurrentFileInInkLoop() });
@@ -1971,6 +2011,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.nativeEditTimers?.clear?.();
     this.previewSignatures?.clear?.();
     this.controlledKnowledgeSignatures?.clear?.();
+    this.cloudProjectionPaths?.clear?.();
     this.app.workspace.detachLeavesOfType(INKLOOP_VIEW_TYPE);
   }
 
@@ -2060,6 +2101,22 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     if (existing === file.markdown) return false;
     await this.app.vault.adapter.write(file.path, file.markdown);
     return true;
+  }
+
+  async seedControlledKnowledgeSignaturesFromVault() {
+    const prefix = `${this.settings.documentsDir}/`;
+    const previousPull = await this.readJson(this.sidecarPath("cloud-knowledge-pull.json"), null);
+    for (const path of Array.isArray(previousPull?.rendered_paths) ? previousPull.rendered_paths : []) {
+      if (typeof path === "string" && path.startsWith(prefix)) this.cloudProjectionPaths.add(path);
+    }
+    const files = typeof this.app.vault.getMarkdownFiles === "function" ? this.app.vault.getMarkdownFiles() : [];
+    let seeded = 0;
+    for (const file of files) {
+      if (!file?.path?.startsWith(prefix)) continue;
+      const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
+      seeded += rememberControlledKnowledgeSignatures(this.controlledKnowledgeSignatures, file.path, markdown);
+    }
+    return seeded;
   }
 
   async removePath(path) {
@@ -2158,7 +2215,11 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     );
     const files = renderCloudKnowledgeMarkdown(this.settings, filtered.objects, filtered.projections, visibleAiTurns);
     let changed = 0;
-    for (const file of files) if (await this.writeRenderedMarkdownFile(file)) changed += 1;
+    for (const file of files) {
+      this.cloudProjectionPaths.add(file.path);
+      rememberControlledKnowledgeSignatures(this.controlledKnowledgeSignatures, file.path, file.markdown);
+      if (await this.writeRenderedMarkdownFile(file)) changed += 1;
+    }
     const staleProjectionArchive = await this.archiveStaleCloudKnowledgeProjections(files);
     const result = {
       schema_version: "inkloop.obsidian_cloud_knowledge_pull.v1",
@@ -2962,14 +3023,10 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   async updateControlledKnowledgeProjection(file) {
     if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return null;
     const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
-    const edits = parseControlledKnowledgeEdits(markdown);
+    const edits = controlledKnowledgeEditsSinceBaseline(this.controlledKnowledgeSignatures, file.path, markdown);
     if (!edits.length) return null;
     const events = [];
     for (const edit of edits) {
-      const signatureKey = `${file.path}::${edit.document_id}::${edit.ko_id}`;
-      const signature = JSON.stringify({ document_id: edit.document_id, ko_id: edit.ko_id, patch: edit.patch });
-      if (this.controlledKnowledgeSignatures.get(signatureKey) === signature) continue;
-      this.controlledKnowledgeSignatures.set(signatureKey, signature);
       const event = await this.appendRuntimeSyncEvent({
         doc_id: edit.document_id,
         operation: "knowledge.update",
@@ -3311,7 +3368,9 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     const isTracked = this.isInkLoopPath(file.path) || trackedDocId || (oldPath && (this.isInkLoopPath(oldPath) || oldTrackedDocId));
     if (!isTracked) return;
     if (eventType === "rename" && oldPath && oldTrackedDocId) await this.updateTrackedSourcePath(file, oldPath);
+    const managedProjection = eventType === "modify" ? await this.isCloudKnowledgeProjectionFile(file) : false;
     const controlledEvent = eventType === "modify" ? await this.updateControlledKnowledgeProjection(file) : null;
+    if (managedProjection && !controlledEvent) return;
     const refreshDocId = trackedDocId || oldTrackedDocId || sidecarDocId || oldSidecarDocId || controlledEvent?.doc_id;
     this.lastChange = {
       event_type: controlledEvent ? "inkloop_controlled_knowledge_edit" : eventType,
@@ -3332,6 +3391,13 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       this.pendingTimer = null;
       void this.syncNow(reason, { notify: false });
     }, this.settings.debounceMs);
+  }
+
+  async isCloudKnowledgeProjectionFile(file) {
+    if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return false;
+    if (this.cloudProjectionPaths.has(file.path)) return true;
+    const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
+    return isCloudKnowledgeProjectionMarkdown(markdown);
   }
 
   startRuntimePolling() {
@@ -3532,8 +3598,9 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   }
 
   async syncNow(reason, options = {}) {
+    const shouldNotify = options.notify ?? false;
     if (!this.settings.runtimePushEndpoint && !this.settings.runtimePullEndpoint && !this.settings.syncEndpoint) {
-      if (options.notify ?? this.settings.notifyManualSync) new Notice("InkLoop runtime sync endpoint is not configured");
+      if (shouldNotify) new Notice("InkLoop runtime sync endpoint is not configured");
       await this.writeStatus({ status: "sync_skipped", reason, last_change: this.lastChange });
       return;
     }
@@ -3548,7 +3615,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       const latency = Math.round(performance.now() - started);
       const hardFailed = push.failed > 0 || legacy?.ok === false;
       const hasConflicts = pull.conflicted > 0;
-      if (hardFailed || hasConflicts || (options.notify ?? this.settings.notifyManualSync)) {
+      if (shouldNotify) {
         const message = hardFailed
           ? `InkLoop runtime sync needs attention (${latency}ms)`
           : hasConflicts
@@ -3575,7 +3642,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         error: String(error?.message || error),
         synced_at: new Date().toISOString(),
       });
-      new Notice(`InkLoop sync failed: ${String(error?.message || error)}`);
+      if (shouldNotify) new Notice(`InkLoop sync failed: ${String(error?.message || error)}`);
     }
   }
 

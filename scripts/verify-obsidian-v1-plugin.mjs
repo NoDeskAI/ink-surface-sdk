@@ -137,6 +137,11 @@ function verifyRuntimeSyncBoundary() {
       'knowledge.update',
       'inkloop_controlled_knowledge_edit',
       'controlled_schema_version',
+      'seedControlledKnowledgeSignaturesFromVault',
+      'rememberControlledKnowledgeSignatures',
+      'isCloudKnowledgeProjectionMarkdown',
+      'if (managedProjection && !controlledEvent) return',
+      'const shouldNotify = options.notify ?? false',
       'inkloop_projection_id',
       'origin: { device_id',
       'runtimeNamespaceSegments',
@@ -182,11 +187,46 @@ function loadPluginCloudRenderer() {
     return null;
   }
   try {
-    return new Function(`${source.slice(start, end)}\nreturn { renderCloudKnowledgeMarkdown };`)();
+    const controlledConstants = `
+const CONTROLLED_FIELDS_MARKER = "<!-- inkloop:controlled-fields v1 -->";
+const KNOWLEDGE_STATUSES = new Set(["inbox", "accepted", "edited", "follow_up", "dismissed", "export_ready", "exported", "archived"]);
+const RISK_STATUSES = new Set(["open", "watching", "mitigated", "closed"]);
+`;
+    return new Function(`${controlledConstants}\n${source.slice(start, end)}\nreturn { renderCloudKnowledgeMarkdown, rememberControlledKnowledgeSignatures, controlledKnowledgeEditsSinceBaseline, isCloudKnowledgeProjectionMarkdown };`)();
   } catch (error) {
     fail(`could not evaluate Obsidian plugin Cloud Knowledge renderer: ${String(error?.message || error)}`);
     return null;
   }
+}
+
+function verifyCloudProjectionWritesDoNotBecomeControlledEdits() {
+  const renderer = loadPluginCloudRenderer();
+  if (!renderer) return;
+  const signatures = new Map();
+  const filePath = 'InkLoop/Reading/Test/Test.md';
+  const markdown = `---
+inkloop_document_id: "doc_test"
+inkloop_knowledge_object_id: "ko_test"
+inkloop_knowledge_kind: "reading_note"
+---
+
+<!-- inkloop:controlled-fields v1 -->
+- Status: accepted
+- Tags: inkloop, reading
+`;
+  renderer.rememberControlledKnowledgeSignatures(signatures, filePath, markdown);
+  if (!renderer.isCloudKnowledgeProjectionMarkdown(markdown)) {
+    fail('Cloud Knowledge Markdown was not recognized as a managed projection');
+  }
+  const unchanged = renderer.controlledKnowledgeEditsSinceBaseline(signatures, filePath, markdown);
+  if (unchanged.length !== 0) fail('Cloud-rendered controlled fields were incorrectly emitted as user edits');
+
+  const edited = markdown.replace('- Status: accepted', '- Status: archived');
+  const changed = renderer.controlledKnowledgeEditsSinceBaseline(signatures, filePath, edited);
+  if (changed.length !== 1 || changed[0].patch.status !== 'archived') {
+    fail('A real user controlled-field edit was not emitted after projection baseline seeding');
+  }
+  note('Cloud-rendered controlled fields are baselined while real user edits still produce one update');
 }
 
 function verifyCloudKnowledgeMeetingHubRendersKoWithoutQuote() {
@@ -452,6 +492,7 @@ verifyPackageFiles();
 verifyRuntimeSyncBoundary();
 verifyCloudKnowledgeMeetingHubRendersKoWithoutQuote();
 verifyCloudKnowledgeReadingHubUsesProjectionAnnotationBody();
+verifyCloudProjectionWritesDoNotBecomeControlledEdits();
 verifySettingsBoundaryStyles();
 verifyInstaller();
 verifyInstallerSmoke();
