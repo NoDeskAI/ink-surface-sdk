@@ -688,6 +688,7 @@ async function loadIntoState(buf: ArrayBuffer, filename: string, persist: Blob |
   const fresh = () => sctx.loadGeneration === loadGen; // 先把异步结果算到局部、校验仍是最新再写字段，避免旧载入覆盖新载入
   cancelActiveRender(); // 切文档先取消在途渲染，防旧页像素继续写 pageCv（B3）
   sctx.syntheticDoc = null;
+  clearSyntheticPaginationCache(); // 切文档：释放上一本 synthetic 的分页缓存（EPUB→PDF 后别常驻大 layout）
 
   const fileHash = await sha256Hex(buf);
   if (!fresh()) return null; // openDoc 之前的早退都安全：模块 current 尚未被本次触碰
@@ -985,6 +986,7 @@ export function renderBlankSurface(documentId: string, title = '空白页', opts
   hideSecondaryPageCanvas();
   getActiveContext().pdf = null; // 脱离上一份 PDF（防 zoom/翻页误渲旧页）
   getActiveContext().syntheticDoc = null;
+  clearSyntheticPaginationCache(); // 白板：同上，释放上一本 synthetic 的分页缓存
   getActiveContext().storeDoc = null; setActiveDoc(null); // 白板无持久化文档：store.current 置空，页缓存/阅读位置写操作变 no-op（P0-4）
   state.fileHash = documentId;
   state.documentId = documentId;
@@ -1446,6 +1448,32 @@ function paginateSyntheticBlocks(doc: SyntheticSurfaceDocument, width: number, p
   return pages;
 }
 
+// synthetic(EPUB/Markdown) 分页缓存：paginateSyntheticBlocks 只依赖 (doc, width, height)——
+// 字体写死不随 zoom 变。renderSyntheticSurface 是翻页/切视图热路径，早先每次翻页都全量重排整本
+// （大 EPUB 1336 页 → 每翻一页几万次 measureText 折行 = 秒级卡顿·真机实测根因）。同书同视口下
+// 分页结果不变，缓存后翻页 O(整本)→O(1)；换书(doc 引用变)/改视口(width|height 变)自动失效重算。
+let syntheticPaginationCache: {
+  doc: SyntheticSurfaceDocument;
+  width: number;
+  height: number;
+  paged: SyntheticPageLayout[];
+} | null = null;
+
+function getPaginatedSyntheticPages(doc: SyntheticSurfaceDocument, width: number, height: number): SyntheticPageLayout[] {
+  const c = syntheticPaginationCache;
+  if (c && c.doc === doc && c.width === width && c.height === height) return c.paged;
+  const paged = paginateSyntheticBlocks(doc, width, height);
+  syntheticPaginationCache = { doc, width, height, paged };
+  return paged;
+}
+
+/** 清 synthetic 分页缓存。离开 synthetic 渲染（切 PDF / 白板 / 销毁文档）时调用：换新 synthetic 文档时
+ *  getPaginatedSyntheticPages 靠 doc 引用变本会自然重算，但 EPUB→PDF 后没有新 synthetic 文档来替换，
+ *  缓存会继续强引用上一整本 EPUB 的全部页 layout（大对象常驻内存）——这里提前释放。 */
+function clearSyntheticPaginationCache(): void {
+  syntheticPaginationCache = null;
+}
+
 function syntheticSpreadOrientation(): PdfSpreadOrientation {
   return pdfSpreadOrientation(availableStageBox());
 }
@@ -1502,7 +1530,7 @@ export function renderSyntheticSurface(): void {
   cancelActiveRender();
   hideSecondaryPageCanvas();
   const slotSize = syntheticPageSlotSize();
-  const paged = paginateSyntheticBlocks(doc, slotSize.width, slotSize.height);
+  const paged = getPaginatedSyntheticPages(doc, slotSize.width, slotSize.height);
   state.pageCount = Math.max(1, paged.length);
   state.pageIndex = Math.min(Math.max(0, state.pageIndex), state.pageCount - 1);
   if (slotSize.spread && state.pageIndex % 2 === 1) state.pageIndex -= 1;
