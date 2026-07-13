@@ -654,9 +654,15 @@ export function startLibrarySyncLoop(onChange?: () => void, intervalMs = LOOP_MS
     timer = window.setInterval(() => void tick(), intervalMs);
     document.addEventListener('visibilitychange', visibleTick);
     window.addEventListener('online', onlineTick);
-    streamStop = startLibraryManifestStream(() => void tick());
+    const restartStream = (): void => {
+      streamStop?.();
+      streamStop = startLibraryManifestStream(() => void tick());
+    };
+    restartStream();
+    // 身份升级（local_user → feishu_ou_*）：SSE 是用旧身份建的、只 tick 收不到新桶实时更新，
+    // 必须 abort 重连才能在新命名空间下重新订阅（否则只能等轮询）。
     authStop = onAuthChange((event) => {
-      if (event.kind === 'login') void tick();
+      if (event.kind === 'login') { restartStream(); void tick(); }
     });
   }
   const session = getSession();

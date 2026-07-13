@@ -89,7 +89,7 @@ export async function publishVaultFromDevice(opts: VaultPublishOpts = {}): Promi
     throwIfAborted();
 
     stage = 'publish';
-    const published = await publishVaultRelease(release, { userId, deviceId, signal: ctrl.signal });
+    const published = await publishVaultRelease(release, { deviceId, signal: ctrl.signal }); // userId 由后端 token 决定，不前端传
     // 完整性闸：postJson 非 2xx 已抛错落 catch；这里再挡「2xx 但 ok:false / 文件数不符」的弱失败，别静默报成功。
     const expectedFileCount = release.files.length;
     const rejected = published.ok === false;

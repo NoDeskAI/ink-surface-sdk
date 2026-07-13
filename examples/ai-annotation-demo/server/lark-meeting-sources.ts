@@ -68,8 +68,6 @@ interface MinimalLarkClient {
   listMeetingsByNoWithToken?: (meetingNo: string, token: string, opts: Record<string, unknown>) => Promise<unknown>;
 }
 
-const meetingNoLookupCooldown = new Map<string, { untilMs: number; message: string }>();
-
 interface CalendarMeetingEvent {
   event_id: string;
   summary?: string;
@@ -270,6 +268,7 @@ function candidateRecords(raw: unknown): Record<string, unknown>[] {
   return [
     data.items,
     data.meetings,
+    data.meeting_briefs,   // list_by_no 的返回形状（{id, meeting_no, topic}）
     data.meeting_list,
     data.list,
     data.meeting ? [data.meeting] : null,
@@ -354,27 +353,6 @@ async function botWorkspaceVisibleToUser(workspace: FeishuBotWorkspace, userOpen
 
 function feishuMsg(json: Record<string, unknown>): string {
   return String(json.msg || json.message || json.error || json.code || 'unknown Feishu error');
-}
-
-function isFrequencyLimitError(error: unknown): boolean {
-  return /frequency limit|rate limit|too many requests|触发频控|频率/i.test(String((error as Error)?.message || error));
-}
-
-function lookupCooldownMessage(meetingNo: string, nowMs: number): string | null {
-  const hit = meetingNoLookupCooldown.get(meetingNo);
-  if (!hit) return null;
-  if (hit.untilMs <= nowMs) {
-    meetingNoLookupCooldown.delete(meetingNo);
-    return null;
-  }
-  return hit.message;
-}
-
-function rememberLookupCooldown(meetingNo: string, message: string, nowMs: number): void {
-  meetingNoLookupCooldown.set(meetingNo, {
-    message,
-    untilMs: nowMs + 2 * 60_000,
-  });
 }
 
 function dataOf(json: Record<string, unknown>): Record<string, unknown> {
@@ -679,6 +657,58 @@ function mergeSources(sources: LarkMeetingSource[], nowMs: number): LarkMeetingS
     .sort((a, b) => a.scheduled_at.localeCompare(b.scheduled_at));
 }
 
+/**
+ * 单场按需解析：给定入会短号 + 该场计划时间，用 ±6h 窗单次 list_by_no 拿真 VC meeting_id。
+ * 打开某场会议时才调（一次一场），替代原先一次性给一批会议批量解析（那会触发飞书频率限流、
+ * 且周期会所有实例共享短号必须靠具体时间窗才能区分实例）。
+ */
+export async function resolveLarkMeetingInstance(
+  meetingNo: string,
+  scheduledAt: string,
+  options: Pick<LarkMeetingSourcesOptions, 'env' | 'createClient' | 'nowMs'> = {},
+): Promise<{ meeting: LarkMeetingSource | null }> {
+  const no = String(meetingNo || '').trim();
+  const targetMs = Date.parse(scheduledAt);
+  if (!/^\d{6,20}$/.test(no) || !Number.isFinite(targetMs)) {
+    throw Object.assign(new Error('invalid meeting_no or scheduled_at'), { status: 400 });
+  }
+  const env = options.env || process.env;
+  const config = appConfig(env);
+  if (!config) throw Object.assign(new Error('Lark is not configured'), { status: 503 });
+  const nowMs = options.nowMs ?? Date.now();
+  const oauth = await resolveUserOAuthToken(env, nowMs, { createClient: options.createClient });
+  const client = (options.createClient || createLarkClient)({
+    ...process.env,
+    ...env,
+    LARK_APP_ID: config.appId,
+    LARK_APP_SECRET: config.appSecret,
+    ...(config.baseUrl ? { LARK_BASE_URL: config.baseUrl } : {}),
+  }) as MinimalLarkClient;
+
+  const WINDOW_SECONDS = 6 * 3600;
+  const opts = {
+    start_time: Math.floor(targetMs / 1000) - WINDOW_SECONDS,
+    end_time: Math.floor(targetMs / 1000) + WINDOW_SECONDS,
+    page_size: 10,
+  };
+  const raw = oauth.usable && oauth.token && client.listMeetingsByNoWithToken
+    ? await client.listMeetingsByNoWithToken(no, oauth.token, opts)
+    : await client.listMeetingsByNo?.(no, opts);
+  const code = obj(raw).code;
+  if (code != null && Number(code) !== 0) throw new Error(feishuMsg(obj(raw)));
+
+  const meeting = candidateRecords(raw)
+    .map((record) => meetingSourceFromRecord(record, { meeting_no: no, scheduled_at: new Date(targetMs).toISOString() }, nowMs))
+    .filter((source): source is LarkMeetingSource =>
+      !!source
+      && source.meeting_no === no
+      && !!source.feishu_meeting_id
+      && source.feishu_meeting_id !== no
+      && Math.abs(Date.parse(source.scheduled_at) - targetMs) <= WINDOW_SECONDS * 1000)
+    .sort((a, b) => Math.abs(Date.parse(a.scheduled_at) - targetMs) - Math.abs(Date.parse(b.scheduled_at) - targetMs))[0] ?? null;
+  return { meeting };
+}
+
 export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions = {}): Promise<LarkMeetingSourcesResult> {
   const env = options.env || process.env;
   const config = appConfig(env);
@@ -763,39 +793,9 @@ export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions
       errors.push({ source: 'user_calendar', code: 'calendar_failed', message: String((e as Error)?.message || e), required_scope: USER_CALENDAR_SCOPES.join(','), permission_url: permissionUrl(config.appId, USER_CALENDAR_SCOPES) });
     }
   }
-  const linkFallbacks = sources.filter((source) => source.meeting_no || source.meeting_url);
-  for (const fallback of linkFallbacks.slice(0, 20)) {
-    const meetingNo = fallback.meeting_no || meetingNoFromUrl(fallback.meeting_url);
-    if (!meetingNo || (!client.listMeetingsByNo && !client.listMeetingsByNoWithToken)) continue;
-    const cooldown = lookupCooldownMessage(meetingNo, nowMs);
-    if (cooldown) {
-      errors.push({ source: 'lark_meeting_timeline_lookup', code: 'list_by_no_cooldown', message: cooldown, required_scope: 'vc:meeting.meetingid:read', permission_url: permissionUrl(config.appId, ['vc:meeting.meetingid:read']) });
-      continue;
-    }
-    try {
-      const opts = { start_time: startSeconds, end_time: endSeconds, page_size: 10 };
-      let raw: unknown;
-      if (userOAuth.token && client.listMeetingsByNoWithToken) {
-        try {
-          raw = await client.listMeetingsByNoWithToken(meetingNo, userOAuth.token, opts);
-        } catch (userError) {
-          if (!client.listMeetingsByNo) throw userError;
-          raw = await client.listMeetingsByNo(meetingNo, opts);
-          errors.push({ source: 'lark_meeting_timeline_lookup_user_oauth', code: 'user_oauth_lookup_failed', message: String((userError as Error)?.message || userError), required_scope: 'vc:meeting.meetingid:read', permission_url: permissionUrl(config.appId, ['vc:meeting.meetingid:read']) });
-        }
-      } else {
-        raw = await client.listMeetingsByNo?.(meetingNo, opts);
-      }
-      for (const record of candidateRecords(raw)) {
-        const source = meetingSourceFromRecord(record, fallback, nowMs);
-        if (source) sources.push(source);
-      }
-    } catch (e) {
-      const message = String((e as Error)?.message || e);
-      if (isFrequencyLimitError(e)) rememberLookupCooldown(meetingNo, message, nowMs);
-      errors.push({ source: 'lark_meeting_timeline_lookup', code: 'list_by_no_failed', message, required_scope: 'vc:meeting.meetingid:read', permission_url: permissionUrl(config.appId, ['vc:meeting.meetingid:read']) });
-    }
-  }
+  // 不再在这里批量 list_by_no 解析每一场的真 meeting_id——一次性给一批会解析会触发飞书频率限流
+  // (list_by_no_cooldown)，且周期会所有实例共享短号、批量用大窗无法区分实例。改为打开某场会议时
+  // 用该场 scheduled_at 的 ±6h 窗按需单场解析（见 resolveLarkMeetingInstance / 前端 resolveMeetingInstance）。
   try {
     if (client.searchMeetings || (userOAuth.token && client.searchMeetingsWithToken)) {
       const vcSearchPageSize = Math.min(pageSize, 10);

@@ -16,10 +16,11 @@ describe('vault-publish client', () => {
       calls.push({ url: String(url), init });
       return new Response(JSON.stringify({ ok: true, release_id: 'r1', file_count: 1 }), { status: 200, headers: { 'content-type': 'application/json' } });
     }));
-    const r = await publishVaultRelease(release, { userId: 'u_demo', deviceId: 'mac' });
+    const r = await publishVaultRelease(release, { deviceId: 'mac' });
     expect(r.release_id).toBe('r1');
-    // 断言路径后缀（不锁整串）：core/api 在生产/设备构建会前缀 VITE_API_BASE_URL，dev 同源为空——测试对 base 中立。
-    expect(calls[0].url.endsWith('/api/panel-vault/users/u_demo/releases')).toBe(true);
+    // 路径不再带 userId——后端按 token 权威身份填桶（不锁整串·测试对 base 中立）。
+    expect(calls[0].url.endsWith('/api/panel-vault/releases')).toBe(true);
+    expect(calls[0].url.includes('/users/')).toBe(false);
     expect(calls[0].init.method).toBe('POST');
     const body = JSON.parse(String(calls[0].init.body));
     expect(body.manifest.release_hash).toBe('sha256:ab');
@@ -27,14 +28,14 @@ describe('vault-publish client', () => {
     expect(body.device_id).toBe('mac');
   });
 
-  it('userId 进路径做 encodeURIComponent', async () => {
+  it('publish 路径不含客户端 userId（防越桶/local_user 冒充）', async () => {
     const calls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       calls.push(String(url));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }));
-    await publishVaultRelease(release, { userId: 'u/evil' });
-    expect(calls[0].endsWith('/api/panel-vault/users/u%2Fevil/releases')).toBe(true);
+    await publishVaultRelease(release, {});
+    expect(calls[0].endsWith('/api/panel-vault/releases')).toBe(true);
   });
 
   it('fetchLatestRelease → GET latest', async () => {
@@ -49,6 +50,6 @@ describe('vault-publish client', () => {
 
   it('非 2xx → 抛（postJson 行为）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
-    await expect(publishVaultRelease(release, { userId: 'u_demo' })).rejects.toThrow();
+    await expect(publishVaultRelease(release, {})).rejects.toThrow();
   });
 });

@@ -29,6 +29,7 @@ import { materialLinkId, materialDocxPdfDocId } from '../features/meeting/feishu
 import { forgetClaim, meetingNoFromUrl, resolveClaim, rememberClaim } from '../features/meeting/group-claims';
 import { apiUrl, getJson, postJson } from '../core/api';
 import { getSession } from '../core/auth';
+import { refreshCoreSessionFromAuthority } from '../core/session-reconcile';
 import { showMobileToast, dismissMobileToast } from './toast';
 import { devEmit } from '../core/dev-telemetry';
 import { notePanelSyncOk, notePanelSyncError } from './meeting-sync-status';
@@ -346,7 +347,8 @@ async function upsertPanelMeetingInner(mt: PanelFeishuMeeting, type: PanelMeetin
     ...(endMs ? { ended_at: new Date(endMs).toISOString() } : {}),
     ...(justWentLive ? { live_unread: true } : {}),
     ...(nextStatus === 'ended' ? { live_unread: false } : {}), // 会都结束了·「现在有会议开始了」的提醒不再有意义
-    feishu_meeting_id: mt.meeting_id,
+    // 只有真 VC meeting_id 才落 feishu_meeting_id；短号(meeting_no)冒充时不写（避免周期会实例共享同一 id 导致错配）。
+    ...(mt.meeting_id && mt.meeting_id !== mt.meeting_no ? { feishu_meeting_id: mt.meeting_id } : {}),
     feishu_meeting_no: mt.meeting_no,
     feishu_topic: mt.topic,
     source_kind: 'vc',                                                                  // panel VC 接管（syncCalendarMeetings 不再回刷此卡）
@@ -501,7 +503,8 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
           ? { started_at: source.scheduled_at, vc_meeting_start_t0: new Date(source.scheduled_at).getTime(), t0_source: 'calendar', align_state: 'estimated' }
           : {}),
       ...(source.ended_at ? { ended_at: source.ended_at } : {}),
-      ...(source.feishu_meeting_id ? { feishu_meeting_id: source.feishu_meeting_id } : {}),
+      // 短号冒充 meeting_id 时不写 feishu_meeting_id（周期会所有实例共享同一短号会互相错配）。
+      ...(source.feishu_meeting_id && source.feishu_meeting_id !== meetingNo ? { feishu_meeting_id: source.feishu_meeting_id } : {}),
       ...(meetingNo ? { feishu_meeting_no: meetingNo, calendar_meeting_no: meetingNo } : {}),
       ...(source.title ? { feishu_topic: source.title } : {}),
       ...(source.feishu_minute_token ? { feishu_minute_token: source.feishu_minute_token } : {}),
@@ -595,6 +598,7 @@ let fsIdentityCache: FeishuIdentityResponse | null = null;
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */
 async function syncHomeData(): Promise<void> {
   fsIdentityCache = await feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null);
+  await refreshCoreSessionFromAuthority().catch(() => false); // 校准前端 core session=后端飞书身份（fsIdentityCache 只给会议 UI，不改 core session）
   updateCloudClock(fsIdentityCache?.server_now_ms);
   await syncPanelMeetingsObserved().catch(() => {}); // L1：panel VC 会议 → 本地会议（真 t0 + 归群）
   const cal = await syncCalendarMeetings().catch((e) => ({ connected: false, events: [] as FeishuEvent[], issue: `飞书日历同步失败：${String((e as Error)?.message || e)}` })); // A：日历日程 → 本地 upcoming 会议

@@ -22,9 +22,11 @@ export interface PublishResult {
 }
 
 /** 上传整包 release（设备→panel 存）。内容未变（同 release_hash）panel 幂等返回 deduped。 */
-export async function publishVaultRelease(release: VaultRelease, opts: { userId: string; deviceId?: string; signal?: AbortSignal }): Promise<PublishResult> {
+// 不再在 URL 里带 userId——后端 vault guard 按 token 权威身份(session.user_id)填桶。
+// 前端传 userId 会与后端飞书身份分歧导致 403（前端停 local_user、后端 feishu_ou_）。
+export async function publishVaultRelease(release: VaultRelease, opts: { deviceId?: string; signal?: AbortSignal } = {}): Promise<PublishResult> {
   return postJson<PublishResult>(
-    `${BASE}/users/${u(opts.userId)}/releases`,
+    `${BASE}/releases`,
     { manifest: release.manifest, files: release.files, device_id: opts.deviceId },
     { signal: opts.signal },
   );

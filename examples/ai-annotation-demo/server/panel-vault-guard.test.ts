@@ -21,6 +21,9 @@ describe('guardPanelVaultRest · fail-closed + 白名单', () => {
   it('未配 forceUser → 503（绝不透传客户端 userId）', () => expectStatus(() => guardPanelVaultRest('/users/x/releases', 'POST', ''), 503));
   it('user 不匹配 forceUser → 403（防越桶·非静默改写）', () => expectStatus(() => guardPanelVaultRest('/users/other/releases', 'POST', 'edy'), 403));
   it('合法 POST /users/<u>/releases', () => expect(guardPanelVaultRest('/users/edy/releases', 'POST', 'edy')).toEqual({ rest: '/users/edy/releases', releasePost: true }));
+  it('无 userId 新路径 POST /releases → 用 forceUser 填桶（前端不再传 userId）', () => expect(guardPanelVaultRest('/releases', 'POST', 'edy')).toEqual({ rest: '/users/edy/releases', releasePost: true }));
+  it('无 userId 新路径 GET /releases/latest → 用 forceUser 填桶', () => expect(guardPanelVaultRest('/releases/latest', 'GET', 'edy')).toEqual({ rest: '/users/edy/releases/latest', releasePost: false }));
+  it('无 userId 新路径 GET /blobs/sha256/<hex> → 用 forceUser 填桶', () => expect(guardPanelVaultRest(`/blobs/sha256/${HEX}`, 'GET', 'edy')).toEqual({ rest: `/users/edy/blobs/sha256/${HEX}`, releasePost: false }));
   it('合法 GET /users/<u>/releases/latest', () => expect(guardPanelVaultRest('/users/edy/releases/latest', 'GET', 'edy')).toEqual({ rest: '/users/edy/releases/latest', releasePost: false }));
   it('合法 GET /users/<u>/blobs/sha256/<hex64>（小写化）', () => expect(guardPanelVaultRest(`/users/edy/blobs/sha256/${HEX.toUpperCase()}`, 'GET', 'edy')).toEqual({ rest: `/users/edy/blobs/sha256/${HEX}`, releasePost: false }));
   it('GET 打 POST-only releases → 404', () => expectStatus(() => guardPanelVaultRest('/users/edy/releases', 'GET', 'edy'), 404));
