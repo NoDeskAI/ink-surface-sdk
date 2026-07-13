@@ -2773,7 +2773,12 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       if (index === -1) throw new Error(`Remote annotation block was not found: ${blockId}`);
       const blocks = [...runtime.blocks];
       const block = blocks[index];
-      const annotations = (block.annotations || []).filter((item) => item.ko_id !== annotation.ko_id);
+      const incomingMarkId = String(annotation?.inkloop_mark?.mark_id || annotation?.mark_id || "");
+      const annotations = (block.annotations || []).filter((item) => {
+        const existingMarkId = String(item?.inkloop_mark?.mark_id || item?.mark_id || "");
+        if (incomingMarkId && existingMarkId) return incomingMarkId !== existingMarkId;
+        return item.ko_id !== annotation.ko_id;
+      });
       blocks[index] = {
         ...block,
         annotations: [...annotations, annotation],
@@ -2789,18 +2794,27 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     if (event.operation === "annotation.update" || event.operation === "annotation.delete") {
       const koId = String(event.payload?.ko_id || event.target?.id || "");
       if (!koId) throw new Error("Remote annotation event is missing ko_id.");
+      // ko_id 不等于 mark_id，tombstone 常用 fallback KO —— 允许按 mark_id 兜底定位。
+      const markId = String(event.payload?.mark_id || "");
+      const rawPatch = event.payload?.patch && typeof event.payload.patch === "object"
+        && !Array.isArray(event.payload.patch) ? event.payload.patch : {};
+      const { ko_id: _patchKoId, ...patch } = rawPatch;
       let didUpdate = false;
       const blocks = runtime.blocks.map((block) => {
         const annotations = (block.annotations || []).map((annotation) => {
-          if (annotation.ko_id !== koId) return annotation;
+          const annotationMarkId = String(annotation?.inkloop_mark?.mark_id || annotation?.mark_id || "");
+          if (annotation.ko_id !== koId && (!markId || annotationMarkId !== markId)) return annotation;
           didUpdate = true;
           if (event.operation === "annotation.delete") return { ...annotation, status: "deleted", deleted_at: event.updated_at };
-          return { ...annotation, ...(event.payload?.patch || {}), updated_at: event.updated_at };
+          return { ...annotation, ...patch, updated_at: event.updated_at };
         });
         return { ...block, annotations };
       });
-      if (!didUpdate) throw new Error(`Remote annotation was not found: ${koId}`);
-      await this.writeRuntimeBlocks(runtime, blocks);
+      // delete 幂等：目标不存在（快速 add→delete 被 fold 成 delete-only）不算冲突——否则 conflict 卡 cursor。
+      if (!didUpdate && event.operation === "annotation.update") {
+        throw new Error(`Remote annotation was not found: ${koId}`);
+      }
+      if (didUpdate) await this.writeRuntimeBlocks(runtime, blocks);
       return;
     }
 

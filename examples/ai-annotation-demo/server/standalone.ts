@@ -1933,9 +1933,19 @@ async function buildPostprocessProjection(input: {
   return { ...base, content_hash: await computeDocumentProjectionHash(base) };
 }
 async function applyRuntimeAnnotationPostprocess(event: RuntimeSyncEvent, namespace: CloudKnowledgeNamespace): Promise<void> {
-  if (event.operation !== 'annotation.add') return;
+  if (event.operation !== 'annotation.add' && event.operation !== 'annotation.update') return;
   const payload = recordOf(event.payload);
-  const annotation = recordOf(payload.annotation);
+  const annotation = recordOf(event.operation === 'annotation.update' ? payload.patch : payload.annotation);
+  if (event.operation === 'annotation.update') {
+    // revision（几何修改/复活）：先清旧派生对象再按最新注解体重建，避免同 mark 派生卡片翻倍。
+    const markId = textOf(payload.mark_id, event.target?.id || event.event_id);
+    const koId = textOf(payload.ko_id, event.target?.id || '');
+    await cloudKnowledgeStore.deleteByRuntimeRefs(namespace, {
+      document_id: event.doc_id,
+      mark_ids: markId ? [markId] : [],
+      ko_ids: koId ? [koId] : [],
+    });
+  }
   const docTitle = await documentTitle(namespace, event.doc_id);
   const markText = postprocessSignalText({ annotation, payload, docTitle });
   const quoteText = postprocessQuoteText({ annotation, payload, docTitle }) || markText;

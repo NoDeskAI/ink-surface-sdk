@@ -186,13 +186,15 @@ export async function bridgeRuntimeLedgerToStore(input: RuntimeSyncBridgeInput):
   const watermark = await watermarkStore.read(input.documentId);
   const marks = (await (input.loadMarks ?? getLatestMarkRevisions)(input.documentId)).sort((a, b) => a.seq - b.seq);
   const existingOutbox = await input.runtimeStore.listOutboxEvents();
+  const existingByMark = runtimeEventsByMark(existingOutbox);
+  const markEvents = (mark: PersistedMark) => existingByMark.get(runtimeMarkEventKey(input.documentId, mark.mark_id)) ?? [];
   const existingDedupe = new Set(existingOutbox.map((event) => event.dedupe_key));
   const lastWatermarkSeq = watermark?.last_mark_seq ?? -1;
   const pendingAllMarks = marks.filter((mark) => !isRuntimeReceivedMark(mark) && mark.seq > lastWatermarkSeq);
   const pendingMarks = marks.filter((mark) => {
     if (isRuntimeSilentMark(mark)) return false;
     if (!mark.is_tombstone && isRuntimeInvalidPageNormMark(mark)) return false; // tombstone 常见 bbox=[0,0,0,0]，删除事件必须放行
-    const operation = runtimeOperationForMark(input.documentId, mark, existingOutbox, input.knownMarkIds);
+    const operation = runtimeOperationForMark(input.documentId, mark, markEvents(mark), input.knownMarkIds);
     return mark.seq > lastWatermarkSeq || !existingDedupe.has(runtimeMarkDedupeKey(input.documentId, mark, operation));
   });
   const snapshot = input.buildSnapshot
@@ -223,7 +225,7 @@ export async function bridgeRuntimeLedgerToStore(input: RuntimeSyncBridgeInput):
   }
   let bridged = 0;
   for (const mark of pendingMarks) {
-    const operation = runtimeOperationForMark(input.documentId, mark, existingOutbox, input.knownMarkIds);
+    const operation = runtimeOperationForMark(input.documentId, mark, markEvents(mark), input.knownMarkIds);
     const event = runtimeEventForMark(snapshot, mark, operation, now(), input.originDeviceId);
     if (existingDedupe.has(event.dedupe_key)) continue;
     await input.runtimeStore.appendSyncEvent(event);
@@ -231,6 +233,8 @@ export async function bridgeRuntimeLedgerToStore(input: RuntimeSyncBridgeInput):
     // 否则删除/移动别机 mark 后，自己 pull 因同 device echo 被跳过，hydrate 会把旧版本恢复回来。
     await input.runtimeStore.applyRemoteEvent(event);
     existingOutbox.push(event);
+    const markKey = runtimeMarkEventKey(input.documentId, mark.mark_id);
+    existingByMark.set(markKey, [...(existingByMark.get(markKey) ?? []), event]);
     existingDedupe.add(event.dedupe_key);
     eventIds.push(event.event_id);
     bridged += 1;
@@ -386,6 +390,24 @@ type RuntimeMarkOperation = 'annotation.add' | 'annotation.update' | 'annotation
 
 function runtimeEventMarkId(event: RuntimeSyncEvent): string {
   return typeof event.payload.mark_id === 'string' ? event.payload.mark_id : '';
+}
+
+function runtimeMarkEventKey(docId: string, markId: string): string {
+  return `${docId} ${markId}`;
+}
+
+/** (doc_id, mark_id) → 该 mark 的 outbox 事件：operation 推断从 O(m·n) 全扫降为索引查。 */
+function runtimeEventsByMark(events: RuntimeSyncEvent[]): Map<string, RuntimeSyncEvent[]> {
+  const index = new Map<string, RuntimeSyncEvent[]>();
+  for (const event of events) {
+    const markId = runtimeEventMarkId(event);
+    if (!markId) continue;
+    const key = runtimeMarkEventKey(event.doc_id, markId);
+    const revisions = index.get(key) ?? [];
+    revisions.push(event);
+    index.set(key, revisions);
+  }
+  return index;
 }
 
 export function runtimeMarkDedupeKey(docId: string, mark: PersistedMark, operation: RuntimeMarkOperation): string {

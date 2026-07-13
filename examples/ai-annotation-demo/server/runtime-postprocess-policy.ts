@@ -13,11 +13,13 @@ export function isMeetingRuntimeDocumentId(documentId: string): boolean {
 }
 
 export function shouldPostprocessRuntimeAnnotation(event: RuntimeSyncEvent): boolean {
-  if (event.operation !== 'annotation.add') return false;
+  // update（revision：几何修改/撤销复活）与 add 同等进入后处理判定——否则删除后复活的 mark
+  // 在 Cloud Knowledge 里永远缺席。update 的注解体在 payload.patch。
+  if (event.operation !== 'annotation.add' && event.operation !== 'annotation.update') return false;
   if (isMeetingRuntimeDocumentId(event.doc_id)) return true;
 
   const payload = recordOf(event.payload);
-  const annotation = recordOf(payload.annotation);
+  const annotation = recordOf(event.operation === 'annotation.update' ? payload.patch : payload.annotation);
   if (payload.ai_eligible === true || annotation.ai_eligible === true) return true;
   if (payload.ai_eligible === false || annotation.ai_eligible === false) return false;
 

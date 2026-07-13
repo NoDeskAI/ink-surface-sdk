@@ -394,6 +394,35 @@ export function staleRuntimeManagedMarksForCanonicalRemote(
   return localMarks.filter((mark) => isRuntimeManagedLocalMark(mark) && !canonicalMarkIds.has(mark.mark_id));
 }
 
+function canonicalDeletedRuntimeMarkIds(runtime: RuntimeDocumentSnapshot): Set<string> {
+  const ids = new Set<string>();
+  for (const block of runtime.blocks) {
+    for (const annotation of block.annotations ?? []) {
+      if (annotation.status !== 'deleted') continue;
+      const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+      ids.add(markIdFromRuntimeAnnotation(annotation, meta));
+    }
+  }
+  return ids;
+}
+
+/** 远端删除要落回本地账本：canonical 里显式 status=deleted 的 annotation（B 删了 A 的本地 origin mark，
+ *  annotation.delete 事件把 A 端 canonical 标 deleted）+ 从 canonical 消失的 runtime-managed mark，
+ *  两类都 tombstone 本地账本——否则 A 端 mark 永久可见、两端分叉。 */
+export function runtimeMarksToTombstoneForCanonicalRemote(
+  localMarks: PersistedMark[],
+  runtime: RuntimeDocumentSnapshot,
+): PersistedMark[] {
+  const activeIds = canonicalRuntimeMarkIds(runtime);
+  const explicitDeletedIds = canonicalDeletedRuntimeMarkIds(runtime);
+  const absentManaged = staleRuntimeManagedMarksForCanonicalRemote(localMarks, activeIds);
+  const tombstoneIds = new Set([
+    ...explicitDeletedIds,
+    ...absentManaged.map((mark) => mark.mark_id),
+  ]);
+  return localMarks.filter((mark) => tombstoneIds.has(mark.mark_id));
+}
+
 /** 出站过滤只按 origin 信号防回环（remote/runtime-sync 来源不回推）。
  *  不再按 canonicalMarkIds 整体排除——那会吞掉本地对 canonical mark 的后续 revision/tombstone；
  *  canonical 集合改经 knownMarkIds 传给 bridge 用于 add/update 判定。 */
@@ -447,8 +476,7 @@ export async function hydrateRuntimeAnnotationsToActiveCanvas(store: OfflineRunt
   clearHydratedRuntimeStrokes(docId);
 
   let localMarks = (await getFoldedMarks(docId)).filter((mark) => !isRuntimeInvalidPageNormMark(mark));
-  const canonicalMarkIds = canonicalRuntimeMarkIds(runtime);
-  const staleRuntimeMarks = staleRuntimeManagedMarksForCanonicalRemote(localMarks, canonicalMarkIds);
+  const staleRuntimeMarks = runtimeMarksToTombstoneForCanonicalRemote(localMarks, runtime);
   if (staleRuntimeMarks.length) {
     for (const staleMark of staleRuntimeMarks) {
       await appendMarkEntry(runtimeReconcileTombstoneDraft(staleMark), { notifyRuntime: false });

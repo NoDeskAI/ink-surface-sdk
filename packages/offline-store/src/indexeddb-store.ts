@@ -519,6 +519,8 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
         });
         return { ...block, annotations };
       });
+      // delete 幂等：目标不存在（如快速 add→delete 被 fold 成 delete-only）不算冲突，跳过即可。
+      if (!didUpdate && event.operation === 'annotation.delete') return;
       if (!didUpdate) throw new Error(`Remote annotation was not found: ${ko}`);
       await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
       return;
