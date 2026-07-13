@@ -38,12 +38,19 @@ export function guardPanelVaultRest(rawRest: string, method = 'GET', forceUser =
   if (!forceUser) fail(503, 'vault user 未配置'); // fail-closed：没拿到 session/force user 就不放行（不透传客户端 userId）
   const verb = method.toUpperCase();
   const parts = cleanParts(rawRest || '/');
-  if (parts[0] !== 'users' || !parts[1]) fail(404, 'no such vault route');
-  if (parts[1] !== forceUser) fail(403, `userId mismatch: expected ${forceUser}`); // 显式拒绝越桶（非静默改写）
+  // userId 由后端 token 权威身份(forceUser)决定，不信客户端传的：
+  //  - 新路径省略 userId（如 /releases）→ 直接用 forceUser 填桶（前端不再传 userId，从根上避免 local_user 冒充）。
+  //  - 兼容旧路径 /users/<id>/...：仍显式校验 == forceUser（越桶即 403），不静默改写。
+  let resource = parts;
+  if (parts[0] === 'users') {
+    if (!parts[1]) fail(404, 'no such vault route');
+    if (parts[1] !== forceUser) fail(403, `userId mismatch: expected ${forceUser}`);
+    resource = parts.slice(2);
+  }
   const user = encodeURIComponent(forceUser);
-  if (verb === 'POST' && parts.length === 3 && parts[2] === 'releases') return { rest: `/users/${user}/releases`, releasePost: true };
-  if (verb === 'GET' && parts.length === 4 && parts[2] === 'releases' && parts[3] === 'latest') return { rest: `/users/${user}/releases/latest`, releasePost: false };
-  if (verb === 'GET' && parts.length === 5 && parts[2] === 'blobs' && parts[3] === 'sha256' && HEX64.test(parts[4])) return { rest: `/users/${user}/blobs/sha256/${parts[4].toLowerCase()}`, releasePost: false };
+  if (verb === 'POST' && resource.length === 1 && resource[0] === 'releases') return { rest: `/users/${user}/releases`, releasePost: true };
+  if (verb === 'GET' && resource.length === 2 && resource[0] === 'releases' && resource[1] === 'latest') return { rest: `/users/${user}/releases/latest`, releasePost: false };
+  if (verb === 'GET' && resource.length === 3 && resource[0] === 'blobs' && resource[1] === 'sha256' && HEX64.test(resource[2])) return { rest: `/users/${user}/blobs/sha256/${resource[2].toLowerCase()}`, releasePost: false };
   return fail(404, 'no such vault route');
 }
 
