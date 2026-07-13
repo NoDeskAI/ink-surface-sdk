@@ -40,16 +40,19 @@ async function doRefresh(): Promise<boolean> {
   }
   const remote = me.session;
   if (!remote?.tenant_id || !remote.user_id) return false;
+  // 请求期间若发生 登出/换人（token 变了）→ 旧响应作废，绝不能用旧身份覆盖新 session（否则恢复已登出账号/覆盖新账号）。
+  const latest = getSession();
+  if (!latest || latest.sessionToken !== current.sessionToken || latest.sessionId !== current.sessionId || latest.deviceId !== current.deviceId) return false;
   // 设备身份不该在校准中被换掉——换设备是异常，宁可不动（避免把 A 设备的库挂到 B）。
-  if (remote.device_id && remote.device_id !== current.deviceId) return false;
+  if (remote.device_id && remote.device_id !== latest.deviceId) return false;
 
-  if (remote.tenant_id === current.tenantId && remote.user_id === current.userId) return false;
+  if (remote.tenant_id === latest.tenantId && remote.user_id === latest.userId) return false;
 
   const next: InkLoopSession = {
-    ...current,
+    ...latest,
     tenantId: remote.tenant_id,
     userId: remote.user_id,
-    deviceId: remote.device_id || current.deviceId,
+    deviceId: remote.device_id || latest.deviceId,
   };
   setSession(next); // emit 'login' → runtime/library 监听重建 namespace
   return true;

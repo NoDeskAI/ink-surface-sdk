@@ -691,21 +691,32 @@ export async function resolveLarkMeetingInstance(
     end_time: Math.floor(targetMs / 1000) + WINDOW_SECONDS,
     page_size: 10,
   };
-  const raw = oauth.usable && oauth.token && client.listMeetingsByNoWithToken
-    ? await client.listMeetingsByNoWithToken(no, oauth.token, opts)
-    : await client.listMeetingsByNo?.(no, opts);
+  // 先 user token（拿本人可见的 VC 实例），失败/无 token 再退 tenant token（应用身份·部分会应用可读）。
+  // 恢复旧批量循环里有过的 fallback——只 user 一条路会在 token 缺 scope/过期时整个解析失败。
+  let raw: unknown;
+  if (oauth.usable && oauth.token && client.listMeetingsByNoWithToken) {
+    try {
+      raw = await client.listMeetingsByNoWithToken(no, oauth.token, opts);
+    } catch (userError) {
+      if (!client.listMeetingsByNo) throw userError;
+      raw = await client.listMeetingsByNo(no, opts);
+    }
+  } else {
+    raw = await client.listMeetingsByNo?.(no, opts);
+  }
   const code = obj(raw).code;
   if (code != null && Number(code) !== 0) throw new Error(feishuMsg(obj(raw)));
 
-  const meeting = candidateRecords(raw)
+  const candidates = candidateRecords(raw)
     .map((record) => meetingSourceFromRecord(record, { meeting_no: no, scheduled_at: new Date(targetMs).toISOString() }, nowMs))
     .filter((source): source is LarkMeetingSource =>
       !!source
       && source.meeting_no === no
       && !!source.feishu_meeting_id
-      && source.feishu_meeting_id !== no
-      && Math.abs(Date.parse(source.scheduled_at) - targetMs) <= WINDOW_SECONDS * 1000)
-    .sort((a, b) => Math.abs(Date.parse(a.scheduled_at) - targetMs) - Math.abs(Date.parse(b.scheduled_at) - targetMs))[0] ?? null;
+      && source.feishu_meeting_id !== no);
+  // 周期会同短号多实例：list_by_no brief 没有自己的开始时间（meetingSourceFromRecord 回填了 targetMs），
+  // 无法按时间区分。±6h 窗通常只返回一个实例；若返回多于一个 → 歧义，宁可返 null 也不猜（避免配到相邻实例）。
+  const meeting = candidates.length === 1 ? candidates[0] : null;
   return { meeting };
 }
 
