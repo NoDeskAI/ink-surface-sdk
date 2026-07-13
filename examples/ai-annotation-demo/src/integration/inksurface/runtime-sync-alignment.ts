@@ -1,7 +1,7 @@
 import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import type { OfflineRuntimeStorePort } from 'ink-surface-sdk/offline-store';
 import type { PersistedMark } from '../../core/store-format';
-import { isRuntimeInvalidPageNormMark, isRuntimeSilentMark, runtimeSyncEventIdForMarkId } from './runtime-sync-bridge';
+import { isRuntimeInvalidPageNormMark, isRuntimeSilentMark, runtimeMarkDedupeKey, runtimeSyncEventIdForMarkId } from './runtime-sync-bridge';
 
 export interface VisibleRuntimeMarkAlignmentInput {
   docId: string;
@@ -34,8 +34,8 @@ export function visibleRuntimeMarkSignature(marks: PersistedMark[]): string {
     .join('|');
 }
 
-function visibleRuntimeMarkIds(marks: PersistedMark[]): Set<string> {
-  return new Set(marks.filter((mark) => !isRuntimeSilentMark(mark) && !isRuntimeInvalidPageNormMark(mark)).map((mark) => mark.mark_id));
+function visibleRuntimeMarks(marks: PersistedMark[]): PersistedMark[] {
+  return marks.filter((mark) => !isRuntimeSilentMark(mark) && !isRuntimeInvalidPageNormMark(mark));
 }
 
 function payloadMarkId(event: RuntimeSyncEvent): string {
@@ -43,22 +43,26 @@ function payloadMarkId(event: RuntimeSyncEvent): string {
   return typeof value === 'string' ? value : '';
 }
 
-function eventCoversVisibleMark(event: RuntimeSyncEvent, docId: string, markId: string): boolean {
-  if (event.doc_id !== docId || event.operation !== 'annotation.add') return false;
-  return payloadMarkId(event) === markId || event.event_id === runtimeSyncEventIdForMarkId(markId);
+/** revision 级覆盖判定：add/update 均算断言了该 mark 的当前可见 revision。 */
+function eventCoversVisibleMark(event: RuntimeSyncEvent, docId: string, mark: PersistedMark): boolean {
+  if (event.doc_id !== docId
+    || (event.operation !== 'annotation.add' && event.operation !== 'annotation.update')) return false;
+  if (payloadMarkId(event) !== mark.mark_id) return false;
+  return event.payload.mark_seq === mark.seq
+    || event.event_id === runtimeSyncEventIdForMarkId(mark.mark_id, mark.seq)
+    || event.dedupe_key === runtimeMarkDedupeKey(docId, mark, 'annotation.add')
+    || event.dedupe_key === runtimeMarkDedupeKey(docId, mark, 'annotation.update');
 }
 
-function missingEventIds(events: RuntimeSyncEvent[], docId: string, markIds: Set<string>): string[] {
-  return [...markIds]
-    .filter((markId) => !events.some((event) => eventCoversVisibleMark(event, docId, markId)))
-    .map(runtimeSyncEventIdForMarkId)
+function missingEventIds(events: RuntimeSyncEvent[], docId: string, marks: PersistedMark[]): string[] {
+  return marks
+    .filter((mark) => !events.some((event) => eventCoversVisibleMark(event, docId, mark)))
+    .map((mark) => runtimeSyncEventIdForMarkId(mark.mark_id, mark.seq))
     .sort();
 }
 
-function isVisibleMarkAddEvent(event: RuntimeSyncEvent, docId: string, markIds: Set<string>): boolean {
-  if (event.doc_id !== docId || event.operation !== 'annotation.add') return false;
-  const markId = payloadMarkId(event);
-  return markIds.has(markId) || [...markIds].some((id) => event.event_id === runtimeSyncEventIdForMarkId(id));
+function isVisibleMarkAddEvent(event: RuntimeSyncEvent, docId: string, marks: PersistedMark[]): boolean {
+  return marks.some((mark) => eventCoversVisibleMark(event, docId, mark));
 }
 
 function latestBootstrapIndex(events: RuntimeSyncEvent[], docId: string): number {
@@ -92,7 +96,7 @@ export async function requeueVisibleRuntimeMarksForCloudAlignment(
   input: VisibleRuntimeMarkAlignmentInput,
 ): Promise<VisibleRuntimeMarkAlignmentResult> {
   const now = input.now?.() ?? new Date().toISOString();
-  const markIds = visibleRuntimeMarkIds(input.marks);
+  const marks = visibleRuntimeMarks(input.marks);
   const events = await input.runtimeStore.listOutboxEvents();
   const bootstrapIndex = latestBootstrapIndex(events, input.docId);
   const requeuedEventIds: string[] = [];
@@ -100,22 +104,22 @@ export async function requeueVisibleRuntimeMarksForCloudAlignment(
   let changed = false;
 
   const nextEvents = events.map((event, index) => {
-    const localVisibleEvent = isVisibleMarkAddEvent(event, input.docId, markIds);
-    const latestBootstrap = index === bootstrapIndex && markIds.size > 0;
+    const localVisibleEvent = isVisibleMarkAddEvent(event, input.docId, marks);
+    const latestBootstrap = index === bootstrapIndex && marks.length > 0;
     if ((!localVisibleEvent && !latestBootstrap) || !shouldRequeue(event)) return event;
     changed = true;
     requeuedEventIds.push(event.event_id);
     return resetForCloudReassert(event, now);
   });
 
-  let unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, markIds);
+  let unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, marks);
   if (unresolvedMissingEventIds.length && input.buildEvents) {
     const knownEventIds = new Set(nextEvents.map((event) => event.event_id));
     const knownDedupeKeys = new Set(nextEvents.map((event) => event.dedupe_key).filter(Boolean));
     for (const event of await input.buildEvents()) {
-      const markId = payloadMarkId(event);
-      if (!markIds.has(markId) && ![...markIds].some((id) => event.event_id === runtimeSyncEventIdForMarkId(id))) continue;
-      if (event.doc_id !== input.docId || event.operation !== 'annotation.add') continue;
+      if (event.doc_id !== input.docId
+        || (event.operation !== 'annotation.add' && event.operation !== 'annotation.update')) continue;
+      if (!isVisibleMarkAddEvent(event, input.docId, marks)) continue;
       if (knownEventIds.has(event.event_id)) continue;
       if (event.dedupe_key && knownDedupeKeys.has(event.dedupe_key)) continue;
       const pending = resetForCloudReassert(event, now);
@@ -125,7 +129,7 @@ export async function requeueVisibleRuntimeMarksForCloudAlignment(
       createdEventIds.push(pending.event_id);
       changed = true;
     }
-    unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, markIds);
+    unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, marks);
   }
 
   if (changed) await input.runtimeStore.writeOutboxEvents(nextEvents);
@@ -133,7 +137,7 @@ export async function requeueVisibleRuntimeMarksForCloudAlignment(
   return {
     doc_id: input.docId,
     scanned: input.marks.length,
-    visible_marks: markIds.size,
+    visible_marks: marks.length,
     requeued: requeuedEventIds.length,
     missing_event_ids: unresolvedMissingEventIds,
     requeued_event_ids: requeuedEventIds,

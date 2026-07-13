@@ -214,7 +214,7 @@ describe('staleRuntimeManagedMarksForCanonicalRemote', () => {
 });
 
 describe('outboundRuntimeMarksForCloudPush', () => {
-  it('does not push remote runtime marks or local duplicates already covered by Cloud Hub', () => {
+  it('keeps local-origin revisions outbound even when canonical already knows the mark, while never echoing remote marks', () => {
     const remote = mark({
       mark_id: 'mark_remote',
       seq: 1,
@@ -237,10 +237,12 @@ describe('outboundRuntimeMarksForCloudPush', () => {
       device_id: 'web_current',
     });
 
+    // canonical 已含 mark_already_canonical，但本地 origin 的 revision（如精确擦/移动/撤销复活）仍必须出站；
+    // canonical 集合只用于 bridge 侧 add/update 判定，不再作出站排除（否则几何修改/tombstone 永远漏同步）。
     expect(outboundRuntimeMarksForCloudPush(
       [remote, localDuplicate, newLocal],
       new Set(['mark_already_canonical']),
-    )).toEqual([newLocal]);
+    )).toEqual([localDuplicate, newLocal]);
   });
 });
 

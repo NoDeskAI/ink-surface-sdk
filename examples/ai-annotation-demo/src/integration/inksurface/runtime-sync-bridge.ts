@@ -9,7 +9,7 @@ import { OFFLINE_STORE_SCHEMA_VERSION, type OfflineRuntimeStorePort } from 'ink-
 import type { DocumentProjectionBlock as ProjectionBlock } from 'ink-surface-sdk/knowledge-schema';
 import type { KnowledgeObject } from '../../knowledge/knowledge-object';
 import type { PersistedMark } from '../../core/store-format';
-import { getFoldedMarks } from '../../local/store';
+import { getLatestMarkRevisions } from '../../local/store';
 import { buildRuntimeAndVisual } from './runtime-surface';
 import { resolveRuntimeDocumentIdentity, type RuntimeIdentityInput } from './runtime-identity';
 
@@ -39,6 +39,8 @@ export interface RuntimeSyncBridgeInput {
   runtimeStore: OfflineRuntimeStorePort;
   watermarkStore?: RuntimeBridgeWatermarkStore;
   originDeviceId?: string;
+  /** 已存在于 canonical runtime 的 mark_id 集合：用于判定该 mark 的新 revision 应发 update 而非 add。 */
+  knownMarkIds?: ReadonlySet<string>;
   loadMarks?: (documentId: string) => Promise<PersistedMark[]>;
   buildSnapshot?: () => Promise<RuntimeDocumentSnapshot>;
   now?: () => string;
@@ -95,7 +97,11 @@ export function isRuntimeSilentMark(mark: PersistedMark): boolean {
 }
 
 function isRuntimeReceivedMark(mark: PersistedMark): boolean {
-  return mark.pointer_type === 'remote' || mark.kind_source === 'runtime-sync';
+  const kindSource = mark.kind_source || '';
+  return mark.pointer_type === 'remote'
+    || mark.device_id === 'runtime-sync'
+    || kindSource === 'runtime-sync'
+    || kindSource.startsWith('runtime-sync-');
 }
 
 function isClearlyInvalidPageNormBbox(bbox: readonly number[] | undefined): boolean {
@@ -114,8 +120,9 @@ export function isRuntimeInvalidPageNormMark(mark: PersistedMark): boolean {
   return isClearlyInvalidPageNormBbox(mark.bbox);
 }
 
-export function runtimeSyncEventIdForMarkId(markId: string): string {
-  return `evt_bridge_${markId}`;
+/** revision 级事件身份：同一 mark 的每个 seq 一个独立事件（旧格式 `evt_bridge_<mark>` 无 seq，继续可读不冲突）。 */
+export function runtimeSyncEventIdForMarkId(markId: string, seq: number): string {
+  return `evt_bridge_${markId}:${seq}`;
 }
 
 export function localStorageRuntimeBridgeWatermarks(
@@ -177,14 +184,16 @@ export async function bridgeRuntimeLedgerToStore(input: RuntimeSyncBridgeInput):
   const now = input.now ?? (() => new Date().toISOString());
   const watermarkStore = input.watermarkStore ?? createMemoryRuntimeBridgeWatermarks();
   const watermark = await watermarkStore.read(input.documentId);
-  const marks = (await (input.loadMarks ?? getFoldedMarks)(input.documentId)).sort((a, b) => a.seq - b.seq);
-  const existingDedupe = new Set((await input.runtimeStore.listOutboxEvents()).map((event) => event.dedupe_key));
+  const marks = (await (input.loadMarks ?? getLatestMarkRevisions)(input.documentId)).sort((a, b) => a.seq - b.seq);
+  const existingOutbox = await input.runtimeStore.listOutboxEvents();
+  const existingDedupe = new Set(existingOutbox.map((event) => event.dedupe_key));
   const lastWatermarkSeq = watermark?.last_mark_seq ?? -1;
   const pendingAllMarks = marks.filter((mark) => !isRuntimeReceivedMark(mark) && mark.seq > lastWatermarkSeq);
   const pendingMarks = marks.filter((mark) => {
     if (isRuntimeSilentMark(mark)) return false;
-    if (isRuntimeInvalidPageNormMark(mark)) return false;
-    return mark.seq > lastWatermarkSeq || !existingDedupe.has(runtimeMarkDedupeKey(input.documentId, mark));
+    if (!mark.is_tombstone && isRuntimeInvalidPageNormMark(mark)) return false; // tombstone 常见 bbox=[0,0,0,0]，删除事件必须放行
+    const operation = runtimeOperationForMark(input.documentId, mark, existingOutbox, input.knownMarkIds);
+    return mark.seq > lastWatermarkSeq || !existingDedupe.has(runtimeMarkDedupeKey(input.documentId, mark, operation));
   });
   const snapshot = input.buildSnapshot
     ? await input.buildSnapshot()
@@ -214,9 +223,14 @@ export async function bridgeRuntimeLedgerToStore(input: RuntimeSyncBridgeInput):
   }
   let bridged = 0;
   for (const mark of pendingMarks) {
-    const event = runtimeEventForMark(snapshot, mark, now(), input.originDeviceId);
+    const operation = runtimeOperationForMark(input.documentId, mark, existingOutbox, input.knownMarkIds);
+    const event = runtimeEventForMark(snapshot, mark, operation, now(), input.originDeviceId);
     if (existingDedupe.has(event.dedupe_key)) continue;
     await input.runtimeStore.appendSyncEvent(event);
+    // 本地 materialization：本机 runtime canonical cache 同步应用自己的 revision——
+    // 否则删除/移动别机 mark 后，自己 pull 因同 device echo 被跳过，hydrate 会把旧版本恢复回来。
+    await input.runtimeStore.applyRemoteEvent(event);
+    existingOutbox.push(event);
     existingDedupe.add(event.dedupe_key);
     eventIds.push(event.event_id);
     bridged += 1;
@@ -368,52 +382,128 @@ function runtimeBootstrapRevisionKey(snapshot: RuntimeDocumentSnapshot): string 
   return `${sourceKey}:annotations:${stableRuntimeHash(JSON.stringify(annotationKey))}`;
 }
 
-function runtimeMarkDedupeKey(docId: string, mark: PersistedMark): string {
-  const operation: RuntimeSyncEvent['operation'] = mark.is_tombstone ? 'annotation.delete' : 'annotation.add';
+type RuntimeMarkOperation = 'annotation.add' | 'annotation.update' | 'annotation.delete';
+
+function runtimeEventMarkId(event: RuntimeSyncEvent): string {
+  return typeof event.payload.mark_id === 'string' ? event.payload.mark_id : '';
+}
+
+export function runtimeMarkDedupeKey(docId: string, mark: PersistedMark, operation: RuntimeMarkOperation): string {
   return `${docId}:${operation}:${mark.mark_id}:${mark.seq}`;
 }
 
-function runtimeEventForMark(snapshot: RuntimeDocumentSnapshot, mark: PersistedMark, now: string, originDeviceId?: string): RuntimeSyncEvent {
+function eventCoversMarkRevision(event: RuntimeSyncEvent, docId: string, mark: PersistedMark): boolean {
+  if (event.doc_id !== docId || runtimeEventMarkId(event) !== mark.mark_id) return false;
+  if (event.payload.mark_seq === mark.seq) return true;
+  return (['annotation.add', 'annotation.update', 'annotation.delete'] as const)
+    .some((operation) => event.dedupe_key === runtimeMarkDedupeKey(docId, mark, operation));
+}
+
+/** 推断该 revision 该发 add / update / delete：
+ *  - tombstone → delete；
+ *  - 同 revision 已有事件 → 沿用其 operation（幂等重扫不抖动）；
+ *  - 该 mark 有过任何早先事件、或已在 canonical runtime（knownMarkIds）→ update（覆盖撤销复活场景）；
+ *  - 否则首次出现 → add。
+ *  注意不能用 `seq > 1` 判 revision——seq 从 Date.now() 起跳。 */
+function runtimeOperationForMark(
+  docId: string,
+  mark: PersistedMark,
+  existingEvents: RuntimeSyncEvent[],
+  knownMarkIds?: ReadonlySet<string>,
+): RuntimeMarkOperation {
+  if (mark.is_tombstone) return 'annotation.delete';
+
+  const sameRevision = existingEvents.find((event) => eventCoversMarkRevision(event, docId, mark));
+  if (sameRevision?.operation === 'annotation.add' || sameRevision?.operation === 'annotation.update') {
+    return sameRevision.operation;
+  }
+
+  const hasPriorRevision = !!knownMarkIds?.has(mark.mark_id)
+    || existingEvents.some((event) =>
+      event.doc_id === docId
+      && runtimeEventMarkId(event) === mark.mark_id
+      && (event.operation === 'annotation.add'
+        || event.operation === 'annotation.update'
+        || event.operation === 'annotation.delete'));
+
+  return hasPriorRevision ? 'annotation.update' : 'annotation.add';
+}
+
+function runtimeEventForMark(
+  snapshot: RuntimeDocumentSnapshot,
+  mark: PersistedMark,
+  operation: RuntimeMarkOperation,
+  now: string,
+  originDeviceId?: string,
+): RuntimeSyncEvent {
   const binding = annotationForMark(snapshot.blocks, mark);
   const annotation = binding?.annotation ?? fallbackAnnotation(mark, now);
-  const operation: RuntimeSyncEvent['operation'] = mark.is_tombstone ? 'annotation.delete' : 'annotation.add';
   const target = { type: 'annotation' as const, id: annotation.ko_id, block_id: binding?.blockId };
   const captureDeviceId = mark.device_id || 'inkloop_device';
+  const sourceDeviceId = originDeviceId || captureDeviceId;
+  const annotationWithMarkMeta: RuntimeAnnotation = {
+    ...annotation,
+    inkloop_mark: {
+      ...(isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {}),
+      mark_id: mark.mark_id,
+      mark_seq: mark.seq,
+      marked_text: mark.marked_text,
+      kind: mark.kind || mark.feature_type,
+      feature_type: mark.feature_type,
+      tool: mark.tool,
+      origin: mark.origin,
+      scored_type: mark.scored_type,
+      page_id: mark.page_id,
+      page_index: mark.page_index,
+      bbox: mark.bbox,
+      source_device_id: sourceDeviceId,
+    },
+  };
+  const markPayload = {
+    block_id: binding?.blockId,
+    mark_id: mark.mark_id,
+    mark_seq: mark.seq,
+    marked_text: mark.marked_text,
+    ai_eligible: mark.ai_eligible,
+    kind: mark.kind || mark.feature_type,
+    feature_type: mark.feature_type,
+    tool: mark.tool,
+    origin: mark.origin,
+    scored_type: mark.scored_type,
+    hmp_action: mark.hmp?.action,
+    page_id: mark.page_id,
+    page_index: mark.page_index,
+    bbox: mark.bbox,
+  };
   const event: Omit<RuntimeSyncEvent, 'dedupe_key'> = {
     schema_version: RUNTIME_SYNC_EVENT_SCHEMA_VERSION,
-    event_id: runtimeSyncEventIdForMarkId(mark.mark_id),
+    event_id: runtimeSyncEventIdForMarkId(mark.mark_id, mark.seq),
     source: mark.device_id === 'obsidian' ? 'obsidian_plugin' : 'inkloop_device',
     doc_id: snapshot.doc_id,
     operation,
     target,
     payload: operation === 'annotation.delete'
-      ? { ko_id: annotation.ko_id, mark_id: mark.mark_id, tombstone: true }
-      : {
-          block_id: binding?.blockId,
-          mark_id: mark.mark_id,
-          marked_text: mark.marked_text,
-          ai_eligible: mark.ai_eligible,
-          kind: mark.kind || mark.feature_type,
-          feature_type: mark.feature_type,
-          tool: mark.tool,
-          origin: mark.origin,
-          scored_type: mark.scored_type,
-          hmp_action: mark.hmp?.action,
-          page_id: mark.page_id,
-          page_index: mark.page_index,
-          bbox: mark.bbox,
-          annotation,
-        },
-    origin: { device_id: originDeviceId || captureDeviceId, capture_device_id: captureDeviceId },
+      ? { ko_id: annotation.ko_id, mark_id: mark.mark_id, mark_seq: mark.seq, tombstone: true }
+      : operation === 'annotation.update'
+        ? { ...markPayload, ko_id: annotation.ko_id, patch: annotationWithMarkMeta }
+        : { ...markPayload, annotation: annotationWithMarkMeta },
+    origin: { device_id: sourceDeviceId, capture_device_id: captureDeviceId },
     status: 'pending',
     created_at: mark.created_at || now,
     updated_at: now,
   };
-  return { ...event, dedupe_key: runtimeMarkDedupeKey(snapshot.doc_id, mark) };
+  return { ...event, dedupe_key: runtimeMarkDedupeKey(snapshot.doc_id, mark, operation) };
 }
 
-export function buildRuntimeSyncEventForMark(snapshot: RuntimeDocumentSnapshot, mark: PersistedMark, now: string, originDeviceId?: string): RuntimeSyncEvent {
-  return runtimeEventForMark(snapshot, mark, now, originDeviceId);
+export function buildRuntimeSyncEventForMark(
+  snapshot: RuntimeDocumentSnapshot,
+  mark: PersistedMark,
+  now: string,
+  originDeviceId?: string,
+  operation?: RuntimeMarkOperation,
+): RuntimeSyncEvent {
+  const op = operation ?? (mark.is_tombstone ? 'annotation.delete' : 'annotation.add');
+  return runtimeEventForMark(snapshot, mark, op, now, originDeviceId);
 }
 
 function annotationForMark(blocks: RuntimeSurfaceBlock[], mark: PersistedMark): { blockId: string; annotation: RuntimeAnnotation } | null {

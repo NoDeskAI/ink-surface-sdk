@@ -81,11 +81,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function enrichRuntimeAnnotationEvent(event: RuntimeSyncEvent): RuntimeSyncEvent {
-  if (event.operation !== 'annotation.add') return event;
-  const annotation = event.payload.annotation;
+  // update 的注解体在 payload.patch（annotation.update 语义），add 在 payload.annotation。
+  const annotationKey = event.operation === 'annotation.add'
+    ? 'annotation'
+    : event.operation === 'annotation.update'
+      ? 'patch'
+      : null;
+  if (!annotationKey) return event;
+  const annotation = event.payload[annotationKey];
   if (!isRecord(annotation)) return event;
   const markMeta = {
     mark_id: event.payload.mark_id,
+    mark_seq: event.payload.mark_seq,
     marked_text: event.payload.marked_text,
     kind: event.payload.kind,
     feature_type: event.payload.feature_type,
@@ -104,7 +111,7 @@ function enrichRuntimeAnnotationEvent(event: RuntimeSyncEvent): RuntimeSyncEvent
     ...event,
     payload: {
       ...event.payload,
-      annotation: {
+      [annotationKey]: {
         ...annotation,
         inkloop_mark: {
           ...(isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {}),

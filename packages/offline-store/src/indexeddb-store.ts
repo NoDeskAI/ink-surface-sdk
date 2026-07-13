@@ -113,6 +113,7 @@ function enrichedRemoteAnnotation(event: RuntimeSyncEvent, annotation: RuntimeAn
   const bbox = normBbox(event.payload.bbox) ?? normBbox(existingMeta.bbox) ?? normBbox(annotation.visual_bbox);
   const metaEntries = Object.entries({
     mark_id: event.payload.mark_id,
+    mark_seq: event.payload.mark_seq,
     marked_text: event.payload.marked_text,
     kind: event.payload.kind,
     feature_type: event.payload.feature_type,
@@ -499,13 +500,22 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
     if (event.operation === 'annotation.update' || event.operation === 'annotation.delete') {
       const ko = String(event.payload.ko_id || event.target.id || '');
       if (!ko) throw new Error('Remote annotation event is missing ko_id.');
+      // ko_id 不等于 mark_id，tombstone 构造时常拿不到原 KO —— 允许按 mark_id 兜底定位。
+      const markId = String(event.payload.mark_id || '');
+      const rawPatch = isRecord(event.payload.patch) ? event.payload.patch : {};
+      const enrichedPatch = event.operation === 'annotation.update' && typeof rawPatch.ko_id === 'string'
+        ? enrichedRemoteAnnotation(event, rawPatch as RuntimeAnnotation)
+        : rawPatch;
+      const { ko_id: _patchKoId, ...patch } = enrichedPatch as Record<string, unknown>;
       let didUpdate = false;
       const blocks = runtime.blocks.map((block) => {
         const annotations = (block.annotations || []).map((annotation) => {
-          if (annotation.ko_id !== ko) return annotation;
+          const matchesKo = annotation.ko_id === ko;
+          const matchesMark = !!markId && runtimeAnnotationMarkId(annotation) === markId;
+          if (!matchesKo && !matchesMark) return annotation;
           didUpdate = true;
           if (event.operation === 'annotation.delete') return { ...annotation, status: 'deleted', deleted_at: event.updated_at };
-          return { ...annotation, ...(event.payload.patch as Record<string, unknown> | undefined), updated_at: event.updated_at };
+          return { ...annotation, ...patch, updated_at: event.updated_at };
         });
         return { ...block, annotations };
       });
