@@ -22,6 +22,7 @@ import { redrawInk, undoStroke } from './capture/ink';
 import { restoreLedgerState } from './controllers/ledger-restore';
 import { initEinkMirror, signalInkArea } from './surface/eink';
 import { disarmM103HqHwAreaNow, initM103HqHwArea } from './capture/m103-hqhw-area';
+import { initOnyxPenArea } from './capture/onyx-pen-area';
 import { initM103HqHwSocket } from './capture/m103-hqhw-socket';
 import { forceResetOsdInkNow, nativePointerKind } from './capture/m103-input-source';
 import { shouldStartBookPointerSwipe, shouldStartBookTouchSwipe } from './capture/input-policy';
@@ -40,6 +41,7 @@ import { hydrateRuntimeAnnotationsToActiveCanvas, installWebRuntimeSyncHost, typ
 import { initRuntimeSyncStatus } from './components/runtime-sync-status';
 import { apiBase, apiRouteChoice, getJson, postJson, setApiRoute } from './core/api';
 import { getSession, onAuthChange, setSession } from './core/auth';
+import { refreshCoreSessionFromAuthority } from './core/session-reconcile';
 import { deleteCloudLibraryItem, downloadCloudLibraryItem, hasCloudLibraryItem, pullCloudLibraryManifest, recordLocalImportedSource, retryPendingLibraryUploads, startLibrarySyncLoop, uploadLoadedDocumentSource } from './integration/inksurface/library-sync';
 import { normToPx, pageCss, pageRegionForId } from './core/transform';
 import {
@@ -130,11 +132,18 @@ initInsightPanel({ cards: el('m-cards'), foot: el('m-panel-foot'), count: el('m-
 initDevOverlay(); // dev 叠层（bbox/region/relation/HMP 浮窗·设置页 devOverlay/showRegion/showRelations 控·默认关）——接真桌面同款
 if (features.einkBridge) initEinkMirror(); // 电纸屏镜像：套壳内容变化 → 推 IT8951（web/dev 无桥则 no-op）
 initM103HqHwArea(); // M103 专用：上报当前画布矩形给原生 HqHwBridge 收窄画区（非 M103 直接 no-op）
+initOnyxPenArea(); // ONYX 专用：上报画布矩形给 OnyxPenBridge 收窄 raw drawing 画区（非 ONYX 直接 no-op）
 initM103HqHwSocket(); // M103 专用：接收硬件 socket 笔点（抬笔用同源点补画，消除微重影·非 M103 no-op）
 installM103RawPenCaptureBridge(); // M103 专用：启动即暴露真实物理笔点导出桥，便于真机延迟/持久化验收。
 initMobileShell(); // 外壳交互（导航脊/子导航/工具/rail/文件浮层）——原 mobile.html 内联脚本，正规化后抽出
 initMobileAuthLogin(); // 阶段C：二维码设备登录门禁；有有效 session 时自动隐藏
 void completeFeishuOAuthDeepLink(); // 设备端飞书 OAuth deep link 回调：系统浏览器授权完成 → 回 InkLoop 换 token。
+// 身份校准：前端 core session 停在设备授权时的 local_user，飞书登录后后端 token 已升级成 feishu_ou_*。
+// 启动 + web 重定向登录回来(pageshow/可见)时拉后端权威身份覆盖前端；setSession 会 emit 'login' →
+// runtime-sync-host / library-sync 借此重建 namespace（见 Phase 3）。
+void refreshCoreSessionFromAuthority();
+window.addEventListener('pageshow', () => { void refreshCoreSessionFromAuthority(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshCoreSessionFromAuthority(); });
 initAndroidRuntimeBoundary(); // Android/Paper V1 demo boundary: Web cloud-first -> Paper local-first -> Obsidian projection.
 startCloudDeviceHeartbeat(); // Cloud Hub DeviceManifest：设备在线状态、LAN/同步健康度持久化。
 startCloudDeviceCommandPolling(); // Cloud Hub device commands：Obsidian「回到原文」等运行时打开动作。

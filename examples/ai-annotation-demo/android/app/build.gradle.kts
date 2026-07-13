@@ -10,7 +10,11 @@ android {
     defaultConfig {
         applicationId = "com.inkloop.app"
         minSdk = 26
-        targetSdk = 35
+        // targetSdk 29 让 app 落进 SELinux 域 untrusted_app_29（而非 30+ 的 untrusted_app）。
+        // ONYX 官方手写 app(note/kreader) 都是 targetSdk 29，靠该老域保留对 /dev/input 的读权限；
+        // Android 11+ 从 untrusted_app 域收走了 evdev 读权限 → onyxsdk-pen 的 native RawInputReader
+        // open /dev/input/event3(Wacom) 被 SELinux 拒 → RawInputCallback 零回调。降到 29 复现 ONYX app 的域。
+        targetSdk = 29
         versionCode = 1
         versionName = "0.1.0"
         ndk { abiFilters += listOf("arm64-v8a") } // 端侧 OCR native（OpenCV/ONNX）只打 arm64，控包体（~71MB）
