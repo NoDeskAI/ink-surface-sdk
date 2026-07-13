@@ -484,14 +484,12 @@ async function resolveRealMeetingId(m: PersistedMeeting): Promise<PersistedMeeti
   try {
     const inst = await resolveMeetingInstance(no, m.scheduled_at);
     if (!inst) return m;
+    // 只落 meeting_id 关联——不从解析结果写 started_at/t0：list_by_no brief 没有自己的真实开始时间，
+    // 那个 started_at 是用 scheduled_at 回填的伪造值，写成 vc_event t0 会污染时间轴对齐（真 t0 由 panel VC 事件给）。
     const patch: Partial<PersistedMeeting> = {
       feishu_meeting_id: inst.meeting_id,
       feishu_meeting_no: inst.meeting_no || no,
       ...(inst.topic ? { feishu_topic: inst.topic } : {}),
-      ...(inst.started_at
-        ? { started_at: inst.started_at, vc_meeting_start_t0: Date.parse(inst.started_at), t0_source: 'vc_event', align_state: m.align_state === 'manual' ? 'manual' : 'event' }
-        : {}),
-      ...(inst.ended_at ? { ended_at: inst.ended_at } : {}),
     };
     const updated = await updateMeeting(m.meeting_id, patch);
     return updated ?? { ...m, ...patch };
