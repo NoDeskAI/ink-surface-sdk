@@ -37,6 +37,7 @@ import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
 import { effectiveMeetingEndIso, effectiveMeetingStatus, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { findMeetingForProviderSource, meetingPlatformOf } from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
@@ -285,7 +286,7 @@ function panelMinuteToken(mt: PanelFeishuMeeting): string | null {
   return mt.minute_token || mt.match?.minute_token || null;
 }
 async function findLocalPanelMeeting(panelMeetingId: string): Promise<PersistedMeeting | null> {
-  return (await listAllMeetings()).find((x) => x.feishu_meeting_id === panelMeetingId) ?? null;
+  return (await listAllMeetings()).find((x) => meetingPlatformOf(x) === 'lark' && x.feishu_meeting_id === panelMeetingId) ?? null;
 }
 
 /** panel 会议 → 落成本地会议。靠 feishu_meeting_id 幂等去重·同一 meeting_id 串行（防并发重复建）。本地写失败会抛 → 上层不推 cursor。 */
@@ -315,7 +316,9 @@ async function upsertPanelMeetingInner(mt: PanelFeishuMeeting, type: PanelMeetin
   // B 归群桥：feishu_meeting_id 未命中时，用会议号匹配已落库的日历日程会议 → 合并升级同一张卡（不新建第二张）。
   if (!existing && mt.meeting_no) {
     const no = String(mt.meeting_no);
-    existing = (await listAllMeetings()).find((m) => !m.feishu_meeting_id && m.calendar_meeting_no === no) ?? null;
+    existing = (await listAllMeetings()).find((m) =>
+      meetingPlatformOf(m) === 'lark' && !m.feishu_meeting_id && m.calendar_meeting_no === no,
+    ) ?? null;
   }
   const existingWs = existing ? await getWorkspace(existing.workspace_id) : null;
   // M1·status 严格飞书驱动 + started_at(时间轴 t0)用飞书真实开始时间：
@@ -450,20 +453,12 @@ function calendarIssueText(res: FeishuCalendarEventsResponse | null): string {
 }
 
 function existingMeetingForSource(all: PersistedMeeting[], source: FeishuMeetingSource): PersistedMeeting | undefined {
-  if (source.calendar_event_id) {
-    const byCalendarEvent = all.find((m) => m.feishu_calendar_event_id === source.calendar_event_id);
-    if (byCalendarEvent) return byCalendarEvent;
-  }
-  if (source.feishu_meeting_id) {
-    const byMeetingId = all.find((m) => m.feishu_meeting_id === source.feishu_meeting_id);
-    if (byMeetingId) return byMeetingId;
-  }
-  const no = source.meeting_no || meetingNoFromUrl(source.meeting_url);
-  if (!no) return undefined;
-  const scheduledDay = source.scheduled_at.slice(0, 10);
-  return all.find((m) => {
-    if (m.feishu_meeting_no !== no && m.calendar_meeting_no !== no) return false;
-    return !m.scheduled_at || !scheduledDay || m.scheduled_at.slice(0, 10) === scheduledDay;
+  return findMeetingForProviderSource(all, {
+    platform: 'lark',
+    calendarEventId: source.calendar_event_id,
+    meetingId: source.feishu_meeting_id,
+    meetingNo: source.meeting_no || meetingNoFromUrl(source.meeting_url),
+    scheduledAt: source.scheduled_at,
   });
 }
 
