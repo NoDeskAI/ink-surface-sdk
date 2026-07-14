@@ -223,6 +223,20 @@ export async function getMeetingNoteTranscript(meetingId: string, opts?: { signa
   return getJson<LarkMeetingNoteTranscript>(`${FEISHU_SVC_BASE}/meetings/${encodeURIComponent(meetingId)}/note-transcript`, opts);
 }
 
+/**
+ * 单场按需解析：入会短号 + 该场计划时间 → 真 VC meeting_id（±6h 窗单次 list_by_no）。
+ * 打开某场会议时才调，避免批量解析触发飞书频率限流。返回 null = 没解析出真 id（保持短号未关联态）。
+ */
+export async function resolveMeetingInstance(meetingNo: string, scheduledAt: string, opts?: { signal?: AbortSignal }): Promise<{ meeting_id: string; meeting_no?: string; topic?: string; started_at?: string; ended_at?: string } | null> {
+  if (!meetingNo || !scheduledAt) return null;
+  const q = new URLSearchParams({ meeting_no: meetingNo, scheduled_at: scheduledAt });
+  const r = await getJson<{ meeting: CloudHubMeetingSource | null }>(`${FEISHU_SVC_BASE}/meeting-instance?${q}`, opts);
+  const s = r.meeting;
+  const id = s?.feishu_meeting_id;
+  if (!s || !id || id === (s.meeting_no || meetingNo)) return null;
+  return { meeting_id: id, meeting_no: s.meeting_no, topic: s.title, started_at: s.started_at, ended_at: s.ended_at };
+}
+
 /** 妙记元信息（标题/时长/url）。 */
 export async function getMinuteMeta(token: string, opts?: { signal?: AbortSignal }): Promise<PanelMinuteMeta> {
   const r = await getJson<{ minute: PanelMinuteMeta }>(`${BASE}/minutes/${encodeURIComponent(token)}`, opts);

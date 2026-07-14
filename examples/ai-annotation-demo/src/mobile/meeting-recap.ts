@@ -7,10 +7,10 @@
  */
 import { esc } from '../core/escape';
 import { confirmSheet, infoSheet, pickOneSheet } from './sheet';
-import { getMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute, listAllMeetings } from '../local/store';
+import { getMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute } from '../local/store';
 import { apiUrl, authFetch, getJson, postNdjson } from '../core/api';
 import { settings } from '../app/state';
-import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, bindPanelMinute, getPanelMeetingSummary, generatePanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
+import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, resolveMeetingInstance, bindPanelMinute, getPanelMeetingSummary, generatePanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
 import { parseSrtTranscript, type TranscriptCue } from '../integration/panel-feishu/align';
 import type { RecapSegment } from '../integration/panel-feishu/segment';
 import { buildEpaperMeetingTimeline, type EpaperMeetingTimeline } from '../integration/lark-meeting-timeline/epaper-timeline';
@@ -125,7 +125,8 @@ async function associate(m: PersistedMeeting): Promise<boolean> {
   // offset 推断留到读转写时（需 cues）；此处先存 offset=0。
   // mt.start_time = vc all_meeting_started 的会议开始时刻（真 t0）·非录音开始（录音可能晚几秒~分钟·残差由 recap 文案诚实标出）
   await updateMeeting(m.meeting_id, {
-    feishu_meeting_id: mt.meeting_id,
+    // 短号冒充 meeting_id 时不写（否则周期会实例共享同一短号会互相错配手记）。
+    ...(mt.meeting_id && mt.meeting_id !== mt.meeting_no ? { feishu_meeting_id: mt.meeting_id } : {}),
     feishu_meeting_no: mt.meeting_no,
     feishu_topic: mt.topic,
     ...(mt.minute_token ? { feishu_minute_token: mt.minute_token } : {}),
@@ -450,19 +451,6 @@ const meetingT0 = (m: PersistedMeeting): number =>
     ? (m.feishu_recording_t0 as number)
     : finiteMs(m.vc_meeting_start_t0, m.feishu_recording_t0, m.panel_meeting_start, m.started_at ? Date.parse(m.started_at) : NaN);
 
-function meetingSeriesKey(m: PersistedMeeting): string {
-  return (m.feishu_topic || m.title || '')
-    .replace(/^\s*\d{1,2}[-/]\d{1,2}\s*[|｜]\s*/, '')
-    .replace(/\s+/g, '')
-    .replace(/[·•].*$/, '')
-    .replace(/周例会|周会|例会|会议|会/g, '')
-    .trim();
-}
-
-function meetingStartForMatch(m: PersistedMeeting): number {
-  return finiteMs(m.vc_meeting_start_t0, m.panel_meeting_start, m.started_at ? Date.parse(m.started_at) : NaN, m.scheduled_at ? Date.parse(m.scheduled_at) : NaN);
-}
-
 function activeInkMarks(marks: PersistedMark[]): PersistedMark[] {
   return marks
     .filter((mark) => !mark.is_tombstone && hasMeetingInk(mark))
@@ -477,29 +465,37 @@ async function directMeetingMarks(meetingId: string): Promise<PersistedMark[]> {
   return [...deduped.values()].sort((a, b) => (a.abs_timestamp - b.abs_timestamp) || (a.seq - b.seq));
 }
 
+// 手记严格只属于本地单场 meeting_id（写入端 context_id='mtg_'+id / 'mtgboard_'+id）。
+// 绝不跨会议实例借手记——旧的按 feishu_meeting_id/系列标题/时间窗回退会把预写/兄弟实例的手记
+// 泄漏到所有周期会实例（尤其短号冒充 meeting_id 时 sameFeishu 恒真）。录音落在兄弟实例的场景应由
+// 显式 occurrence 合并解决，不在 recap 层猜。
 async function loadMeetingRecapMarks(meeting: PersistedMeeting): Promise<{ marks: PersistedMark[]; sourceMeeting: PersistedMeeting | null }> {
-  const direct = await directMeetingMarks(meeting.meeting_id);
-  if (direct.length) return { marks: direct, sourceMeeting: meeting };
+  const marks = await directMeetingMarks(meeting.meeting_id);
+  return { marks, sourceMeeting: marks.length ? meeting : null };
+}
 
-  const targetKey = meetingSeriesKey(meeting);
-  const targetStart = meetingStartForMatch(meeting);
-  if (!targetKey || !Number.isFinite(targetStart)) return { marks: [], sourceMeeting: null };
-
-  const candidates: Array<{ meeting: PersistedMeeting; marks: PersistedMark[]; distance: number }> = [];
-  for (const other of await listAllMeetings()) {
-    if (other.meeting_id === meeting.meeting_id) continue;
-    const start = meetingStartForMatch(other);
-    if (!Number.isFinite(start)) continue;
-    const sameFeishu = !!meeting.feishu_meeting_id && other.feishu_meeting_id === meeting.feishu_meeting_id;
-    const sameSeries = meetingSeriesKey(other) === targetKey;
-    const distance = Math.abs(start - targetStart);
-    if (!sameFeishu && (!sameSeries || distance > 7 * 24 * 3600_000)) continue;
-    const marks = await directMeetingMarks(other.meeting_id);
-    if (marks.length) candidates.push({ meeting: other, marks, distance });
+// 打开会后记录时按需解析真 VC meeting_id：日历/周期会来源只有入会短号（meeting_no），
+// 用该场 scheduled_at 的 ±6h 窗单次 list_by_no 换真 id 并持久化。一次一场、不触发批量限流。
+// 失败(限流/网络)不阻断——退回既有值（无真 id 则 recap 显示未关联，不伪造）。
+async function resolveRealMeetingId(m: PersistedMeeting): Promise<PersistedMeeting> {
+  const no = m.feishu_meeting_no || m.calendar_meeting_no;
+  if (!no || !m.scheduled_at) return m;
+  if (m.feishu_meeting_id && m.feishu_meeting_id !== no) return m; // 已有真 id
+  try {
+    const inst = await resolveMeetingInstance(no, m.scheduled_at);
+    if (!inst) return m;
+    // 只落 meeting_id 关联——不从解析结果写 started_at/t0：list_by_no brief 没有自己的真实开始时间，
+    // 那个 started_at 是用 scheduled_at 回填的伪造值，写成 vc_event t0 会污染时间轴对齐（真 t0 由 panel VC 事件给）。
+    const patch: Partial<PersistedMeeting> = {
+      feishu_meeting_id: inst.meeting_id,
+      feishu_meeting_no: inst.meeting_no || no,
+      ...(inst.topic ? { feishu_topic: inst.topic } : {}),
+    };
+    const updated = await updateMeeting(m.meeting_id, patch);
+    return updated ?? { ...m, ...patch };
+  } catch {
+    return m;
   }
-  candidates.sort((a, b) => a.distance - b.distance || b.marks.length - a.marks.length);
-  const best = candidates[0];
-  return best ? { marks: best.marks, sourceMeeting: best.meeting } : { marks: [], sourceMeeting: null };
 }
 
 /** 进 recap 视图：拉转写 + 手写档案 → 分段 → 渲染概览（段级时间线为主体·左侧 #recap-nav 切到飞书纪要/思路总结/InkLoop总结整页）；
@@ -510,10 +506,12 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   updateExportButton(); // 加载中先隐藏导出按钮/nav（还没有有效 recapState）
   updateRecapNav();
   bodyEl.innerHTML = '<p class="rc-note">正在拉取转写…</p>';
-  const m = await getMeeting(meetingId);
+  let m = await getMeeting(meetingId);
   if (!recapAlive(seq, bodyEl)) return;
   if (!m) { bodyEl.innerHTML = '<p class="rc-note">会议不存在。</p>'; return; }
   titleEl.textContent = `${m.title || '会议'} · 会后记录`;
+  m = await resolveRealMeetingId(m); // 日历/周期会来源按需换真 VC meeting_id（会前预写/短号态）
+  if (!recapAlive(seq, bodyEl)) return;
   if (m.panel_summary_unread) void updateMeeting(m.meeting_id, { panel_summary_unread: false }); // 进 recap 即「已读」·清 home/detail 提醒
   const hasPanelMeeting = !!m.feishu_meeting_id;
   const hasMinute = !!m.feishu_minute_token;

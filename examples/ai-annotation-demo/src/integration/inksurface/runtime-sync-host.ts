@@ -2,7 +2,7 @@ import { IndexedDbOfflineRuntimeStore, type OfflineRuntimeStorePort } from 'ink-
 import { HttpRuntimeSyncTransport, RuntimeSyncRunner } from 'ink-surface-sdk/sync-client';
 import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeDocumentSourceKind, RuntimeStrokePoint, RuntimeSurfaceBlock, RuntimeVisualStroke } from 'ink-surface-sdk/runtime-schema';
 import { apiBase, apiUrlWithLocalHttpFallback } from '../../core/api';
-import { authHeaders, getSession, runtimeTenantId, runtimeUserId } from '../../core/auth';
+import { authHeaders, getSession, onAuthChange, runtimeTenantId, runtimeUserId } from '../../core/auth';
 import { appendMarkEntry, getDoc, getFoldedMarks, getFoldedMarksByContext, getMeeting, setAiTurnAppendHook, setRuntimeLedgerAppendHook } from '../../local/store';
 import type { PersistedDoc, PersistedMark } from '../../core/store-format';
 import { bus, getActiveContext, state, strokeMarkIds, type Stroke, type Tool } from '../../app/state';
@@ -579,8 +579,11 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       pullLimit: 100,
     });
   };
-  const watermarks = typeof window !== 'undefined'
-    ? localStorageRuntimeBridgeWatermarks(window.localStorage, `${runtimeTenantId()}/${runtimeUserId()}`)
+  // watermark 按 (tenant/user) 命名空间隔离。身份升级（设备授权 local_user → 飞书 feishu_ou_*）时
+  // 必须重建，否则继续读写旧命名空间的 watermark（cursorKey 每次 createRunner 现取、已自动隔离，无需迁移旧 cursor）。
+  let runtimeNamespace = `${runtimeTenantId()}/${runtimeUserId()}`;
+  let watermarks = typeof window !== 'undefined'
+    ? localStorageRuntimeBridgeWatermarks(window.localStorage, runtimeNamespace)
     : undefined;
   const pendingDocs = new Set<string>();
   const pendingReasons = new Map<string, string>();
@@ -844,6 +847,21 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibilityChange);
   if (typeof window !== 'undefined') window.addEventListener('online', onOnline);
 
+  // 身份升级（core session 从 local_user 校准成 feishu_ou_*，见 session-reconcile）→ 重建 watermark 命名空间、
+  // 清 bootstrap/对齐缓存，并在新命名空间下重新 pull + 重灌当前文档。cursorKey 每次现取已自动切新桶、旧 cursor 不迁移。
+  const authStop = onAuthChange((event) => {
+    if (event.kind !== 'login' || disposed || typeof window === 'undefined') return;
+    const next = `${runtimeTenantId()}/${runtimeUserId()}`;
+    if (next === runtimeNamespace) return;
+    runtimeNamespace = next;
+    watermarks = localStorageRuntimeBridgeWatermarks(window.localStorage, next);
+    visibleAlignmentChecks.clear();
+    bootstrappedDocs.clear();
+    log('identity-upgrade', { namespace: next });
+    if (state.documentId) void syncDocument(state.documentId, 'identity-upgrade');
+    void pullNow('identity-upgrade');
+  });
+
   return {
     deviceId,
     store,
@@ -852,6 +870,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     reconcileNow,
     dispose() {
       disposed = true;
+      authStop();
       setRuntimeLedgerAppendHook(null);
       setAiTurnAppendHook(null);
       if (timer !== null) window.clearTimeout(timer);

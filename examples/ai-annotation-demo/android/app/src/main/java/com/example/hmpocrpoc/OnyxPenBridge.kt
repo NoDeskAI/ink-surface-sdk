@@ -36,8 +36,13 @@ object OnyxPenBridge {
     @Volatile private var rawPointCount = 0L
     @Volatile private var completedStrokeCount = 0L
     @Volatile private var active = false
+    @Volatile private var armed = false
+    @Volatile private var lastArea = ""
     @Volatile private var initialized = false
     @Volatile private var lastError = ""
+
+    // 前端上报的「当前书写画布矩形」(WebView host-local 物理 px)；null=非书写面→disarm。
+    private var requestedArea: Rect? = null
 
     private val currentStroke = ArrayList<OnyxPt>(512)
     private val completedStrokes = ArrayDeque<OnyxStroke>()
@@ -66,12 +71,14 @@ object OnyxPenBridge {
 
     @JvmStatic
     fun onResume() {
-        webViewRef?.get()?.post { ensureReady() }
+        webViewRef?.get()?.post { if (ensureReady()) applyRequestedArea() } // 恢复后按上次画区重 arm，不等前端偶发再报
     }
 
     @JvmStatic
     fun onPause() {
         setRawDrawingEnabled(false)
+        armed = false
+        webViewRef?.get()?.let { wv -> runCatching { EpdController.clearTransientUpdate(wv, true) } }
     }
 
     @JvmStatic
@@ -95,7 +102,7 @@ object OnyxPenBridge {
                 .debugLog(false)
                 .setStrokeWidth(3.0f)
                 .setStrokeStyle(TouchHelper.STROKE_STYLE_PENCIL)
-                .setLimitRect(currentLimitRect(webView), emptyList())
+                .setLimitRect(Rect(0, 0, 1, 1), emptyList()) // 占位·真画区等前端 updateWritingArea 上报
                 .openRawDrawing()
             helper.setRawDrawingRenderEnabled(true)
             helper.setPenUpRefreshEnabled(true)
@@ -117,35 +124,74 @@ object OnyxPenBridge {
         }.onFailure { recordError("configureEac", it) }
     }
 
-    private fun currentLimitRect(webView: WebView): Rect {
-        val rect = Rect()
-        webView.getLocalVisibleRect(rect)
-        if (rect.width() <= 0 || rect.height() <= 0) rect.set(0, 0, webView.width.coerceAtLeast(1), webView.height.coerceAtLeast(1))
-        return rect
-    }
-
+    // 落笔时前端调（@JavascriptInterface → bridge 线程）。arm 与 limitRect 由 updateWritingArea（前端画区
+    // 上报）驱动；这里只在已 arm 时触发 EPD handwriting transient 快刷，不再自己设 limitRect/enable（否则回到整屏）。
     private fun enterFastInk(): Boolean {
-        val webView = webViewRef?.get() ?: return false
-        if (!ensureReady()) return false
-        return runCatching {
-            touchHelper?.setLimitRect(currentLimitRect(webView), emptyList())
-            touchHelper?.setRawDrawingRenderEnabled(true)
-            EpdController.applyTransientUpdate(UpdateMode.HAND_WRITING_REPAINT_MODE)
-            setRawDrawingEnabled(true)
-            enterCount += 1
-            active = true
-            true
-        }.onFailure { recordError("enterFastInk", it) }.getOrDefault(false)
+        webViewRef?.get()?.post {
+            runCatching {
+                if (!armed) return@runCatching
+                EpdController.applyTransientUpdate(UpdateMode.HAND_WRITING_REPAINT_MODE)
+                enterCount += 1
+                active = true
+            }.onFailure { recordError("enterFastInk", it) }
+        }
+        return armed
     }
 
     private fun exitFastInk(): Boolean {
+        webViewRef?.get()?.let { wv ->
+            wv.post {
+                runCatching {
+                    EpdController.clearTransientUpdate(wv, true)
+                    exitCount += 1
+                    active = false
+                }.onFailure { recordError("exitFastInk", it) }
+            }
+        }
+        return true
+    }
+
+    /** 前端上报「当前书写画布矩形」（{x,y,w,h,dpr} host-local 物理 px，见 onyx-pen-area.ts）：收窄 raw drawing
+     *  到这块画布并 arm；null/空/零面积 → disarm（书架/按钮/浮层等非书写面不再是原生画线区）。 */
+    @JvmStatic
+    fun updateWritingArea(rectJson: String?) {
+        val webView = webViewRef?.get() ?: return
+        webView.post {
+            if (!ensureReady()) return@post
+            requestedArea = parseWritingRect(rectJson)
+            applyRequestedArea()
+        }
+    }
+
+    // 把当前 requestedArea 应用到 TouchHelper（有画区→limitRect+enable+armed；null→disable）。onResume 也调它恢复。
+    private fun applyRequestedArea() {
+        runCatching {
+            val rect = requestedArea
+            if (rect != null) {
+                touchHelper?.setLimitRect(rect, emptyList())
+                touchHelper?.setRawDrawingRenderEnabled(true)
+                setRawDrawingEnabled(true)
+                armed = true
+                lastArea = "${rect.left},${rect.top},${rect.right},${rect.bottom}"
+            } else {
+                setRawDrawingEnabled(false)
+                armed = false
+                lastArea = "null"
+            }
+        }.onFailure { recordError("applyRequestedArea", it) }
+    }
+
+    private fun parseWritingRect(rectJson: String?): Rect? {
+        val raw = rectJson?.trim().orEmpty()
+        if (raw.isEmpty() || raw == "null") return null
         return runCatching {
-            setRawDrawingEnabled(false)
-            webViewRef?.get()?.let { EpdController.clearTransientUpdate(it, true) }
-            exitCount += 1
-            active = false
-            true
-        }.onFailure { recordError("exitFastInk", it) }.getOrDefault(false)
+            val o = JSONObject(raw)
+            val x = o.getDouble("x").toInt()
+            val y = o.getDouble("y").toInt()
+            val w = o.getDouble("w").toInt()
+            val h = o.getDouble("h").toInt()
+            if (w <= 0 || h <= 0) null else Rect(x, y, x + w, y + h)
+        }.getOrNull()
     }
 
     private fun setRawDrawingEnabled(enabled: Boolean) {
@@ -251,6 +297,8 @@ object OnyxPenBridge {
     private fun debugStatusJson(): String = JSONObject()
         .put("initialized", initialized)
         .put("active", active)
+        .put("armed", armed)
+        .put("last_area", lastArea)
         .put("last_error", lastError)
         .put("attach_count", attachCount)
         .put("enter_count", enterCount)
@@ -267,6 +315,10 @@ object OnyxPenBridge {
     private class JsApi {
         @JavascriptInterface
         fun enterFastInk(): Boolean = OnyxPenBridge.enterFastInk()
+
+        /** 前端画区上报：{x,y,w,h,dpr} host-local 物理 px → 收窄 raw drawing 并 arm；null → disarm。 */
+        @JavascriptInterface
+        fun updateWritingArea(rectJson: String?) = OnyxPenBridge.updateWritingArea(rectJson)
 
         @JavascriptInterface
         fun exitFastInk(): Boolean = OnyxPenBridge.exitFastInk()

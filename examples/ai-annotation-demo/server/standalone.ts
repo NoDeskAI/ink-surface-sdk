@@ -46,7 +46,7 @@ import {
   larkOAuthAuthStatePath,
   resolveLarkOAuthPublicStatus,
 } from './lark-oauth-state';
-import { fetchLarkMeetingSources } from './lark-meeting-sources';
+import { fetchLarkMeetingSources, resolveLarkMeetingInstance } from './lark-meeting-sources';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import {
   larkRealtimeMeetingSources,
@@ -428,6 +428,17 @@ async function bootstrapLibraryForFeishuLogin(session: InkLoopSessionContext, ne
 async function persistSessionFeishuIdentity(sessionToken: string, session: InkLoopSessionContext, openId: string | null): Promise<LocalDeviceSession | null> {
   if (!LOCAL_DEVICE_AUTH || !openId) return null;
   const nextUserId = inkloopUserIdFromFeishuOpenId(openId);
+  // OAuth 完成时 token 存在升级前的 user 命名空间（local_user），身份升级为 feishu_ou_… 后
+  // 会议/妙记查询按新 user 读 lark-auth 会读到空（oauth_token_missing）。把 token 文件迁到新命名空间。
+  try {
+    const oldAuthPath = sessionScopedLarkAuthPath(session);
+    const newAuthPath = sessionScopedLarkAuthPath({ ...session, user_id: nextUserId });
+    if (oldAuthPath !== newAuthPath) {
+      const raw = readFileSync(oldAuthPath, 'utf8');
+      mkdirSync(dirname(newAuthPath), { recursive: true });
+      writeFileSync(newAuthPath, raw);
+    }
+  } catch { /* 无旧 token 文件（如未走 OAuth）时忽略 */ }
   await bootstrapLibraryForFeishuLogin(session, nextUserId);
   const patch: Partial<LocalDeviceSession> = {
     user_id: nextUserId,
@@ -822,7 +833,9 @@ async function handlePanelVault(req: IncomingMessage, res: ServerResponse): Prom
 //    两条服务之前设备前端裸连、零鉴权（见项目记忆盲区扫描发现）；与 vite.config.ts feishuServiceProxy/convertServiceProxy 同构，
 //    让安卓/生产包也走同源代理注入 secret。响应统一走 Buffer（群文件下载是图片/PDF 字节，.text() 会糟蹋二进制）。──
 const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+$/, '');
-const LARK_MEETING_OAUTH_SCOPE = 'vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+// offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
+// 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
+const LARK_MEETING_OAUTH_SCOPE = 'offline_access vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
 const LARK_MEETING_CALLBACK_PORT = String(process.env.LARK_MEETING_SDK_PORT || process.env.LARK_SDK_PORT || '8789').trim() || '8789';
 const LARK_MEETING_CALLBACK_PATH = '/api/auth/lark/callback';
 const CONVERT_SERVICE_BASE = (process.env.CONVERT_SERVICE_BASE || '').replace(/\/+$/, '');
@@ -1047,6 +1060,20 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
       return send(200, result);
     } catch (e) {
       return send(502, { connected: false, configured: true, source: 'lark_meeting_sources', sources: [], errors: [{ source: 'lark_meeting_sources', code: 'meeting_sources_failed', message: String((e as Error)?.message || e) }] });
+    }
+  }
+  if (apath === '/api/feishu/meeting-instance') {
+    try {
+      const u = new URL(rest, 'http://inkloop.local');
+      const session = await optionalDeviceSession(req);
+      const result = await resolveLarkMeetingInstance(
+        u.searchParams.get('meeting_no') || '',
+        u.searchParams.get('scheduled_at') || '',
+        { env: feishuBotRuntimeEnv(larkEnvForSession(session)) },
+      );
+      return send(200, result);
+    } catch (e) {
+      return send(Number((e as { status?: number })?.status) || 502, { meeting: null, error: String((e as Error)?.message || e) });
     }
   }
   if (!FEISHU_SERVICE_BASE && apath === '/api/feishu/meeting-events/status') {
