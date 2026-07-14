@@ -744,7 +744,6 @@ function meetingAnnotationGroup(annotation) {
 
 function readingAnnotationGroup(annotation) {
   const kind = String(annotation.kind || "").toLowerCase();
-  const tool = String(annotation.tool || annotation.ink_tool || "").toLowerCase();
   if (kind === "summary" || kind === "reading_summary") return "阅读摘要";
   return "阅读笔记";
 }
@@ -862,28 +861,6 @@ function shouldSkipRuntimeWrapperSnapshot(snapshot) {
   return sourceKind === "inkloop_created" && !hasContent;
 }
 
-function yamlValue(value) {
-  if (Array.isArray(value)) return value;
-  if (value === undefined || value === null) return undefined;
-  return JSON.stringify(String(value));
-}
-
-function yamlFrontmatter(entries) {
-  const lines = ["---"];
-  for (const [key, raw] of Object.entries(entries)) {
-    const value = yamlValue(raw);
-    if (value === undefined) continue;
-    if (Array.isArray(value)) {
-      lines.push(`${key}:`);
-      for (const item of value) lines.push(`  - ${JSON.stringify(String(item))}`);
-    } else {
-      lines.push(`${key}: ${value}`);
-    }
-  }
-  lines.push("---");
-  return lines.join("\n");
-}
-
 function cloudDocumentUri(docId) {
   return `inkloop://doc/${encodeURIComponent(docId)}`;
 }
@@ -929,24 +906,6 @@ function cleanCloudDocumentTitle(input, fallback = "InkLoop Document") {
 function cloudKnowledgeFolder(settings, documentTitle, mode = "reading") {
   const section = mode === "meeting" ? "Meetings" : "Reading";
   return `${settings.documentsDir}/${section}/${cleanCloudDocumentTitle(documentTitle)}`;
-}
-
-function shortKoId(koId) {
-  return String(koId || "ko").replace(/^ko_/, "").slice(0, 8);
-}
-
-function cloudNoteBaseName(ko) {
-  return `${safeFileSegment(ko.title || ko.ko_id || "Ink mark")} - ${shortKoId(ko.ko_id)}`;
-}
-
-function cloudCallout(kind) {
-  if (kind === "task" || kind === "meeting_action") return "todo";
-  if (kind === "decision" || kind === "meeting_decision") return "tip";
-  if (kind === "risk" || kind === "meeting_risk") return "warning";
-  if (kind === "qa") return "question";
-  if (kind === "highlight" || kind === "excerpt") return "quote";
-  if (kind === "annotation" || kind === "reading_note" || kind === "ai_note" || kind === "ai_response") return "note";
-  return "summary";
 }
 
 function projectionBlockHasMeetingOnlyAnnotation(block) {
@@ -1257,29 +1216,6 @@ function snapshotDetailLine(label, value, primary) {
   return snapshotTextLine(label, value);
 }
 
-function readingSnapshotForAiTurn(entity, turn) {
-  const answer = cleanCloudAiAnswer(turn);
-  const question = cleanCloudAiQuestion(turn);
-  const referent = cleanCloudAiReferent(turn);
-  if (!answer || isCloudNoiseText(answer, entity.documentTitle)) return null;
-  if (isCloudNoiseText(question, entity.documentTitle) && isCloudNoiseText(referent, entity.documentTitle)) return null;
-  const pageIndex = Number.isFinite(Number(turn.page_index)) ? Number(turn.page_index) : undefined;
-  return {
-    id: turn.ai_turn_id || turn.turn_id || turn.overlay_id || localId("ai"),
-    label: "AI 旁注",
-    title: question && !isCloudNoiseText(question, entity.documentTitle) ? question.slice(0, 56) : "AI 旁注",
-    body: answer,
-    quote: isCloudNoiseText(referent, entity.documentTitle) ? "" : referent,
-    handwriting: isCloudNoiseText(question, entity.documentTitle) ? "" : question,
-    uri: cloudTurnUri(entity, turn),
-    pageIndex,
-    bbox: normalizeSnapshotBBox(turn.inference_view?.anchor_bbox || turn.anchor?.anchor_bbox || turn.overlay?.geometry?.anchor_bbox),
-    annotation: null,
-    createdAt: turn.created_at || turn.updated_at,
-    source: "ai_turn",
-  };
-}
-
 function readingSnapshotForKo(entity, ko) {
   if (entity?.mode === "reading" && ko.provenance?.created_from === "ai_turn") return null;
   const annotation = snapshotAnnotationForKo(entity, ko);
@@ -1534,24 +1470,6 @@ function cloudReadingKoSection(ko) {
   return "thought";
 }
 
-function renderCloudControlledFields(ko) {
-  const lines = [
-    "## Controlled Fields",
-    CONTROLLED_FIELDS_MARKER,
-    `- Status: ${ko.status || "inbox"}`,
-    `- Tags: ${(ko.tags || []).join(", ")}`,
-  ];
-  if (ko.kind === "task" || ko.kind === "meeting_action") lines.push(`- [${ko.controlled_fields?.task_done ? "x" : " "}] Task done`);
-  if (ko.kind === "risk" || ko.kind === "meeting_risk") {
-    lines.push(`- Risk status: ${ko.controlled_fields?.risk_status || "open"}`);
-    lines.push(`- Risk note: ${ko.controlled_fields?.risk_note || ""}`);
-  }
-  if (ko.kind === "highlight" || ko.kind === "excerpt" || ko.kind === "annotation") {
-    lines.push(`- Comment: ${ko.controlled_fields?.comment_md || ""}`);
-  }
-  return lines.join("\n");
-}
-
 function cloudAnnotationForKo(ko) {
   const visualStrokes = Array.isArray(ko.visual_strokes)
     ? ko.visual_strokes
@@ -1641,17 +1559,13 @@ function svgForAnnotation(annotation) {
   ].join("");
 }
 
-function renderCloudSourceHub(settings, entity, noteNames) {
+function renderCloudSourceHub(settings, entity) {
   const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
   const title = cleanCloudDocumentTitle(entity.documentTitle, entity.documentId);
   const uri = cloudDocumentUri(entity.documentId);
   const aiTurnSections = renderCloudAiTurnSections(entity);
   const aiTurnDedupeKeys = renderedCloudAiTurnDedupeKeys(entity);
   const summarySections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => cloudReadingKoSection(ko) === "summary");
-  const readingNoteSections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => {
-    const section = cloudReadingKoSection(ko);
-    return section && section !== "summary";
-  });
   const projectionBody = renderCloudProjectionBlocks(entity.documentProjections, entity.mode);
   const lines = [
     `[在 InkLoop 打开原文](${uri})`,
@@ -1673,50 +1587,6 @@ function renderCloudSourceHub(settings, entity, noteNames) {
     if (aiSnapshots.length) lines.push("## AI 旁注", renderReadingSnapshotBoard(aiSnapshots, { title: "AI 旁注", empty: "暂无 AI 旁注。" }));
   }
   return { path: `${folder}/${title}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
-}
-
-function renderCloudKoNote(settings, entity, ko, noteNames) {
-  const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
-  const base = noteNames.get(ko.ko_id);
-  const uri = cloudKoSourceUri(entity, ko);
-  const lines = [
-    yamlFrontmatter({
-      inkloop_document_id: ko.source?.document_id || entity.documentId,
-      inkloop_document_uri: uri,
-      inkloop_knowledge_object_id: ko.ko_id,
-      inkloop_knowledge_kind: ko.kind,
-      inkloop_projection_role: "knowledge_projection",
-      inkloop_projection_scope: "reviewed_knowledge_only",
-      inkloop_status: ko.status,
-      tags: ko.tags || [],
-    }),
-    `# ${ko.title || ko.ko_id}`,
-    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
-  ];
-  const body = String(ko.body_md || "").trim();
-  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
-  lines.push(renderCloudControlledFields(ko));
-  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
-  if (svg) lines.push(svg);
-  return { path: `${folder}/${base}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
-}
-
-function renderCloudInlineKoSection(ko) {
-  const uri = cloudKoSourceUri({ documentId: ko.source?.document_id || ko.document_id || "" }, ko);
-  const documentId = ko.source?.document_id || ko.document_id || "";
-  const lines = [
-    `<!-- inkloop:begin-ko document_id="${escapeHtml(documentId)}" document_uri="${escapeHtml(uri)}" ko_id="${escapeHtml(ko.ko_id)}" kind="${escapeHtml(ko.kind)}" -->`,
-    `### ${ko.title || ko.ko_id}`,
-    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
-  ];
-  const body = String(ko.body_md || "").trim();
-  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
-  if (uri) lines.push(`[回到原文](${uri})`);
-  lines.push(renderCloudControlledFields(ko).replace(/^## Controlled Fields/u, "#### Controlled Fields"));
-  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
-  if (svg) lines.push(svg);
-  lines.push("<!-- inkloop:end-ko -->");
-  return lines.join("\n\n");
 }
 
 function renderCloudKnowledgeMarkdown(settings, objects, projections, aiTurns = []) {
@@ -1746,16 +1616,12 @@ function renderCloudKnowledgeMarkdown(settings, objects, projections, aiTurns = 
   for (const turn of aiTurns || []) {
     ensure(turn.document_id, turn.document_title || turn.inference_view?.document_title)?.aiTurns.push(turn);
   }
-  const noteNames = new Map();
-  for (const entity of byDoc.values()) {
-    for (const ko of knowledgeObjectsForProjectionMode(entity)) noteNames.set(ko.ko_id, cloudNoteBaseName(ko));
-  }
   const files = [];
   for (const entity of [...byDoc.values()].sort((a, b) => a.documentTitle.localeCompare(b.documentTitle))) {
     entity.knowledgeObjects.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
     entity.documentProjections.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
     entity.aiTurns.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
-    files.push(renderCloudSourceHub(settings, entity, noteNames));
+    files.push(renderCloudSourceHub(settings, entity));
   }
   return files;
 }
