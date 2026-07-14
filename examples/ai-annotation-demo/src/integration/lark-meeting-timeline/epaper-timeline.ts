@@ -2,8 +2,9 @@
 // TS config does not resolve declarations outside src for relative .mjs imports.
 // Keep the escape hatch narrow so pdfjs .mjs typing stays untouched.
 // @ts-ignore - local SDK ESM import is verified by vitest and Vite at runtime.
-import { buildMeetingPlatformTimelineView as sdkBuildMeetingPlatformTimelineView } from '../../../Lark-Meeting-Timeline-main/packages/meeting-timeline-sdk/adapters/platform-timeline-view.mjs';
+import { buildMeetingPlatformTimelineView as sdkBuildMeetingPlatformTimelineView } from '../../../vendor/meeting-timeline-sdk/adapters/platform-timeline-view.mjs';
 import type { PersistedMeeting } from '../../core/store-format';
+import { meetingPlatformOf, meetingTranscriptSource } from '../../mobile/meeting-platform';
 import type { TranscriptCue } from '../panel-feishu/align';
 import { buildSegments, buildSegmentMarks, type RecapSegment, type SegmentMark } from '../panel-feishu/segment';
 
@@ -39,7 +40,7 @@ export interface EpaperSdkTimelineView {
   next_actions: string[];
 }
 
-const buildMeetingPlatformTimelineView = sdkBuildMeetingPlatformTimelineView as (
+const buildMeetingPlatformTimelineView = sdkBuildMeetingPlatformTimelineView as unknown as (
   platform: string,
   input?: Record<string, unknown>,
   options?: Record<string, unknown>,
@@ -96,7 +97,7 @@ function meetingPayload(meeting: PersistedMeeting, t0AbsMs: number): Record<stri
   const start = safeTime(t0AbsMs, meeting.vc_meeting_start_t0, meeting.feishu_recording_t0, meeting.panel_meeting_start, meeting.started_at, meeting.scheduled_at);
   const end = safeTime(meeting.ended_at);
   return {
-    platform: 'lark',
+    platform: meetingPlatformOf(meeting),
     meeting_id: meeting.feishu_meeting_id || meeting.feishu_meeting_no || meeting.meeting_id,
     external_meeting_id: meeting.feishu_meeting_no || meeting.calendar_meeting_no,
     title: meeting.feishu_topic || meeting.title || '会议',
@@ -106,14 +107,14 @@ function meetingPayload(meeting: PersistedMeeting, t0AbsMs: number): Record<stri
   };
 }
 
-function transcriptPayload(cues: TranscriptCue[]): Array<Record<string, unknown>> {
+function transcriptPayload(cues: TranscriptCue[], source: string): Array<Record<string, unknown>> {
   return cues.map((cue) => ({
     id: `cue-${cue.index}`,
     start_ms: cue.startMs,
     end_ms: cue.endMs,
     speaker_name: cue.speaker || '未知说话人',
     text: cue.text,
-    source: 'lark_minute',
+    source,
     raw: { index: cue.index, rawText: cue.rawText },
   }));
 }
@@ -173,11 +174,12 @@ function marksFromSdkView(segmentMarks: SegmentMark[], view: EpaperSdkTimelineVi
 }
 
 export function buildEpaperMeetingTimeline(input: EpaperMeetingTimelineInput): EpaperMeetingTimeline {
+  const platform = meetingPlatformOf(input.meeting);
   const rawById = new Map(input.marks.map((mark) => [mark.mark_id, mark] as const));
   const localSegmentMarks = buildSegmentMarks(input.marks, input.t0AbsMs, input.offsetMs);
-  const transcript = transcriptPayload(input.cues);
+  const transcript = transcriptPayload(input.cues, meetingTranscriptSource(input.meeting));
   const annotations = annotationPayload(localSegmentMarks, rawById);
-  const sdkView = buildMeetingPlatformTimelineView('lark', {
+  const sdkView = buildMeetingPlatformTimelineView(platform, {
     meeting: meetingPayload(input.meeting, input.t0AbsMs),
     transcript_segments: transcript,
     marks: annotations,
