@@ -289,11 +289,21 @@ function controlledKnowledgeEditsSinceBaseline(signatures, filePath, markdown) {
   for (const edit of parseControlledKnowledgeEdits(markdown)) {
     const key = controlledKnowledgeSignatureKey(filePath, edit);
     const signature = controlledKnowledgeSignature(edit);
-    if (signatures.get(key) === signature) continue;
-    signatures.set(key, signature);
-    changed.push(edit);
+    const previousSignature = signatures.get(key);
+    if (previousSignature === signature) continue;
+    changed.push({ edit, key, signature, previousSignature });
   }
   return changed;
+}
+
+function beginControlledKnowledgeEdit(signatures, change) {
+  signatures.set(change.key, change.signature);
+}
+
+function rollbackControlledKnowledgeEdit(signatures, change) {
+  if (signatures.get(change.key) !== change.signature) return;
+  if (change.previousSignature === undefined) signatures.delete(change.key);
+  else signatures.set(change.key, change.previousSignature);
 }
 
 async function sha256Tagged(input) {
@@ -2889,23 +2899,31 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   async updateControlledKnowledgeProjection(file) {
     if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return null;
     const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
-    const edits = controlledKnowledgeEditsSinceBaseline(this.controlledKnowledgeSignatures, file.path, markdown);
-    if (!edits.length) return null;
+    const changes = controlledKnowledgeEditsSinceBaseline(this.controlledKnowledgeSignatures, file.path, markdown);
+    if (!changes.length) return null;
     const events = [];
-    for (const edit of edits) {
-      const event = await this.appendRuntimeSyncEvent({
-        doc_id: edit.document_id,
-        operation: "knowledge.update",
-        target: { type: "knowledge_object", id: edit.ko_id },
-        payload: {
-          ko_id: edit.ko_id,
-          kind: edit.kind,
-          patch: edit.patch,
-          projection_path: file.path,
-          source: "obsidian_controlled_fields",
-          controlled_schema_version: edit.schema_version,
-        },
-      });
+    for (const change of changes) {
+      const { edit } = change;
+      beginControlledKnowledgeEdit(this.controlledKnowledgeSignatures, change);
+      let event;
+      try {
+        event = await this.appendRuntimeSyncEvent({
+          doc_id: edit.document_id,
+          operation: "knowledge.update",
+          target: { type: "knowledge_object", id: edit.ko_id },
+          payload: {
+            ko_id: edit.ko_id,
+            kind: edit.kind,
+            patch: edit.patch,
+            projection_path: file.path,
+            source: "obsidian_controlled_fields",
+            controlled_schema_version: edit.schema_version,
+          },
+        });
+      } catch (error) {
+        rollbackControlledKnowledgeEdit(this.controlledKnowledgeSignatures, change);
+        throw error;
+      }
       events.push(event);
       this.lastChange = {
         event_type: "inkloop_controlled_knowledge_edit",

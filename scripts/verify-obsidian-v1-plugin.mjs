@@ -192,7 +192,7 @@ const CONTROLLED_FIELDS_MARKER = "<!-- inkloop:controlled-fields v1 -->";
 const KNOWLEDGE_STATUSES = new Set(["inbox", "accepted", "edited", "follow_up", "dismissed", "export_ready", "exported", "archived"]);
 const RISK_STATUSES = new Set(["open", "watching", "mitigated", "closed"]);
 `;
-    return new Function(`${controlledConstants}\n${source.slice(start, end)}\nreturn { renderCloudKnowledgeMarkdown, rememberControlledKnowledgeSignatures, controlledKnowledgeEditsSinceBaseline, isCloudKnowledgeProjectionMarkdown };`)();
+    return new Function(`${controlledConstants}\n${source.slice(start, end)}\nreturn { renderCloudKnowledgeMarkdown, rememberControlledKnowledgeSignatures, controlledKnowledgeEditsSinceBaseline, beginControlledKnowledgeEdit, rollbackControlledKnowledgeEdit, isCloudKnowledgeProjectionMarkdown };`)();
   } catch (error) {
     fail(`could not evaluate Obsidian plugin Cloud Knowledge renderer: ${String(error?.message || error)}`);
     return null;
@@ -223,10 +223,18 @@ inkloop_knowledge_kind: "reading_note"
 
   const edited = markdown.replace('- Status: accepted', '- Status: archived');
   const changed = renderer.controlledKnowledgeEditsSinceBaseline(signatures, filePath, edited);
-  if (changed.length !== 1 || changed[0].patch.status !== 'archived') {
+  if (changed.length !== 1 || changed[0].edit.patch.status !== 'archived') {
     fail('A real user controlled-field edit was not emitted after projection baseline seeding');
   }
-  note('Cloud-rendered controlled fields are baselined while real user edits still produce one update');
+  renderer.beginControlledKnowledgeEdit(signatures, changed[0]);
+  if (renderer.controlledKnowledgeEditsSinceBaseline(signatures, filePath, edited).length !== 0) {
+    fail('An in-flight controlled-field edit was emitted more than once');
+  }
+  renderer.rollbackControlledKnowledgeEdit(signatures, changed[0]);
+  if (renderer.controlledKnowledgeEditsSinceBaseline(signatures, filePath, edited).length !== 1) {
+    fail('A failed controlled-field edit could not be retried after signature rollback');
+  }
+  note('Cloud-rendered controlled fields are baselined, deduplicated in flight, and retried after failure');
 }
 
 function verifyCloudKnowledgeMeetingHubRendersKoWithoutQuote() {
