@@ -341,6 +341,13 @@ export interface PersistedMeeting {
   material_doc_ids: string[];       // 可能有用的文件（指向 docs/pdf_blobs 的 document_id）
   material_links?: PersistedMeetingMaterialLink[]; // 链接型资料（妙记 docx 等·不强求可批注·见 PersistedMeetingMaterialLink）
   summary?: string;                 // 会后「思路总结」（AI 综合，先空）
+  // ── 多平台会议标识（optional·零迁移；缺省按存量飞书字段推断）──
+  platform?: 'lark' | 'google_meet' | 'manual'; // 会议平台；存量飞书会议可不写
+  provider_meeting_id?: string;        // 平台会议场次主键；Google Meet 使用 conferenceRecord.name
+  provider_calendar_event_id?: string; // 平台日历实例 id；Google Meet 使用 Calendar event instance id
+  provider_space_name?: string;        // 平台会议空间；Google Meet 使用 spaces/{id}
+  provider_transcript_ref?: string;    // 平台转写工件引用；Google Meet 使用 transcripts/{id}
+  meeting_url?: string;                // 平台通用入会链接；飞书与 Google Meet 均可使用
   // ── WS2-C 飞书妙记对照（optional·零迁移；近似对照非精确对齐·见 integration/panel-feishu）──
   feishu_meeting_id?: string;       // 关联的飞书 VC 会议 id
   feishu_meeting_no?: string;       // 9 位会议号
@@ -350,7 +357,7 @@ export interface PersistedMeeting {
   panel_meeting_start?: number;     // panel 会议 start_time（epoch ms·≠录音起点·保留 raw 供核对/兜底）
   vc_meeting_start_t0?: number;     // vc all_meeting_started.start_time（epoch ms·会议开始·L1 真 t0 来源）
   feishu_recording_t0?: number;     // 真录音 t0 绝对墙钟（epoch ms）；旧数据可能装过 panel start 近似（兼容读·见 recapT0）
-  t0_source?: 'local_enter' | 'panel_start' | 'vc_event' | 'recording_event' | 'calendar' | 'manual'; // t0 来源（会中用会议 t0·会后优先录音 t0·诚实标注）
+  t0_source?: 'local_enter' | 'panel_start' | 'vc_event' | 'recording_event' | 'calendar' | 'provider_event' | 'manual'; // t0 来源（provider_event=平台真实事件；会后优先录音 t0）
   align_offset_ms?: number;         // 用户/启发式微调（cueAbs = t0 + offset + cue 相对）
   align_state?: 'uncalibrated' | 'approx' | 'estimated' | 'event' | 'manual'; // 校准状态（event=会议事件 t0·录音残差未消除·UI 明示防假精确）
   feishu_match_confirmed_at?: string; // 用户确认关联的时刻
