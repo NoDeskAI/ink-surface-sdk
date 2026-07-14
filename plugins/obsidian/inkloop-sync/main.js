@@ -258,6 +258,54 @@ function parseControlledKnowledgeEdits(markdown) {
   return edits;
 }
 
+function isCloudKnowledgeProjectionMarkdown(markdown) {
+  const front = parseProjectionFrontmatter(markdown);
+  const hasDocumentId = typeof front.inkloop_document_id === "string" && front.inkloop_document_id.length > 0;
+  return hasDocumentId && (
+    front.inkloop_projection_role === "source_file_unit"
+    || typeof front.inkloop_knowledge_object_id === "string"
+    || String(markdown || "").includes("<!-- inkloop:begin-ko ")
+  );
+}
+
+function controlledKnowledgeSignatureKey(filePath, edit) {
+  return `${filePath}::${edit.document_id}::${edit.ko_id}`;
+}
+
+function controlledKnowledgeSignature(edit) {
+  return JSON.stringify({ document_id: edit.document_id, ko_id: edit.ko_id, patch: edit.patch });
+}
+
+function rememberControlledKnowledgeSignatures(signatures, filePath, markdown) {
+  const edits = parseControlledKnowledgeEdits(markdown);
+  for (const edit of edits) {
+    signatures.set(controlledKnowledgeSignatureKey(filePath, edit), controlledKnowledgeSignature(edit));
+  }
+  return edits.length;
+}
+
+function controlledKnowledgeEditsSinceBaseline(signatures, filePath, markdown) {
+  const changed = [];
+  for (const edit of parseControlledKnowledgeEdits(markdown)) {
+    const key = controlledKnowledgeSignatureKey(filePath, edit);
+    const signature = controlledKnowledgeSignature(edit);
+    const previousSignature = signatures.get(key);
+    if (previousSignature === signature) continue;
+    changed.push({ edit, key, signature, previousSignature });
+  }
+  return changed;
+}
+
+function beginControlledKnowledgeEdit(signatures, change) {
+  signatures.set(change.key, change.signature);
+}
+
+function rollbackControlledKnowledgeEdit(signatures, change) {
+  if (signatures.get(change.key) !== change.signature) return;
+  if (change.previousSignature === undefined) signatures.delete(change.key);
+  else signatures.set(change.key, change.previousSignature);
+}
+
 async function sha256Tagged(input) {
   const bytes = new TextEncoder().encode(String(input || ""));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -706,7 +754,6 @@ function meetingAnnotationGroup(annotation) {
 
 function readingAnnotationGroup(annotation) {
   const kind = String(annotation.kind || "").toLowerCase();
-  const tool = String(annotation.tool || annotation.ink_tool || "").toLowerCase();
   if (kind === "summary" || kind === "reading_summary") return "阅读摘要";
   return "阅读笔记";
 }
@@ -824,28 +871,6 @@ function shouldSkipRuntimeWrapperSnapshot(snapshot) {
   return sourceKind === "inkloop_created" && !hasContent;
 }
 
-function yamlValue(value) {
-  if (Array.isArray(value)) return value;
-  if (value === undefined || value === null) return undefined;
-  return JSON.stringify(String(value));
-}
-
-function yamlFrontmatter(entries) {
-  const lines = ["---"];
-  for (const [key, raw] of Object.entries(entries)) {
-    const value = yamlValue(raw);
-    if (value === undefined) continue;
-    if (Array.isArray(value)) {
-      lines.push(`${key}:`);
-      for (const item of value) lines.push(`  - ${JSON.stringify(String(item))}`);
-    } else {
-      lines.push(`${key}: ${value}`);
-    }
-  }
-  lines.push("---");
-  return lines.join("\n");
-}
-
 function cloudDocumentUri(docId) {
   return `inkloop://doc/${encodeURIComponent(docId)}`;
 }
@@ -891,24 +916,6 @@ function cleanCloudDocumentTitle(input, fallback = "InkLoop Document") {
 function cloudKnowledgeFolder(settings, documentTitle, mode = "reading") {
   const section = mode === "meeting" ? "Meetings" : "Reading";
   return `${settings.documentsDir}/${section}/${cleanCloudDocumentTitle(documentTitle)}`;
-}
-
-function shortKoId(koId) {
-  return String(koId || "ko").replace(/^ko_/, "").slice(0, 8);
-}
-
-function cloudNoteBaseName(ko) {
-  return `${safeFileSegment(ko.title || ko.ko_id || "Ink mark")} - ${shortKoId(ko.ko_id)}`;
-}
-
-function cloudCallout(kind) {
-  if (kind === "task" || kind === "meeting_action") return "todo";
-  if (kind === "decision" || kind === "meeting_decision") return "tip";
-  if (kind === "risk" || kind === "meeting_risk") return "warning";
-  if (kind === "qa") return "question";
-  if (kind === "highlight" || kind === "excerpt") return "quote";
-  if (kind === "annotation" || kind === "reading_note" || kind === "ai_note" || kind === "ai_response") return "note";
-  return "summary";
 }
 
 function projectionBlockHasMeetingOnlyAnnotation(block) {
@@ -1219,29 +1226,6 @@ function snapshotDetailLine(label, value, primary) {
   return snapshotTextLine(label, value);
 }
 
-function readingSnapshotForAiTurn(entity, turn) {
-  const answer = cleanCloudAiAnswer(turn);
-  const question = cleanCloudAiQuestion(turn);
-  const referent = cleanCloudAiReferent(turn);
-  if (!answer || isCloudNoiseText(answer, entity.documentTitle)) return null;
-  if (isCloudNoiseText(question, entity.documentTitle) && isCloudNoiseText(referent, entity.documentTitle)) return null;
-  const pageIndex = Number.isFinite(Number(turn.page_index)) ? Number(turn.page_index) : undefined;
-  return {
-    id: turn.ai_turn_id || turn.turn_id || turn.overlay_id || localId("ai"),
-    label: "AI 旁注",
-    title: question && !isCloudNoiseText(question, entity.documentTitle) ? question.slice(0, 56) : "AI 旁注",
-    body: answer,
-    quote: isCloudNoiseText(referent, entity.documentTitle) ? "" : referent,
-    handwriting: isCloudNoiseText(question, entity.documentTitle) ? "" : question,
-    uri: cloudTurnUri(entity, turn),
-    pageIndex,
-    bbox: normalizeSnapshotBBox(turn.inference_view?.anchor_bbox || turn.anchor?.anchor_bbox || turn.overlay?.geometry?.anchor_bbox),
-    annotation: null,
-    createdAt: turn.created_at || turn.updated_at,
-    source: "ai_turn",
-  };
-}
-
 function readingSnapshotForKo(entity, ko) {
   if (entity?.mode === "reading" && ko.provenance?.created_from === "ai_turn") return null;
   const annotation = snapshotAnnotationForKo(entity, ko);
@@ -1496,24 +1480,6 @@ function cloudReadingKoSection(ko) {
   return "thought";
 }
 
-function renderCloudControlledFields(ko) {
-  const lines = [
-    "## Controlled Fields",
-    CONTROLLED_FIELDS_MARKER,
-    `- Status: ${ko.status || "inbox"}`,
-    `- Tags: ${(ko.tags || []).join(", ")}`,
-  ];
-  if (ko.kind === "task" || ko.kind === "meeting_action") lines.push(`- [${ko.controlled_fields?.task_done ? "x" : " "}] Task done`);
-  if (ko.kind === "risk" || ko.kind === "meeting_risk") {
-    lines.push(`- Risk status: ${ko.controlled_fields?.risk_status || "open"}`);
-    lines.push(`- Risk note: ${ko.controlled_fields?.risk_note || ""}`);
-  }
-  if (ko.kind === "highlight" || ko.kind === "excerpt" || ko.kind === "annotation") {
-    lines.push(`- Comment: ${ko.controlled_fields?.comment_md || ""}`);
-  }
-  return lines.join("\n");
-}
-
 function cloudAnnotationForKo(ko) {
   const visualStrokes = Array.isArray(ko.visual_strokes)
     ? ko.visual_strokes
@@ -1603,17 +1569,13 @@ function svgForAnnotation(annotation) {
   ].join("");
 }
 
-function renderCloudSourceHub(settings, entity, noteNames) {
+function renderCloudSourceHub(settings, entity) {
   const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
   const title = cleanCloudDocumentTitle(entity.documentTitle, entity.documentId);
   const uri = cloudDocumentUri(entity.documentId);
   const aiTurnSections = renderCloudAiTurnSections(entity);
   const aiTurnDedupeKeys = renderedCloudAiTurnDedupeKeys(entity);
   const summarySections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => cloudReadingKoSection(ko) === "summary");
-  const readingNoteSections = renderCloudKoSections(entity, aiTurnDedupeKeys, (ko) => {
-    const section = cloudReadingKoSection(ko);
-    return section && section !== "summary";
-  });
   const projectionBody = renderCloudProjectionBlocks(entity.documentProjections, entity.mode);
   const lines = [
     `[在 InkLoop 打开原文](${uri})`,
@@ -1635,50 +1597,6 @@ function renderCloudSourceHub(settings, entity, noteNames) {
     if (aiSnapshots.length) lines.push("## AI 旁注", renderReadingSnapshotBoard(aiSnapshots, { title: "AI 旁注", empty: "暂无 AI 旁注。" }));
   }
   return { path: `${folder}/${title}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
-}
-
-function renderCloudKoNote(settings, entity, ko, noteNames) {
-  const folder = cloudKnowledgeFolder(settings, entity.documentTitle, entity.mode);
-  const base = noteNames.get(ko.ko_id);
-  const uri = cloudKoSourceUri(entity, ko);
-  const lines = [
-    yamlFrontmatter({
-      inkloop_document_id: ko.source?.document_id || entity.documentId,
-      inkloop_document_uri: uri,
-      inkloop_knowledge_object_id: ko.ko_id,
-      inkloop_knowledge_kind: ko.kind,
-      inkloop_projection_role: "knowledge_projection",
-      inkloop_projection_scope: "reviewed_knowledge_only",
-      inkloop_status: ko.status,
-      tags: ko.tags || [],
-    }),
-    `# ${ko.title || ko.ko_id}`,
-    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
-  ];
-  const body = String(ko.body_md || "").trim();
-  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
-  lines.push(renderCloudControlledFields(ko));
-  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
-  if (svg) lines.push(svg);
-  return { path: `${folder}/${base}.md`, markdown: `${lines.join("\n\n").trimEnd()}\n` };
-}
-
-function renderCloudInlineKoSection(ko) {
-  const uri = cloudKoSourceUri({ documentId: ko.source?.document_id || ko.document_id || "" }, ko);
-  const documentId = ko.source?.document_id || ko.document_id || "";
-  const lines = [
-    `<!-- inkloop:begin-ko document_id="${escapeHtml(documentId)}" document_uri="${escapeHtml(uri)}" ko_id="${escapeHtml(ko.ko_id)}" kind="${escapeHtml(ko.kind)}" -->`,
-    `### ${ko.title || ko.ko_id}`,
-    `> [!${cloudCallout(ko.kind)}] ${ko.title || ko.kind || "InkLoop note"}`,
-  ];
-  const body = String(ko.body_md || "").trim();
-  if (body) lines.push(body.split("\n").map((line) => `> ${line}`).join("\n"));
-  if (uri) lines.push(`[回到原文](${uri})`);
-  lines.push(renderCloudControlledFields(ko).replace(/^## Controlled Fields/u, "#### Controlled Fields"));
-  const svg = svgForAnnotation(cloudAnnotationForKo(ko));
-  if (svg) lines.push(svg);
-  lines.push("<!-- inkloop:end-ko -->");
-  return lines.join("\n\n");
 }
 
 function renderCloudKnowledgeMarkdown(settings, objects, projections, aiTurns = []) {
@@ -1708,16 +1626,12 @@ function renderCloudKnowledgeMarkdown(settings, objects, projections, aiTurns = 
   for (const turn of aiTurns || []) {
     ensure(turn.document_id, turn.document_title || turn.inference_view?.document_title)?.aiTurns.push(turn);
   }
-  const noteNames = new Map();
-  for (const entity of byDoc.values()) {
-    for (const ko of knowledgeObjectsForProjectionMode(entity)) noteNames.set(ko.ko_id, cloudNoteBaseName(ko));
-  }
   const files = [];
   for (const entity of [...byDoc.values()].sort((a, b) => a.documentTitle.localeCompare(b.documentTitle))) {
     entity.knowledgeObjects.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
     entity.documentProjections.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
     entity.aiTurns.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
-    files.push(renderCloudSourceHub(settings, entity, noteNames));
+    files.push(renderCloudSourceHub(settings, entity));
   }
   return files;
 }
@@ -1933,9 +1847,11 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.nativeEditTimers = new Map();
     this.previewSignatures = new Map();
     this.controlledKnowledgeSignatures = new Map();
+    this.cloudProjectionPaths = new Set();
     this.appendQueues = new Map();
     this.refreshPreviewsRunning = false;
     this.statusPath = `${this.settings.baseDir}/.obsidian-plugin-status.json`;
+    await this.seedControlledKnowledgeSignaturesFromVault();
 
     this.addCommand({ id: "sync-inkloop-now", name: "Sync InkLoop now", callback: () => this.syncNow("command", { notify: true }) });
     this.addCommand({ id: "open-current-file-in-inkloop", name: "Open current file with InkLoop sidecar", callback: () => this.openCurrentFileInInkLoop() });
@@ -1971,6 +1887,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     this.nativeEditTimers?.clear?.();
     this.previewSignatures?.clear?.();
     this.controlledKnowledgeSignatures?.clear?.();
+    this.cloudProjectionPaths?.clear?.();
     this.app.workspace.detachLeavesOfType(INKLOOP_VIEW_TYPE);
   }
 
@@ -2060,6 +1977,22 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     if (existing === file.markdown) return false;
     await this.app.vault.adapter.write(file.path, file.markdown);
     return true;
+  }
+
+  async seedControlledKnowledgeSignaturesFromVault() {
+    const prefix = `${this.settings.documentsDir}/`;
+    const previousPull = await this.readJson(this.sidecarPath("cloud-knowledge-pull.json"), null);
+    for (const path of Array.isArray(previousPull?.rendered_paths) ? previousPull.rendered_paths : []) {
+      if (typeof path === "string" && path.startsWith(prefix)) this.cloudProjectionPaths.add(path);
+    }
+    const files = typeof this.app.vault.getMarkdownFiles === "function" ? this.app.vault.getMarkdownFiles() : [];
+    let seeded = 0;
+    for (const file of files) {
+      if (!file?.path?.startsWith(prefix)) continue;
+      const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
+      seeded += rememberControlledKnowledgeSignatures(this.controlledKnowledgeSignatures, file.path, markdown);
+    }
+    return seeded;
   }
 
   async removePath(path) {
@@ -2158,7 +2091,11 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     );
     const files = renderCloudKnowledgeMarkdown(this.settings, filtered.objects, filtered.projections, visibleAiTurns);
     let changed = 0;
-    for (const file of files) if (await this.writeRenderedMarkdownFile(file)) changed += 1;
+    for (const file of files) {
+      this.cloudProjectionPaths.add(file.path);
+      rememberControlledKnowledgeSignatures(this.controlledKnowledgeSignatures, file.path, file.markdown);
+      if (await this.writeRenderedMarkdownFile(file)) changed += 1;
+    }
     const staleProjectionArchive = await this.archiveStaleCloudKnowledgeProjections(files);
     const result = {
       schema_version: "inkloop.obsidian_cloud_knowledge_pull.v1",
@@ -2962,27 +2899,31 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   async updateControlledKnowledgeProjection(file) {
     if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return null;
     const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
-    const edits = parseControlledKnowledgeEdits(markdown);
-    if (!edits.length) return null;
+    const changes = controlledKnowledgeEditsSinceBaseline(this.controlledKnowledgeSignatures, file.path, markdown);
+    if (!changes.length) return null;
     const events = [];
-    for (const edit of edits) {
-      const signatureKey = `${file.path}::${edit.document_id}::${edit.ko_id}`;
-      const signature = JSON.stringify({ document_id: edit.document_id, ko_id: edit.ko_id, patch: edit.patch });
-      if (this.controlledKnowledgeSignatures.get(signatureKey) === signature) continue;
-      this.controlledKnowledgeSignatures.set(signatureKey, signature);
-      const event = await this.appendRuntimeSyncEvent({
-        doc_id: edit.document_id,
-        operation: "knowledge.update",
-        target: { type: "knowledge_object", id: edit.ko_id },
-        payload: {
-          ko_id: edit.ko_id,
-          kind: edit.kind,
-          patch: edit.patch,
-          projection_path: file.path,
-          source: "obsidian_controlled_fields",
-          controlled_schema_version: edit.schema_version,
-        },
-      });
+    for (const change of changes) {
+      const { edit } = change;
+      beginControlledKnowledgeEdit(this.controlledKnowledgeSignatures, change);
+      let event;
+      try {
+        event = await this.appendRuntimeSyncEvent({
+          doc_id: edit.document_id,
+          operation: "knowledge.update",
+          target: { type: "knowledge_object", id: edit.ko_id },
+          payload: {
+            ko_id: edit.ko_id,
+            kind: edit.kind,
+            patch: edit.patch,
+            projection_path: file.path,
+            source: "obsidian_controlled_fields",
+            controlled_schema_version: edit.schema_version,
+          },
+        });
+      } catch (error) {
+        rollbackControlledKnowledgeEdit(this.controlledKnowledgeSignatures, change);
+        throw error;
+      }
       events.push(event);
       this.lastChange = {
         event_type: "inkloop_controlled_knowledge_edit",
@@ -3311,7 +3252,9 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
     const isTracked = this.isInkLoopPath(file.path) || trackedDocId || (oldPath && (this.isInkLoopPath(oldPath) || oldTrackedDocId));
     if (!isTracked) return;
     if (eventType === "rename" && oldPath && oldTrackedDocId) await this.updateTrackedSourcePath(file, oldPath);
+    const managedProjection = eventType === "modify" ? await this.isCloudKnowledgeProjectionFile(file) : false;
     const controlledEvent = eventType === "modify" ? await this.updateControlledKnowledgeProjection(file) : null;
+    if (managedProjection && !controlledEvent) return;
     const refreshDocId = trackedDocId || oldTrackedDocId || sidecarDocId || oldSidecarDocId || controlledEvent?.doc_id;
     this.lastChange = {
       event_type: controlledEvent ? "inkloop_controlled_knowledge_edit" : eventType,
@@ -3332,6 +3275,13 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       this.pendingTimer = null;
       void this.syncNow(reason, { notify: false });
     }, this.settings.debounceMs);
+  }
+
+  async isCloudKnowledgeProjectionFile(file) {
+    if (!file?.path || !/\.md$/i.test(file.path) || !file.path.startsWith(`${this.settings.documentsDir}/`)) return false;
+    if (this.cloudProjectionPaths.has(file.path)) return true;
+    const markdown = await this.app.vault.cachedRead(file).catch(() => this.app.vault.adapter.read(file.path));
+    return isCloudKnowledgeProjectionMarkdown(markdown);
   }
 
   startRuntimePolling() {
@@ -3532,8 +3482,9 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
   }
 
   async syncNow(reason, options = {}) {
+    const shouldNotify = options.notify ?? false;
     if (!this.settings.runtimePushEndpoint && !this.settings.runtimePullEndpoint && !this.settings.syncEndpoint) {
-      if (options.notify ?? this.settings.notifyManualSync) new Notice("InkLoop runtime sync endpoint is not configured");
+      if (shouldNotify) new Notice("InkLoop runtime sync endpoint is not configured");
       await this.writeStatus({ status: "sync_skipped", reason, last_change: this.lastChange });
       return;
     }
@@ -3548,7 +3499,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
       const latency = Math.round(performance.now() - started);
       const hardFailed = push.failed > 0 || legacy?.ok === false;
       const hasConflicts = pull.conflicted > 0;
-      if (hardFailed || hasConflicts || (options.notify ?? this.settings.notifyManualSync)) {
+      if (shouldNotify) {
         const message = hardFailed
           ? `InkLoop runtime sync needs attention (${latency}ms)`
           : hasConflicts
@@ -3575,7 +3526,7 @@ module.exports = class InkLoopSyncPlugin extends Plugin {
         error: String(error?.message || error),
         synced_at: new Date().toISOString(),
       });
-      new Notice(`InkLoop sync failed: ${String(error?.message || error)}`);
+      if (shouldNotify) new Notice(`InkLoop sync failed: ${String(error?.message || error)}`);
     }
   }
 
