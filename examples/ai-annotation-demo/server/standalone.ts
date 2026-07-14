@@ -835,7 +835,11 @@ async function handlePanelVault(req: IncomingMessage, res: ServerResponse): Prom
 const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+$/, '');
 // offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
 // 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
-const LARK_MEETING_OAUTH_SCOPE = 'offline_access vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+// 默认取「2026-07-13 已验证授予的权限集合 + offline_access(新版 OAuth 专用·换取 refresh_token)」。
+// 旧版授权端点会把 URL scope 当后台 API 权限逐项校验，offline_access 不在权限列表会直接报缺少权限——
+// 授权端点已随 vendor larkClient 切到新版 accounts.feishu.cn。需要增删 scope 用环境变量覆盖，别往回加 vc:meeting:readonly（已被细粒度权限取代）。
+const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
 const LARK_MEETING_CALLBACK_PORT = String(process.env.LARK_MEETING_SDK_PORT || process.env.LARK_SDK_PORT || '8789').trim() || '8789';
 const LARK_MEETING_CALLBACK_PATH = '/api/auth/lark/callback';
 const CONVERT_SERVICE_BASE = (process.env.CONVERT_SERVICE_BASE || '').replace(/\/+$/, '');
