@@ -640,6 +640,10 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     return String((error as Error)?.message || error || 'unknown error');
   }
 
+  // 最近一次对外发布的状态：静默轮询成功默认不发布（避免刷屏），但若横幅正挂着 failed，
+  // 必须发一次 synced 清场——否则服务端瞬断（如 hub 重启）后的单次失败会永远挂在 UI 上。
+  let lastPublishedState: RuntimeSyncStatusDetail['state'] | '' = '';
+
   function publishStatus(detail: Omit<RuntimeSyncStatusDetail, 'at' | 'device_id'>): void {
     const payload: RuntimeSyncStatusDetail = {
       ...detail,
@@ -647,6 +651,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       device_id: deviceId,
       api_base: apiBase() || (typeof location !== 'undefined' ? location.origin : ''),
     };
+    lastPublishedState = payload.state;
     bus.emit('runtime-sync:status', payload);
     if (typeof document !== 'undefined') {
       document.dispatchEvent(new CustomEvent('inkloop:runtime-sync-status', { detail: payload }));
@@ -814,6 +819,10 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       const result = await createRunner().pullOnce();
       await applyPulledRemoteDocs(result, reason);
       if (visibleStatus || result.applied > 0) {
+        publishStatus({ state: 'synced', reason, pulled: result.applied });
+      } else if (lastPublishedState === 'failed' && (await pendingEventCount()) === 0) {
+        // 服务端瞬断（如 hub 重启）的单次失败会把横幅打成 failed；静默轮询恢复且本地无积压时清场，
+        // 否则假失败会一直挂到下次显式同步。真有积压/失败事件时不清，交给 flush/reconcile 重试路径。
         publishStatus({ state: 'synced', reason, pulled: result.applied });
       }
       if (result.received > 0 || result.applied > 0 || result.conflicted > 0) log('runtime-sync:pull', { reason, result });
