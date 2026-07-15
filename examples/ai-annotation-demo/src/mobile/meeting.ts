@@ -20,7 +20,8 @@ import {
   appendMarkEntry,
 } from '../local/store';
 import { esc } from '../core/escape';
-import { confirmSheet, formSheet, infoSheet, pickSheet, pickOneSheet } from './sheet';
+import QRCode from 'qrcode';
+import { confirmSheet, formSheet, infoSheet, mountSheet, pickSheet, pickOneSheet } from './sheet';
 import { loadRecapView, resetRecapView, recapHandleBack, refreshPanelSummaryCache } from './meeting-recap'; // summarizeMeeting 迁 recap 内调用(M2b)
 import type { MeetingStatus, PersistedMeeting, PersistedMeetingMaterialLink, PersistedWorkspace, PersistedDoc, PersistedMark } from '../core/store-format';
 import { pollPanelMeetingEvents, listActivePanelMeetings, type PanelFeishuMeeting, type PanelMeetingEvent } from '../integration/panel-feishu/client';
@@ -39,6 +40,13 @@ import { signalInkArea } from '../surface/eink';
 import { effectiveMeetingEndIso, effectiveMeetingStatus, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
 import { findMeetingForProviderSource, meetingPlatformOf } from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
+import {
+  getGoogleOAuthStatus,
+  listGoogleMeetingSources,
+  pollGoogleDeviceOAuth,
+  startGoogleDeviceOAuth,
+} from '../integration/google-meet/client';
+import { syncGoogleMeetingSources } from './google-meeting-sync';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -589,6 +597,34 @@ async function syncCalendarMeetings(): Promise<{ connected: boolean; events: Fei
 let fsConnectedCache = false; // 飞书日历连接态（syncHomeData 更新·日程子页 badge 用·切子页免重新请求）
 let fsCalendarIssue = '';
 let fsIdentityCache: FeishuIdentityResponse | null = null;
+const GOOGLE_CALENDAR_CONNECTED_KEY = 'inkloop.googleCalendarConnected';
+function googleCalendarConnectionHint(): boolean {
+  try { return localStorage.getItem(GOOGLE_CALENDAR_CONNECTED_KEY) === '1'; }
+  catch { return false; }
+}
+function rememberGoogleCalendarConnection(connected: boolean): void {
+  try {
+    if (connected) localStorage.setItem(GOOGLE_CALENDAR_CONNECTED_KEY, '1');
+    else localStorage.removeItem(GOOGLE_CALENDAR_CONNECTED_KEY);
+  } catch { /* storage unavailable: keep the in-memory connection state */ }
+}
+let googleConnectedCache = googleCalendarConnectionHint();
+
+async function syncGoogleCalendarMeetings(): Promise<void> {
+  // No connection hint means no Google request at all; the explicit connect control performs discovery/authentication.
+  if (!googleCalendarConnectionHint()) return;
+  const status = await getGoogleOAuthStatus();
+  googleConnectedCache = status.connected;
+  rememberGoogleCalendarConnection(status.connected);
+  if (!status.connected) return;
+  const response = await listGoogleMeetingSources();
+  await syncGoogleMeetingSources(response.sources || [], {
+    listAllMeetings,
+    upsertScheduleWorkspace,
+    createMeeting,
+    updateMeeting,
+  });
+}
 
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */
 async function syncHomeData(): Promise<void> {
@@ -604,6 +640,7 @@ async function syncHomeData(): Promise<void> {
   const meetingSources = await syncMeetingSources().catch((e) => ({ connected: false, imported: 0, issue: `飞书会议源同步失败：${String((e as Error)?.message || e)}` }));
   fsConnectedCache = fsConnectedCache || meetingSources.connected;
   if (!fsCalendarIssue && meetingSources.issue) fsCalendarIssue = meetingSources.issue;
+  await syncGoogleCalendarMeetings().catch(() => {});
 }
 
 /** home 数据签名：workspace 名称/来源 + 会议状态/标题/时间/未读标记，任一变化才值得重渲（电纸屏免无谓刷新）。
@@ -619,6 +656,7 @@ function homeSig(workspaces: PersistedWorkspace[], meetings: PersistedMeeting[])
     fsIdentityCache?.oauth?.authenticated ? 'auth' : 'noauth',
     fsIdentityCache?.oauth?.connected ? 'connected' : 'disconnected',
     fsIdentityCache?.session?.feishu_open_id || '',
+    googleConnectedCache ? 'google-connected' : 'google-disconnected',
   ].join(':');
   return `${identity}@${clock}#${ws}#${mtg}`;
 }
@@ -656,6 +694,9 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
     const fsOk = fsIdentityOk
       ? `<button class="fs-ok fs-ok-btn" id="mh-identity" type="button" title="飞书身份"><span class="d"></span>飞书身份</button>`
       : `<button class="hbtn" id="mh-identity" type="button">登录飞书</button>`;
+    const googleCtl = googleConnectedCache
+      ? `<button class="fs-ok fs-ok-btn" id="mh-google-calendar" type="button" title="Google 日历"><span class="d"></span>Google 日历</button>`
+      : `<button class="hbtn" id="mh-google-calendar" type="button">连接 Google 日历</button>`;
     const items: string[] = [];
     if (meetingHomeFilter === 'active' && liveUnread.length) {
       items.push(`<button class="hbtn" id="mh-live" style="display:block;width:calc(100% - 36px);margin:10px 18px 0;text-align:left;font-weight:600">🔔 ${liveUnread.length === 1 ? `「${esc(liveUnread[0].title)}」现在开始了` : `${liveUnread.length} 场会议现在开始了`} · 点击参加 ›</button>`);
@@ -698,7 +739,7 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
     mtgPagers.delete('home');
     el('mv-home').classList.toggle('has-vpages', pageCount > 1);
     el('mv-home').innerHTML =
-      `<div class="vhead meeting-home-head"><button class="book-back meeting-back" id="mh-books" type="button" aria-label="返回书架">${SVG_BACK}<span>书架</span></button><h1>会议</h1>${filterHtml}<span class="sp"></span>${bindBtn}${fsOk}${simBtn}</div>`
+      `<div class="vhead meeting-home-head"><button class="book-back meeting-back" id="mh-books" type="button" aria-label="返回书架">${SVG_BACK}<span>书架</span></button><h1>会议</h1>${filterHtml}<span class="sp"></span>${bindBtn}${googleCtl}${fsOk}${simBtn}</div>`
       + `<div class="mbody">${visibleRows}</div>${pagerHtml}`;
     el('mv-home').querySelector('#mh-books')?.addEventListener('click', () => exitToBookShelf());
     el('mv-home').querySelectorAll<HTMLElement>('[data-mh-filter]').forEach((button) => button.addEventListener('click', () => {
@@ -716,6 +757,7 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
       void openMeeting(m.workspace_id, m.meeting_id);
     });
     el('mv-home').querySelector('#mh-bind-current')?.addEventListener('click', () => { void bindCurrentFeishuMeeting(); });
+    el('mv-home').querySelector('#mh-google-calendar')?.addEventListener('click', () => { void openGoogleCalendarConnection(); });
     el('mv-home').querySelector('#mh-identity')?.addEventListener('click', () => { void openFeishuIdentitySheet(); });
   }
   el('mv-home').querySelector('#mh-live')?.addEventListener('click', () => { // 跳第一场刚开始的会议（openMeeting 会清 live_unread）
@@ -773,6 +815,60 @@ async function startDeviceFeishuLogin(): Promise<void> {
   const payload = await getJson<{ auth_url: string; redirect_mode?: string }>(`/api/feishu-svc/api/feishu/oauth/device/start?redirect=${redirect}`, { auth: true });
   if (!payload.auth_url) throw new Error('missing_feishu_auth_url');
   window.location.href = payload.auth_url;
+}
+
+/** Google 授权不能在设备 WebView 里完成（Google 拒绝嵌入式 WebView：disallowed_useragent），
+ *  所以展示二维码 + 链接让用户在手机/电脑浏览器完成授权，设备端轮询 complete。 */
+async function openGoogleCalendarConnection(): Promise<void> {
+  try {
+    const current = await getGoogleOAuthStatus().catch(() => null);
+    if (current?.connected) {
+      googleConnectedCache = true;
+      rememberGoogleCalendarConnection(true);
+      await syncGoogleCalendarMeetings();
+      await renderHome({ keepPage: true });
+      await infoSheet({ title: 'Google 日历', message: 'Google 日历已连接，Meet 日程已刷新。' });
+      return;
+    }
+
+    const payload = await startGoogleDeviceOAuth();
+    if (!payload.auth_url) throw new Error('missing_google_auth_url');
+    const qrDataUrl = await QRCode.toDataURL(payload.auth_url, { width: 220, margin: 1 });
+    let dismissed = false;
+    const h = mountSheet(
+      '连接 Google 日历',
+      `<div class="msheet-qr"><img src="${qrDataUrl}" alt="Google 授权二维码" width="220" height="220" /></div>`
+      + `<p class="msheet-msg">用手机或电脑浏览器扫码（或打开下方链接）完成 Google 授权。授权完成后这里会自动关闭并刷新会议列表。</p>`
+      + `<p class="msheet-msg msheet-link"><a href="${esc(payload.auth_url)}" target="_blank" rel="noopener noreferrer">${esc(payload.auth_url)}</a></p>`,
+      null,
+    );
+    h.footOk.textContent = '取消';
+    h.scrim.querySelector('[data-ok]')?.addEventListener('click', () => { dismissed = true; h.close(); });
+    h.scrim.addEventListener('mousedown', (e) => { if (e.target === h.scrim) { dismissed = true; h.close(); } });
+
+    try {
+      for (let attempt = 0; attempt < 200 && !dismissed; attempt += 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1_500));
+        const completion = await pollGoogleDeviceOAuth().catch(() => null);
+        if (!completion || dismissed) continue;
+        if (completion.status === 'failed') throw new Error(completion.error || 'google_oauth_failed');
+        if (completion.status !== 'complete' || !completion.connected) continue;
+        h.close();
+        googleConnectedCache = true;
+        rememberGoogleCalendarConnection(true);
+        await renderHome({ sync: 'blocking', keepPage: true });
+        await infoSheet({ title: 'Google 日历已连接', message: '带 Google Meet 链接的日程已加入会议列表。' });
+        return;
+      }
+      if (dismissed) return;
+      throw new Error('google_oauth_poll_timeout');
+    } catch (error) {
+      h.close();
+      throw error;
+    }
+  } catch (error) {
+    await infoSheet({ title: 'Google 日历连接失败', message: String((error as Error)?.message || error) });
+  }
 }
 
 function identitySummary(me: FeishuIdentityResponse): string {

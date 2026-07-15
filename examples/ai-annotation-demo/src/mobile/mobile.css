@@ -615,6 +615,7 @@
   button.fs-ok:active{background:#f0f0f0;}
   .fs-ok .d{width:6px;height:6px;border-radius:50%;background:#111;}
   .meeting-home-head{flex-wrap:wrap;}
+  .meeting-home-head .fs-ok{margin-left:0;}
   .mh-tabs{display:flex;align-items:center;gap:6px;margin-left:4px;border:1px solid var(--hair2);border-radius:9px;padding:3px;background:var(--page);}
   .mh-tabs button{appearance:none;border:0;background:transparent;color:var(--mut);border-radius:6px;padding:5px 9px;display:inline-flex;align-items:baseline;gap:6px;font:12px var(--sans);cursor:pointer;}
   .mh-tabs button.on{background:#111;color:#fff;}
@@ -872,6 +873,9 @@
   .msheet-h{font:600 15px var(--sans);color:var(--ink);margin-bottom:13px;}
   .msheet-bd{overflow-y:auto;}
   .msheet-msg{font:13.5px/1.6 var(--sans);color:var(--ink-soft);white-space:pre-wrap;margin:0 0 4px;}
+  .msheet-qr{display:flex;justify-content:center;margin:4px 0 10px;}
+  .msheet-qr img{border:1px solid var(--hair2);border-radius:6px;}
+  .msheet-link a{color:var(--ink-soft);word-break:break-all;}
   .msheet-check{display:flex;align-items:flex-start;gap:11px;margin:13px 0 2px;padding:11px 2px;border-top:1px solid var(--hair);cursor:pointer;}
   .msheet-check-input{position:absolute;opacity:0;pointer-events:none;}
   .msheet-check-box{flex:0 0 auto;width:21px;height:21px;border:1.5px solid var(--hair2);border-radius:6px;position:relative;background:var(--page);margin-top:1px;}
