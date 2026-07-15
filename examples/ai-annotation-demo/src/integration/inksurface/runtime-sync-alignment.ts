@@ -6,7 +6,7 @@ import { isRuntimeInvalidPageNormMark, isRuntimeSilentMark, runtimeMarkDedupeKey
 export interface VisibleRuntimeMarkAlignmentInput {
   docId: string;
   marks: PersistedMark[];
-  runtimeStore: Pick<OfflineRuntimeStorePort, 'listOutboxEvents' | 'writeOutboxEvents'>;
+  runtimeStore: Pick<OfflineRuntimeStorePort, 'listOutboxEvents' | 'appendSyncEvent'>;
   buildEvents?: () => RuntimeSyncEvent[] | Promise<RuntimeSyncEvent[]>;
   now?: () => string;
 }
@@ -65,31 +65,19 @@ function isVisibleMarkAddEvent(event: RuntimeSyncEvent, docId: string, marks: Pe
   return marks.some((mark) => eventCoversVisibleMark(event, docId, mark));
 }
 
-function latestBootstrapIndex(events: RuntimeSyncEvent[], docId: string): number {
-  let latest = -1;
-  events.forEach((event, index) => {
-    if (event.doc_id === docId && event.operation === 'runtime.bootstrap') latest = index;
-  });
-  return latest;
-}
-
-function shouldRequeue(event: RuntimeSyncEvent): boolean {
-  return event.status === 'sent' || event.status === 'failed';
-}
-
-function resetForCloudReassert(event: RuntimeSyncEvent, now: string): RuntimeSyncEvent {
-  const next: RuntimeSyncEvent = {
+function newPendingEvent(event: RuntimeSyncEvent, now: string): RuntimeSyncEvent {
+  const pending: RuntimeSyncEvent = {
     ...event,
     status: 'pending',
     attempt_count: 0,
     updated_at: now,
   };
-  delete next.last_error;
-  delete next.next_retry_at;
-  delete next.sent_at;
-  delete next.ack_id;
-  delete next.deduped_by_event_id;
-  return next;
+  delete pending.last_error;
+  delete pending.next_retry_at;
+  delete pending.sent_at;
+  delete pending.ack_id;
+  delete pending.deduped_by_event_id;
+  return pending;
 }
 
 export async function requeueVisibleRuntimeMarksForCloudAlignment(
@@ -97,50 +85,35 @@ export async function requeueVisibleRuntimeMarksForCloudAlignment(
 ): Promise<VisibleRuntimeMarkAlignmentResult> {
   const now = input.now?.() ?? new Date().toISOString();
   const marks = visibleRuntimeMarks(input.marks);
-  const events = await input.runtimeStore.listOutboxEvents();
-  const bootstrapIndex = latestBootstrapIndex(events, input.docId);
-  const requeuedEventIds: string[] = [];
+  const nextEvents = await input.runtimeStore.listOutboxEvents();
   const createdEventIds: string[] = [];
-  let changed = false;
-
-  const nextEvents = events.map((event, index) => {
-    const localVisibleEvent = isVisibleMarkAddEvent(event, input.docId, marks);
-    const latestBootstrap = index === bootstrapIndex && marks.length > 0;
-    if ((!localVisibleEvent && !latestBootstrap) || !shouldRequeue(event)) return event;
-    changed = true;
-    requeuedEventIds.push(event.event_id);
-    return resetForCloudReassert(event, now);
-  });
 
   let unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, marks);
   if (unresolvedMissingEventIds.length && input.buildEvents) {
     const knownEventIds = new Set(nextEvents.map((event) => event.event_id));
     const knownDedupeKeys = new Set(nextEvents.map((event) => event.dedupe_key).filter(Boolean));
     for (const event of await input.buildEvents()) {
-      if (event.doc_id !== input.docId
-        || (event.operation !== 'annotation.add' && event.operation !== 'annotation.update')) continue;
-      if (!isVisibleMarkAddEvent(event, input.docId, marks)) continue;
+      const missingMarks = marks.filter((mark) => !nextEvents.some((candidate) => eventCoversVisibleMark(candidate, input.docId, mark)));
+      if (!isVisibleMarkAddEvent(event, input.docId, missingMarks)) continue;
       if (knownEventIds.has(event.event_id)) continue;
       if (event.dedupe_key && knownDedupeKeys.has(event.dedupe_key)) continue;
-      const pending = resetForCloudReassert(event, now);
+      const pending = newPendingEvent(event, now);
+      await input.runtimeStore.appendSyncEvent(pending);
       nextEvents.push(pending);
       knownEventIds.add(pending.event_id);
       if (pending.dedupe_key) knownDedupeKeys.add(pending.dedupe_key);
       createdEventIds.push(pending.event_id);
-      changed = true;
     }
     unresolvedMissingEventIds = missingEventIds(nextEvents, input.docId, marks);
   }
-
-  if (changed) await input.runtimeStore.writeOutboxEvents(nextEvents);
 
   return {
     doc_id: input.docId,
     scanned: input.marks.length,
     visible_marks: marks.length,
-    requeued: requeuedEventIds.length,
+    requeued: 0,
     missing_event_ids: unresolvedMissingEventIds,
-    requeued_event_ids: requeuedEventIds,
+    requeued_event_ids: [],
     created_event_ids: createdEventIds,
   };
 }

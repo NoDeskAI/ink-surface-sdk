@@ -251,6 +251,24 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
     await this.replaceAll('outbox', events.map((event, index) => ({ ...event, indexeddb_sequence: index + 1 })));
   }
 
+  async updateOutboxEvents(updates: RuntimeSyncEvent[]): Promise<void> {
+    if (!updates.length) return;
+    const db = await this.open();
+    const transaction = db.transaction('outbox', 'readwrite');
+    const store = transaction.objectStore('outbox');
+    const done = transactionDone(transaction);
+    for (const update of updates) {
+      const existing = await requestToPromise(store.get(update.event_id)) as StoredRuntimeSyncEvent | undefined;
+      store.put({
+        ...update,
+        ...(existing?.indexeddb_sequence !== undefined
+          ? { indexeddb_sequence: existing.indexeddb_sequence }
+          : {}),
+      });
+    }
+    await done;
+  }
+
   async appendSyncEvent(event: RuntimeSyncEvent): Promise<void> {
     const events = await this.getAll<StoredRuntimeSyncEvent>('outbox');
     const nextSequence = Math.max(0, ...events.map((item) => item.indexeddb_sequence ?? 0)) + 1;

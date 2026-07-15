@@ -120,6 +120,30 @@ function parseTime(input?: string): number {
   return Number.isFinite(time) ? time : 0;
 }
 
+export function isRuntimeDeadLetter(event: RuntimeSyncEvent, maxAttempts: number): boolean {
+  return event.status !== 'sent' && (event.attempt_count ?? 0) >= Math.max(1, maxAttempts);
+}
+
+export function rearmDeadLettersOnce(
+  events: RuntimeSyncEvent[],
+  maxAttempts: number,
+  now: string,
+): RuntimeSyncEvent[] {
+  const attemptCount = Math.max(1, maxAttempts) - 1;
+  return events.map((event) => {
+    if (!isRuntimeDeadLetter(event, maxAttempts)) return event;
+    const rearmed: RuntimeSyncEvent = {
+      ...event,
+      status: 'pending',
+      attempt_count: attemptCount,
+      updated_at: now,
+    };
+    delete rearmed.last_error;
+    delete rearmed.next_retry_at;
+    return rearmed;
+  });
+}
+
 function shouldAttempt(event: RuntimeSyncEvent, now: string, maxAttempts: number): boolean {
   if (event.status === 'sent') return false;
   if ((event.attempt_count ?? 0) >= maxAttempts) return false;
@@ -219,6 +243,18 @@ export class RuntimeSyncRunner {
     let failed = 0;
     let deduped = 0;
 
+    if (!eligibleIndexes.length) {
+      return {
+        scanned: events.length,
+        eligible: 0,
+        sent: 0,
+        failed: 0,
+        deduped: 0,
+        skipped: events.length,
+        attempted_event_ids: [],
+      };
+    }
+
     for (const batch of chunk(representatives, this.batchSize)) {
       const batchEvents = batch.map(({ event }) => event);
       attemptedEventIds.push(...batchEvents.map((event) => event.event_id));
@@ -248,8 +284,16 @@ export class RuntimeSyncRunner {
       }
     }
 
-    const latestEvents = await this.outbox.listOutboxEvents();
-    await this.outbox.writeOutboxEvents(this.mergeUpdatedEvents(latestEvents, nextEvents));
+    const updatedEvents = groups.flatMap((group) => group.map((item) => nextEvents[item.index]));
+    const incrementalOutbox = this.outbox as RuntimeOutboxPort & {
+      updateOutboxEvents?: (updates: RuntimeSyncEvent[]) => Promise<void>;
+    };
+    if (incrementalOutbox.updateOutboxEvents) {
+      await incrementalOutbox.updateOutboxEvents(updatedEvents);
+    } else {
+      const latestEvents = await this.outbox.listOutboxEvents();
+      await this.outbox.writeOutboxEvents(this.mergeUpdatedEvents(latestEvents, updatedEvents));
+    }
     return {
       scanned: events.length,
       eligible: eligibleIndexes.length,

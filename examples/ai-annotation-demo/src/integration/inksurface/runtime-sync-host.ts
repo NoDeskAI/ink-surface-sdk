@@ -1,5 +1,5 @@
 import { IndexedDbOfflineRuntimeStore, type OfflineRuntimeStorePort } from 'ink-surface-sdk/offline-store';
-import { HttpRuntimeSyncTransport, RuntimeSyncRunner } from 'ink-surface-sdk/sync-client';
+import { HttpRuntimeSyncTransport, isRuntimeDeadLetter, rearmDeadLettersOnce, RuntimeSyncRunner } from 'ink-surface-sdk/sync-client';
 import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeDocumentSourceKind, RuntimeStrokePoint, RuntimeSurfaceBlock, RuntimeVisualStroke } from 'ink-surface-sdk/runtime-schema';
 import { apiBase, apiUrlWithLocalHttpFallback } from '../../core/api';
 import { authHeaders, getSession, onAuthChange, runtimeTenantId, runtimeUserId } from '../../core/auth';
@@ -15,12 +15,13 @@ import { meetingContextId, meetingIdFromRuntimeDocumentId, runtimeDocumentIdForL
 import { buildRuntimeSnapshotFromProjection, bridgeRuntimeLedgerToStore, buildRuntimeSyncEventForMark, isRuntimeInvalidPageNormMark, localStorageRuntimeBridgeWatermarks } from './runtime-sync-bridge';
 import { requeueVisibleRuntimeMarksForCloudAlignment, visibleRuntimeMarkSignature } from './runtime-sync-alignment';
 import { RuntimeStoreInbox } from './runtime-inbox';
-import type { RuntimeSyncStatusDetail, RuntimeSyncUiState } from '../../components/runtime-sync-status';
+import { RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, type RuntimeSyncStatusDetail, type RuntimeSyncUiState } from '../../components/runtime-sync-status';
 
 const MAGIC_SYNC_DEBOUNCE_MS = 120;
 const MAGIC_SYNC_POLL_MS = 500;
 const MAGIC_SYNC_RECONCILE_MS = 3_000;
 const MAGIC_SYNC_RECONCILE_STALE_MS = 15_000;
+const MAGIC_SYNC_OUTBOX_DRAIN_MS = 15_000;
 
 export interface WebRuntimeSyncHostOptions {
   deviceId?: string;
@@ -31,6 +32,7 @@ export interface WebRuntimeSyncHostOptions {
   pollMs?: number;
   reconcileMs?: number;
   reconcileStaleMs?: number;
+  outboxDrainMs?: number;
   maxAttempts?: number;
   retryDelayMs?: number;
   runtimeStore?: OfflineRuntimeStorePort;
@@ -596,6 +598,7 @@ async function runtimeDocumentTitle(documentId: string): Promise<string> {
 export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {}): WebRuntimeSyncHost {
   const deviceId = options.deviceId || getSession()?.deviceId || stableDeviceId();
   const store = options.runtimeStore || new IndexedDbOfflineRuntimeStore({ dbName: 'inkloop-runtime-store' });
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 25);
   const createRunner = (): RuntimeSyncRunner => {
     const transport = new HttpRuntimeSyncTransport({
       endpoint: options.pushEndpoint || runtimeSyncUrl('/v1/runtime/events:push'),
@@ -608,7 +611,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       cursorKey: runtimeCursorKey(deviceId),
       inbox: new RuntimeStoreInbox(store, { deviceId, advanceCursorOnRecoverableConflicts: true }),
       batchSize: Math.max(1, options.batchSize ?? 25),
-      maxAttempts: Math.max(1, options.maxAttempts ?? 25),
+      maxAttempts,
       retryDelayMs: Math.max(0, options.retryDelayMs ?? 2_000),
       pullLimit: 100,
     });
@@ -627,11 +630,15 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   const pollMs = Math.max(0, options.pollMs ?? MAGIC_SYNC_POLL_MS);
   const reconcileMs = Math.max(0, options.reconcileMs ?? MAGIC_SYNC_RECONCILE_MS);
   const reconcileStaleMs = Math.max(1_000, options.reconcileStaleMs ?? MAGIC_SYNC_RECONCILE_STALE_MS);
+  const outboxDrainMs = Math.max(0, options.outboxDrainMs ?? MAGIC_SYNC_OUTBOX_DRAIN_MS);
   let timer: number | null = null;
   let pollTimer: number | null = null;
   let reconcileTimer: number | null = null;
+  let outboxDrainTimer: number | null = null;
   let disposed = false;
   let syncQueue: Promise<void> = Promise.resolve();
+  let pullInFlight: Promise<void> | null = null;
+  let drainInFlight: Promise<void> | null = null;
   const visibleAlignmentChecks = new Map<string, { signature: string; checked_at: number }>();
 
   const log = (event: string, details?: unknown): void => options.logger?.(event, details);
@@ -658,37 +665,149 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     }
   }
 
-  async function pendingEventCount(docId?: string): Promise<number> {
+  interface OutboxCounts {
+    retryable: number;
+    dead: number;
+  }
+
+  async function outboxCounts(docId?: string): Promise<OutboxCounts> {
     try {
       const events = await store.listPendingEvents(docId);
-      return events.filter((event) => event.status !== 'sent').length;
+      return events.reduce<OutboxCounts>((counts, event) => {
+        if (isRuntimeDeadLetter(event, maxAttempts)) counts.dead += 1;
+        else if (event.status !== 'sent') counts.retryable += 1;
+        return counts;
+      }, { retryable: 0, dead: 0 });
     } catch {
-      return 0;
+      return { retryable: 0, dead: 0 };
     }
   }
 
   async function publishDocStatus(stateName: RuntimeSyncUiState, docId: string, reason: string, extra: Partial<RuntimeSyncStatusDetail> = {}): Promise<void> {
-    const pending = await pendingEventCount(docId);
+    const counts = await outboxCounts();
     publishStatus({
       state: stateName,
       reason,
       doc_id: docId,
-      pending_event_count: pending,
+      pending_event_count: counts.retryable,
+      dead_letter_count: counts.dead,
       ...extra,
     });
   }
 
-  async function latestOutboxError(docId: string, eventIds: string[]): Promise<string | undefined> {
+  async function latestOutboxError(docId: string | undefined, eventIds: string[] = []): Promise<string | undefined> {
     try {
       const ids = new Set(eventIds);
       const failed = (await store.listPendingEvents(docId))
         .filter((event) => event.status === 'failed' && (!ids.size || ids.has(event.event_id)))
+        .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
         .map((event) => String(event.last_error || '').trim())
         .filter(Boolean);
       return failed[0];
     } catch {
       return undefined;
     }
+  }
+
+  function enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = syncQueue.then(task, task);
+    syncQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async function publishOutboxStatus(
+    counts: OutboxCounts,
+    reason: string,
+    result?: { sent: number; failed: number; attempted_event_ids: string[] },
+    error?: string,
+  ): Promise<void> {
+    const latestError = error || (result?.failed
+      ? await latestOutboxError(undefined, result.attempted_event_ids)
+      : counts.dead > 0 ? await latestOutboxError(undefined) : undefined);
+    publishStatus({
+      state: result?.failed && counts.retryable > 0
+        ? 'failed'
+        : counts.retryable > 0
+          ? 'queued'
+          : counts.dead > 0 ? 'dead_letter' : 'synced',
+      reason,
+      pending_event_count: counts.retryable,
+      dead_letter_count: counts.dead,
+      pushed: result?.sent,
+      error: latestError,
+    });
+  }
+
+  function drainOutbox(reason: string): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (drainInFlight) return drainInFlight;
+    const run = enqueue(async () => {
+      if (disposed) return;
+      const before = await outboxCounts();
+      if (before.retryable === 0 && reason !== 'boot-outbox-drain') return;
+      if (before.retryable > 0) {
+        publishStatus({
+          state: 'syncing',
+          reason,
+          pending_event_count: before.retryable,
+          dead_letter_count: before.dead,
+        });
+      }
+      const result = await createRunner().runOnce();
+      await publishOutboxStatus(await outboxCounts(), reason, result);
+      log('runtime-sync:outbox-drain', { reason, result });
+    }).catch(async (error) => {
+      const message = errorMessage(error);
+      const counts = await outboxCounts();
+      publishStatus({
+        state: 'failed',
+        reason,
+        pending_event_count: counts.retryable,
+        dead_letter_count: counts.dead,
+        error: message,
+      });
+      log('runtime-sync:outbox-drain-error', { reason, error: message });
+    }).finally(() => {
+      drainInFlight = null;
+    });
+    drainInFlight = run;
+    return run;
+  }
+
+  function retryDeadLettersOnce(reason = 'manual-dead-letter-retry'): Promise<void> {
+    return enqueue(async () => {
+      if (disposed) return;
+      const events = await store.listOutboxEvents();
+      const rearmedEvents = rearmDeadLettersOnce(events, maxAttempts, nowIso());
+      const updates = rearmedEvents.filter((event, index) => event !== events[index]);
+      if (updates.length) {
+        if (store.updateOutboxEvents) await store.updateOutboxEvents(updates);
+        else await store.writeOutboxEvents(rearmedEvents);
+      }
+      const before = await outboxCounts();
+      if (updates.length) {
+        publishStatus({
+          state: 'syncing',
+          reason,
+          pending_event_count: before.retryable,
+          dead_letter_count: before.dead,
+        });
+      }
+      const result = await createRunner().runOnce();
+      await publishOutboxStatus(await outboxCounts(), reason, result);
+      log('runtime-sync:dead-letters-rearmed', { reason, rearmed: updates.length, result });
+    }).catch(async (error) => {
+      const message = errorMessage(error);
+      const counts = await outboxCounts();
+      publishStatus({
+        state: 'failed',
+        reason,
+        pending_event_count: counts.retryable,
+        dead_letter_count: counts.dead,
+        error: message,
+      });
+      log('runtime-sync:dead-letter-retry-error', { reason, error: message });
+    });
   }
 
   function shouldAlignVisibleMarks(reason: string): boolean {
@@ -753,20 +872,23 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       : undefined;
     const sync = await createRunner().syncOnce();
     if (sync.pull) await applyPulledRemoteDocs(sync.pull, reason);
-    const pending = await pendingEventCount(result.doc_id);
+    const counts = await outboxCounts();
     const pushError = sync.push.failed > 0
       ? await latestOutboxError(result.doc_id, sync.push.attempted_event_ids)
       : undefined;
     publishStatus({
-      state: sync.push.failed > 0 ? 'failed' : pending > 0 ? 'queued' : 'synced',
+      state: sync.push.failed > 0 && counts.retryable > 0
+        ? 'failed'
+        : counts.retryable > 0 ? 'queued' : counts.dead > 0 ? 'dead_letter' : 'synced',
       reason,
       doc_id: result.doc_id,
-      pending_event_count: pending,
+      pending_event_count: counts.retryable,
+      dead_letter_count: counts.dead,
       pushed: sync.push.sent,
       pulled: sync.pull?.applied,
       error: sync.push.failed > 0 ? pushError || `${sync.push.failed} event(s) failed` : undefined,
     });
-    if (alignment && (alignment.requeued > 0 || alignment.missing_event_ids.length > 0)) {
+    if (alignment && (alignment.created_event_ids.length > 0 || alignment.missing_event_ids.length > 0)) {
       bus.emit('runtime-sync:local-visible-aligned', { reason, alignment });
       log('runtime-sync:local-visible-aligned', { reason, alignment });
     }
@@ -774,12 +896,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   }
 
   async function syncDocument(documentId: string, reason = 'mark-ledger'): Promise<void> {
-    const run = syncQueue.then(
-      () => syncDocumentNow(documentId, reason),
-      () => syncDocumentNow(documentId, reason),
-    );
-    syncQueue = run.catch(() => undefined);
-    return run;
+    return enqueue(() => syncDocumentNow(documentId, reason));
   }
 
   async function flush(reason = 'scheduled'): Promise<void> {
@@ -793,7 +910,15 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
         await syncDocument(docId, docReason);
       } catch (error) {
         const message = errorMessage(error);
-        publishStatus({ state: 'failed', reason, doc_id: docId, error: message });
+        const counts = await outboxCounts();
+        publishStatus({
+          state: 'failed',
+          reason,
+          doc_id: docId,
+          pending_event_count: counts.retryable,
+          dead_letter_count: counts.dead,
+          error: message,
+        });
         log('runtime-sync:error', { reason, doc_id: docId, error: message });
       }
     }
@@ -811,26 +936,64 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     }, debounceMs);
   }
 
-  async function pullNow(reason = 'poll'): Promise<void> {
+  async function pullNowInternal(reason: string): Promise<void> {
     if (disposed) return;
     const visibleStatus = reason !== 'poll';
-    if (visibleStatus) publishStatus({ state: 'pulling', reason });
+    if (visibleStatus) {
+      const counts = await outboxCounts();
+      publishStatus({
+        state: 'pulling',
+        reason,
+        pending_event_count: counts.retryable,
+        dead_letter_count: counts.dead,
+      });
+    }
     try {
       const result = await createRunner().pullOnce();
       await applyPulledRemoteDocs(result, reason);
+      const counts = await outboxCounts();
       if (visibleStatus || result.applied > 0) {
-        publishStatus({ state: 'synced', reason, pulled: result.applied });
-      } else if (lastPublishedState === 'failed' && (await pendingEventCount()) === 0) {
+        publishStatus({
+          state: counts.retryable > 0 ? 'queued' : counts.dead > 0 ? 'dead_letter' : 'synced',
+          reason,
+          pending_event_count: counts.retryable,
+          dead_letter_count: counts.dead,
+          pulled: result.applied,
+        });
+      } else if (lastPublishedState === 'failed' && counts.retryable === 0) {
         // 服务端瞬断（如 hub 重启）的单次失败会把横幅打成 failed；静默轮询恢复且本地无积压时清场，
         // 否则假失败会一直挂到下次显式同步。真有积压/失败事件时不清，交给 flush/reconcile 重试路径。
-        publishStatus({ state: 'synced', reason, pulled: result.applied });
+        publishStatus({
+          state: counts.dead > 0 ? 'dead_letter' : 'synced',
+          reason,
+          pending_event_count: counts.retryable,
+          dead_letter_count: counts.dead,
+          pulled: result.applied,
+        });
       }
       if (result.received > 0 || result.applied > 0 || result.conflicted > 0) log('runtime-sync:pull', { reason, result });
     } catch (error) {
       const message = errorMessage(error);
-      publishStatus({ state: 'failed', reason, error: message });
+      const counts = await outboxCounts();
+      publishStatus({
+        state: 'failed',
+        reason,
+        pending_event_count: counts.retryable,
+        dead_letter_count: counts.dead,
+        error: message,
+      });
       log('runtime-sync:pull-error', { reason, error: message });
     }
+  }
+
+  function pullNow(reason = 'poll'): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (pullInFlight) return pullInFlight;
+    const run = enqueue(() => pullNowInternal(reason)).finally(() => {
+      pullInFlight = null;
+    });
+    pullInFlight = run;
+    return run;
   }
 
   async function reconcileNow(documentId = state.documentId || '', reason = 'local-visible-reconcile'): Promise<void> {
@@ -850,7 +1013,15 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       await syncDocument(documentId, reason);
     } catch (error) {
       const message = errorMessage(error);
-      publishStatus({ state: 'failed', reason, doc_id: documentId, error: message });
+      const counts = await outboxCounts();
+      publishStatus({
+        state: 'failed',
+        reason,
+        doc_id: documentId,
+        pending_event_count: counts.retryable,
+        dead_letter_count: counts.dead,
+        error: message,
+      });
       log('runtime-sync:reconcile-error', { reason, document_id: documentId, error: message });
     }
   }
@@ -878,19 +1049,28 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   if (reconcileMs > 0 && typeof window !== 'undefined') {
     reconcileTimer = window.setInterval(() => void reconcileNow(), reconcileMs);
   }
+  if (outboxDrainMs > 0 && typeof window !== 'undefined') {
+    outboxDrainTimer = window.setInterval(() => void drainOutbox('outbox-retry'), outboxDrainMs);
+  }
   const onVisibilityChange = (): void => {
     if (document.visibilityState === 'hidden') return;
+    void drainOutbox('visible-outbox-drain');
     void flush('visible');
     void reconcileNow(state.documentId || '', 'visible-reconcile');
     void pullNow('visible');
   };
   const onOnline = (): void => {
+    void drainOutbox('online-outbox-drain');
     void flush('online');
     void reconcileNow(state.documentId || '', 'online');
     void pullNow('online');
   };
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibilityChange);
   if (typeof window !== 'undefined') window.addEventListener('online', onOnline);
+  const onDeadLetterRetry = (): void => {
+    void retryDeadLettersOnce();
+  };
+  if (typeof document !== 'undefined') document.addEventListener(RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, onDeadLetterRetry);
 
   // 身份升级（core session 从 local_user 校准成 feishu_ou_*，见 session-reconcile）→ 重建 watermark 命名空间、
   // 清 bootstrap/对齐缓存，并在新命名空间下重新 pull + 重灌当前文档。cursorKey 每次现取已自动切新桶、旧 cursor 不迁移。
@@ -904,8 +1084,11 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     bootstrappedDocs.clear();
     log('identity-upgrade', { namespace: next });
     if (state.documentId) void syncDocument(state.documentId, 'identity-upgrade');
+    void drainOutbox('identity-upgrade-outbox-drain');
     void pullNow('identity-upgrade');
   });
+
+  void drainOutbox('boot-outbox-drain');
 
   return {
     deviceId,
@@ -921,7 +1104,9 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       if (timer !== null) window.clearTimeout(timer);
       if (pollTimer !== null) window.clearInterval(pollTimer);
       if (reconcileTimer !== null) window.clearInterval(reconcileTimer);
+      if (outboxDrainTimer !== null) window.clearInterval(outboxDrainTimer);
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (typeof document !== 'undefined') document.removeEventListener(RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, onDeadLetterRetry);
       if (typeof window !== 'undefined') window.removeEventListener('online', onOnline);
     },
   };

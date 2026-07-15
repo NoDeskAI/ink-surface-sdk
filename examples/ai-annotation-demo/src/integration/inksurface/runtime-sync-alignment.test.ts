@@ -58,7 +58,7 @@ function event(input: Partial<RuntimeSyncEvent> & { event_id: string; doc_id?: s
   };
 }
 
-function memoryOutbox(initial: RuntimeSyncEvent[]): Pick<OfflineRuntimeStorePort, 'listOutboxEvents' | 'writeOutboxEvents'> & { events: RuntimeSyncEvent[] } {
+function memoryOutbox(initial: RuntimeSyncEvent[]): Pick<OfflineRuntimeStorePort, 'listOutboxEvents' | 'appendSyncEvent'> & { events: RuntimeSyncEvent[] } {
   let events = initial;
   return {
     get events() {
@@ -67,14 +67,14 @@ function memoryOutbox(initial: RuntimeSyncEvent[]): Pick<OfflineRuntimeStorePort
     async listOutboxEvents() {
       return events.map((item) => ({ ...item, payload: { ...item.payload } }));
     },
-    async writeOutboxEvents(nextEvents) {
-      events = nextEvents.map((item) => ({ ...item, payload: { ...item.payload } }));
+    async appendSyncEvent(nextEvent) {
+      events.push({ ...nextEvent, payload: { ...nextEvent.payload } });
     },
   };
 }
 
 describe('runtime sync visible mark alignment', () => {
-  it('requeues sent and exhausted local-visible mark events without touching hidden or unrelated events', async () => {
+  it('preserves sent, failed, and bootstrap terminal state while creating only the missing visible event', async () => {
     const visible = mark({ mark_id: 'mark_visible', seq: 1 });
     const failed = mark({ mark_id: 'mark_failed', seq: 2 });
     const missing = mark({ mark_id: 'mark_missing', seq: 3 });
@@ -104,6 +104,7 @@ describe('runtime sync visible mark alignment', () => {
         attempt_count: 5,
         last_error: 'network down',
         next_retry_at: '2099-01-01T00:00:00.000Z',
+        ack_id: 'ack_failed_evidence',
       }),
       event({
         event_id: runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq),
@@ -119,31 +120,58 @@ describe('runtime sync visible mark alignment', () => {
       docId: 'doc_align',
       marks: [visible, failed, missing, hidden],
       runtimeStore: store,
+      buildEvents: async () => [
+        event({
+          event_id: runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
+          status: 'sent',
+          payload: { mark_id: visible.mark_id, mark_seq: visible.seq },
+        }),
+        event({
+          event_id: runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq),
+          status: 'sent',
+          payload: { mark_id: failed.mark_id, mark_seq: failed.seq },
+        }),
+        event({
+          event_id: runtimeSyncEventIdForMarkId(missing.mark_id, missing.seq),
+          status: 'sent',
+          payload: { mark_id: missing.mark_id, mark_seq: missing.seq },
+          ack_id: 'stale_missing_ack',
+          sent_at: '2026-07-08T00:00:02.000Z',
+        }),
+      ],
       now: () => '2026-07-08T00:00:10.000Z',
     });
 
     expect(result).toMatchObject({
       visible_marks: 3,
-      requeued: 3,
-      missing_event_ids: [runtimeSyncEventIdForMarkId(missing.mark_id, missing.seq)],
-      requeued_event_ids: [
-        runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
-        runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq),
-        'evt_bootstrap_latest',
-      ],
+      requeued: 0,
+      missing_event_ids: [],
+      requeued_event_ids: [],
+      created_event_ids: [runtimeSyncEventIdForMarkId(missing.mark_id, missing.seq)],
     });
     const byId = new Map(store.events.map((item) => [item.event_id, item]));
     expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq))).toMatchObject({
+      status: 'sent',
+      attempt_count: 1,
+      sent_at: '2026-07-08T00:00:01.000Z',
+      ack_id: 'ack_visible',
+    });
+    expect(byId.get(runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq))).toMatchObject({
+      status: 'failed',
+      attempt_count: 5,
+      last_error: 'network down',
+      next_retry_at: '2099-01-01T00:00:00.000Z',
+      ack_id: 'ack_failed_evidence',
+    });
+    expect(byId.get(runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq))).toMatchObject({ status: 'sent', ack_id: 'ack_hidden' });
+    expect(byId.get('evt_bootstrap_old')).toMatchObject({ status: 'sent' });
+    expect(byId.get('evt_other_doc')).toMatchObject({ status: 'sent', ack_id: 'ack_other' });
+    expect(byId.get('evt_bootstrap_latest')).toMatchObject({ status: 'sent', ack_id: 'ack_bootstrap' });
+    expect(byId.get(runtimeSyncEventIdForMarkId(missing.mark_id, missing.seq))).toMatchObject({
       status: 'pending',
       attempt_count: 0,
       updated_at: '2026-07-08T00:00:10.000Z',
     });
-    expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq))?.ack_id).toBeUndefined();
-    expect(byId.get(runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq))?.next_retry_at).toBeUndefined();
-    expect(byId.get(runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq))).toMatchObject({ status: 'sent', ack_id: 'ack_hidden' });
-    expect(byId.get('evt_bootstrap_old')).toMatchObject({ status: 'sent' });
-    expect(byId.get('evt_other_doc')).toMatchObject({ status: 'sent', ack_id: 'ack_other' });
-    expect(byId.get('evt_bootstrap_latest')).toMatchObject({ status: 'pending', attempt_count: 0 });
   });
 
   it('builds a stable signature for visible mark changes and ignores hidden review-later entries', () => {
