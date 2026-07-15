@@ -2,8 +2,9 @@
  * ONYX BOOX 设备专用：把「当前书写画布矩形」上报给原生 OnyxPenBridge，收窄 raw drawing 画区。
  *
  * 背景：ONYX TouchHelper 的 limitRect 若设成整个 WebView，书架/按钮/弹层等非书写面也会被当成原生画线区
- * （用笔点会出墨）。这里前端上报当前可写画布（`#ink-layer` 原版页 / `.reader-ink` 重排页）的矩形，只在
- * 真书写面 arm、离开/书架/浮层上报 null 让原生 disarm。不带 M103 那套 OSD 清理（ONYX 无 hq.hw 硬件叠层）。
+ * （用笔点会出墨）。这里前端上报当前可写画布（`#ink-layer` 原版页 / `.reader-ink` 重排页）的矩形，并把
+ * 浮在画布上的笔触栏作为 exclude；只在真书写面 arm、离开/书架/浮层上报 null 让原生 disarm。
+ * 不带 M103 那套 OSD 清理（ONYX 无 hq.hw 硬件叠层）。
  *
  * 只在这台设备生效——`isOnyxPaperDevice()` 门控；非 ONYX 时 `window.InkLoopOnyxPen.updateWritingArea`
  * 不存在，channel() 返回 null，全部 no-op。独立设备模块，不侵入 ink.ts/reader.ts 共用主代码。
@@ -20,6 +21,9 @@ function channel(): OnyxPenChannel | null {
 }
 
 const CANDIDATE_SELECTORS = '#ink-layer, .reader-ink, #reader';
+// fixed 笔触栏的 z-index 只影响 DOM 命中，不会在 TouchHelper 的 native 手写区里自动挖洞。
+// #pen-toolbar / data 属性为横向新版工具栏预留，避免设备模块绑死某一代壳布局。
+const EXCLUDE_SELECTORS = '#m-rail, #pen-toolbar, [data-onyx-pen-exclude]';
 // 会遮挡/顶掉可写画布的浮层：打开时整个 disarm（报 null），别让原生在浮层底下响应笔迹。
 const BLOCKING_CHROME = ['files-open', 'insight-open', 'side-open'];
 
@@ -31,7 +35,36 @@ function canvasBlocked(): boolean {
   return !!spine && !spine.hidden; // 会议时间脊展开遮挡画布
 }
 
-interface AreaRect { x: number; y: number; w: number; h: number; dpr: number }
+interface CssRect { left: number; top: number; width: number; height: number }
+export interface OnyxPenPhysicalRect { x: number; y: number; w: number; h: number }
+interface AreaPayload extends OnyxPenPhysicalRect { dpr: number; exclude?: OnyxPenPhysicalRect[] }
+
+/** limit/exclude 都用 WebView host-local 物理 px；只下发相交部分，避免 SDK 收到画区外的无关洞。 */
+export function buildOnyxPenAreaPayload(
+  limit: CssRect,
+  excludeCandidates: readonly CssRect[],
+  devicePixelRatio: number,
+): AreaPayload {
+  const dpr = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  const right = limit.left + limit.width;
+  const bottom = limit.top + limit.height;
+  const exclude = excludeCandidates.flatMap((candidate): OnyxPenPhysicalRect[] => {
+    const left = Math.max(limit.left, candidate.left);
+    const top = Math.max(limit.top, candidate.top);
+    const clippedRight = Math.min(right, candidate.left + candidate.width);
+    const clippedBottom = Math.min(bottom, candidate.top + candidate.height);
+    if (clippedRight <= left || clippedBottom <= top) return [];
+    return [{ x: left * dpr, y: top * dpr, w: (clippedRight - left) * dpr, h: (clippedBottom - top) * dpr }];
+  });
+  return {
+    x: limit.left * dpr,
+    y: limit.top * dpr,
+    w: limit.width * dpr,
+    h: limit.height * dpr,
+    dpr,
+    ...(exclude.length ? { exclude } : {}),
+  };
+}
 
 export interface OnyxPenAreaEligibility {
   writable: boolean;
@@ -51,8 +84,18 @@ export function shouldArmOnyxPenArea(input: OnyxPenAreaEligibility): boolean {
   return !input.blocked;
 }
 
-/** 当前可见书写画布的矩形（host-local 物理 px）；非书写面/书架/非画笔工具/被遮挡 → null。 */
-function visibleCanvasRect(): AreaRect | null {
+function visibleExcludeRects(): DOMRect[] {
+  return [...document.querySelectorAll<HTMLElement>(EXCLUDE_SELECTORS)].flatMap((el): DOMRect[] => {
+    if (el.hidden) return [];
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return [];
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? [rect] : [];
+  });
+}
+
+/** 当前可见书写画区（host-local 物理 px）；非书写面/书架/非画笔工具/被遮挡 → null。 */
+function visibleCanvasArea(): AreaPayload | null {
   if (!shouldArmOnyxPenArea({
     writable: document.body.classList.contains('writable'),
     mode: document.body.dataset.mode,
@@ -69,7 +112,7 @@ function visibleCanvasRect(): AreaRect | null {
     if (el.offsetParent === null) continue; // display:none / 祖先隐藏
     const r = el.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) {
-      return { x: r.left * dpr, y: r.top * dpr, w: r.width * dpr, h: r.height * dpr, dpr };
+      return buildOnyxPenAreaPayload(r, visibleExcludeRects(), dpr);
     }
   }
   return null;
@@ -79,8 +122,10 @@ let lastSig = '';
 function reportNow(): void {
   const ch = channel();
   if (!ch) return;
-  const rect = visibleCanvasRect();
-  const sig = rect ? `${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.w)},${Math.round(rect.h)}` : 'null';
+  const rect = visibleCanvasArea();
+  const sig = rect
+    ? [rect, ...(rect.exclude ?? [])].map((r) => `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`).join('|')
+    : 'null';
   if (sig === lastSig) return; // 画区几何没变（写字/mark 重绘不改几何）→ 不重报，保持 arm、不打断书写
   lastSig = sig;
   try { ch.updateWritingArea(rect ? JSON.stringify(rect) : 'null'); } catch { /* no-op */ }
