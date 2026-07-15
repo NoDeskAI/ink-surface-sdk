@@ -178,6 +178,45 @@ describe('google oauth state', () => {
     });
   });
 
+  it('single-flights concurrent refreshes of the same token path（并发只发一次 token 请求·结果共享）', async () => {
+    const runtimeEnv = env();
+    const initialMs = Date.parse('2026-07-14T08:00:00.000Z');
+    beginGoogleDeviceOAuth(runtimeEnv, identity, { state: 'state-race', nowMs: initialMs });
+    let refreshCalls = 0;
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        access_token: 'expired-access',
+        refresh_token: 'refresh-race',
+        expires_in: 60,
+        scope: GOOGLE_OAUTH_SCOPES.join(' '),
+      }))
+      .mockImplementation(async () => {
+        refreshCalls += 1;
+        await new Promise((r) => setTimeout(r, 20));
+        return jsonResponse({ access_token: 'fresh-race', expires_in: 3600 });
+      });
+    await completeGoogleOAuthCallback(
+      runtimeEnv,
+      { code: 'code-race', state: 'state-race' },
+      { fetchImpl: fetchImpl as unknown as typeof fetch, nowMs: initialMs },
+    );
+
+    const [a, b, c] = await Promise.all([
+      resolveUserGoogleToken(runtimeEnv, identity, initialMs + 61_000, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      resolveUserGoogleToken(runtimeEnv, identity, initialMs + 61_000, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      resolveUserGoogleToken(runtimeEnv, identity, initialMs + 61_000, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+    ]);
+
+    expect(refreshCalls).toBe(1);
+    expect([a.usable, b.usable, c.usable]).toEqual([true, true, true]);
+    expect([a.token, b.token, c.token]).toEqual(['fresh-race', 'fresh-race', 'fresh-race']);
+    expect(JSON.parse(readFileSync(googleOAuthTokenPath(runtimeEnv, identity), 'utf8'))).toMatchObject({
+      access_token: 'fresh-race',
+      refresh_token: 'refresh-race',
+      reauth_required: false,
+    });
+  });
+
   it('keeps transient refresh failures retryable and succeeds on the next attempt', async () => {
     const runtimeEnv = env();
     const initialMs = Date.parse('2026-07-14T08:00:00.000Z');

@@ -6,11 +6,51 @@ import {
   beginLarkOAuthLogin,
   completeLarkOAuthCallback,
   resolveLarkOAuthPublicStatus,
+  resolveUserOAuthToken,
 } from './lark-oauth-state';
 
 describe('lark oauth state', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('single-flights concurrent refreshes of the same state path (rolling refresh_token 只消耗一次)', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-refresh-race-'));
+    const authPath = join(tempDir, 'lark-auth.json');
+    const obtainedAt = Date.now() - 3 * 60 * 60 * 1000; // access token 已过期（2h）·refresh 仍有效
+    writeFileSync(authPath, JSON.stringify({
+      token: {
+        access_token: 'stale_token',
+        refresh_token: 'refresh_1',
+        expires_in: 7200,
+        refresh_expires_in: 30 * 24 * 60 * 60,
+        obtained_at_ms: obtainedAt,
+        scope: 'vc:meeting.search:read',
+      },
+      user: { data: { open_id: 'ou_user_a' } },
+    }));
+    const env = { LARK_APP_ID: 'cli_test', LARK_APP_SECRET: 'secret', LARK_MEETING_AUTH_STATE_PATH: authPath };
+    let refreshCalls = 0;
+    const refreshOAuthToken = vi.fn(async () => {
+      refreshCalls += 1;
+      await new Promise((r) => setTimeout(r, 20));
+      return { access_token: 'fresh_token', refresh_token: 'refresh_2', expires_in: 7200, refresh_expires_in: 30 * 24 * 60 * 60, scope: 'vc:meeting.search:read' };
+    });
+    const createClient = () => ({ refreshOAuthToken });
+    try {
+      const [a, b, c] = await Promise.all([
+        resolveUserOAuthToken(env, Date.now(), { createClient }),
+        resolveUserOAuthToken(env, Date.now(), { createClient }),
+        resolveUserOAuthToken(env, Date.now(), { createClient }),
+      ]);
+      expect(refreshCalls).toBe(1);
+      expect(a.usable && b.usable && c.usable).toBe(true);
+      expect([a.token, b.token, c.token]).toEqual(['fresh_token', 'fresh_token', 'fresh_token']);
+      const persisted = JSON.parse(readFileSync(authPath, 'utf8')) as { token: { refresh_token: string } };
+      expect(persisted.token.refresh_token).toBe('refresh_2');
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('starts and completes Cloud Hub-owned OAuth without depending on the SDK daemon', async () => {

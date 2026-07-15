@@ -336,6 +336,9 @@ export async function completeLarkOAuthCallback(env: LarkOAuthEnv, input: {
   return { user, status: await resolveLarkOAuthPublicStatus(env, String(token.scope || ''), nowMs, { createClient: input.createClient }) };
 }
 
+// 同一 state path 的并发刷新只跑一次（single-flight）——飞书 refresh_token 一次性轮换，双刷必出输家。
+const larkRefreshInflight = new Map<string, Promise<LarkUserOAuthState>>();
+
 export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(), options: {
   createClient?: (env: Record<string, unknown>) => unknown;
 } = {}): Promise<LarkUserOAuthState> {
@@ -375,6 +378,12 @@ export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(
   const config = appConfig(env);
   if (!config) return { ...base, usable: false, reason: 'oauth_refresh_not_configured' };
 
+  // 刷新按 state path single-flight：设备 12s meeting-sources 轮询 + oauth status + sidecar 内部
+  // token 端点会并发打同一份 state 文件，而飞书 v2 refresh_token 一次性轮换——并发双刷时输家用
+  // 已消耗的 refresh_token 必失败，误报 oauth_refresh_failed（前端表现=「请刷新飞书身份」假掉线）。
+  const inflight = larkRefreshInflight.get(path);
+  if (inflight) return inflight;
+  const job = (async (): Promise<LarkUserOAuthState> => {
   try {
     const client = (options.createClient || createLarkClient)(withLarkOAuthAuthorizeUrl({
       ...process.env,
@@ -409,6 +418,28 @@ export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(
       refreshExpired: false,
     };
   } catch (e) {
+    // 竞态让位：失败前回读 state——若另一路并发刷新已成功写回新 token，用它的成果，不误报失败。
+    try {
+      const latestParsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      const latestToken = obj(latestParsed.token);
+      const latestAccess = text(latestToken.access_token);
+      const latestExpiresAtMs = expiryMs(latestToken, 'expires_in');
+      if (latestAccess && latestAccess !== token && (!latestExpiresAtMs || Date.now() < latestExpiresAtMs)) {
+        return {
+          token: latestAccess,
+          scopes: tokenScopeList(latestToken.scope),
+          userOpenIds: userOpenIdCandidates(latestParsed),
+          usable: true,
+          path,
+          refreshed: true,
+          refreshTokenPresent: !!text(latestToken.refresh_token),
+          refreshExpired: false,
+        };
+      }
+    } catch { /* 回读失败就按原失败路径返回 */ }
     return { ...base, usable: false, reason: 'oauth_refresh_failed', refreshError: String((e as Error)?.message || e) };
   }
+  })().finally(() => { larkRefreshInflight.delete(path); });
+  larkRefreshInflight.set(path, job);
+  return job;
 }

@@ -404,6 +404,10 @@ export function googleDeviceOAuthCompletion(
   };
 }
 
+// 同一 token path 的并发刷新只跑一次（single-flight）：并发双刷会让后完成的失败请求
+// 用旧快照覆盖已成功的结果，永久错误还会误写 reauth_required。
+const googleRefreshInflight = new Map<string, Promise<GoogleUserTokenResolution>>();
+
 export async function resolveUserGoogleToken(
   env: GoogleOAuthEnv,
   identity: GoogleOAuthIdentity,
@@ -456,6 +460,11 @@ export async function resolveUserGoogleToken(
   } catch {
     return { ...base, usable: false, reason: 'google_oauth_refresh_not_configured' };
   }
+  // 刷新按 token path single-flight：status/transcript/meeting-sources/MTL catch-up 会并发触发，
+  // Google refresh_token 可复用但并发双刷会互相用旧快照覆盖写回（失败者还会误标 reauth_required）。
+  const inflight = googleRefreshInflight.get(path);
+  if (inflight) return inflight;
+  const job = (async (): Promise<GoogleUserTokenResolution> => {
   try {
     const refreshed = await tokenRequest(new URLSearchParams({
       client_id: config.clientId,
@@ -495,12 +504,32 @@ export async function resolveUserGoogleToken(
     const reauthRequired = error instanceof GoogleOAuthError
       && !!oauthCode
       && GOOGLE_OAUTH_REAUTH_ERROR_CODES.has(oauthCode);
-    writeTokenState(path, {
-      ...state,
-      reauth_required: reauthRequired,
-      refresh_error: refreshError,
-      updated_at: new Date(nowMs).toISOString(),
-    });
+    // 竞态让位：失败落盘前回读——若另一路已刷新成功写回了新 token，用它的成果，绝不用旧快照覆盖。
+    const latest = readTokenState(path);
+    const latestAccess = clean(latest?.access_token);
+    const latestExpiresAtMs = Number(latest?.expires_at_ms) || 0;
+    if (latest && !latest.reauth_required && latestAccess && latestAccess !== accessToken && latestExpiresAtMs > Date.now()) {
+      return {
+        usable: true,
+        token: latestAccess,
+        scopes: tokenScopes(latest.scope),
+        expiry: new Date(latestExpiresAtMs).toISOString(),
+        expiresAtMs: latestExpiresAtMs,
+        refreshTokenPresent: !!clean(latest.refresh_token),
+        refreshed: true,
+        reauthRequired: false,
+        path,
+      };
+    }
+    // 只在文件里的 refresh_token 仍是我们用的这枚时才写失败标记（防覆盖并发写入）
+    if (!latest || clean(latest.refresh_token) === refreshToken) {
+      writeTokenState(path, {
+        ...(latest || state),
+        reauth_required: reauthRequired,
+        refresh_error: refreshError,
+        updated_at: new Date(nowMs).toISOString(),
+      });
+    }
     return {
       ...base,
       usable: false,
@@ -509,6 +538,9 @@ export async function resolveUserGoogleToken(
       refreshError,
     };
   }
+  })().finally(() => { googleRefreshInflight.delete(path); });
+  googleRefreshInflight.set(path, job);
+  return job;
 }
 
 /** MTL receiver tokens are scoped to tenant/user rather than one Paper device. Try that
