@@ -47,6 +47,17 @@ import {
   resolveLarkOAuthPublicStatus,
 } from './lark-oauth-state';
 import { fetchLarkMeetingSources, resolveLarkMeetingInstance } from './lark-meeting-sources';
+import {
+  beginGoogleDeviceOAuth,
+  completeGoogleOAuthCallback,
+  googleCalendarSyncPath,
+  googleDeviceOAuthCompletion,
+  googleOAuthErrorPayload,
+  resolveGoogleOAuthStatus,
+  resolveUserGoogleToken,
+  type GoogleOAuthIdentity,
+} from './google-oauth-state';
+import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import {
   larkRealtimeMeetingSources,
@@ -851,6 +862,132 @@ function escapeHtml(value: unknown): string {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function googleOAuthIdentity(session: InkLoopSessionContext): GoogleOAuthIdentity {
+  return {
+    tenantId: session.tenant_id || LOCAL_AUTH_TENANT_ID,
+    userId: session.user_id || LOCAL_AUTH_USER_ID,
+    deviceId: session.device_id || session.session_id || 'device',
+  };
+}
+
+function googleOAuthDisabled(): boolean {
+  return !String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim();
+}
+
+function sendGoogleHtml(res: ServerResponse, status: number, title: string, message: string): void {
+  res.statusCode = status;
+  res.setHeader('content-type', 'text/html; charset=utf-8');
+  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:28px;line-height:1.6"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></body>`);
+}
+
+async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url || '/api/google', 'http://inkloop.local');
+  const path = url.pathname;
+  const callback = path === '/api/google/oauth/callback';
+  if (googleOAuthDisabled()) {
+    if (callback) sendGoogleHtml(res, 503, 'Google 日历未启用', 'google_oauth_disabled');
+    else sendJson(res, 503, { error: { code: 'google_oauth_disabled', message: 'Google OAuth is disabled' } });
+    return;
+  }
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
+    return;
+  }
+
+  if (callback) {
+    const providerError = url.searchParams.get('error');
+    if (providerError) {
+      sendGoogleHtml(res, 400, 'Google 授权失败', providerError);
+      return;
+    }
+    try {
+      const result = await completeGoogleOAuthCallback(process.env, {
+        code: url.searchParams.get('code') || '',
+        state: url.searchParams.get('state') || '',
+      });
+      const scopeMessage = result.status.connected
+        ? 'Google 日历已连接，可以回到 InkLoop。'
+        : `授权已写入，但仍缺少权限：${result.status.missing_scopes.join(', ')}`;
+      sendGoogleHtml(res, 200, 'Google 授权完成', scopeMessage);
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendGoogleHtml(res, failure.status, 'Google 授权失败', `${failure.body.error.code}: ${failure.body.error.message}`);
+    }
+    return;
+  }
+
+  const session = await requireDeviceSession(req, res);
+  if (!session) return;
+  const identity = googleOAuthIdentity(session);
+
+  if (path === '/api/google/oauth/device/start') {
+    try {
+      const payload = beginGoogleDeviceOAuth(process.env, identity);
+      sendJson(res, 200, { ...payload, auth_mode: 'device_oauth', data_isolation: 'inkloop_session_namespace' });
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/oauth/device/complete') {
+    const completion = googleDeviceOAuthCompletion(process.env, identity);
+    if (completion.status !== 'complete') {
+      sendJson(res, 200, completion);
+      return;
+    }
+    try {
+      const status = await resolveGoogleOAuthStatus(process.env, identity);
+      sendJson(res, 200, { ...completion, connected: status.connected, oauth: status });
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/oauth/status') {
+    try {
+      sendJson(res, 200, await resolveGoogleOAuthStatus(process.env, identity));
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/meeting-sources') {
+    try {
+      const resolved = await resolveUserGoogleToken(process.env, identity);
+      if (!resolved.usable || !resolved.token) {
+        sendJson(res, 401, {
+          connected: false,
+          sources: [],
+          error: { code: resolved.reason || 'google_oauth_unavailable', message: 'Google OAuth authorization is required' },
+        });
+        return;
+      }
+      const result = await fetchGoogleMeetingSources(resolved.token, {
+        path: googleCalendarSyncPath(process.env, identity),
+      }, {
+        refreshAccessToken: async () => {
+          const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
+          if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
+          return refreshed.token;
+        },
+      });
+      sendJson(res, 200, { connected: true, configured: true, ...result });
+    } catch (error) {
+      const failure = googleCalendarErrorPayload(error);
+      sendJson(res, failure.status, { connected: false, sources: [], ...failure.body });
+    }
+    return;
+  }
+
+  sendJson(res, 404, { error: { code: 'google_route_not_found', message: 'Google API route not found' } });
 }
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {
   const configured = String(process.env.LARK_CLOUD_HUB_REDIRECT_URI || process.env.INKLOOP_LARK_REDIRECT_URI || process.env.LARK_REDIRECT_URI || '').trim();
@@ -2155,6 +2292,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
   // 阶段C：二维码设备登录（在 POST-only 闸之前·create/status/ack 都有 POST/GET 混合）
   if (url.startsWith('/api/inkloop/auth')) { await handleInkLoopAuth(req, res); return; }
+  // Google Calendar OAuth + meeting sources；callback 由 Google 直连，其余子路由在 handler 内校验设备 session。
+  if (url.startsWith('/api/google')) { await handleGoogleApi(req, res); return; }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/panel-feishu')) { await handlePanelFeishu(req, res); return; }
   // 交付路线 Y：vault release GET/POST 代理（在 POST-only 闸之前·因含 GET latest/blob）
