@@ -218,6 +218,55 @@ describe('IndexedDbOfflineRuntimeStore', () => {
     await store.close();
   });
 
+  it('retains a deleted annotation stub when delete follows an annotation-stripping bootstrap', async () => {
+    const store = new IndexedDbOfflineRuntimeStore({
+      dbName: `inksurface-test-${Date.now()}-${Math.random()}`,
+      factory: indexedDB,
+      now: () => '2026-07-15T00:00:03.000Z',
+    });
+    const existing = snapshot();
+    existing.blocks[0].annotations = [{
+      ko_id: 'ko_deleted_after_bootstrap',
+      status: 'edited',
+      inkloop_mark: { mark_id: 'mark_deleted_after_bootstrap' },
+    }];
+    await store.writeDocumentSnapshot(existing);
+
+    const bootstrap = snapshot();
+    bootstrap.blocks[0].annotations = [];
+    expect((await store.applyRemoteEvent(event({
+      event_id: 'evt_delete_chain_bootstrap_idb',
+      operation: 'runtime.bootstrap',
+      payload: { snapshot: bootstrap },
+    }))).status).toBe('applied');
+    expect((await store.loadDocument('doc_indexeddb'))?.blocks[0].annotations).toEqual([]);
+
+    const deletion = event({
+      event_id: 'evt_delete_chain_idb',
+      operation: 'annotation.delete',
+      target: { type: 'annotation', id: 'ko_deleted_after_bootstrap', block_id: 'blk_indexeddb' },
+      payload: {
+        ko_id: 'ko_deleted_after_bootstrap',
+        mark_id: 'mark_deleted_after_bootstrap',
+        block_id: 'blk_indexeddb',
+        deleted_at: '2026-07-15T00:00:02.000Z',
+      },
+    });
+    expect((await store.applyRemoteEvent(deletion)).status).toBe('applied');
+    expect((await store.applyRemoteEvent(deletion)).status).toBe('skipped');
+    expect((await store.loadDocument('doc_indexeddb'))?.blocks[0].annotations).toEqual([
+      {
+        ko_id: 'ko_deleted_after_bootstrap',
+        status: 'deleted',
+        deleted_at: '2026-07-15T00:00:02.000Z',
+        inkloop_mark: { mark_id: 'mark_deleted_after_bootstrap' },
+      },
+    ]);
+    expect(await store.listOutboxEvents()).toEqual([]);
+
+    await store.close();
+  });
+
   it('falls back to page_index when a remote annotation add has no block id', async () => {
     const store = new IndexedDbOfflineRuntimeStore({
       dbName: `inksurface-test-${Date.now()}-${Math.random()}`,

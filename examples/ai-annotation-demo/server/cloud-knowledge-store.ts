@@ -1,6 +1,13 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { DocumentProjection, KnowledgeObject, KnowledgeRiskStatus, KnowledgeStatus } from '../../../packages/knowledge-schema/src/index';
+import {
+  canonicalJson,
+  sha256ContentHash,
+  type DocumentProjection,
+  type KnowledgeObject,
+  type KnowledgeRiskStatus,
+  type KnowledgeStatus,
+} from '../../../packages/knowledge-schema/src/index';
 
 export interface CloudKnowledgeNamespace {
   tenant_id?: string;
@@ -31,6 +38,8 @@ export interface CloudKnowledgeIndex {
 }
 
 export interface CloudKnowledgeObjectPatch {
+  title?: string;
+  body_md?: string;
   status?: KnowledgeStatus;
   tags?: string[];
   task_done?: boolean;
@@ -109,6 +118,41 @@ function mergeKnowledgeObject(existing: KnowledgeObject | undefined, incoming: K
       ...(markIds.length ? { mark_ids: markIds } : {}),
       ...(aiTurnIds.length ? { ai_turn_ids: aiTurnIds } : {}),
     },
+  };
+}
+
+async function patchedKnowledgeObject(existing: KnowledgeObject, patch: CloudKnowledgeObjectPatch, updatedAt: string): Promise<KnowledgeObject> {
+  const controlledPatch = Object.fromEntries(Object.entries({
+    task_done: patch.task_done,
+    risk_status: patch.risk_status,
+    risk_note: patch.risk_note,
+    comment_md: patch.comment_md,
+  }).filter(([, value]) => value !== undefined));
+  const nextObject: KnowledgeObject = {
+    ...existing,
+    ...(patch.title !== undefined ? { title: patch.title } : {}),
+    ...(patch.body_md !== undefined ? { body_md: patch.body_md } : {}),
+    ...(patch.status ? { status: patch.status } : {}),
+    ...(patch.tags ? { tags: patch.tags } : {}),
+    ...(Object.keys(controlledPatch).length
+      ? { controlled_fields: { ...(existing.controlled_fields || {}), ...controlledPatch } }
+      : {}),
+    updated_at: updatedAt,
+  };
+  if (patch.title === undefined && patch.body_md === undefined && patch.status === undefined) return nextObject;
+  const extended = nextObject as KnowledgeObject & { visual_strokes?: unknown; surface_strokes?: unknown };
+  return {
+    ...nextObject,
+    content_hash: await sha256ContentHash(canonicalJson({
+      kind: nextObject.kind,
+      title: nextObject.title,
+      body_md: nextObject.body_md,
+      source: nextObject.source,
+      ...(nextObject.source_refs ? { source_refs: nextObject.source_refs } : {}),
+      status: nextObject.status,
+      ...(extended.visual_strokes ? { visual_strokes: extended.visual_strokes } : {}),
+      ...(extended.surface_strokes ? { surface_strokes: extended.surface_strokes } : {}),
+    })),
   };
 }
 
@@ -219,21 +263,7 @@ export class JsonCloudKnowledgeStore {
       const index = await this.readIndex(namespace);
       const existing = index.knowledge_objects.find((item) => item.ko_id === koId);
       if (!existing) throw Object.assign(new Error('knowledge_object_not_found'), { status: 404 });
-      const nextObject: KnowledgeObject = {
-        ...existing,
-        ...(patch.status ? { status: patch.status } : {}),
-        ...(patch.tags ? { tags: patch.tags } : {}),
-        controlled_fields: {
-          ...(existing.controlled_fields || {}),
-          ...Object.fromEntries(Object.entries({
-            task_done: patch.task_done,
-            risk_status: patch.risk_status,
-            risk_note: patch.risk_note,
-            comment_md: patch.comment_md,
-          }).filter(([, value]) => value !== undefined)),
-        },
-        updated_at: updatedAt,
-      };
+      const nextObject = await patchedKnowledgeObject(existing, patch, updatedAt);
       const next = index.knowledge_objects.filter((item) => item.ko_id !== koId);
       next.push(nextObject);
       await this.writeIndex(namespace, { ...index, knowledge_objects: next });

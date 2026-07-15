@@ -153,6 +153,26 @@ function fallbackAnnotationBlockIndex(blocks: RuntimeSurfaceBlock[], event: Runt
   return blocks.length ? 0 : -1;
 }
 
+function remoteDeleteBlockIndex(blocks: RuntimeSurfaceBlock[], event: RuntimeSyncEvent): number {
+  const targetBlockId = String(event.payload.block_id || event.target.block_id || '');
+  const targetIndex = targetBlockId ? blocks.findIndex((block) => blockId(block) === targetBlockId) : -1;
+  return targetIndex >= 0 ? targetIndex : (blocks.length ? 0 : -1);
+}
+
+function remoteDeletedAt(event: RuntimeSyncEvent): string {
+  const payloadDeletedAt = typeof event.payload.deleted_at === 'string' ? event.payload.deleted_at.trim() : '';
+  return payloadDeletedAt || event.updated_at;
+}
+
+function remoteDeletedAnnotationStub(event: RuntimeSyncEvent, koIdValue: string, markId: string): RuntimeAnnotation {
+  return {
+    ko_id: koIdValue,
+    status: 'deleted',
+    deleted_at: remoteDeletedAt(event),
+    ...(markId ? { inkloop_mark: { mark_id: markId } } : {}),
+  };
+}
+
 async function sha256Tagged(input: string): Promise<string> {
   const crypto = globalThis.crypto;
   if (!crypto?.subtle) return `sha256:fallback-${input.length.toString(16)}`;
@@ -514,13 +534,23 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
           const matchesMark = !!markId && runtimeAnnotationMarkId(annotation) === markId;
           if (!matchesKo && !matchesMark) return annotation;
           didUpdate = true;
-          if (event.operation === 'annotation.delete') return { ...annotation, status: 'deleted', deleted_at: event.updated_at };
+          if (event.operation === 'annotation.delete') return { ...annotation, status: 'deleted', deleted_at: remoteDeletedAt(event) };
           return { ...annotation, ...patch, updated_at: event.updated_at };
         });
         return { ...block, annotations };
       });
-      // delete 幂等：目标不存在（如快速 add→delete 被 fold 成 delete-only）不算冲突，跳过即可。
-      if (!didUpdate && event.operation === 'annotation.delete') return;
+      if (!didUpdate && event.operation === 'annotation.delete') {
+        const targetIndex = remoteDeleteBlockIndex(blocks, event);
+        // A blockless snapshot has nowhere to retain a tombstone; delete remains idempotent.
+        if (targetIndex === -1) return;
+        const targetBlock = blocks[targetIndex];
+        blocks[targetIndex] = {
+          ...targetBlock,
+          annotations: [...(targetBlock.annotations || []), remoteDeletedAnnotationStub(event, ko, markId)],
+        };
+        await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
+        return;
+      }
       if (!didUpdate) throw new Error(`Remote annotation was not found: ${ko}`);
       await this.writeDocumentSnapshot({ ...runtime, document: { ...runtime.document, updated_at: this.now() }, blocks });
       return;

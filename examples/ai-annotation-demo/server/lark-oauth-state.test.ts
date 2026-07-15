@@ -21,7 +21,6 @@ describe('lark oauth state', () => {
       LARK_APP_SECRET: 'secret',
       LARK_MEETING_AUTH_STATE_PATH: authPath,
     };
-    const createAuthorizeUrl = vi.fn((state: string) => `https://accounts.feishu.cn/auth?state=${state}`);
     const exchangeOAuthCode = vi.fn(async () => ({
       access_token: 'user_token',
       refresh_token: 'refresh_token',
@@ -30,7 +29,7 @@ describe('lark oauth state', () => {
       scope: 'vc:meeting.search:read vc:note:read',
     }));
     const fetchUserInfo = vi.fn(async () => ({ data: { open_id: 'ou_user_a' } }));
-    const createClient = vi.fn(() => ({ createAuthorizeUrl, exchangeOAuthCode, fetchUserInfo }));
+    const createClient = vi.fn(() => ({ exchangeOAuthCode, fetchUserInfo }));
 
     try {
       const login = beginLarkOAuthLogin(env, {
@@ -41,10 +40,10 @@ describe('lark oauth state', () => {
         createClient,
       });
 
-      expect(login.auth_url).toContain('state_test');
-      expect(createClient).toHaveBeenCalledWith(expect.objectContaining({
-        LARK_REDIRECT_URI: 'http://localhost:8731/api/feishu-svc/api/feishu/oauth/callback',
-      }));
+      const authUrl = new URL(login.auth_url);
+      expect(authUrl.origin + authUrl.pathname).toBe('https://accounts.feishu.cn/open-apis/authen/v1/authorize');
+      expect(authUrl.searchParams.get('client_id')).toBe('cli_test');
+      expect(authUrl.searchParams.get('state')).toBe('state_test');
 
       const completed = await completeLarkOAuthCallback(env, {
         code: 'oauth_code',
