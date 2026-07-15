@@ -34,7 +34,9 @@ import { createCloudDeviceHandler } from './cloud-device-handler';
 import { JsonCloudDeviceStore } from './cloud-device-store';
 import { fetchFeishuBotCalendarEvents } from './feishu-bot-calendar';
 import {
+  fetchFeishuBotMessageResource,
   fetchFeishuBotWorkspaces,
+  fetchFeishuBotWorkspaceDocxLinks,
   fetchFeishuBotWorkspaceFiles,
   fetchFeishuBotWorkspaceMembers,
   fetchFeishuBotWorkspaceMessages,
@@ -69,6 +71,9 @@ import {
 } from './mtl-receiver-auth';
 import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
+import { exportLarkDocxToPdf } from './lark-docx-export';
+import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
+import { resolvePanelAuthBase } from './standalone-service-config';
 import {
   larkRealtimeMeetingSources,
   larkRealtimeMeetingStoreStatus,
@@ -179,8 +184,8 @@ function setCors(req: IncomingMessage, res: ServerResponse): void {
 //    与 vite.config.ts panelFeishuProxy 同构，让安卓/生产包也能拉妙记转写。──
 const PANEL_FEISHU_BASE = (process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
 const INKLOOP_SHARED_SECRET = process.env.INKLOOP_SHARED_SECRET || '';
-// 阶段C：二维码设备登录代理 + session introspection 校验（复用 PANEL_FEISHU_BASE 当 panel 地址，未来可用独立 PANEL_AUTH_BASE 覆盖）。
-const PANEL_AUTH_BASE = (process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+// 阶段C：二维码设备登录代理 + session introspection 校验。会议 sidecar 不提供 auth，禁止从 PANEL_FEISHU_BASE 隐式继承。
+const PANEL_AUTH_BASE = resolvePanelAuthBase(process.env);
 const LOCAL_DEVICE_AUTH = process.env.INKLOOP_LOCAL_DEVICE_AUTH === '1';
 const LOCAL_DEVICE_AUTH_AUTO_APPROVE = process.env.INKLOOP_LOCAL_DEVICE_AUTH_AUTO_APPROVE === '1';
 const LOCAL_AUTH_STORE = process.env.INKLOOP_LOCAL_AUTH_STORE || resolve(ROOT, '.inkloop/auth-sessions.json');
@@ -612,7 +617,7 @@ async function resolveDeviceSession(req: IncomingMessage): Promise<InkLoopSessio
   const localSession = localDeviceSessionFromToken(token);
   if (localSession) return localSession;
   if (LOCAL_DEVICE_AUTH && !PANEL_AUTH_BASE) throw Object.assign(new Error('reauth_required'), { status: 401 });
-  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) throw Object.assign(new Error('PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置'), { status: 503 });
+  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) throw Object.assign(new Error('PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置'), { status: 503 });
   const r = await fetch(`${PANEL_AUTH_BASE}/api/internal/inkloop/sessions/introspect`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-inkloop-secret': INKLOOP_SHARED_SECRET },
@@ -648,7 +653,7 @@ async function handleInkLoopAuth(req: IncomingMessage, res: ServerResponse): Pro
     return;
   }
   const send = (code: number, obj: unknown): void => sendJson(res, code, obj);
-  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置' });
+  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置' });
   const method = req.method || 'GET';
   const rest = (req.url || '').replace(/^\/api\/inkloop\/auth/, '');
   const apath = (rest || '/').split('?')[0];
@@ -856,7 +861,8 @@ async function handlePanelVault(req: IncomingMessage, res: ServerResponse): Prom
 const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+$/, '');
 // offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
 // 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
-const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+// drive:export:readonly 用于 docx 官方 export_tasks；已有 token refresh 不会扩 scope，老用户需重新授权一次。
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly';
 // 默认取「2026-07-13 已验证授予的权限集合 + offline_access(新版 OAuth 专用·换取 refresh_token)」。
 // 旧版授权端点会把 URL scope 当后台 API 权限逐项校验，offline_access 不在权限列表会直接报缺少权限——
 // 授权端点已随 vendor larkClient 切到新版 accounts.feishu.cn。需要增删 scope 用环境变量覆盖，别往回加 vc:meeting:readonly（已被细粒度权限取代）。
@@ -1231,6 +1237,37 @@ async function relayBinary(res: ServerResponse, r: Response): Promise<void> {
   const cd = r.headers.get('content-disposition'); if (cd) res.setHeader('content-disposition', cd);
   res.end(buf);
 }
+
+async function relayStreamingBinary(res: ServerResponse, r: Response): Promise<void> {
+  res.statusCode = r.status;
+  res.setHeader('content-type', r.headers.get('content-type') || 'application/octet-stream');
+  const contentLength = r.headers.get('content-length');
+  if (contentLength) res.setHeader('content-length', contentLength);
+  const contentDisposition = r.headers.get('content-disposition');
+  if (contentDisposition) res.setHeader('content-disposition', contentDisposition);
+  if (!r.body) { res.end(); return; }
+  const reader = r.body.getReader();
+  try {
+    while (!res.destroyed) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      if (!res.write(Buffer.from(chunk.value))) {
+        await new Promise<void>((resolveDrain) => {
+          const done = (): void => {
+            res.off('drain', done);
+            res.off('close', done);
+            resolveDrain();
+          };
+          res.once('drain', done);
+          res.once('close', done);
+        });
+      }
+    }
+    if (!res.destroyed) res.end();
+  } finally {
+    if (res.destroyed) await reader.cancel().catch(() => undefined);
+  }
+}
 // 阶段D：这几条端点要「我本人」的飞书用户身份（走 panel 统一 token 店），需要有效设备 session 才能拿到
 // tenant_id/user_id/feishu_open_id 转发给 feishu-service；其余群/文件/应用日历端点走 tenant 身份，不需要 session。
 const FEISHU_NEEDS_USER_CONTEXT = /^\/api\/feishu\/(oauth\/status|my\/events|meetings\/[^/]+\/note-transcript|docx\/[^/]+\/(meta|raw-content|pdf)|docx\/[^/]+\/media\/[^/]+)$/;
@@ -1256,6 +1293,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
     || (localBotConfigRoute && (req.method === 'POST' || req.method === 'DELETE'));
   if (req.method !== 'GET' && !allowedWrite) return send(405, { error: 'GET only' });
   const botWorkspaceMatch = apath.match(/^\/api\/feishu\/workspaces\/([^/]+)\/(members|messages|files)$/);
+  const localMaterialRoute = matchLocalFeishuMaterialRoute(apath);
   if (localBotConfigRoute) {
     const session = await requireDeviceSession(req, res);
     if (!session) return;
@@ -1629,6 +1667,60 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
       return send(502, { connected: false, configured: true, source: 'feishu_bot_im', auth_mode: 'tenant_access_token', workspaces: [], error: { code: 'bot_workspaces_failed', message: String((e as Error)?.message || e) } });
     }
   }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'workspace_docx_links') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    try {
+      const u = new URL(rest, 'http://inkloop.local');
+      const limit = Number(u.searchParams.get('limit') || u.searchParams.get('page_size') || '') || undefined;
+      return send(200, await fetchFeishuBotWorkspaceDocxLinks(localMaterialRoute.chatId, { pageSize: limit, env: feishuBotRuntimeEnv() }));
+    } catch (e) {
+      return send(502, { connected: false, configured: true, source: 'feishu_bot_im', auth_mode: 'tenant_access_token', links: [], error: { code: 'bot_docx_links_failed', message: String((e as Error)?.message || e) } });
+    }
+  }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'message_file') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    const u = new URL(rest, 'http://inkloop.local');
+    const type = u.searchParams.get('type') || 'file';
+    if (type !== 'file' && type !== 'image') return send(400, { error: { code: 'invalid_resource_type', message: 'type must be file or image' } });
+    try {
+      const result = await fetchFeishuBotMessageResource(localMaterialRoute.messageId, localMaterialRoute.resourceKey, type, { env: feishuBotRuntimeEnv() });
+      if (!result.ok || !result.response) return send(result.status || 502, { error: result.error });
+      const name = u.searchParams.get('name');
+      if (name && !result.response.headers.has('content-disposition')) {
+        res.setHeader('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(name)}`);
+      }
+      await relayStreamingBinary(res, result.response);
+      return;
+    } catch (e) {
+      if (!res.headersSent) return send(502, { error: { code: 'resource_download_failed', message: String((e as Error)?.message || e) } });
+      res.destroy(e as Error);
+      return;
+    }
+  }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'docx_pdf') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    if (!session.tenant_id || !session.user_id || !session.feishu_open_id) return send(409, { error: { code: 'reauth_required', message: '当前 session 未绑定飞书身份' } });
+    const documentId = localMaterialRoute.documentId;
+    try {
+      const result = await exportLarkDocxToPdf(documentId, {
+        env: feishuBotRuntimeEnv(larkEnvForSession(session)),
+        expectedOpenId: session.feishu_open_id,
+      });
+      if (!result.ok || !result.response) return send(result.status || 502, { error: result.error });
+      if (!result.response.headers.has('content-disposition')) {
+        res.setHeader('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(result.file_name || `${documentId}.pdf`)}`);
+      }
+      await relayStreamingBinary(res, result.response);
+      return;
+    } catch (e) {
+      if (!res.headersSent) return send(Number((e as { status?: number })?.status) || 502, { error: { code: 'docx_pdf_failed', message: String((e as Error)?.message || e) } });
+      res.destroy(e as Error);
+      return;
+    }
+  }
   if (!FEISHU_SERVICE_BASE && botWorkspaceMatch) {
     try {
       const u = new URL(rest, 'http://inkloop.local');
@@ -1648,7 +1740,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
             image_key: message.image_key,
             resource_key: message.image_key || message.file_key || message.message_id,
             create_time: message.create_time,
-            download_path: `/api/feishu/messages/${encodeURIComponent(message.message_id)}/file/${encodeURIComponent(message.image_key || message.file_key || '')}?type=${message.msg_type === 'image' ? 'image' : 'file'}&name=${encodeURIComponent(message.file_name || (message.msg_type === 'image' ? '［图片］' : '文件'))}`,
+            download_path: `/api/feishu/workspaces/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(message.message_id)}/file/${encodeURIComponent(message.image_key || message.file_key || '')}?type=${message.msg_type === 'image' ? 'image' : 'file'}&name=${encodeURIComponent(message.file_name || (message.msg_type === 'image' ? '［图片］' : '文件'))}`,
           })),
         });
       }

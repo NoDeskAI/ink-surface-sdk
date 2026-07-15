@@ -75,6 +75,24 @@ export interface FeishuBotWorkspaceMessagesResult extends FeishuBotImBaseResult 
   messages: FeishuBotMessage[];
 }
 
+export interface FeishuBotDocxLink {
+  message_id: string;
+  create_time?: string;
+  url: string;
+  token: string;
+}
+
+export interface FeishuBotWorkspaceDocxLinksResult extends FeishuBotImBaseResult {
+  links: FeishuBotDocxLink[];
+}
+
+export interface FeishuBotMessageResourceResult {
+  ok: boolean;
+  status: number;
+  response?: Response;
+  error?: FeishuBotImError;
+}
+
 function appConfig(env: FeishuBotImEnv): { appId: string; appSecret: string; baseUrl: string } | null {
   const appId = String(env.FEISHU_APP_ID || env.LARK_APP_ID || '').trim();
   const appSecret = String(env.FEISHU_APP_SECRET || env.LARK_APP_SECRET || '').trim();
@@ -211,6 +229,20 @@ function normalizeMessage(item: Record<string, unknown>): FeishuBotMessage | nul
   };
 }
 
+const DOCX_RE = /https?:\/\/[^\s"'<>（）()]+\/docx\/([A-Za-z0-9_-]{8,40})(?:[?#][^\s"'<>（）()]*)?/g;
+
+export function extractFeishuDocxLinks(text: string): Array<{ url: string; token: string }> {
+  const seen = new Set<string>();
+  const links: Array<{ url: string; token: string }> = [];
+  for (const match of String(text || '').matchAll(DOCX_RE)) {
+    const token = match[1];
+    if (seen.has(token)) continue;
+    seen.add(token);
+    links.push({ url: match[0], token });
+  }
+  return links;
+}
+
 export async function fetchFeishuBotWorkspaces(options: FeishuBotImFetchOptions = {}): Promise<FeishuBotWorkspacesResult> {
   const result = await withToken(options, async ({ fetchImpl, config, token }) => {
     const res = await requestJson(fetchImpl, config.baseUrl, '/open-apis/im/v1/chats?page_size=100', { headers: { authorization: `Bearer ${token}` } });
@@ -312,5 +344,47 @@ export async function fetchFeishuBotWorkspaceFiles(chatId: string, options: Feis
   return {
     ...result,
     messages: result.messages.filter((message) => message.msg_type === 'file' || message.msg_type === 'image'),
+  };
+}
+
+export async function fetchFeishuBotWorkspaceDocxLinks(chatId: string, options: FeishuBotImFetchOptions = {}): Promise<FeishuBotWorkspaceDocxLinksResult> {
+  const result = await fetchFeishuBotWorkspaceMessages(chatId, { ...options, pageSize: Math.max(options.pageSize || DEFAULT_MESSAGE_PAGE_SIZE, 50) });
+  return {
+    ...result,
+    links: result.messages
+      .filter((message) => message.msg_type === 'text' && message.text)
+      .flatMap((message) => extractFeishuDocxLinks(message.text || '').map((link) => ({
+        message_id: message.message_id,
+        ...(message.create_time ? { create_time: message.create_time } : {}),
+        ...link,
+      }))),
+  };
+}
+
+export async function fetchFeishuBotMessageResource(messageId: string, resourceKey: string, type: 'file' | 'image', options: FeishuBotImFetchOptions = {}): Promise<FeishuBotMessageResourceResult> {
+  const result = await withToken(options, async ({ fetchImpl, config, token }) => {
+    const response = await fetchImpl(
+      `${config.baseUrl}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(resourceKey)}?type=${encodeURIComponent(type)}`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    const contentType = response.headers.get('content-type') || '';
+    if (response.ok && !/application\/json/i.test(contentType)) {
+      return { ok: true, status: response.status, response } satisfies FeishuBotMessageResourceResult;
+    }
+    const raw = await response.text().catch(() => '');
+    let json: Record<string, unknown> = {};
+    try { json = raw ? JSON.parse(raw) as Record<string, unknown> : {}; }
+    catch { json = { raw }; }
+    return {
+      ok: false,
+      status: response.ok ? 502 : response.status,
+      error: { code: String(json.code || `http_${response.status}`), message: feishuMsg(json) },
+    } satisfies FeishuBotMessageResourceResult;
+  });
+  if ('ok' in result) return result;
+  return {
+    ok: false,
+    status: result.configured ? 502 : 503,
+    error: result.error || { code: 'resource_download_failed', message: 'Feishu resource download failed' },
   };
 }
