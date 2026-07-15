@@ -107,7 +107,14 @@ export interface HttpRuntimeSyncTransportConfig {
   deviceId: string;
   pullEndpoint?: string;
   headers?: Record<string, string> | (() => Record<string, string>);
+  /** pull 超时（默认 15s）：轮询高频、payload 小，挂死要快速止损。 */
   requestTimeoutMs?: number;
+  /** push 超时（默认 60s）：一批 25 条带笔迹点阵的事件在弱网上传合法地慢，15s 会把大批次永远掐死在半路。 */
+  sendTimeoutMs?: number;
+}
+
+function timeoutAbort(controller: AbortController, ms: number): ReturnType<typeof setTimeout> {
+  return setTimeout(() => controller.abort(new Error(`runtime sync request timed out after ${ms}ms`)), ms);
 }
 
 function nowIso(): string {
@@ -414,7 +421,7 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
 
   async send(events: RuntimeSyncEvent[]): Promise<RuntimeSyncAck[]> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.max(1, this.config.requestTimeoutMs ?? 15_000));
+    const timeout = timeoutAbort(controller, Math.max(1, this.config.sendTimeoutMs ?? 60_000));
     let response: Response;
     try {
       response = await fetch(this.config.endpoint, {
@@ -451,7 +458,7 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
     });
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.max(1, this.config.requestTimeoutMs ?? 15_000));
+    const timeout = timeoutAbort(controller, Math.max(1, this.config.requestTimeoutMs ?? 15_000));
     let response: Response;
     try {
       response = await fetch(endpoint, {
