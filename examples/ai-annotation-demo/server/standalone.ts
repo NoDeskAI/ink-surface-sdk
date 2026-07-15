@@ -14,7 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -870,6 +870,10 @@ const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:me
 // 旧版授权端点会把 URL scope 当后台 API 权限逐项校验，offline_access 不在权限列表会直接报缺少权限——
 // 授权端点已随 vendor larkClient 切到新版 accounts.feishu.cn。需要增删 scope 用环境变量覆盖，别往回加 vc:meeting:readonly（已被细粒度权限取代）。
 const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
+// 「已连接」判定只看核心功能 scope（会议/日历/docx）——授权请求 scope 每次扩容（drive:export、minutes 等）
+// 都会让老 token 被误判 connected=false、前端停拉日历。新增能力各自的端点自行校验所需 scope。
+const LARK_CORE_REQUIRED_SCOPE = (process.env.LARK_CORE_REQUIRED_SCOPE
+  || 'vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download').trim();
 const LARK_MEETING_CALLBACK_PORT = String(process.env.LARK_MEETING_SDK_PORT || process.env.LARK_SDK_PORT || '8789').trim() || '8789';
 const LARK_MEETING_CALLBACK_PATH = '/api/auth/lark/callback';
 const CONVERT_SERVICE_BASE = (process.env.CONVERT_SERVICE_BASE || '').replace(/\/+$/, '');
@@ -1350,10 +1354,11 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         lookaheadSeconds,
         pageSize: Number(u.searchParams.get('page_size') || '') || undefined,
         userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
+        // 三态过滤：有飞书身份=按身份过滤；无身份=[]（什么都不给·否则反而看到全量=泄漏）
         extraSources: larkRealtimeMeetingSources(ROOT, {
           lookbackSeconds,
           lookaheadSeconds,
-          userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
+          userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : [],
         }),
         env: feishuBotRuntimeEnv(larkEnvForSession(session)),
       });
@@ -1407,6 +1412,8 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         meeting_url: body.meeting_url || body.url,
         meeting_no: body.meeting_no,
         feishu_meeting_id: body.feishu_meeting_id || body.meeting_id,
+        // 手动绑定必须落归属，否则创建者自己按身份过滤后立刻看不到这条记录
+        owner_open_id: session.feishu_open_id || undefined,
         source_event_type: 'manual_bind_current_meeting',
         source_event_id: body.source_event_id,
         source_transport: 'manual',
@@ -1570,7 +1577,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
   if (!FEISHU_SERVICE_BASE && apath === '/api/feishu/oauth/status') {
     try {
       const session = await optionalDeviceSession(req);
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE);
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE);
       return send(200, {
         ...status,
         redirect_uri: larkOAuthRedirectUri(req),
@@ -1588,7 +1595,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
       const sessionToken = localSessionTokenFor(req);
       const session = await requireDeviceSession(req, res);
       if (!session) return;
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE);
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE);
       const openId = session.feishu_open_id || status.user_open_ids[0] || null;
       if (openId && !session.feishu_open_id) await persistSessionFeishuIdentity(sessionToken, session, openId);
       const teamAccess = await fetchFeishuTeamAccess({ env: feishuBotRuntimeEnv(), userOpenId: openId });
@@ -1621,7 +1628,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
   if (!FEISHU_SERVICE_BASE && apath === '/api/feishu/oauth/refresh') {
     try {
       const session = await optionalDeviceSession(req);
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE, Date.now());
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE, Date.now());
       return send(200, {
         ...status,
         redirect_uri: larkOAuthRedirectUri(req),
@@ -2500,11 +2507,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // 妙记取数的 token 真相源收编到 hub 这份 v2 OAuth state（resolveUserOAuthToken 自带懒刷新）。
   if (url === '/api/internal/lark-user-token') {
     if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+    res.setHeader('cache-control', 'no-store');
+    // 带 forwarded 头=经过了反向代理，即便 socket 是 loopback 也视为外部请求
+    const forwarded = req.headers.forwarded || req.headers['x-forwarded-for'];
     const remote = String(req.socket.remoteAddress || '');
-    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-    const secretHeader = String(req.headers['x-inkloop-secret'] || '');
-    const authed = isLoopback && !!INKLOOP_SHARED_SECRET && secretHeader.length === INKLOOP_SHARED_SECRET.length
-      && timingSafeEqual(Buffer.from(secretHeader), Buffer.from(INKLOOP_SHARED_SECRET));
+    const isLoopback = !forwarded && (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1');
+    const actual = Buffer.from(String(req.headers['x-inkloop-secret'] || ''));
+    const expected = Buffer.from(INKLOOP_SHARED_SECRET);
+    const authed = isLoopback && expected.length > 0
+      && actual.length === expected.length && timingSafeEqual(actual, expected);
     if (!authed) { sendJson(res, 403, { ok: false, reason: 'forbidden' }); return; }
     // hub 的 lark auth state 按 `.inkloop/lark-auth/<tenant>/feishu_<open_id>/<device>.json` 分桶（见 sessionScopedLarkAuthPath）。
     // 带 open_id：取该用户最近登录设备的 state 走 resolveUserOAuthToken（自带懒刷新）；不带：枚举可用 open_id（不发 token）。

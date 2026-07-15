@@ -174,12 +174,17 @@ export function listLarkRealtimeMeetings(root: string, options: { nowMs?: number
 }
 
 export function larkRealtimeMeetingSources(root: string, options: { nowMs?: number; lookbackSeconds?: number; lookaheadSeconds?: number; userOpenIds?: string[] } = {}): LarkMeetingSource[] {
+  // 过滤契约两态：undefined=不过滤（demo/内部调用）；数组=严格按 owner/participant 命中放行——
+  // 空数组（请求者无飞书身份）自然什么都不给（否则无身份反而看到全量=泄漏），
+  // 无归属的存量记录对有身份用户同样隐藏（手动绑定已改为落 owner，老记录随回看窗口自然淘汰）。
+  const filterByUser = Array.isArray(options.userOpenIds);
   const userOpenIds = new Set(uniqueText(options.userOpenIds));
-  return listLarkRealtimeMeetings(root, options).filter((item) => (
-    !userOpenIds.size
-    || userOpenIds.has(text(item.owner_open_id))
-    || uniqueText(item.participant_open_ids).some((openId) => userOpenIds.has(openId))
-  )).map((item) => ({
+  return listLarkRealtimeMeetings(root, options).filter((item) => {
+    if (!filterByUser) return true;
+    const owner = text(item.owner_open_id);
+    const participants = uniqueText(item.participant_open_ids);
+    return (!!owner && userOpenIds.has(owner)) || participants.some((openId) => userOpenIds.has(openId));
+  }).map((item) => ({
     source_id: `realtime:${item.id}`,
     source: 'lark_meeting_timeline',
     title: item.title,

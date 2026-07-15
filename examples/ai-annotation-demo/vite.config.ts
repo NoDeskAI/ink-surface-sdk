@@ -119,9 +119,11 @@ async function requireDeviceSessionDev(
   const send = (code: number, obj: unknown): void => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
   const token = bearerTokenFromReq(req) || String(req.headers['x-inkloop-session'] || '').trim();
   if (!token) { send(401, { error: 'missing_session_token' }); return null; }
-  const BASE = (process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+  // 与 standalone 的 resolvePanelAuthBase 契约一致：只认显式 PANEL_AUTH_BASE，不回退 PANEL_FEISHU_BASE
+  // （新 meeting sidecar 不提供 auth API，回退会把 session introspect 打到错误服务上）。
+  const BASE = (process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
   const SECRET = process.env.INKLOOP_SHARED_SECRET || '';
-  if (!BASE || !SECRET) { send(503, { error: 'PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置' }); return null; }
+  if (!BASE || !SECRET) { send(503, { error: 'PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置' }); return null; }
   try {
     const r = await fetch(`${BASE}/api/internal/inkloop/sessions/introspect`, {
       method: 'POST',

@@ -152,17 +152,19 @@ export function meetingInputFromEvent(payload: unknown, eventType: string, nowMs
   const participant = eventParticipant(payload);
   const eventId = eventIdFromPayload(payload);
   const isParticipantEvent = /(join_meeting|leave_meeting)/i.test(eventType);
-  const isEnd = !isParticipantEvent && /(_ended|meeting_ended)/i.test(eventType);
   const isStart = !isParticipantEvent && /(_started|meeting_started)/i.test(eventType);
+  const lifecycleEnd = !isParticipantEvent && /(_ended|meeting_ended)/i.test(eventType);
+  // ended 事件可能漏投（长连接随机路由到别的消费者/断连窗口）——join/leave payload 里若自带明确的
+  // 会议 end_time，也当结束处理（裸 leave 不能推断整场结束，只更新参与者）。
+  const explicitEndedAt = iso(firstText(meeting.end_time, meeting.end_at, event.end_time, event.end_at));
+  const isEnd = lifecycleEnd || (isParticipantEvent && !!explicitEndedAt);
   if (!isStart && !isEnd && !isParticipantEvent) return null;
 
   const meetingUrl = firstText(meeting.url, meeting.meeting_url, meeting.join_url, meeting.share_url, event.meeting_url, event.join_url);
   const meetingNo = firstText(meeting.meeting_no, meeting.open_meeting_id, event.meeting_no, event.open_meeting_id, meetingNoFromUrl(meetingUrl));
   const feishuMeetingId = firstText(meeting.id, meeting.meeting_id, event.meeting_id, event.vc_meeting_id, event.open_meeting_id);
   const startedAt = iso(firstText(meeting.start_time, meeting.start_at, meeting.begin_time, event.start_time, event.start_at, event.begin_time)) || new Date(nowMs).toISOString();
-  const endedAt = isEnd
-    ? (iso(firstText(meeting.end_time, meeting.end_at, event.end_time, event.end_at)) || new Date(nowMs).toISOString())
-    : undefined;
+  const endedAt = isEnd ? (explicitEndedAt || new Date(nowMs).toISOString()) : undefined;
   const title = firstText(meeting.topic, meeting.title, meeting.name, event.topic, event.title)
     || (participant.name ? `飞书会议 · ${participant.name}` : '飞书即时会议');
   const ownerOpenId = openIdsFromUsers(meeting.owner, meeting.host_user)[0] || '';
