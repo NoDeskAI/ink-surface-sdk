@@ -7,7 +7,14 @@ import {
   chooseGoogleMeetRecord,
   fetchGoogleMeetingTranscript,
   googleMeetingLinesToSrt,
+  normalizeGoogleMeetRecording,
+  normalizeGoogleMeetSmartNote,
 } from './google-meet-records';
+
+const smartNotesFixture = JSON.parse(readFileSync(new URL('./fixtures/google-meet-smart-notes-list.json', import.meta.url), 'utf8'));
+const recordingsFixture = JSON.parse(readFileSync(new URL('./fixtures/google-meet-recordings-list.json', import.meta.url), 'utf8'));
+const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const oversizedSmartNoteText = `Gemini overview\n\n${'会议纪要'.repeat(12_000)}`;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -82,6 +89,8 @@ describe('google meet records', () => {
       }
       if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [] });
       if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse({ smartNotes: [] });
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
       throw new Error(`unexpected ${url.pathname}`);
     });
 
@@ -118,6 +127,17 @@ describe('google meet records', () => {
       if (url.pathname === '/v2/conferenceRecords/main/participants') {
         return jsonResponse({ participants: [{ name: 'conferenceRecords/main/participants/p1', signedinUser: { displayName: 'Ada' } }] });
       }
+      if (url.pathname === '/v2/conferenceRecords/main/smartNotes' && !url.searchParams.get('pageToken')) {
+        return jsonResponse({ ...smartNotesFixture, nextPageToken: 'smart-page-2' });
+      }
+      if (url.pathname === '/v2/conferenceRecords/main/smartNotes' && url.searchParams.get('pageToken') === 'smart-page-2') {
+        return jsonResponse({ smartNotes: [] });
+      }
+      if (url.pathname === '/v2/conferenceRecords/main/recordings') return jsonResponse(recordingsFixture);
+      if (url.pathname === '/drive/v3/files/gemini-note-file-1/export') {
+        expect(url.searchParams.get('mimeType')).toBe('text/plain');
+        return new Response(oversizedSmartNoteText);
+      }
       if (url.pathname.endsWith('/transcripts/tx1/entries') && !url.searchParams.get('pageToken')) {
         return jsonResponse({
           transcriptEntries: [{
@@ -148,6 +168,7 @@ describe('google meet records', () => {
     }, {
       nowMs: Date.parse('2026-07-15T02:02:00.000Z'),
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
     });
     expect(pending).toMatchObject({ status: 'pending', next_check_at: '2026-07-15T02:05:00.000Z' });
 
@@ -158,6 +179,7 @@ describe('google meet records', () => {
     }, {
       nowMs: Date.parse('2026-07-15T02:05:00.000Z'),
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
     });
 
     expect(result.status).toBe('ready');
@@ -167,10 +189,24 @@ describe('google meet records', () => {
     ]);
     expect(result.transcript?.srt).toContain('00:00:01,500 --> 00:00:03,000\nAda: First line');
     expect(result.transcript?.srt).toContain('00:00:04,000 --> 00:00:05,250\nAda: Second line');
+    expect(result.smart_note).toMatchObject({
+      export_uri: 'https://docs.google.com/document/d/gemini-note-file-1/edit',
+    });
+    expect(result.smart_note?.text).toMatch(/^Gemini overview/);
+    expect(Buffer.byteLength(result.smart_note?.text || '', 'utf8')).toBeLessThanOrEqual(100 * 1024);
+    expect(result.recordings).toEqual([{
+      export_uri: 'https://drive.google.com/file/d/meeting-recording-file-1/view',
+      state: 'FILE_GENERATED',
+    }]);
     const stored = JSON.parse(readFileSync(path, 'utf8'));
-    const job = Object.values(stored.meetings)[0] as { status: string; terminal: boolean; entries: unknown[] };
+    const job = Object.values(stored.meetings)[0] as { status: string; terminal: boolean; entries: unknown[]; smart_note: unknown; recordings: unknown[] };
     expect(job).toMatchObject({ status: 'ready', terminal: true });
     expect(job.entries).toHaveLength(2);
+    expect(job.smart_note).toMatchObject({
+      name: 'conferenceRecords/main/smartNotes/note-1',
+      document: 'documents/gemini-note-file-1',
+    });
+    expect(job.recordings).toEqual([expect.objectContaining({ drive_file: 'files/meeting-recording-file-1' })]);
   });
 
   it('advances the durable 2/5/15/30/60/120 minute ladder and terminates as not_generated', async () => {
@@ -185,6 +221,8 @@ describe('google meet records', () => {
       }] });
       if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: 'conferenceRecords/main/transcripts/tx1', state: 'STARTED' }] });
       if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse({ smartNotes: [] });
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
       throw new Error(`unexpected ${url.pathname}`);
     });
     const expectedNext = [2, 5, 15, 30, 60, 120];
@@ -232,6 +270,8 @@ describe('google meet records', () => {
         return jsonResponse({ transcripts: [{ name: 'conferenceRecords/late/transcripts/tx1', state: 'FILE_GENERATED' }] });
       }
       if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse({ smartNotes: [] });
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
       if (url.pathname.endsWith('/transcripts/tx1/entries')) {
         return jsonResponse({ transcriptEntries: [{
           name: 'conferenceRecords/late/transcripts/tx1/entries/e1',
@@ -279,6 +319,66 @@ describe('google meet records', () => {
     });
     const stored = JSON.parse(readFileSync(path, 'utf8'));
     expect(Object.values(stored.meetings)[0]).toMatchObject({ status: 'ready', terminal: true });
+  });
+
+  it('marks a smart note as scope-missing without blocking a ready transcript', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T01:00:00.000Z',
+      endTime: '2026-07-15T02:00:00.000Z',
+    };
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse(smartNotesFixture);
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      if (url.pathname === '/drive/v3/files/gemini-note-file-1/export') return new Response('Exported after reauthorization.');
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+
+    const result = await fetchGoogleMeetingTranscript('token-without-drive', { path }, {
+      meetingCode: 'abc-defg-hij',
+      scheduledAt: record.startTime,
+    }, {
+      nowMs: Date.parse('2026-07-15T02:05:00.000Z'),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: ['https://www.googleapis.com/auth/meetings.space.readonly'],
+    });
+
+    expect(result).toMatchObject({ status: 'ready', smart_note: { scope_missing: true } });
+    expect(fetchImpl.mock.calls.some(([url]) => String(url).includes('/drive/v3/files/'))).toBe(false);
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.values(stored.meetings)[0]).toMatchObject({ smart_note_scope_missing: true });
+
+    const afterReauthorization = await fetchGoogleMeetingTranscript('token-with-drive', { path }, {
+      meetingCode: 'abc-defg-hij',
+      scheduledAt: record.startTime,
+    }, {
+      nowMs: Date.parse('2026-07-15T02:05:01.000Z'),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    });
+    expect(afterReauthorization.smart_note).toMatchObject({ text: 'Exported after reauthorization.' });
+    const refreshed = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.values(refreshed.meetings)[0]).not.toHaveProperty('smart_note_scope_missing');
+  });
+
+  it('normalizes smartNotes and recordings from the locked API fixtures', () => {
+    expect(normalizeGoogleMeetSmartNote(smartNotesFixture.smartNotes[0])).toEqual({
+      name: 'conferenceRecords/main/smartNotes/note-1',
+      document: 'documents/gemini-note-file-1',
+      exportUri: 'https://docs.google.com/document/d/gemini-note-file-1/edit',
+    });
+    expect(normalizeGoogleMeetRecording(recordingsFixture.recordings[0])).toEqual({
+      name: 'conferenceRecords/main/recordings/recording-1',
+      state: 'FILE_GENERATED',
+      drive_file: 'files/meeting-recording-file-1',
+      export_uri: 'https://drive.google.com/file/d/meeting-recording-file-1/view',
+    });
   });
 
   it('converts absolute transcript times to relative SRT times', () => {

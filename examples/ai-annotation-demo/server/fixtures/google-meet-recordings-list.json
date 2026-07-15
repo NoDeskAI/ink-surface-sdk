@@ -1,0 +1,12 @@
+{
+  "recordings": [
+    {
+      "name": "conferenceRecords/main/recordings/recording-1",
+      "state": "FILE_GENERATED",
+      "driveDestination": {
+        "file": "files/meeting-recording-file-1",
+        "exportUri": "https://drive.google.com/file/d/meeting-recording-file-1/view"
+      }
+    }
+  ]
+}

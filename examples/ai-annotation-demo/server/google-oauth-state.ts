@@ -11,6 +11,7 @@ const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
 export const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/calendar.events.readonly',
   'https://www.googleapis.com/auth/meetings.space.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
 ] as const;
 
 export interface GoogleOAuthEnv {

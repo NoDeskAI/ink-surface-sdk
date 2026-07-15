@@ -332,6 +332,24 @@ export async function loadGoogleTranscript(m: PersistedMeeting): Promise<LoadedT
     if (m.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
     if (result.record?.name && result.record.name !== m.provider_meeting_id) patch.provider_meeting_id = result.record.name;
     if (result.transcript?.name && result.transcript.name !== m.provider_transcript_ref) patch.provider_transcript_ref = result.transcript.name;
+    const fetchedAt = new Date().toISOString();
+    const smartNoteText = result.smart_note?.text?.trim();
+    if (smartNoteText) {
+      patch.google_smart_note = {
+        text: smartNoteText,
+        ...(result.smart_note?.export_uri ? { export_uri: result.smart_note.export_uri } : {}),
+        fetched_at: fetchedAt,
+      };
+    }
+    const scopeMissing = result.smart_note?.scope_missing === true;
+    if (!!m.google_smart_note_scope_missing !== scopeMissing) patch.google_smart_note_scope_missing = scopeMissing;
+    if (result.recordings?.length) {
+      const recordings = result.recordings.filter((recording) => recording.export_uri?.trim()).map((recording) => ({
+        export_uri: recording.export_uri.trim(),
+        state: recording.state || 'STATE_UNSPECIFIED',
+      }));
+      if (recordings.length) patch.google_recordings = recordings;
+    }
     const startMs = feishuEpochMs(result.record?.start_time);
     const endMs = feishuEpochMs(result.record?.end_time);
     if (startMs > 0) {
@@ -644,7 +662,10 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
     offsetMs: finiteMs(m.align_offset_ms),
   });
   // 转写与手写都空 → 无可展示；但**转写未就绪而有手写时仍要把手写档案露出来**（否则用户的手写被整页静默隐藏）。
-  if (!cues.length && !timeline.segmentMarks.length && !hasPanelMeeting) {
+  const hasGoogleArtifacts = !!m.google_smart_note?.text
+    || !!m.google_smart_note_scope_missing
+    || !!m.google_recordings?.length;
+  if (!cues.length && !timeline.segmentMarks.length && !hasPanelMeeting && !hasGoogleArtifacts) {
     const status = m.provider_transcript_status;
     const message = status === 'not_generated'
       ? 'Google Meet 已结束，但未生成转写。本场也没有手写档案。'
@@ -935,8 +956,21 @@ function wireFeishuSummaryImages(bodyEl: HTMLElement): void {
 function renderRecapFeishuPage(bodyEl: HTMLElement): void {
   if (!recapState) return;
   if (meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript') {
+    const smartNote = recapState.meeting.google_smart_note;
+    if (smartNote?.text.trim()) {
+      const paragraphs = smartNote.text.trim().split(/\n\s*\n+/).filter(Boolean)
+        .map((paragraph) => `<p class="rc-rich-p">${esc(paragraph).replaceAll('\n', '<br>')}</p>`).join('');
+      bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>Gemini 智能纪要</b><span class="mdl">Google Meet 原文</span></div>`
+        + `<div class="rc-rich">${paragraphs}</div>`
+        + (smartNote.export_uri ? `<a class="rc-smart-note-link" href="${esc(smartNote.export_uri)}" target="_blank" rel="noopener">在 Google Docs 查看</a>` : '')
+        + `</div>`;
+      return;
+    }
+    const message = recapState.meeting.google_smart_note_scope_missing
+      ? '需要重新授权 Google（新增 Drive 读取权限），授权后重新进入本页即可同步 Gemini 智能纪要。'
+      : 'Google 智能纪要（Gemini）尚未接入；接入后这里会显示官方纪要原文。原始发言和 InkLoop 后处理不受影响。';
     bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>智能纪要</b><span class="mdl">Google Meet</span></div>`
-      + `<div class="empty">Google 智能纪要（Gemini）尚未接入；接入后这里会显示官方纪要原文。原始发言和 InkLoop 后处理不受影响。</div></div>`;
+      + `<div class="empty">${esc(message)}</div></div>`;
     return;
   }
   const rec = recapState.feishuSummary ?? recapState.meeting.feishu_note_summary ?? null;
@@ -1125,6 +1159,7 @@ export async function ensureGooglePanelSummary(m: PersistedMeeting, cues: Transc
     const response = await generateGoogleMeetingSummary({
       title: m.title || '(未命名会议)',
       transcript: capped.lines.join('\n'),
+      ...(m.google_smart_note?.text ? { smart_note: m.google_smart_note.text } : {}),
       model: settings.inferModel,
     });
     const summary: PanelMeetingSummaryRecord = {
@@ -1383,6 +1418,30 @@ function overviewCardHtml(opts: { action: string; title: string; meta: string; b
     + `</button>`;
 }
 
+export function googleSmartNoteCardState(meeting: Pick<PersistedMeeting, 'google_smart_note' | 'google_smart_note_scope_missing'>): {
+  meta: string; body: string; disabled: boolean;
+} {
+  if (meeting.google_smart_note?.text.trim()) {
+    return { meta: '已同步', body: '查看 Gemini 官方智能纪要纯文本。', disabled: false };
+  }
+  if (meeting.google_smart_note_scope_missing) {
+    return { meta: '需要授权', body: '需要重新授权 Google（新增 Drive 读取权限）', disabled: true };
+  }
+  return { meta: '未接入', body: 'Google 智能纪要（Gemini）接入后会显示在这里。', disabled: true };
+}
+
+export function googleRecordingLinks(meeting: Pick<PersistedMeeting, 'google_recordings'>): Array<{ export_uri: string; state: string }> {
+  return (meeting.google_recordings || []).filter((recording) => !!recording.export_uri?.trim());
+}
+
+export function renderGoogleRecordingsHtml(meeting: Pick<PersistedMeeting, 'google_recordings'>): string {
+  const recordings = googleRecordingLinks(meeting);
+  if (!recordings.length) return '';
+  return `<div class="rc-recordings"><span>会议录像</span>`
+    + recordings.map((recording, index) => `<a href="${esc(recording.export_uri)}" target="_blank" rel="noopener">${recordings.length > 1 ? `录像 ${index + 1} · ` : ''}在 Google Drive 查看</a>`).join('')
+    + `</div>`;
+}
+
 /** 概览：会后第一屏。只放核心状态和入口；长转写进入「原始发言」详情页。 */
 function renderRecapOverview(bodyEl: HTMLElement): void {
   if (!recapState) return;
@@ -1395,6 +1454,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     ? ` · 来自${recapState.markSourceMeeting.feishu_topic || recapState.markSourceMeeting.title || '相近会议'}`
     : '';
   const google = meetingTranscriptSource(meeting) === 'google_meet_transcript';
+  const smartNoteCard = googleSmartNoteCardState(meeting);
   const feishuReady = !!(recapState.feishuSummary?.content || meeting.feishu_note_summary?.content);
   const conclusions = overviewConclusionItems();
   const conclusionHtml = conclusions.length
@@ -1410,12 +1470,13 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     + `<section class="rc-over-hero">`
     + `<div><span class="rc-kicker">会后概览</span><h2>${esc(title)}</h2><p>${esc(fmtClock(meetingT0(meeting)) || fmtClock(Date.parse(meeting.scheduled_at)) || '时间未知')} · ${esc(meetingDurationLabel(meeting, cues))} · ${esc(google && meeting.align_state === 'event' ? '场次真实时间对齐' : (meeting.align_state ? ALIGN_LABEL[meeting.align_state] : '约对齐'))}</p></div>`
     + `<div class="rc-metrics"><span><b>${cues.length || '-'}</b>句</span><span><b>${speakerCount || '-'}</b>人</span><span><b>${inkCount}</b>手写</span></div>`
+    + (google ? renderGoogleRecordingsHtml(meeting) : '')
     + `</section>`
     + `<section class="rc-over-focus"><div class="rc-sec-title"><b>会议要点</b><span>${esc(panelSummaryLabel())}</span></div><div class="rc-over-list">${conclusionHtml}</div></section>`
     + `<section class="rc-entry-grid">`
     + overviewCardHtml({ action: 'transcript', title: '原始发言', meta: rawMeta, body: rawBody, disabled: !cues.length })
     + (google
-      ? overviewCardHtml({ action: 'feishu', title: '智能纪要', meta: '未接入', body: 'Google 智能纪要（Gemini）接入后会显示在这里。', disabled: true })
+      ? overviewCardHtml({ action: 'feishu', title: '智能纪要', ...smartNoteCard })
       : overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : '等待生成', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : '飞书官方智能纪要还没有同步。', disabled: !feishuReady }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: inkCount ? `${inkCount} 处${markSource}` : '0 处', body: inkBody, disabled: inkPages.length === 0 })
     + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。' })

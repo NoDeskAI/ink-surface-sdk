@@ -20,7 +20,12 @@ vi.mock('../integration/google-meet/client', async (importOriginal) => ({
   getGoogleMeetingTranscript: mocks.getGoogleMeetingTranscript,
 }));
 
-import { ensureGooglePanelSummary, loadGoogleTranscript } from './meeting-recap';
+import {
+  ensureGooglePanelSummary,
+  googleSmartNoteCardState,
+  loadGoogleTranscript,
+  renderGoogleRecordingsHtml,
+} from './meeting-recap';
 
 function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting {
   return {
@@ -75,7 +80,12 @@ describe('meeting recap Google transcript branch', () => {
       text: `长转写片段 ${index} ${'内容'.repeat(50)}`,
       rawText: `Grace: 长转写片段 ${index}`,
     }))];
-    const summary = await ensureGooglePanelSummary(googleMeeting(), cues);
+    const summary = await ensureGooglePanelSummary(googleMeeting({
+      google_smart_note: {
+        text: 'Gemini notes say the recovery path should ship first.',
+        fetched_at: '2026-07-15T02:10:00.000Z',
+      },
+    }), cues);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/google/meeting-summary');
@@ -83,6 +93,7 @@ describe('meeting recap Google transcript branch', () => {
     expect(request.transcript).toContain('[0:01]Ada：确认先发布会议恢复能力');
     expect(request.transcript).toContain('转写在此截断');
     expect(request.transcript.length).toBeLessThan(16_200);
+    expect(request.smart_note).toBe('Gemini notes say the recovery path should ship first.');
     expect(summary).toMatchObject({
       minute_token: 'google_meet:local-google-1',
       meeting_id: 'abc-defg-hij',
@@ -131,6 +142,11 @@ describe('meeting recap Google transcript branch', () => {
         lines: [],
         srt: '1\n00:00:01,000 --> 00:00:02,000\nAda: Hello',
       },
+      smart_note: {
+        text: 'Gemini overview\n\nDecision: ship recovery first.',
+        export_uri: 'https://docs.google.com/document/d/note-1/edit',
+      },
+      recordings: [{ export_uri: 'https://drive.google.com/file/d/video-1/view', state: 'FILE_GENERATED' }],
     });
     const meeting = googleMeeting();
 
@@ -147,6 +163,11 @@ describe('meeting recap Google transcript branch', () => {
       align_state: 'event',
       started_at: '2026-07-15T01:02:03.000Z',
       ended_at: '2026-07-15T02:04:05.000Z',
+      google_smart_note: expect.objectContaining({
+        text: 'Gemini overview\n\nDecision: ship recovery first.',
+        export_uri: 'https://docs.google.com/document/d/note-1/edit',
+      }),
+      google_recordings: [{ export_uri: 'https://drive.google.com/file/d/video-1/view', state: 'FILE_GENERATED' }],
     }));
     const patch = mocks.updateMeeting.mock.calls[0][1] as Record<string, unknown>;
     expect(Object.values(patch)).not.toContain(undefined);
@@ -171,5 +192,40 @@ describe('meeting recap Google transcript branch', () => {
     expect(loaded).toMatchObject({ sourceToken: 'google_meet:local-google-1', cues: [{ speaker: 'Grace', text: 'Cached line' }] });
     expect(mocks.updateMeeting).toHaveBeenCalledWith('local-google-1', { provider_transcript_status: 'pending' });
     expect(mocks.putCachedMinute).not.toHaveBeenCalled();
+  });
+
+  it('persists the Drive scope-missing state without requiring a transcript body', async () => {
+    mocks.getGoogleMeetingTranscript.mockResolvedValue({
+      status: 'pending',
+      smart_note: {
+        export_uri: 'https://docs.google.com/document/d/note-1/edit',
+        scope_missing: true,
+      },
+    });
+    const meeting = googleMeeting();
+
+    await loadGoogleTranscript(meeting);
+
+    expect(mocks.updateMeeting).toHaveBeenCalledWith(meeting.meeting_id, expect.objectContaining({
+      provider_transcript_status: 'pending',
+      google_smart_note_scope_missing: true,
+    }));
+    expect(meeting.google_smart_note).toBeUndefined();
+  });
+
+  it('models all smart-note card states and renders no recording markup for an empty list', () => {
+    expect(googleSmartNoteCardState(googleMeeting({
+      google_smart_note: { text: 'Synced', fetched_at: '2026-07-15T02:00:00.000Z' },
+    }))).toEqual(expect.objectContaining({ meta: '已同步', disabled: false }));
+    expect(googleSmartNoteCardState(googleMeeting({ google_smart_note_scope_missing: true }))).toEqual({
+      meta: '需要授权',
+      body: '需要重新授权 Google（新增 Drive 读取权限）',
+      disabled: true,
+    });
+    expect(googleSmartNoteCardState(googleMeeting())).toEqual(expect.objectContaining({ meta: '未接入', disabled: true }));
+    expect(renderGoogleRecordingsHtml(googleMeeting())).toBe('');
+    expect(renderGoogleRecordingsHtml(googleMeeting({
+      google_recordings: [{ export_uri: 'https://drive.google.com/file/d/video-1/view', state: 'FILE_GENERATED' }],
+    }))).toContain('target="_blank" rel="noopener">在 Google Drive 查看</a>');
   });
 });

@@ -1,0 +1,11 @@
+{
+  "smartNotes": [
+    {
+      "name": "conferenceRecords/main/smartNotes/note-1",
+      "docsDestination": {
+        "document": "documents/gemini-note-file-1",
+        "exportUri": "https://docs.google.com/document/d/gemini-note-file-1/edit"
+      }
+    }
+  ]
+}

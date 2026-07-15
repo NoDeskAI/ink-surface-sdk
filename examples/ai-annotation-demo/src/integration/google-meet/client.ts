@@ -89,6 +89,8 @@ export interface GoogleMeetingTranscriptResponse {
   status: 'ready' | 'pending' | 'not_generated' | 'no_record';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: { name: string; lines: GoogleMeetingTranscriptLine[]; srt: string };
+  smart_note?: { title?: string; text?: string; export_uri?: string; scope_missing?: boolean };
+  recordings?: Array<{ export_uri: string; state: string }>;
   participants?: Array<Record<string, unknown>>;
   next_check_at?: string;
 }
@@ -128,7 +130,7 @@ export function getGoogleMeetingTranscript(
 
 /** 本仓库 Cloud Hub 直接消费已缓存的 Google 转写；不经过只认识飞书妙记的 panel-workplace。 */
 export function generateGoogleMeetingSummary(
-  input: { title: string; transcript: string; model?: string },
+  input: { title: string; transcript: string; smart_note?: string; model?: string },
   opts?: { signal?: AbortSignal },
 ): Promise<GoogleMeetingSummaryResponse> {
   return postJson<GoogleMeetingSummaryResponse>(`${BASE}/meeting-summary`, input, { ...opts, auth: true });

@@ -4,7 +4,10 @@ import { normalizeGoogleMeetTranscriptEntries } from '../vendor/meeting-timeline
 import { normalizeAbsoluteMs } from '../vendor/meeting-timeline-sdk/time.mjs';
 
 const GOOGLE_MEET_BASE = 'https://meet.googleapis.com/v2';
+const GOOGLE_DRIVE_BASE = 'https://www.googleapis.com/drive/v3';
+const GOOGLE_DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 const MAX_ATTEMPTS = 3;
+const SMART_NOTE_TEXT_MAX_BYTES = 100 * 1024;
 export const GOOGLE_MEET_POLL_MINUTES = [2, 5, 15, 30, 60, 120] as const;
 
 export interface GoogleMeetRecordsRef {
@@ -25,6 +28,31 @@ export interface GoogleMeetTranscript {
   startTime?: string;
   endTime?: string;
   docsDestination?: { document?: string; exportUri?: string };
+}
+
+export interface GoogleMeetSmartNote {
+  name: string;
+  docsDestination?: { document?: string; exportUri?: string };
+}
+
+export interface GoogleMeetRecording {
+  name: string;
+  state?: string;
+  driveDestination?: { file?: string; exportUri?: string };
+}
+
+export interface GoogleMeetSmartNoteArtifact {
+  name: string;
+  exportUri?: string;
+  document?: string;
+  text?: string;
+}
+
+export interface GoogleMeetRecordingArtifact {
+  name: string;
+  state?: string;
+  drive_file?: string;
+  export_uri?: string;
 }
 
 export interface GoogleMeetParticipant {
@@ -75,6 +103,10 @@ export interface GoogleMeetJobState {
   transcript_state?: string;
   entries?: GoogleMeetTranscriptEntry[];
   participants?: GoogleMeetParticipant[];
+  smart_note?: GoogleMeetSmartNoteArtifact;
+  smart_note_scope_missing?: boolean;
+  recordings?: GoogleMeetRecordingArtifact[];
+  artifacts_fetched_at?: string;
   status: 'pending' | 'ready' | 'not_generated' | 'no_record';
   next_check_at?: string;
   attempt: number;
@@ -93,12 +125,15 @@ export interface GoogleMeetRecordsOptions {
   refreshAccessToken?: () => Promise<string>;
   sleepImpl?: (delayMs: number) => Promise<void>;
   nowMs?: number;
+  grantedScopes?: readonly string[];
 }
 
 export interface GoogleMeetingTranscriptResult {
   status: 'ready' | 'pending' | 'not_generated' | 'no_record';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: { name: string; lines: GoogleMeetTranscriptLine[]; srt: string };
+  smart_note?: { title?: string; text?: string; export_uri?: string; scope_missing?: boolean };
+  recordings?: Array<{ export_uri: string; state: string }>;
   participants?: GoogleMeetParticipant[];
   next_check_at?: string;
 }
@@ -168,11 +203,11 @@ interface RequestOptions {
   refreshAccessToken?: () => Promise<string>;
 }
 
-async function fetchJson(
+async function fetchResponse(
   url: string,
   auth: { token: string; refreshed: boolean },
   options: RequestOptions,
-): Promise<Record<string, unknown>> {
+): Promise<Response> {
   let attempt = 0;
   while (attempt < MAX_ATTEMPTS) {
     attempt += 1;
@@ -183,7 +218,7 @@ async function fetchJson(
       attempt -= 1;
       continue;
     }
-    if (response.ok) return readJson(response);
+    if (response.ok) return response;
     const body = await readJson(response);
     if (retryable(response.status) && attempt < MAX_ATTEMPTS) {
       await options.sleepImpl(250 * (2 ** (attempt - 1)));
@@ -200,10 +235,48 @@ async function fetchJson(
   throw new GoogleMeetRecordsError('google_meet_retry_exhausted', 502);
 }
 
+async function fetchJson(
+  url: string,
+  auth: { token: string; refreshed: boolean },
+  options: RequestOptions,
+): Promise<Record<string, unknown>> {
+  return readJson(await fetchResponse(url, auth, options));
+}
+
+async function fetchText(
+  url: string,
+  auth: { token: string; refreshed: boolean },
+  options: RequestOptions,
+): Promise<string> {
+  return (await fetchResponse(url, auth, options)).text();
+}
+
 function meetUrl(resource: string, query: Record<string, string> = {}): string {
   const url = new URL(`${GOOGLE_MEET_BASE}/${resource.replace(/^\/+/, '')}`);
   for (const [key, value] of Object.entries(query)) if (value) url.searchParams.set(key, value);
   return url.toString();
+}
+
+function driveExportUrl(document: string): string | null {
+  const raw = document.trim();
+  if (!raw) return null;
+  let id = raw;
+  try {
+    const url = new URL(raw);
+    const match = url.pathname.match(/\/(?:d|documents)\/([^/]+)/);
+    id = match?.[1] || url.pathname.split('/').filter(Boolean).at(-1) || '';
+  } catch {
+    id = raw.replace(/^documents\//, '').split('/').filter(Boolean).at(-1) || '';
+  }
+  if (!id) return null;
+  const url = new URL(`${GOOGLE_DRIVE_BASE}/files/${encodeURIComponent(id)}/export`);
+  url.searchParams.set('mimeType', 'text/plain');
+  return url.toString();
+}
+
+function capUtf8(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, 'utf8');
+  return bytes.length <= maxBytes ? text : bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/, '');
 }
 
 async function listAll<T>(input: {
@@ -298,6 +371,69 @@ function chooseTranscript(transcripts: GoogleMeetTranscript[]): GoogleMeetTransc
   return ranked[0];
 }
 
+export function normalizeGoogleMeetSmartNote(note: GoogleMeetSmartNote): GoogleMeetSmartNoteArtifact | null {
+  const name = String(note?.name || '').trim();
+  if (!name) return null;
+  const exportUri = String(note.docsDestination?.exportUri || '').trim();
+  const document = String(note.docsDestination?.document || '').trim();
+  return { name, ...(exportUri ? { exportUri } : {}), ...(document ? { document } : {}) };
+}
+
+export function normalizeGoogleMeetRecording(recording: GoogleMeetRecording): GoogleMeetRecordingArtifact | null {
+  const name = String(recording?.name || '').trim();
+  if (!name) return null;
+  const state = String(recording.state || '').trim();
+  const driveFile = String(recording.driveDestination?.file || '').trim();
+  const exportUri = String(recording.driveDestination?.exportUri || '').trim();
+  return {
+    name,
+    ...(state ? { state } : {}),
+    ...(driveFile ? { drive_file: driveFile } : {}),
+    ...(exportUri ? { export_uri: exportUri } : {}),
+  };
+}
+
+async function fetchChosenArtifacts(
+  recordName: string,
+  auth: { token: string; refreshed: boolean },
+  options: RequestOptions,
+  grantedScopes: readonly string[],
+): Promise<Pick<GoogleMeetJobState, 'smart_note' | 'smart_note_scope_missing' | 'recordings'>> {
+  const smartNotes = await listAll<GoogleMeetSmartNote>({
+    resource: `${recordName}/smartNotes`,
+    collection: 'smartNotes',
+    auth,
+    options,
+  });
+  const recordings = await listAll<GoogleMeetRecording>({
+    resource: `${recordName}/recordings`,
+    collection: 'recordings',
+    auth,
+    options,
+  });
+  const smartNote = smartNotes
+    .map(normalizeGoogleMeetSmartNote)
+    .filter((note): note is GoogleMeetSmartNoteArtifact => !!note)
+    .sort((left, right) => left.name.localeCompare(right.name))[0];
+  const normalizedRecordings = recordings
+    .map(normalizeGoogleMeetRecording)
+    .filter((recording): recording is GoogleMeetRecordingArtifact => !!recording);
+  let scopeMissing = false;
+  if (smartNote?.document) {
+    if (!grantedScopes.includes(GOOGLE_DRIVE_READONLY_SCOPE)) {
+      scopeMissing = true;
+    } else {
+      const exportUrl = driveExportUrl(smartNote.document);
+      if (exportUrl) smartNote.text = capUtf8(await fetchText(exportUrl, auth, options), SMART_NOTE_TEXT_MAX_BYTES);
+    }
+  }
+  return {
+    ...(smartNote ? { smart_note: smartNote } : {}),
+    ...(scopeMissing ? { smart_note_scope_missing: true } : {}),
+    ...(normalizedRecordings.length ? { recordings: normalizedRecordings } : {}),
+  };
+}
+
 function recordCandidatesByName(candidates: StoredRecordCandidate[]): Map<string, StoredRecordCandidate> {
   return new Map(candidates.map((candidate) => [candidate.record.name, candidate]));
 }
@@ -371,6 +507,16 @@ function responseFromJob(job: GoogleMeetJobState): GoogleMeetingTranscriptResult
     ...(record ? { record: { name: record.name, ...(record.startTime ? { start_time: record.startTime } : {}), ...(record.endTime ? { end_time: record.endTime } : {}) } } : {}),
     ...(job.participants?.length ? { participants: job.participants } : {}),
     ...(job.next_check_at && !job.terminal ? { next_check_at: job.next_check_at } : {}),
+    ...(job.smart_note ? { smart_note: {
+      ...(job.smart_note.text ? { text: job.smart_note.text } : {}),
+      ...(job.smart_note.exportUri ? { export_uri: job.smart_note.exportUri } : {}),
+      ...(job.smart_note_scope_missing ? { scope_missing: true } : {}),
+    } } : {}),
+    ...(job.recordings?.some((recording) => recording.export_uri) ? {
+      recordings: job.recordings.flatMap((recording) => recording.export_uri
+        ? [{ export_uri: recording.export_uri, state: recording.state || 'STATE_UNSPECIFIED' }]
+        : []),
+    } : {}),
   };
   if (job.status === 'ready' && record?.startTime && job.transcript_name && job.entries) {
     const lines = normalizeGoogleMeetingLines(job.entries, job.participants);
@@ -455,7 +601,10 @@ async function runCatchUp(
   const terminalRetryDue = !!current?.terminal
     && current.status !== 'ready'
     && (!Number.isFinite(currentUpdatedMs) || nowMs - currentUpdatedMs >= 10 * 60_000);
-  if ((current?.terminal && !terminalRetryDue) || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
+  const driveScopeAdded = !!current?.smart_note_scope_missing && (options.grantedScopes || []).includes(GOOGLE_DRIVE_READONLY_SCOPE);
+  const artifactBackfillDue = current?.status === 'ready' && !current.artifacts_fetched_at;
+  if ((current?.terminal && !terminalRetryDue && !driveScopeAdded && !artifactBackfillDue)
+    || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
     return responseFromJob(current);
   }
 
@@ -493,6 +642,17 @@ async function runCatchUp(
     terminal: false,
     updated_at: new Date(nowMs).toISOString(),
   };
+
+  if (chosenRecord) {
+    const artifacts = await fetchChosenArtifacts(
+      chosenRecord.name,
+      auth,
+      requestOptions,
+      options.grantedScopes || [],
+    );
+    Object.assign(updated, artifacts);
+    updated.artifacts_fetched_at = new Date(nowMs).toISOString();
+  }
 
   if (chosenRecord && transcript?.name && transcriptReady(transcript)) {
     const entries = await listAll<GoogleMeetTranscriptEntry>({

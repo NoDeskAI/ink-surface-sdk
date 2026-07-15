@@ -434,10 +434,11 @@ export async function runReadingNotePostprocess(payload: any): Promise<{ title: 
 export async function runMeetingPanelSummary(payload: any): Promise<{ summary: MeetingPanelSummary; model: string }> {
   const title = String(payload?.title || '').trim().slice(0, 300) || '(未命名会议)';
   const transcript = String(payload?.transcript || '').trim();
+  const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
   if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
   const model = String(payload?.model || cfg().model);
-  const user = JSON.stringify({ meeting_title: title, transcript });
+  const user = JSON.stringify({ meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
   const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');

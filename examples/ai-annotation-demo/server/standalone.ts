@@ -1086,6 +1086,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
         scheduledAt,
         attendance: mtlAttendanceWindows(mtlReceiverIdentity(session), meetingCode),
       }, {
+        grantedScopes: resolved.scopes,
         refreshAccessToken: async () => {
           const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
           if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
