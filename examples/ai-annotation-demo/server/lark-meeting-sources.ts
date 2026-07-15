@@ -738,7 +738,12 @@ export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions
 
   const userOAuth = await resolveUserOAuthToken(env, nowMs, { createClient: options.createClient });
   const userOpenIds = uniqueText([...(options.userOpenIds || []), ...userOAuth.userOpenIds]);
+  // 与 realtime store 同一过滤契约：调用方传数组=要求按身份过滤；数组为空（请求者无飞书身份）时
+  // bot 日历/bot 群聊/VC 搜索三路全部跳过——否则无身份反而看到全 tenant 会议（泄漏）。
+  // undefined=demo/内部调用不过滤，维持原全量行为。判定只看调用方数组，不混入本机 OAuth state 的杂散身份。
+  const identityRequiredButMissing = Array.isArray(options.userOpenIds) && options.userOpenIds.length === 0;
 
+  if (!identityRequiredButMissing) {
   try {
     const cal = await fetchFeishuBotCalendarEvents({ nowMs, lookbackSeconds, lookaheadSeconds, pageSize, env });
     if (cal.error) errors.push({ source: 'bot_calendar', code: cal.error.code, message: cal.error.message, permission_url: cal.error.permission_url, required_scope: cal.error.required_scopes?.join(',') });
@@ -764,6 +769,7 @@ export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions
     }
   } catch (e) {
     errors.push({ source: 'bot_im', code: 'chat_scan_failed', message: String((e as Error)?.message || e) });
+  }
   }
 
   const client = (options.createClient || createLarkClient)({
@@ -795,7 +801,7 @@ export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions
       required_scope: USER_CALENDAR_SCOPES.join(','),
       permission_url: permissionUrl(config.appId, USER_CALENDAR_SCOPES),
     });
-  } else if (userOAuth.token) {
+  } else if (userOAuth.token && !identityRequiredButMissing) {
     try {
       const userCalendar = await fetchUserCalendarSources({ config, token: userOAuth.token, nowMs, lookbackSeconds, lookaheadSeconds, pageSize });
       sources.push(...userCalendar.sources);
@@ -808,7 +814,7 @@ export async function fetchLarkMeetingSources(options: LarkMeetingSourcesOptions
   // (list_by_no_cooldown)，且周期会所有实例共享短号、批量用大窗无法区分实例。改为打开某场会议时
   // 用该场 scheduled_at 的 ±6h 窗按需单场解析（见 resolveLarkMeetingInstance / 前端 resolveMeetingInstance）。
   try {
-    if (client.searchMeetings || (userOAuth.token && client.searchMeetingsWithToken)) {
+    if (!identityRequiredButMissing && (client.searchMeetings || (userOAuth.token && client.searchMeetingsWithToken))) {
       const vcSearchPageSize = Math.min(pageSize, 10);
       const baseOpts = { start_time: startSeconds, end_time: endSeconds, page_size: vcSearchPageSize };
       const opts = userOAuth.token && userOpenIds.length

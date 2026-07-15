@@ -144,11 +144,11 @@ function inkloopAuthProxy(env: Record<string, string>): Plugin {
       for (const k of ['PANEL_AUTH_BASE', 'PANEL_FEISHU_BASE', 'INKLOOP_SHARED_SECRET']) {
         if (env[k] && !process.env[k]) process.env[k] = env[k];
       }
-      const BASE = (process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+      const BASE = (process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
       const SECRET = process.env.INKLOOP_SHARED_SECRET || '';
       server.middlewares.use('/api/inkloop/auth', (req, res) => {
         const send = (code: number, obj: unknown) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
-        if (!BASE || !SECRET) return send(503, { error: 'PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置' });
+        if (!BASE || !SECRET) return send(503, { error: 'PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置' });
         const method = req.method || 'GET';
         const apath = (req.url || '/').split('?')[0];
         const create = method === 'POST' && apath === '/device-authorizations';
@@ -522,7 +522,7 @@ function parseFeishuDocxTicketTargetDev(raw: string): { token: string; action: s
 }
 
 async function issueDownloadTicketDev(sessionToken: string, target: { token: string; action: string }): Promise<string> {
-  const base = (process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+  const base = (process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
   const token = process.env.INTERNAL_SERVICE_TOKEN || '';
   if (!base || !token) throw Object.assign(new Error('PANEL_AUTH_BASE / INTERNAL_SERVICE_TOKEN 未配置'), { status: 503 });
   const r = await fetch(`${base}/api/internal/inkloop/download-tickets`, {
@@ -578,7 +578,7 @@ function convertServiceProxy(env: Record<string, string>): Plugin {
 }
 
 function runtimeSyncDevServer(env: Record<string, string>): Plugin {
-  const authBase = (env.PANEL_AUTH_BASE || env.PANEL_FEISHU_BASE || process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+  const authBase = (env.PANEL_AUTH_BASE || process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
   const sharedSecret = env.INKLOOP_SHARED_SECRET || process.env.INKLOOP_SHARED_SECRET || '';
   const canResolveSession = !!authBase && !!sharedSecret;
   const requireSessionFlag = env.INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION || process.env.INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION || (canResolveSession ? '1' : '0');
@@ -624,7 +624,7 @@ function runtimeSyncDevServer(env: Record<string, string>): Plugin {
 }
 
 function cloudLibraryDevServer(env: Record<string, string>): Plugin {
-  const authBase = (env.PANEL_AUTH_BASE || env.PANEL_FEISHU_BASE || process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+  const authBase = (env.PANEL_AUTH_BASE || process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
   const sharedSecret = env.INKLOOP_SHARED_SECRET || process.env.INKLOOP_SHARED_SECRET || '';
   const canResolveSession = !!authBase && !!sharedSecret;
   const handleCloudLibrary = createCloudLibraryHandler({
@@ -655,7 +655,7 @@ function cloudLibraryDevServer(env: Record<string, string>): Plugin {
 }
 
 function cloudKnowledgeDevServer(env: Record<string, string>): Plugin {
-  const authBase = (env.PANEL_AUTH_BASE || env.PANEL_FEISHU_BASE || process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+  const authBase = (env.PANEL_AUTH_BASE || process.env.PANEL_AUTH_BASE || '').replace(/\/+$/, '');
   const sharedSecret = env.INKLOOP_SHARED_SECRET || process.env.INKLOOP_SHARED_SECRET || '';
   const canResolveSession = !!authBase && !!sharedSecret;
   const handleCloudKnowledge = createCloudKnowledgeHandler({

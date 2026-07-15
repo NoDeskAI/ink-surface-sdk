@@ -1353,7 +1353,8 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         lookbackSeconds,
         lookaheadSeconds,
         pageSize: Number(u.searchParams.get('page_size') || '') || undefined,
-        userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
+        // 与 extraSources 同契约：无飞书身份=[]（bot 日历/群聊/VC 搜索全跳过），不再 undefined 走全量
+        userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : [],
         // 三态过滤：有飞书身份=按身份过滤；无身份=[]（什么都不给·否则反而看到全量=泄漏）
         extraSources: larkRealtimeMeetingSources(ROOT, {
           lookbackSeconds,
