@@ -66,6 +66,21 @@ function firstText(...values: unknown[]): string {
   return '';
 }
 
+function openIdFromUser(value: unknown): string {
+  const user = obj(value);
+  const nestedId = obj(user.id);
+  const explicitOpenId = firstText(nestedId.open_id, user.open_id);
+  if (explicitOpenId) return explicitOpenId;
+  // VC UserInfo may be { id, user_type }; only an ou_ id is safe to treat as open_id.
+  const scalarId = text(user.id);
+  return scalarId.startsWith('ou_') ? scalarId : '';
+}
+
+function openIdsFromUsers(...values: unknown[]): string[] {
+  const candidates = values.flatMap((value) => Array.isArray(value) ? value : [value]);
+  return [...new Set(candidates.map(openIdFromUser).filter(Boolean))];
+}
+
 function parseMs(value: unknown): number {
   if (value == null || value === '') return 0;
   const n = Number(value);
@@ -131,14 +146,15 @@ function meetingNoFromUrl(value: string): string {
   return value.match(/https:\/\/(?:vc|meeting)\.feishu\.cn\/j\/(\d+)/)?.[1] || '';
 }
 
-function meetingInputFromEvent(payload: unknown, eventType: string, nowMs: number): Parameters<typeof upsertLarkRealtimeMeeting>[1] | null {
+export function meetingInputFromEvent(payload: unknown, eventType: string, nowMs: number): Parameters<typeof upsertLarkRealtimeMeeting>[1] | null {
   const meeting = meetingFromEvent(payload);
   const event = eventPayload(payload);
   const participant = eventParticipant(payload);
   const eventId = eventIdFromPayload(payload);
-  const isEnd = /(_ended|meeting_ended|leave_meeting)/i.test(eventType);
-  const isStart = /(_started|meeting_started|join_meeting)/i.test(eventType);
-  if (!isStart && !isEnd) return null;
+  const isParticipantEvent = /(join_meeting|leave_meeting)/i.test(eventType);
+  const isEnd = !isParticipantEvent && /(_ended|meeting_ended)/i.test(eventType);
+  const isStart = !isParticipantEvent && /(_started|meeting_started)/i.test(eventType);
+  if (!isStart && !isEnd && !isParticipantEvent) return null;
 
   const meetingUrl = firstText(meeting.url, meeting.meeting_url, meeting.join_url, meeting.share_url, event.meeting_url, event.join_url);
   const meetingNo = firstText(meeting.meeting_no, meeting.open_meeting_id, event.meeting_no, event.open_meeting_id, meetingNoFromUrl(meetingUrl));
@@ -149,6 +165,10 @@ function meetingInputFromEvent(payload: unknown, eventType: string, nowMs: numbe
     : undefined;
   const title = firstText(meeting.topic, meeting.title, meeting.name, event.topic, event.title)
     || (participant.name ? `飞书会议 · ${participant.name}` : '飞书即时会议');
+  const ownerOpenId = openIdsFromUsers(meeting.owner, meeting.host_user)[0] || '';
+  const participantOpenIds = isParticipantEvent
+    ? openIdsFromUsers(event.participant, event.operator)
+    : [];
   if (!feishuMeetingId && !meetingNo && !meetingUrl && !eventId) return null;
   return {
     title,
@@ -159,6 +179,8 @@ function meetingInputFromEvent(payload: unknown, eventType: string, nowMs: numbe
     ...(meetingUrl ? { meeting_url: meetingUrl } : {}),
     ...(meetingNo ? { meeting_no: meetingNo } : {}),
     ...(feishuMeetingId ? { feishu_meeting_id: feishuMeetingId } : {}),
+    ...(ownerOpenId ? { owner_open_id: ownerOpenId } : {}),
+    ...(participantOpenIds.length ? { participant_open_ids: participantOpenIds } : {}),
     source_event_type: eventType,
     source_event_id: eventId,
     source_transport: 'lark_ws_event',

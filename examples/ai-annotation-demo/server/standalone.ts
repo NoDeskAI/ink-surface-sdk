@@ -15,7 +15,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -73,7 +73,7 @@ import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from '
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import { exportLarkDocxToPdf } from './lark-docx-export';
 import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
-import { resolvePanelAuthBase } from './standalone-service-config';
+import { resolvePanelAuthBase, rewriteLegacyConvertSource } from './standalone-service-config';
 import {
   larkRealtimeMeetingSources,
   larkRealtimeMeetingStoreStatus,
@@ -1347,7 +1347,11 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         lookaheadSeconds,
         pageSize: Number(u.searchParams.get('page_size') || '') || undefined,
         userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
-        extraSources: larkRealtimeMeetingSources(ROOT, { lookbackSeconds, lookaheadSeconds }),
+        extraSources: larkRealtimeMeetingSources(ROOT, {
+          lookbackSeconds,
+          lookaheadSeconds,
+          userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
+        }),
         env: feishuBotRuntimeEnv(larkEnvForSession(session)),
       });
       return send(200, result);
@@ -1679,8 +1683,15 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
     }
   }
   if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'message_file') {
-    const session = await requireDeviceSession(req, res);
-    if (!session) return;
+    // convert sidecar 服务端抓取源文件时带 x-inkloop-secret（老 feishu-service 的服务间鉴权约定），
+    // 没有设备 session——放行 secret 命中的服务间请求，其余仍走设备 session 门。
+    const secretHeader = String(req.headers['x-inkloop-secret'] || '');
+    const serviceAuthed = !!INKLOOP_SHARED_SECRET && secretHeader.length === INKLOOP_SHARED_SECRET.length
+      && timingSafeEqual(Buffer.from(secretHeader), Buffer.from(INKLOOP_SHARED_SECRET));
+    if (!serviceAuthed) {
+      const session = await requireDeviceSession(req, res);
+      if (!session) return;
+    }
     const u = new URL(rest, 'http://inkloop.local');
     const type = u.searchParams.get('type') || 'file';
     if (type !== 'file' && type !== 'image') return send(400, { error: { code: 'invalid_resource_type', message: 'type must be file or image' } });
@@ -1803,7 +1814,8 @@ async function handleConvertService(req: IncomingMessage, res: ServerResponse): 
   const send = (code: number, obj: unknown): void => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
   if (req.method !== 'GET') return send(405, { error: 'GET only' });
   if (!CONVERT_SERVICE_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'CONVERT_SERVICE_BASE / INKLOOP_SHARED_SECRET 未配置' });
-  const rest = (req.url || '').replace(/^\/api\/convert/, '');
+  const selfFeishuBase = (process.env.CONVERT_FEISHU_SOURCE_BASE || `http://127.0.0.1:${PORT}/api/feishu-svc`).replace(/\/+$/, '');
+  const rest = rewriteLegacyConvertSource((req.url || '').replace(/^\/api\/convert/, ''), selfFeishuBase);
   const apath = (rest || '/').split('?')[0];
   if (apath !== '/to-pdf') return send(403, { error: 'path not allowed' });
   const sourceUrl = new URL(req.url || '/', 'http://inkloop.local').searchParams.get('url') || '';
