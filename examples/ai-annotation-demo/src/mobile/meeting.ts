@@ -41,12 +41,13 @@ import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatfor
 import { findMeetingForProviderSource, meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
 import {
+  getMeetingLiveState,
   getGoogleOAuthStatus,
   listGoogleMeetingSources,
   pollGoogleDeviceOAuth,
   startGoogleDeviceOAuth,
 } from '../integration/google-meet/client';
-import { syncGoogleMeetingSources } from './google-meeting-sync';
+import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-meeting-sync';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -754,6 +755,10 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
     createMeeting,
     updateMeeting,
   });
+  if (!response.mtl_token_configured) return;
+  const liveState = await getMeetingLiveState();
+  if (!liveState.connected) return;
+  await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
 }
 
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */

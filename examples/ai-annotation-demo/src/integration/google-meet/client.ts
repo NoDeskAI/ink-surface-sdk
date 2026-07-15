@@ -56,6 +56,25 @@ export interface GoogleMeetingSourcesResponse {
   sync_token_present: boolean;
   full_sync: boolean;
   cursor_reset: boolean;
+  mtl_token_configured?: boolean;
+}
+
+export interface GoogleMeetingLiveWindow {
+  platform: string;
+  meeting_id: string;
+  meeting_code?: string;
+  meeting_url?: string;
+  title?: string;
+  started_at_ms: number;
+  ended_at_ms?: number;
+  detector_source?: string;
+  updated_at: string;
+}
+
+export interface GoogleMeetingLiveStateResponse {
+  connected: boolean;
+  source: 'mtl_receiver';
+  windows: GoogleMeetingLiveWindow[];
 }
 
 export interface GoogleMeetingTranscriptLine {
@@ -93,6 +112,10 @@ export function pollGoogleDeviceOAuth(opts?: { signal?: AbortSignal }): Promise<
 
 export function listGoogleMeetingSources(opts?: { signal?: AbortSignal }): Promise<GoogleMeetingSourcesResponse> {
   return getJson<GoogleMeetingSourcesResponse>(`${BASE}/meeting-sources`, { ...opts, auth: true });
+}
+
+export function getMeetingLiveState(opts?: { signal?: AbortSignal }): Promise<GoogleMeetingLiveStateResponse> {
+  return getJson<GoogleMeetingLiveStateResponse>(`${BASE}/meeting-live-state`, { ...opts, auth: true });
 }
 
 export function getGoogleMeetingTranscript(

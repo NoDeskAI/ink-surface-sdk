@@ -60,6 +60,14 @@ import {
 } from './google-oauth-state';
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
 import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
+import {
+  currentMtlToken,
+  mintMtlToken,
+  mtlReceiverBaseUrl,
+  revokeMtlToken,
+  type MtlReceiverIdentity,
+} from './mtl-receiver-auth';
+import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import {
   larkRealtimeMeetingSources,
@@ -874,6 +882,13 @@ function googleOAuthIdentity(session: InkLoopSessionContext): GoogleOAuthIdentit
   };
 }
 
+function mtlReceiverIdentity(session: InkLoopSessionContext): MtlReceiverIdentity {
+  return {
+    tenant_id: session.tenant_id || LOCAL_AUTH_TENANT_ID,
+    user_id: session.user_id || LOCAL_AUTH_USER_ID,
+  };
+}
+
 function googleOAuthDisabled(): boolean {
   return !String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim();
 }
@@ -901,6 +916,47 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
       const status = Number((error as { status?: number })?.status) || 502;
       sendJson(res, status, { error: { code: String((error as Error)?.message || error), message: 'Google meeting summary generation failed' } });
     }
+    return;
+  }
+  if (path === '/api/google/mtl-token') {
+    if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'DELETE') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET/POST/DELETE only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    res.setHeader('cache-control', 'no-store');
+    const identity = mtlReceiverIdentity(session);
+    if (req.method === 'DELETE') {
+      const current = currentMtlToken(identity);
+      const revoked = current ? revokeMtlToken(current.token, identity) : false;
+      sendJson(res, 200, { ok: true, revoked });
+      return;
+    }
+    const current = req.method === 'POST' ? mintMtlToken(identity) : currentMtlToken(identity);
+    sendJson(res, 200, current ? {
+      token: current.token,
+      base_url: mtlReceiverBaseUrl(current.token),
+      created_at: current.record.created_at,
+      ...(req.method === 'POST' && 'created' in current ? { created: current.created } : {}),
+    } : { token: null, base_url: null });
+    return;
+  }
+  if (path === '/api/google/meeting-live-state') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    res.setHeader('cache-control', 'no-store');
+    const identity = mtlReceiverIdentity(session);
+    const configured = !!currentMtlToken(identity);
+    sendJson(res, 200, {
+      connected: configured,
+      source: 'mtl_receiver',
+      windows: configured ? listMtlMeetingWindows(identity) : [],
+    });
     return;
   }
   const callback = path === '/api/google/oauth/callback';
@@ -997,7 +1053,12 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
           return refreshed.token;
         },
       });
-      sendJson(res, 200, { connected: true, configured: true, ...result });
+      sendJson(res, 200, {
+        connected: true,
+        configured: true,
+        mtl_token_configured: !!currentMtlToken(mtlReceiverIdentity(session)),
+        ...result,
+      });
     } catch (error) {
       const failure = googleCalendarErrorPayload(error);
       sendJson(res, failure.status, { connected: false, sources: [], ...failure.body });
@@ -1020,7 +1081,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
       }
       const result = await fetchGoogleMeetingTranscript(resolved.token, {
         path: googleMeetRecordsPath(process.env, identity),
-      }, { meetingCode, scheduledAt }, {
+      }, {
+        meetingCode,
+        scheduledAt,
+        attendance: mtlAttendanceWindows(mtlReceiverIdentity(session), meetingCode),
+      }, {
         refreshAccessToken: async () => {
           const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
           if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
@@ -2342,6 +2407,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (url.startsWith('/api/inkloop/auth')) { await handleInkLoopAuth(req, res); return; }
   // Google Calendar OAuth + meeting sources；callback 由 Google 直连，其余子路由在 handler 内校验设备 session。
   if (url.startsWith('/api/google')) { await handleGoogleApi(req, res); return; }
+  // MTL browser extension receiver uses a per-user secret path and includes GET /api/state.
+  if (url.startsWith('/api/mtl/')) { await handleMtlReceiver(req, res); return; }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/panel-feishu')) { await handlePanelFeishu(req, res); return; }
   // 交付路线 Y：vault release GET/POST 代理（在 POST-only 闸之前·因含 GET latest/blob）

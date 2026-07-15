@@ -8,6 +8,7 @@ import {
   completeGoogleOAuthCallback,
   googleDeviceOAuthCompletion,
   googleOAuthTokenPath,
+  resolveAnyUserGoogleToken,
   resolveGoogleOAuthStatus,
   resolveUserGoogleToken,
   type GoogleOAuthEnv,
@@ -143,5 +144,30 @@ describe('google oauth state', () => {
       reauth_required: true,
       refresh_error: 'google_oauth_token_request_failed',
     });
+  });
+
+  it('resolves a user token without requiring the originating device id', async () => {
+    const runtimeEnv = env();
+    const nowMs = Date.parse('2026-07-14T08:00:00.000Z');
+    beginGoogleDeviceOAuth(runtimeEnv, identity, { state: 'state-user-token', nowMs });
+    await completeGoogleOAuthCallback(runtimeEnv, {
+      code: 'code-user-token',
+      state: 'state-user-token',
+    }, {
+      nowMs,
+      fetchImpl: vi.fn(async () => jsonResponse({
+        access_token: 'user-access-token',
+        refresh_token: 'user-refresh-token',
+        expires_in: 3600,
+        scope: GOOGLE_OAUTH_SCOPES.join(' '),
+      })) as unknown as typeof fetch,
+    });
+
+    const resolved = await resolveAnyUserGoogleToken(runtimeEnv, {
+      tenantId: identity.tenantId,
+      userId: identity.userId,
+    }, nowMs + 1_000);
+
+    expect(resolved).toMatchObject({ usable: true, token: 'user-access-token' });
   });
 });

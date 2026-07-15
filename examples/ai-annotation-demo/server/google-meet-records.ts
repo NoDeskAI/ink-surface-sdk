@@ -55,6 +55,11 @@ export interface GoogleMeetTranscriptLine {
   text: string;
 }
 
+export interface GoogleMeetAttendanceWindow {
+  startMs: number;
+  endMs: number;
+}
+
 interface StoredRecordCandidate {
   record: GoogleMeetRecord;
   transcripts: GoogleMeetTranscript[];
@@ -252,9 +257,30 @@ export function chooseGoogleMeetRecord(records: GoogleMeetRecord[], scheduledAt:
 export function chooseGoogleMeetCandidate(
   candidates: StoredRecordCandidate[],
   scheduledAt: string,
+  attendance: GoogleMeetAttendanceWindow[] = [],
 ): StoredRecordCandidate | undefined {
-  const withTranscript = candidates.filter((candidate) => candidate.transcripts.some(transcriptReady));
-  const pool = withTranscript.length ? withTranscript : candidates;
+  const validAttendance = attendance.filter((window) => (
+    Number.isFinite(window.startMs)
+    && Number.isFinite(window.endMs)
+    && window.endMs >= window.startMs
+  ));
+  const overlapping = validAttendance.length
+    ? candidates.filter((candidate) => {
+      const startMs = recordStartMs(candidate.record);
+      let endMs = startMs;
+      try {
+        endMs = normalizeAbsoluteMs(candidate.record.endTime, 'conference_record_end') || startMs;
+      } catch {
+        endMs = startMs;
+      }
+      return !!startMs && validAttendance.some((window) => (
+        Math.min(endMs, window.endMs) > Math.max(startMs, window.startMs)
+      ));
+    })
+    : [];
+  const attendancePool = overlapping.length ? overlapping : candidates;
+  const withTranscript = attendancePool.filter((candidate) => candidate.transcripts.some(transcriptReady));
+  const pool = withTranscript.length ? withTranscript : attendancePool;
   const chosenRecord = chooseGoogleMeetRecord(pool.map((candidate) => candidate.record), scheduledAt);
   return chosenRecord ? pool.find((candidate) => candidate.record.name === chosenRecord.name) : undefined;
 }
@@ -415,7 +441,7 @@ const jobsInFlight = new Map<string, Promise<GoogleMeetingTranscriptResult>>();
 async function runCatchUp(
   token: string,
   recordsRef: GoogleMeetRecordsRef,
-  input: { meetingCode: string; scheduledAt: string },
+  input: { meetingCode: string; scheduledAt: string; attendance?: GoogleMeetAttendanceWindow[] },
   options: GoogleMeetRecordsOptions,
 ): Promise<GoogleMeetingTranscriptResult> {
   const meetingCode = input.meetingCode.trim();
@@ -425,7 +451,11 @@ async function runCatchUp(
   const state = loadState(recordsRef.path);
   const key = meetingKey(meetingCode, scheduledAt);
   const current = state.meetings[key];
-  if (current?.terminal || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
+  const currentUpdatedMs = Date.parse(current?.updated_at || '');
+  const terminalRetryDue = !!current?.terminal
+    && current.status !== 'ready'
+    && (!Number.isFinite(currentUpdatedMs) || nowMs - currentUpdatedMs >= 10 * 60_000);
+  if ((current?.terminal && !terminalRetryDue) || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
     return responseFromJob(current);
   }
 
@@ -436,7 +466,7 @@ async function runCatchUp(
   };
   const auth = { token, refreshed: false };
   const records = await fetchCandidates(meetingCode, auth, requestOptions);
-  const chosen = chooseGoogleMeetCandidate(records, scheduledAt);
+  const chosen = chooseGoogleMeetCandidate(records, scheduledAt, input.attendance);
   const chosenRecord = chosen?.record;
   const anchorMs = pollAnchorMs(current || {
     meeting_code: meetingCode,
@@ -490,7 +520,7 @@ async function runCatchUp(
 export function fetchGoogleMeetingTranscript(
   token: string,
   recordsRef: GoogleMeetRecordsRef,
-  input: { meetingCode: string; scheduledAt: string },
+  input: { meetingCode: string; scheduledAt: string; attendance?: GoogleMeetAttendanceWindow[] },
   options: GoogleMeetRecordsOptions = {},
 ): Promise<GoogleMeetingTranscriptResult> {
   if (!String(token || '').trim()) return Promise.reject(new GoogleMeetRecordsError('google_meet_token_missing', 401));

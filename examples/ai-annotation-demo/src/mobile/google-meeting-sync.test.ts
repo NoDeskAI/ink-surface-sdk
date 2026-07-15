@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PersistedMeeting, PersistedWorkspace } from '../core/store-format';
-import type { GoogleMeetingSource } from '../integration/google-meet/client';
-import { syncGoogleMeetingSources } from './google-meeting-sync';
+import type { GoogleMeetingLiveWindow, GoogleMeetingSource } from '../integration/google-meet/client';
+import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-meeting-sync';
 
 const NOW = Date.parse('2026-07-14T08:00:00.000Z');
 
@@ -29,6 +29,20 @@ function source(id: string, patch: Partial<GoogleMeetingSource> = {}): GoogleMee
     meeting_code: 'abc-defg-hij',
     meeting_url: 'https://meet.google.com/abc-defg-hij',
     status: 'confirmed',
+    ...patch,
+  };
+}
+
+function liveWindow(patch: Partial<GoogleMeetingLiveWindow> = {}): GoogleMeetingLiveWindow {
+  return {
+    platform: 'google_meet',
+    meeting_id: 'abc-defg-hij',
+    meeting_code: 'abc-defg-hij',
+    meeting_url: 'https://meet.google.com/abc-defg-hij',
+    title: 'Google live window',
+    started_at_ms: Date.parse('2026-07-15T01:02:00.000Z'),
+    detector_source: 'meeting_app_extension',
+    updated_at: '2026-07-15T01:02:01.000Z',
     ...patch,
   };
 }
@@ -200,5 +214,73 @@ describe('Google meeting source persistence', () => {
     expect(state.meetings[0].ended_at).toBeUndefined();
     expect(state.meetings[0].t0_source).toBeUndefined();
     expect(state.meetings[0].align_state).toBeUndefined();
+  });
+
+  it('merges detector start/end windows into the matching Google Calendar card', async () => {
+    const google = meeting('google-live-state', {
+      platform: 'google_meet',
+      calendar_meeting_no: 'abc-defg-hij',
+      status: 'ended',
+      ended_at: '2026-07-15T00:30:00.000Z',
+    });
+    const state = dependencies([google]);
+    const endedAtMs = Date.parse('2026-07-15T01:55:00.000Z');
+
+    const result = await syncGoogleMeetingLiveState([
+      liveWindow(),
+      liveWindow({ ended_at_ms: endedAtMs, updated_at: '2026-07-15T01:55:01.000Z' }),
+    ], state.deps);
+
+    expect(result).toEqual({ matched: 2, updated: 2 });
+    expect(state.meetings[0]).toMatchObject({
+      status: 'ended',
+      started_at: '2026-07-15T01:02:00.000Z',
+      ended_at: '2026-07-15T01:55:00.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-15T01:02:00.000Z'),
+      t0_source: 'local_detector',
+      align_state: 'estimated',
+    });
+    expect(state.meetings[0]).not.toHaveProperty('provider_meeting_id');
+  });
+
+  it('clears an old detector end when the same Calendar occurrence becomes active again', async () => {
+    const google = meeting('google-rejoined', {
+      platform: 'google_meet',
+      calendar_meeting_no: 'abc-defg-hij',
+      status: 'ended',
+      ended_at: '2026-07-15T00:50:00.000Z',
+    });
+    const state = dependencies([google]);
+
+    await syncGoogleMeetingLiveState([liveWindow()], state.deps);
+
+    expect(state.meetings[0]).toMatchObject({ status: 'live', t0_source: 'local_detector' });
+    expect(state.meetings[0].ended_at).toBeUndefined();
+  });
+
+  it('does not downgrade a provider event anchor and ignores an unmatched detector window', async () => {
+    const providerAnchored = meeting('google-provider-anchor', {
+      platform: 'google_meet',
+      calendar_meeting_no: 'abc-defg-hij',
+      started_at: '2026-07-15T01:00:30.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-15T01:00:30.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
+    const state = dependencies([providerAnchored]);
+
+    const result = await syncGoogleMeetingLiveState([
+      liveWindow(),
+      liveWindow({ meeting_id: 'zzz-yyyy-xxx', meeting_code: 'zzz-yyyy-xxx' }),
+    ], state.deps);
+
+    expect(result).toEqual({ matched: 1, updated: 1 });
+    expect(state.meetings[0]).toMatchObject({
+      status: 'live',
+      started_at: '2026-07-15T01:00:30.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-15T01:00:30.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
   });
 });

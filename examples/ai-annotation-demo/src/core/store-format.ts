@@ -358,7 +358,7 @@ export interface PersistedMeeting {
   panel_meeting_start?: number;     // panel 会议 start_time（epoch ms·≠录音起点·保留 raw 供核对/兜底）
   vc_meeting_start_t0?: number;     // vc all_meeting_started.start_time（epoch ms·会议开始·L1 真 t0 来源）
   feishu_recording_t0?: number;     // 真录音 t0 绝对墙钟（epoch ms）；旧数据可能装过 panel start 近似（兼容读·见 recapT0）
-  t0_source?: 'local_enter' | 'panel_start' | 'vc_event' | 'recording_event' | 'calendar' | 'provider_event' | 'manual'; // t0 来源（provider_event=平台真实事件；会后优先录音 t0）
+  t0_source?: 'local_enter' | 'local_detector' | 'panel_start' | 'vc_event' | 'recording_event' | 'calendar' | 'provider_event' | 'manual'; // t0 来源（provider_event=平台真实事件；local_detector=浏览器本地探测；会后优先录音 t0）
   align_offset_ms?: number;         // 用户/启发式微调（cueAbs = t0 + offset + cue 相对）
   align_state?: 'uncalibrated' | 'approx' | 'estimated' | 'event' | 'manual'; // 校准状态（event=会议事件 t0·录音残差未消除·UI 明示防假精确）
   feishu_match_confirmed_at?: string; // 用户确认关联的时刻

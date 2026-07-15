@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -449,6 +449,46 @@ export async function resolveUserGoogleToken(
     });
     return { ...base, usable: false, reauthRequired: true, reason: 'reauth_required', refreshError };
   }
+}
+
+/** MTL receiver tokens are scoped to tenant/user rather than one Paper device. Try that
+ * user's device buckets in deterministic order and reuse the normal refresh path. */
+export async function resolveAnyUserGoogleToken(
+  env: GoogleOAuthEnv,
+  identity: Pick<GoogleOAuthIdentity, 'tenantId' | 'userId'>,
+  nowMs = Date.now(),
+  options: GoogleOAuthFetchOptions = {},
+): Promise<GoogleUserTokenResolution> {
+  const userRoot = resolve(
+    authRoot(env),
+    safePathPart(identity.tenantId, 'tenant'),
+    safePathPart(identity.userId, 'user'),
+  );
+  let deviceIds: string[] = [];
+  try {
+    deviceIds = readdirSync(userRoot, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .map((entry) => entry.name.slice(0, -'.json'.length))
+      .filter((deviceId) => deviceId !== 'calendar-sync' && deviceId !== 'meet-records')
+      .sort();
+  } catch {
+    // No device bucket means this user has not connected Google yet.
+  }
+  let last: GoogleUserTokenResolution = {
+    usable: false,
+    scopes: [],
+    refreshTokenPresent: false,
+    refreshed: false,
+    reauthRequired: false,
+    reason: 'google_oauth_not_connected',
+    path: userRoot,
+  };
+  for (const deviceId of deviceIds) {
+    const resolved = await resolveUserGoogleToken(env, { ...identity, deviceId }, nowMs, options);
+    if (resolved.usable && resolved.token) return resolved;
+    last = resolved;
+  }
+  return last;
 }
 
 export async function resolveGoogleOAuthStatus(

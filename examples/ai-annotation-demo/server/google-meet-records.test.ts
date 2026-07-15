@@ -44,6 +44,28 @@ describe('google meet records', () => {
     expect(chooseGoogleMeetCandidate([rejoin, { ...main, transcripts: [] }], scheduledAt)?.record.name).toBe('conferenceRecords/rejoin');
   });
 
+  it('absolutely prefers records overlapping an attendance window and keeps legacy behavior without one', () => {
+    const scheduledAt = '2026-07-15T04:00:00.000Z';
+    const transcriptReadyButAbsent = {
+      record: { name: 'conferenceRecords/absent', startTime: '2026-07-15T03:58:00.000Z', endTime: '2026-07-15T04:05:00.000Z' },
+      transcripts: [{ name: 'conferenceRecords/absent/transcripts/t1', state: 'FILE_GENERATED' }],
+    };
+    const attended = {
+      record: { name: 'conferenceRecords/attended', startTime: '2026-07-15T04:20:00.000Z', endTime: '2026-07-15T05:00:00.000Z' },
+      transcripts: [],
+    };
+
+    expect(chooseGoogleMeetCandidate([
+      transcriptReadyButAbsent,
+      attended,
+    ], scheduledAt, [{
+      startMs: Date.parse('2026-07-15T04:25:00.000Z'),
+      endMs: Date.parse('2026-07-15T04:55:00.000Z'),
+    }])?.record.name).toBe('conferenceRecords/attended');
+    expect(chooseGoogleMeetCandidate([transcriptReadyButAbsent, attended], scheduledAt)?.record.name)
+      .toBe('conferenceRecords/absent');
+  });
+
   it('persists all record candidates and chooses the start nearest to the calendar schedule', async () => {
     const path = statePath();
     const scheduledAt = '2026-07-15T01:00:00.000Z';
@@ -190,6 +212,73 @@ describe('google meet records', () => {
     const stored = JSON.parse(readFileSync(path, 'utf8'));
     const job = Object.values(stored.meetings)[0] as { attempt: number; terminal: boolean };
     expect(job).toMatchObject({ attempt: 6, terminal: true });
+  });
+
+  it('rechecks a stale terminal job and flips to ready when a new record appears', async () => {
+    const path = statePath();
+    const scheduledAt = '2026-07-15T01:00:00.000Z';
+    const terminalAtMs = Date.parse('2026-07-15T04:00:00.000Z');
+    let recordAvailable = false;
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') {
+        return jsonResponse({ conferenceRecords: recordAvailable ? [{
+          name: 'conferenceRecords/late',
+          startTime: '2026-07-15T01:05:00.000Z',
+          endTime: '2026-07-15T02:00:00.000Z',
+        }] : [] });
+      }
+      if (url.pathname.endsWith('/transcripts')) {
+        return jsonResponse({ transcripts: [{ name: 'conferenceRecords/late/transcripts/tx1', state: 'FILE_GENERATED' }] });
+      }
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/transcripts/tx1/entries')) {
+        return jsonResponse({ transcriptEntries: [{
+          name: 'conferenceRecords/late/transcripts/tx1/entries/e1',
+          participant: 'conferenceRecords/late/participants/p1',
+          startTime: '2026-07-15T01:05:01.000Z',
+          endTime: '2026-07-15T01:05:02.000Z',
+          text: 'Late transcript',
+        }] });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+
+    const terminal = await fetchGoogleMeetingTranscript('token', { path }, {
+      meetingCode: 'abc-defg-hij',
+      scheduledAt,
+    }, {
+      nowMs: terminalAtMs,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(terminal.status).toBe('no_record');
+    const callsAtTerminal = fetchImpl.mock.calls.length;
+
+    recordAvailable = true;
+    const stillTerminal = await fetchGoogleMeetingTranscript('token', { path }, {
+      meetingCode: 'abc-defg-hij',
+      scheduledAt,
+    }, {
+      nowMs: terminalAtMs + 9 * 60_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(stillTerminal.status).toBe('no_record');
+    expect(fetchImpl).toHaveBeenCalledTimes(callsAtTerminal);
+
+    const ready = await fetchGoogleMeetingTranscript('token', { path }, {
+      meetingCode: 'abc-defg-hij',
+      scheduledAt,
+    }, {
+      nowMs: terminalAtMs + 10 * 60_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(ready).toMatchObject({
+      status: 'ready',
+      record: { name: 'conferenceRecords/late' },
+      transcript: { name: 'conferenceRecords/late/transcripts/tx1' },
+    });
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.values(stored.meetings)[0]).toMatchObject({ status: 'ready', terminal: true });
   });
 
   it('converts absolute transcript times to relative SRT times', () => {

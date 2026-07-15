@@ -1,5 +1,5 @@
 import type { MeetingStatus, PersistedMeeting, PersistedWorkspace } from '../core/store-format';
-import type { GoogleMeetingSource } from '../integration/google-meet/client';
+import type { GoogleMeetingLiveWindow, GoogleMeetingSource } from '../integration/google-meet/client';
 import { findMeetingForProviderSource } from './meeting-platform';
 
 export interface GoogleMeetingSyncDependencies {
@@ -14,6 +14,11 @@ export interface GoogleMeetingSyncResult {
   imported: number;
   updated: number;
   cancelled: number;
+}
+
+export interface GoogleMeetingLiveSyncResult {
+  matched: number;
+  updated: number;
 }
 
 function sourceStatus(source: GoogleMeetingSource, nowMs: number): MeetingStatus {
@@ -93,6 +98,56 @@ export async function syncGoogleMeetingSources(
     await dependencies.updateMeeting(created.meeting_id, patch);
     meetings = [...meetings, { ...created, ...patch, updated_at: new Date(nowMs).toISOString() } as PersistedMeeting];
     result.imported += 1;
+  }
+  return result;
+}
+
+function hasStrongerGoogleAnchor(meeting: PersistedMeeting): boolean {
+  return meeting.t0_source === 'provider_event' || meeting.t0_source === 'recording_event';
+}
+
+/** Merge MTL detector windows only into Calendar-created Google cards. Unknown windows remain
+ * server-side diagnostics and never manufacture or overwrite an unrelated local meeting. */
+export async function syncGoogleMeetingLiveState(
+  windows: GoogleMeetingLiveWindow[],
+  dependencies: Pick<GoogleMeetingSyncDependencies, 'listAllMeetings' | 'updateMeeting'>,
+): Promise<GoogleMeetingLiveSyncResult> {
+  const result: GoogleMeetingLiveSyncResult = { matched: 0, updated: 0 };
+  if (!windows.length) return result;
+  let meetings = await dependencies.listAllMeetings();
+  const ordered = [...windows].sort((left, right) => Date.parse(left.updated_at) - Date.parse(right.updated_at));
+  for (const window of ordered) {
+    if (window.platform !== 'google_meet' || !window.meeting_code || !Number.isFinite(window.started_at_ms)) continue;
+    const existing = findMeetingForProviderSource(meetings, {
+      platform: 'google_meet',
+      meetingNo: window.meeting_code,
+      scheduledAt: new Date(window.started_at_ms).toISOString(),
+    });
+    if (!existing) continue;
+    result.matched += 1;
+    const strongerAnchor = hasStrongerGoogleAnchor(existing);
+    const patch: Partial<PersistedMeeting> = window.ended_at_ms
+      ? {
+        status: 'ended',
+        ended_at: strongerAnchor && existing.ended_at
+          ? existing.ended_at
+          : new Date(window.ended_at_ms).toISOString(),
+      }
+      : {
+        status: 'live',
+        ended_at: undefined,
+        ...(!strongerAnchor ? {
+          started_at: new Date(window.started_at_ms).toISOString(),
+          vc_meeting_start_t0: window.started_at_ms,
+          t0_source: 'local_detector' as const,
+          align_state: 'estimated' as const,
+        } : {}),
+      };
+    await dependencies.updateMeeting(existing.meeting_id, patch);
+    meetings = meetings.map((meeting) => meeting.meeting_id === existing.meeting_id
+      ? { ...meeting, ...patch }
+      : meeting);
+    result.updated += 1;
   }
   return result;
 }
