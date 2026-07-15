@@ -1,5 +1,6 @@
 /** Google OAuth + Calendar client. All requests go through core/api so APK appassets resolve to Cloud Hub. */
-import { getJson } from '../../core/api';
+import { getJson, postJson } from '../../core/api';
+import type { PanelMeetingSummaryFive } from '../../core/store-format';
 
 const BASE = '/api/google';
 
@@ -73,6 +74,11 @@ export interface GoogleMeetingTranscriptResponse {
   next_check_at?: string;
 }
 
+export interface GoogleMeetingSummaryResponse {
+  summary: PanelMeetingSummaryFive;
+  model: string;
+}
+
 export function getGoogleOAuthStatus(opts?: { signal?: AbortSignal }): Promise<GoogleOAuthStatusResponse> {
   return getJson<GoogleOAuthStatusResponse>(`${BASE}/oauth/status`, { ...opts, auth: true });
 }
@@ -95,4 +101,12 @@ export function getGoogleMeetingTranscript(
 ): Promise<GoogleMeetingTranscriptResponse> {
   const query = new URLSearchParams({ meeting_code: input.meetingCode, scheduled_at: input.scheduledAt });
   return getJson<GoogleMeetingTranscriptResponse>(`${BASE}/meeting-transcript?${query.toString()}`, { ...opts, auth: true });
+}
+
+/** 本仓库 Cloud Hub 直接消费已缓存的 Google 转写；不经过只认识飞书妙记的 panel-workplace。 */
+export function generateGoogleMeetingSummary(
+  input: { title: string; transcript: string; model?: string },
+  opts?: { signal?: AbortSignal },
+): Promise<GoogleMeetingSummaryResponse> {
+  return postJson<GoogleMeetingSummaryResponse>(`${BASE}/meeting-summary`, input, { ...opts, auth: true });
 }

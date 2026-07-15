@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PersistedMeeting } from '../core/store-format';
 
 const mocks = vi.hoisted(() => ({
@@ -20,7 +20,7 @@ vi.mock('../integration/google-meet/client', async (importOriginal) => ({
   getGoogleMeetingTranscript: mocks.getGoogleMeetingTranscript,
 }));
 
-import { loadGoogleTranscript } from './meeting-recap';
+import { ensureGooglePanelSummary, loadGoogleTranscript } from './meeting-recap';
 
 function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting {
   return {
@@ -44,6 +44,78 @@ describe('meeting recap Google transcript branch', () => {
     mocks.getCachedMinute.mockResolvedValue(null);
     mocks.putCachedMinute.mockResolvedValue(undefined);
     mocks.updateMeeting.mockResolvedValue(null);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('generates and persists a structured InkLoop panel summary through the hub', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      model: 'glm-test',
+      summary: {
+        conclusions: ['确认先发布会议恢复能力'],
+        action_items: [{ task: '补充真机验证', owner: 'Ada' }],
+        risks: [],
+        open_questions: ['长转写分块何时上线'],
+        next_steps: ['完成回归'],
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const cues = [{
+      index: 1,
+      startMs: 1_000,
+      endMs: 2_000,
+      speaker: 'Ada',
+      text: '确认先发布会议恢复能力，并补充真机验证。',
+      rawText: 'Ada: 确认先发布会议恢复能力，并补充真机验证。',
+    }, ...Array.from({ length: 200 }, (_, index) => ({
+      index: index + 2,
+      startMs: (index + 2) * 1_000,
+      endMs: (index + 3) * 1_000,
+      speaker: 'Grace',
+      text: `长转写片段 ${index} ${'内容'.repeat(50)}`,
+      rawText: `Grace: 长转写片段 ${index}`,
+    }))];
+    const summary = await ensureGooglePanelSummary(googleMeeting(), cues);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/google/meeting-summary');
+    const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(request.transcript).toContain('[0:01]Ada：确认先发布会议恢复能力');
+    expect(request.transcript).toContain('转写在此截断');
+    expect(request.transcript.length).toBeLessThan(16_200);
+    expect(summary).toMatchObject({
+      minute_token: 'google_meet:local-google-1',
+      meeting_id: 'abc-defg-hij',
+      model: 'glm-test',
+      summary: { conclusions: ['确认先发布会议恢复能力'] },
+    });
+    expect(mocks.updateMeeting).toHaveBeenCalledWith('local-google-1', expect.objectContaining({
+      panel_summary: summary,
+      panel_summary_status: 'ready',
+    }));
+  });
+
+  it('shares the in-flight generation and does not resend when a summary already exists', async () => {
+    let resolveFetch!: (response: Response) => void;
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    vi.stubGlobal('fetch', fetchMock);
+    const cues = [{ index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '讨论发布计划。', rawText: '讨论发布计划。' }];
+    const meeting = googleMeeting();
+
+    const first = ensureGooglePanelSummary(meeting, cues);
+    const second = ensureGooglePanelSummary(meeting, cues);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    resolveFetch(new Response(JSON.stringify({
+      model: 'glm-test',
+      summary: { conclusions: ['发布计划已讨论'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const [a, b] = await Promise.all([first, second]);
+
+    expect(a).toEqual(b);
+    expect(mocks.updateMeeting).toHaveBeenCalledTimes(1);
+    const cached = await ensureGooglePanelSummary(googleMeeting({ panel_summary: a! }), cues);
+    expect(cached).toEqual(a);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('caches ready SRT and patches provider-event t0 without undefined fields', async () => {

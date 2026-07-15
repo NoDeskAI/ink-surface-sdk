@@ -17,7 +17,7 @@ import { buildEpaperMeetingTimeline, type EpaperMeetingTimeline } from '../integ
 import { publishEntityToVault } from '../integration/inksurface/vault-publish-device';
 import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, FeishuNoteSummaryRecord } from '../core/store-format';
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
-import { getGoogleMeetingTranscript } from '../integration/google-meet/client';
+import { generateGoogleMeetingSummary, getGoogleMeetingTranscript } from '../integration/google-meet/client';
 import { meetingTranscriptSource } from './meeting-platform';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
@@ -208,6 +208,7 @@ interface RecapV2 {
   markSourceMeeting: PersistedMeeting | null; // 手写可能来自同系列会议的本地手记，用于恢复未重新关联的笔迹。
 }
 let recapState: RecapV2 | null = null;
+const googlePanelSummaryInFlight = new Map<string, Promise<PanelMeetingSummaryRecord | null>>();
 // 防异步串会：打开 A 后快速返回/打开 B，A 的晚到结果（转写/AI 摘要）不能覆盖 B 的视图/状态。
 let recapLoadSeq = 0;
 export function resetRecapView(): void { recapLoadSeq++; recapState = null; delete document.body.dataset.recapView; updateExportButton(); updateRecapNav(); }
@@ -655,10 +656,11 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   }
 
   const segments = timeline.segments;
+  const shouldGenerateGooglePanelSummary = hasGoogleTranscript && cues.length > 0 && !m.panel_summary;
   recapState = { meeting: m, segments, cues, view: 'overview', detailIdx: 0, ovPage: 0, dtPage: 0, txPage: 0, bodyEl, transcriptMissing: !cues.length,
     feishuSummary: m.feishu_note_summary ?? null,
     panelSummary: m.panel_summary ?? null,
-    panelSummaryStatus: m.panel_summary ? 'ready' : (hasGoogleTranscript ? 'not_generated' : (m.panel_summary_status ?? 'loading')),
+    panelSummaryStatus: m.panel_summary ? 'ready' : (hasGoogleTranscript ? (cues.length ? 'generating' : 'missing_minute') : (m.panel_summary_status ?? 'loading')),
     timeline,
     marksById: new Map(marks.map((mk) => [mk.mark_id, mk] as const)),
     markSourceMeeting: loadedMarks.sourceMeeting };
@@ -668,7 +670,8 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   updateRecapNav();
   wireRecapNav();
   if (renderedFromCache) void refreshTranscriptAfterInitialRender(seq, bodyEl, m.meeting_id);
-  if (!hasGoogleTranscript) void loadPanelSummary(seq, bodyEl, m); // L5：只对飞书异步拉 panel 总结
+  if (shouldGenerateGooglePanelSummary) void loadGooglePanelSummary(seq, bodyEl, m, cues);
+  else if (!hasGoogleTranscript) void loadPanelSummary(seq, bodyEl, m); // 飞书仍从 panel-workplace 拉已生成总结。
 }
 
 function renderRecap(bodyEl: HTMLElement): void {
@@ -1080,6 +1083,79 @@ async function generatePanelSummary(seq: number, bodyEl: HTMLElement, localMeeti
   if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
 }
 
+type CappedTranscript = { lines: string[]; truncated: boolean; usedCueCount: number };
+function cappedTranscriptLines(cues: TranscriptCue[]): CappedTranscript {
+  const lines: string[] = [];
+  let used = 0; let usedCueCount = 0; let truncated = false;
+  for (const cue of cues) {
+    const row = `[${clk(cue.startMs)}]${cue.speaker ? cue.speaker + '：' : ''}${cue.text}`;
+    if (used + row.length > SUMMARY_TRANSCRIPT_CAP) {
+      lines.push(`…（转写在此截断·后 ${cues.length - usedCueCount} 句未提供·别对未提供部分下结论）`);
+      truncated = true;
+      break;
+    }
+    lines.push(row);
+    used += row.length;
+    usedCueCount++;
+  }
+  return { lines, truncated, usedCueCount };
+}
+
+/** Google 路线的纯数据生成入口：已有结果直接复用，同一会议并发请求共享一个 in-flight Promise。 */
+export async function ensureGooglePanelSummary(m: PersistedMeeting, cues: TranscriptCue[]): Promise<PanelMeetingSummaryRecord | null> {
+  if (m.panel_summary) return m.panel_summary;
+  if (!cues.length) return null;
+  const running = googlePanelSummaryInFlight.get(m.meeting_id);
+  if (running) return running;
+  const task = (async (): Promise<PanelMeetingSummaryRecord> => {
+    const capped = cappedTranscriptLines(cues);
+    const response = await generateGoogleMeetingSummary({
+      title: m.title || '(未命名会议)',
+      transcript: capped.lines.join('\n'),
+      model: settings.inferModel,
+    });
+    const summary: PanelMeetingSummaryRecord = {
+      minute_token: googleTranscriptCacheToken(m.meeting_id),
+      meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.meeting_id,
+      topic: m.title,
+      generated_at: Date.now(),
+      model: response.model,
+      summary: response.summary,
+    };
+    await updateMeeting(m.meeting_id, {
+      panel_summary: summary,
+      panel_summary_fetched_at: new Date().toISOString(),
+      panel_summary_status: 'ready',
+    });
+    return summary;
+  })();
+  googlePanelSummaryInFlight.set(m.meeting_id, task);
+  try {
+    return await task;
+  } finally {
+    if (googlePanelSummaryInFlight.get(m.meeting_id) === task) googlePanelSummaryInFlight.delete(m.meeting_id);
+  }
+}
+
+async function loadGooglePanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMeeting, cues: TranscriptCue[]): Promise<void> {
+  if (m.panel_summary || !cues.length) return;
+  if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) {
+    recapState.panelSummaryStatus = 'generating';
+    renderRecap(bodyEl);
+  }
+  try {
+    const summary = await ensureGooglePanelSummary(m, cues);
+    if (!summary || !recapAlive(seq, bodyEl) || recapState?.meeting.meeting_id !== m.meeting_id) return;
+    recapState.panelSummary = summary;
+    recapState.meeting = { ...recapState.meeting, panel_summary: summary, panel_summary_status: 'ready' };
+    recapState.panelSummaryStatus = 'ready';
+  } catch {
+    await updateMeeting(m.meeting_id, { panel_summary_status: 'failed' }).catch(() => null);
+    if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) recapState.panelSummaryStatus = 'failed';
+  }
+  if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
+}
+
 function uniqText(items: string[], limit: number): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -1199,15 +1275,21 @@ function panelSummaryHtml(): string {
 
 /** 绑定 panel 总结块的按钮（生成 / 刷新重试）——正常态与空态共用。 */
 function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
-  bodyEl.querySelector('#ps-gen')?.addEventListener('click', () => { // 生成 panel 总结（带 seq/会议守卫·防串会）
+  bodyEl.querySelector('#ps-gen')?.addEventListener('click', () => { // 生成总结（Google 走 hub；飞书走 panel）
     if (!recapState) return;
-    void generatePanelSummary(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
+    if (meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript') {
+      void loadGooglePanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
+    } else void generatePanelSummary(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
   });
   bodyEl.querySelector('#ps-refresh')?.addEventListener('click', () => { // 失败/未找到时重拉
     if (!recapState) return;
-    recapState.panelSummaryStatus = 'loading';
-    renderRecap(bodyEl);
-    void loadPanelSummary(recapLoadSeq, bodyEl, recapState.meeting);
+    if (meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript') {
+      void loadGooglePanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
+    } else {
+      recapState.panelSummaryStatus = 'loading';
+      renderRecap(bodyEl);
+      void loadPanelSummary(recapLoadSeq, bodyEl, recapState.meeting);
+    }
   });
 }
 
@@ -1510,12 +1592,8 @@ function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], marks: P
   const lines: string[] = [`会议标题：${m.title || '(未命名)'}`];
   if (m.started_at) lines.push(`开始时间：${m.started_at}`);
   lines.push('', '<转写 可能因过长被截断·见末尾标记>');
-  let used = 0; let usedCueCount = 0; let truncated = false;
-  for (const c of cues) {
-    const row = `[${clk(c.startMs)}]${c.speaker ? c.speaker + '：' : ''}${c.text}`;
-    if (used + row.length > SUMMARY_TRANSCRIPT_CAP) { lines.push(`…（转写在此截断·后 ${cues.length - usedCueCount} 句未提供·别对未提供部分下结论）`); truncated = true; break; }
-    lines.push(row); used += row.length; usedCueCount++;
-  }
+  const capped = cappedTranscriptLines(cues);
+  lines.push(...capped.lines);
   lines.push('</转写>', '');
   lines.push('<手写标注 各为用户当时的强调·时间是近似会议相对时刻·非与某句转写的精确对应>');
   if (marks.length) for (const mk of marks) {
@@ -1524,7 +1602,7 @@ function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], marks: P
   }
   else lines.push('（本场没有手写标注）');
   lines.push('</手写标注>', '', '请按系统要求产出会后思路总结。');
-  return { prompt: lines.join('\n'), truncated, usedCueCount };
+  return { prompt: lines.join('\n'), truncated: capped.truncated, usedCueCount: capped.usedCueCount };
 }
 
 /** 会后思路总结：拉转写 + 手写档案 → 流式 /api/chat（meeting_summary role·不走 chatTurn 不污染书 buffer）→ 写 summary。 */

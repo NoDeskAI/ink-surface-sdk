@@ -22,7 +22,7 @@ import { homedir } from 'node:os';
 import { assertNonEmptyVaultRelease, guardPanelVaultReqUrl, panelVaultGuardPayload, resolvePanelVaultGuardUser } from './panel-vault-guard';
 import {
   runReflow, runReflowAi, reflowAiStream, chatStream,
-  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runReflowVlm,
+  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
 } from './infer';
 import { runOcrLayout } from './ocr-layout-dev.mjs';
 import { createRuntimeSyncDevHandler } from './runtime-sync-dev';
@@ -887,6 +887,22 @@ function sendGoogleHtml(res: ServerResponse, status: number, title: string, mess
 async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url || '/api/google', 'http://inkloop.local');
   const path = url.pathname;
+  if (path === '/api/google/meeting-summary') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'POST only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    try {
+      const payload = JSON.parse(await readBody(req, 64 * 1024));
+      sendJson(res, 200, await runMeetingPanelSummary(payload));
+    } catch (error) {
+      const status = Number((error as { status?: number })?.status) || 502;
+      sendJson(res, status, { error: { code: String((error as Error)?.message || error), message: 'Google meeting summary generation failed' } });
+    }
+    return;
+  }
   const callback = path === '/api/google/oauth/callback';
   if (googleOAuthDisabled()) {
     if (callback) sendGoogleHtml(res, 503, 'Google 日历未启用', 'google_oauth_disabled');
