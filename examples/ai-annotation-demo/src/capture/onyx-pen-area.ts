@@ -94,8 +94,17 @@ function visibleExcludeRects(): DOMRect[] {
   });
 }
 
+// 2026-07-16 用户拍板：BOOX 先整体回退 WebView 慢速墨迹——原生 raw 快速路径激活期间固件 InputDispatcher
+// 会丢 finger 事件（书写遮罩/控件点不动，根因见 research/pen-controls/boox-mask-rootcause-2026-07-15；
+// 边栏展开=disarm=一切正常的真机实证坐实了前提）。摸清原生路径后在 pen 线重启。
+// 实验开关：localStorage.setItem('inkloop.onyx.raw.enabled','1') 后重载可临时恢复原生快速路径。
+function onyxRawEnabled(): boolean {
+  try { return localStorage.getItem('inkloop.onyx.raw.enabled') === '1'; } catch { return false; }
+}
+
 /** 当前可见书写画区（host-local 物理 px）；非书写面/书架/非画笔工具/被遮挡 → null。 */
 function visibleCanvasArea(): AreaPayload | null {
+  if (!onyxRawEnabled()) return null; // 回退期：永不 arm，原生侧保持 disarm，全部走 WebView 墨迹
   if (!shouldArmOnyxPenArea({
     writable: document.body.classList.contains('writable'),
     mode: document.body.dataset.mode,
