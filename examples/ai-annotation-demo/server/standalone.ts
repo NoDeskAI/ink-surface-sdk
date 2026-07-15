@@ -14,7 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -47,6 +47,7 @@ import {
   completeLarkOAuthCallback,
   larkOAuthAuthStatePath,
   resolveLarkOAuthPublicStatus,
+  resolveUserOAuthToken,
 } from './lark-oauth-state';
 import { fetchLarkMeetingSources, resolveLarkMeetingInstance } from './lark-meeting-sources';
 import {
@@ -862,7 +863,9 @@ const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+
 // offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
 // 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
 // drive:export:readonly 用于 docx 官方 export_tasks；已有 token refresh 不会扩 scope，老用户需重新授权一次。
-const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly';
+// minutes:minutes:readonly 用于妙记信息/搜索；minutes:minutes.transcript:export 用于转写导出（飞书 99991679 点名，
+// 与 minutes:minute:download 二选一）。token 收编：panel sidecar 的独立 v1 OAuth 已废，妙记取数改用 hub 这份 token。
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.transcript:export';
 // 默认取「2026-07-13 已验证授予的权限集合 + offline_access(新版 OAuth 专用·换取 refresh_token)」。
 // 旧版授权端点会把 URL scope 当后台 API 权限逐项校验，offline_access 不在权限列表会直接报缺少权限——
 // 授权端点已随 vendor larkClient 切到新版 accounts.feishu.cn。需要增删 scope 用环境变量覆盖，别往回加 vc:meeting:readonly（已被细粒度权限取代）。
@@ -2490,6 +2493,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         devices: process.env.INKLOOP_DEVICE_STORE || resolve(ROOT, '.inkloop/devices'),
       },
     });
+    return;
+  }
+  // 妙记 token 收编：panel meeting sidecar 从 hub 取 user_access_token（loopback + shared secret 双门）。
+  // 背景：sidecar 原有独立 v1 OAuth token 库已死（refresh_token 被 hub 侧重授权顶掉·2026-07-15），
+  // 妙记取数的 token 真相源收编到 hub 这份 v2 OAuth state（resolveUserOAuthToken 自带懒刷新）。
+  if (url === '/api/internal/lark-user-token') {
+    if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+    const remote = String(req.socket.remoteAddress || '');
+    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+    const secretHeader = String(req.headers['x-inkloop-secret'] || '');
+    const authed = isLoopback && !!INKLOOP_SHARED_SECRET && secretHeader.length === INKLOOP_SHARED_SECRET.length
+      && timingSafeEqual(Buffer.from(secretHeader), Buffer.from(INKLOOP_SHARED_SECRET));
+    if (!authed) { sendJson(res, 403, { ok: false, reason: 'forbidden' }); return; }
+    // hub 的 lark auth state 按 `.inkloop/lark-auth/<tenant>/feishu_<open_id>/<device>.json` 分桶（见 sessionScopedLarkAuthPath）。
+    // 带 open_id：取该用户最近登录设备的 state 走 resolveUserOAuthToken（自带懒刷新）；不带：枚举可用 open_id（不发 token）。
+    const larkAuthRoot = resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID);
+    const openIdParam = new URL(req.url || '/', 'http://inkloop.local').searchParams.get('open_id')?.trim() || '';
+    if (!openIdParam) {
+      let openIds: string[] = [];
+      try {
+        openIds = readdirSync(larkAuthRoot)
+          .filter((name) => name.startsWith('feishu_'))
+          .map((name) => name.slice('feishu_'.length));
+      } catch { /* 目录不存在 = 无人登录 */ }
+      sendJson(res, 200, { ok: true, open_ids: openIds });
+      return;
+    }
+    const userDir = resolve(larkAuthRoot, inkloopUserIdFromFeishuOpenId(openIdParam));
+    let statePath = '';
+    try {
+      const files = readdirSync(userDir).filter((name) => name.endsWith('.json'));
+      let latest = -1;
+      for (const name of files) {
+        const mtime = statSync(resolve(userDir, name)).mtimeMs;
+        if (mtime > latest) { latest = mtime; statePath = resolve(userDir, name); }
+      }
+    } catch { /* 用户目录不存在 */ }
+    if (!statePath) { sendJson(res, 404, { ok: false, reason: 'oauth_not_logged_in' }); return; }
+    const oauth = await resolveUserOAuthToken({ ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath });
+    if (!oauth.usable || !oauth.token) {
+      sendJson(res, 409, { ok: false, reason: oauth.reason || 'oauth_unusable', ...(oauth.refreshError ? { refresh_error: oauth.refreshError } : {}) });
+      return;
+    }
+    sendJson(res, 200, { ok: true, access_token: oauth.token, open_ids: oauth.userOpenIds.length ? oauth.userOpenIds : [openIdParam], scopes: oauth.scopes });
     return;
   }
   if (url.startsWith('/v1/runtime/')) {
