@@ -1024,18 +1024,34 @@ async function openFeishuIdentitySheet(): Promise<void> {
     return;
   }
   const missingScopes = me.oauth?.missing_scopes || [];
-  const shouldRelogin = missingScopes.length || me.oauth?.reason;
-  const ok = await confirmSheet({
+  const needRelogin = !!(missingScopes.length || me.oauth?.reason);
+  // 刷新身份必须是常驻动作：缺 scope 时所有接口都正常返回、没有任何 401/409 会触发重授权提示，
+  // 用户需要一个不依赖"系统判定坏了"的主动入口（2026-07-15 卡 live 会议无法自愈的教训）。
+  const action = await pickOneSheet({
     title: '飞书身份',
-    message: identitySummary(me),
-    confirm: shouldRelogin ? '重新授权' : '刷新',
+    items: [
+      {
+        id: 'refresh',
+        label: needRelogin ? '重新授权（缺少权限）' : '刷新身份',
+        sub: needRelogin ? `缺少权限：${missingScopes.join(', ') || me.oauth?.reason}` : '重新扫码授权，更新权限与登录状态',
+      },
+      { id: 'switch', label: '切换账号', sub: '即将支持' },
+      { id: 'detail', label: '查看身份详情', sub: me.session?.feishu_open_id || undefined },
+    ],
+    defaultId: 'refresh',
+    confirm: '确定',
   });
-  if (!ok) return;
-  if (shouldRelogin) {
+  if (!action) return;
+  if (action === 'refresh') {
     try { await startDeviceFeishuLogin(); }
     catch (e) { await infoSheet({ title: '飞书登录失败', message: String((e as Error)?.message || e) }); }
     return;
   }
+  if (action === 'switch') {
+    await infoSheet({ title: '切换账号', message: '切换到另一个飞书账号暂未支持。当前可先用「刷新身份」重新扫码授权。' });
+    return;
+  }
+  await infoSheet({ title: '飞书身份', message: identitySummary(me) });
   if (meetingProviderLeadVisible) renderMeetingProviderLead();
   else await renderHome({ sync: 'blocking', keepPage: true });
 }

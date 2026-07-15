@@ -14,6 +14,7 @@ export interface RuntimeSyncTransportPort {
 
 export interface RuntimeSyncRunnerOptions {
   batchSize?: number;
+  maxBatchBytes?: number;
   maxAttempts?: number;
   retryDelayMs?: number;
   deviceId?: string;
@@ -109,7 +110,7 @@ export interface HttpRuntimeSyncTransportConfig {
   headers?: Record<string, string> | (() => Record<string, string>);
   /** pull 超时（默认 15s）：轮询高频、payload 小，挂死要快速止损。 */
   requestTimeoutMs?: number;
-  /** push 超时（默认 60s）：一批 25 条带笔迹点阵的事件在弱网上传合法地慢，15s 会把大批次永远掐死在半路。 */
+  /** push 超时（默认 120s）：带笔迹点阵的事件批次在弱网上传合法地慢，短超时会把大批次永远掐死在半路。 */
   sendTimeoutMs?: number;
 }
 
@@ -162,10 +163,26 @@ function retryAt(now: string, retryDelayMs: number): string {
   return new Date(parseTime(now) + retryDelayMs).toISOString();
 }
 
-function chunk<T>(values: T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let index = 0; index < values.length; index += size) chunks.push(values.slice(index, index + size));
-  return chunks;
+// 单批 payload 体积封顶：老标记带完整笔迹点阵、单条可达几百 KB，按条数(25)打包一批能到 5MB+，
+// 弱网上传必超时且重试永远整批失败。按累计字节切批后每个请求都在可完成的量级；超上限的巨型事件单独成批。
+const DEFAULT_MAX_BATCH_BYTES = 600_000;
+
+function chunkByBytes<T>(items: T[], maxCount: number, maxBytes: number, sizeOf: (item: T) => number): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let bytes = 0;
+  for (const item of items) {
+    const size = sizeOf(item);
+    if (current.length && (current.length >= maxCount || bytes + size > maxBytes)) {
+      batches.push(current);
+      current = [];
+      bytes = 0;
+    }
+    current.push(item);
+    bytes += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
 }
 
 function isRuntimeSyncAck(value: unknown): value is RuntimeSyncAck {
@@ -207,6 +224,7 @@ function appendQuery(endpoint: string, params: Record<string, string | number | 
 
 export class RuntimeSyncRunner {
   private readonly batchSize: number;
+  private readonly maxBatchBytes: number;
   private readonly maxAttempts: number;
   private readonly retryDelayMs: number;
   private readonly deviceId?: string;
@@ -221,6 +239,7 @@ export class RuntimeSyncRunner {
     options: RuntimeSyncRunnerOptions = {},
   ) {
     this.batchSize = Math.max(1, options.batchSize ?? 25);
+    this.maxBatchBytes = Math.max(1_024, options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES);
     this.maxAttempts = Math.max(1, options.maxAttempts ?? 5);
     this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_000);
     this.deviceId = options.deviceId;
@@ -262,7 +281,7 @@ export class RuntimeSyncRunner {
       };
     }
 
-    for (const batch of chunk(representatives, this.batchSize)) {
+    for (const batch of chunkByBytes(representatives, this.batchSize, this.maxBatchBytes, (item) => JSON.stringify(item.event).length)) {
       const batchEvents = batch.map(({ event }) => event);
       attemptedEventIds.push(...batchEvents.map((event) => event.event_id));
       let acks: RuntimeSyncAck[];
@@ -421,7 +440,7 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
 
   async send(events: RuntimeSyncEvent[]): Promise<RuntimeSyncAck[]> {
     const controller = new AbortController();
-    const timeout = timeoutAbort(controller, Math.max(1, this.config.sendTimeoutMs ?? 60_000));
+    const timeout = timeoutAbort(controller, Math.max(1, this.config.sendTimeoutMs ?? 120_000));
     let response: Response;
     try {
       response = await fetch(this.config.endpoint, {
