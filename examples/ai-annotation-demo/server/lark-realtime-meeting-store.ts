@@ -16,7 +16,7 @@ export interface LarkRealtimeMeetingRecord {
   participant_open_ids?: string[];
   source_event_type?: string;
   source_event_id?: string;
-  source_transport?: 'lark_ws_event' | 'lark_http_event' | 'manual';
+  source_transport?: 'lark_ws_event' | 'lark_http_event' | 'lark_rest_reconcile' | 'manual';
   created_at: string;
   updated_at: string;
 }

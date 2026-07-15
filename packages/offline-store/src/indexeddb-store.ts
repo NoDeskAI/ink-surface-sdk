@@ -257,14 +257,19 @@ export class IndexedDbOfflineRuntimeStore implements OfflineRuntimeStorePort {
     const transaction = db.transaction('outbox', 'readwrite');
     const store = transaction.objectStore('outbox');
     const done = transactionDone(transaction);
+    // put 必须在 get 的 onsuccess 回调里同步排队：Safari/部分老 WebView 会在 promise
+    // continuation 前把事务置 inactive，事务里 await 后再 put 会抛 TransactionInactiveError。
     for (const update of updates) {
-      const existing = await requestToPromise(store.get(update.event_id)) as StoredRuntimeSyncEvent | undefined;
-      store.put({
-        ...update,
-        ...(existing?.indexeddb_sequence !== undefined
-          ? { indexeddb_sequence: existing.indexeddb_sequence }
-          : {}),
-      });
+      const request = store.get(update.event_id) as IDBRequest<StoredRuntimeSyncEvent | undefined>;
+      request.onsuccess = () => {
+        const existing = request.result;
+        store.put({
+          ...update,
+          ...(existing?.indexeddb_sequence !== undefined
+            ? { indexeddb_sequence: existing.indexeddb_sequence }
+            : {}),
+        });
+      };
     }
     await done;
   }

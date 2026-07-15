@@ -142,6 +142,11 @@ function authRoot(env: GoogleOAuthEnv): string {
   return resolve(clean(env.GOOGLE_AUTH_ROOT) || DEFAULT_GOOGLE_AUTH_ROOT);
 }
 
+/** Google 授权状态根目录（`<root>/<tenant>/<user>/…`）；供 hub 侧周期任务枚举已连接用户。 */
+export function googleAuthRoot(env: GoogleOAuthEnv): string {
+  return authRoot(env);
+}
+
 function pendingStorePath(env: GoogleOAuthEnv): string {
   return resolve(clean(env.GOOGLE_OAUTH_PENDING_STORE) || resolve(authRoot(env), 'pending-device-oauth.json'));
 }

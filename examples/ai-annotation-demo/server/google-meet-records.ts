@@ -582,6 +582,88 @@ async function fetchCandidates(
   return candidates;
 }
 
+const GOOGLE_MEET_ARTIFACT_BACKFILL_WINDOW_MS = 60 * 60_000;
+const GOOGLE_MEET_ARTIFACT_BACKFILL_MIN_INTERVAL_MS = 2 * 60_000;
+
+// Gemini 智能纪要在会议结束后几分钟才导出成 Doc：转写 ready 的首次拉取常拿到"只有资源名"的空壳
+// （无 docsDestination/text）。空壳不算终态——会议结束后一小时内限频回查，直到拿到正文或窗口关闭。
+function googleMeetArtifactBackfillDue(job: GoogleMeetJobState | undefined, nowMs: number): boolean {
+  if (job?.status !== 'ready') return false;
+  const fetchedAtMs = Date.parse(job.artifacts_fetched_at || '');
+  if (!Number.isFinite(fetchedAtMs)) return true;
+  if (job.smart_note_scope_missing) return false; // scope 缺失走 driveScopeAdded 专门路径
+  if (job.smart_note?.text) return false;
+  const chosen = job.chosen_record_name ? recordCandidatesByName(job.records).get(job.chosen_record_name) : undefined;
+  if (nowMs - pollAnchorMs(job, chosen?.record) > GOOGLE_MEET_ARTIFACT_BACKFILL_WINDOW_MS) return false;
+  return nowMs - fetchedAtMs >= GOOGLE_MEET_ARTIFACT_BACKFILL_MIN_INTERVAL_MS;
+}
+
+/** artifact-only 回补：只重拉 smartNotes/recordings，保留 ready job 的转写与记录不动。 */
+async function backfillJobArtifacts(
+  job: GoogleMeetJobState,
+  auth: { token: string; refreshed: boolean },
+  requestOptions: RequestOptions,
+  grantedScopes: readonly string[],
+  nowMs: number,
+): Promise<GoogleMeetJobState | null> {
+  const chosen = job.chosen_record_name ? recordCandidatesByName(job.records).get(job.chosen_record_name) : undefined;
+  if (!chosen?.record.name) return null;
+  const artifacts = await fetchChosenArtifacts(chosen.record.name, auth, requestOptions, grantedScopes);
+  const updated: GoogleMeetJobState = {
+    ...job,
+    ...(artifacts.smart_note ? { smart_note: artifacts.smart_note } : {}),
+    ...(artifacts.recordings ? { recordings: artifacts.recordings } : {}),
+    artifacts_fetched_at: new Date(nowMs).toISOString(),
+    updated_at: new Date(nowMs).toISOString(),
+  };
+  if (artifacts.smart_note_scope_missing) updated.smart_note_scope_missing = true;
+  else delete updated.smart_note_scope_missing;
+  return updated;
+}
+
+export interface GoogleMeetSmartNoteBackfillResult {
+  scanned: number;
+  backfilled: number;
+  completed: number;
+  errors: string[];
+}
+
+/** hub 侧周期回补：扫 meet-records 里"ready 但纪要正文没到手且仍在窗口内"的 job，主动补拉。
+ * 设备不在线/recap 没打开也能拿到 Gemini 纪要——设备端请求只是另一个触发源，不是唯一触发源。 */
+export async function backfillGoogleMeetSmartNotes(
+  token: string,
+  recordsRef: GoogleMeetRecordsRef,
+  options: GoogleMeetRecordsOptions = {},
+): Promise<GoogleMeetSmartNoteBackfillResult> {
+  const nowMs = options.nowMs ?? Date.now();
+  const result: GoogleMeetSmartNoteBackfillResult = { scanned: 0, backfilled: 0, completed: 0, errors: [] };
+  if (!String(token || '').trim()) return result;
+  const state = loadState(recordsRef.path);
+  const requestOptions: RequestOptions = {
+    fetchImpl: options.fetchImpl || fetch,
+    sleepImpl: options.sleepImpl || defaultSleep,
+    refreshAccessToken: options.refreshAccessToken,
+  };
+  const auth = { token, refreshed: false };
+  let changed = false;
+  for (const [key, job] of Object.entries(state.meetings)) {
+    if (!googleMeetArtifactBackfillDue(job, nowMs)) continue;
+    result.scanned += 1;
+    try {
+      const updated = await backfillJobArtifacts(job, auth, requestOptions, options.grantedScopes || [], nowMs);
+      if (!updated) continue;
+      state.meetings[key] = updated;
+      changed = true;
+      result.backfilled += 1;
+      if (updated.smart_note?.text) result.completed += 1;
+    } catch (e) {
+      result.errors.push(`${key}: ${String((e as Error)?.message || e)}`);
+    }
+  }
+  if (changed) saveState(recordsRef.path, state);
+  return result;
+}
+
 const jobsInFlight = new Map<string, Promise<GoogleMeetingTranscriptResult>>();
 
 async function runCatchUp(
@@ -602,7 +684,7 @@ async function runCatchUp(
     && current.status !== 'ready'
     && (!Number.isFinite(currentUpdatedMs) || nowMs - currentUpdatedMs >= 10 * 60_000);
   const driveScopeAdded = !!current?.smart_note_scope_missing && (options.grantedScopes || []).includes(GOOGLE_DRIVE_READONLY_SCOPE);
-  const artifactBackfillDue = current?.status === 'ready' && !current.artifacts_fetched_at;
+  const artifactBackfillDue = googleMeetArtifactBackfillDue(current, nowMs);
   if ((current?.terminal && !terminalRetryDue && !driveScopeAdded && !artifactBackfillDue)
     || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
     return responseFromJob(current);
@@ -614,6 +696,20 @@ async function runCatchUp(
     refreshAccessToken: options.refreshAccessToken,
   };
   const auth = { token, refreshed: false };
+
+  // ready job 只差 artifact（智能纪要空壳/新授权 drive scope）时走 artifact-only 回补：
+  // 不重拉 conference records/transcripts/entries——全量重跑一旦 Google 列表瞬时抖空，
+  // 已到手的 ready 转写会被降级覆盖成 pending/no_record。
+  if (current?.status === 'ready' && (artifactBackfillDue || driveScopeAdded)) {
+    const refreshed = await backfillJobArtifacts(current, auth, requestOptions, options.grantedScopes || [], nowMs);
+    if (refreshed) {
+      state.meetings[key] = refreshed;
+      saveState(recordsRef.path, state);
+      return responseFromJob(refreshed);
+    }
+    // chosen record 异常缺失才会走到这：退回全量路径自愈。
+  }
+
   const records = await fetchCandidates(meetingCode, auth, requestOptions);
   const chosen = chooseGoogleMeetCandidate(records, scheduledAt, input.attendance);
   const chosenRecord = chosen?.record;
@@ -684,7 +780,10 @@ export function fetchGoogleMeetingTranscript(
   options: GoogleMeetRecordsOptions = {},
 ): Promise<GoogleMeetingTranscriptResult> {
   if (!String(token || '').trim()) return Promise.reject(new GoogleMeetRecordsError('google_meet_token_missing', 401));
-  const lockKey = `${recordsRef.path}|${input.meetingCode}|${input.scheduledAt}`;
+  // scheduledAt 归一化后再做 single-flight key：同一会议的等价时间写法（±时区/秒精度）不该绕过去重。
+  let scheduledKey = input.scheduledAt;
+  try { scheduledKey = new Date(absoluteMs(input.scheduledAt, 'scheduled_at')).toISOString(); } catch { /* 非法输入交给 runCatchUp 抛同样的错 */ }
+  const lockKey = `${recordsRef.path}|${input.meetingCode.trim()}|${scheduledKey}`;
   const existing = jobsInFlight.get(lockKey);
   if (existing) return existing;
   const job = runCatchUp(token, recordsRef, input, options).finally(() => jobsInFlight.delete(lockKey));

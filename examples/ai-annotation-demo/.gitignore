@@ -7,7 +7,8 @@ test-results/
 *.log
 .idea/
 .env
-.env.bedrock
+.env.*
+!.env.example
 .env.kimi
 
 # dev-only 调试通道遥测（server/debug.mjs 落盘，仅本地定位问题用）

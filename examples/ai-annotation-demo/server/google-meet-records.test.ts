@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  backfillGoogleMeetSmartNotes,
   chooseGoogleMeetCandidate,
   chooseGoogleMeetRecord,
   fetchGoogleMeetingTranscript,
@@ -365,6 +366,158 @@ describe('google meet records', () => {
     expect(afterReauthorization.smart_note).toMatchObject({ text: 'Exported after reauthorization.' });
     const refreshed = JSON.parse(readFileSync(path, 'utf8'));
     expect(Object.values(refreshed.meetings)[0]).not.toHaveProperty('smart_note_scope_missing');
+  });
+
+  it('backfills a stub smart note (name only) after Gemini finishes exporting the doc', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    let noteExported = false;
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) {
+        return jsonResponse({ smartNotes: [{
+          name: `${record.name}/smartNotes/note1`,
+          ...(noteExported ? { docsDestination: { document: 'gemini-doc-1', exportUri: 'https://docs.google.com/document/d/gemini-doc-1/edit' } } : {}),
+        }] });
+      }
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      if (url.pathname === '/drive/v3/files/gemini-doc-1/export') return new Response('Gemini 智能纪要正文');
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const options = {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    };
+    const input = { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime };
+
+    // 会议结束 40 秒后首拉：转写 ready，但 Gemini Doc 还没导出——smart_note 只有资源名。
+    const first = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+    });
+    expect(first.status).toBe('ready');
+    expect(first.smart_note ?? {}).not.toHaveProperty('text');
+    const callsAfterFirst = fetchImpl.mock.calls.length;
+
+    // 2 分钟限频内的请求走缓存，不打 Google。
+    const throttled = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T14:26:30.000Z'),
+    });
+    expect(throttled.status).toBe('ready');
+    expect(fetchImpl.mock.calls.length).toBe(callsAfterFirst);
+
+    // 3 分钟后 Doc 导出完成：限频窗口过了，回补拉到正文。
+    noteExported = true;
+    const backfilled = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T14:28:50.000Z'),
+    });
+    expect(backfilled.smart_note).toMatchObject({ text: 'Gemini 智能纪要正文' });
+    expect(backfilled.status).toBe('ready');
+    const callsAfterBackfill = fetchImpl.mock.calls.length;
+    expect(callsAfterBackfill).toBeGreaterThan(callsAfterFirst);
+    // 回补必须是 artifact-only：不重拉 conference records/entries，已到手的 ready 转写不被全量重跑覆盖。
+    const backfillRoundPaths = fetchImpl.mock.calls.slice(callsAfterFirst).map(([urlValue]) => new URL(String(urlValue)).pathname);
+    expect(backfillRoundPaths.some((p) => p === '/v2/conferenceRecords' || p.endsWith('/entries') || p.endsWith('/transcripts'))).toBe(false);
+
+    // 正文到手 = 终态，后续请求不再回查。
+    const settled = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T14:40:00.000Z'),
+    });
+    expect(settled.smart_note).toMatchObject({ text: 'Gemini 智能纪要正文' });
+    expect(fetchImpl.mock.calls.length).toBe(callsAfterBackfill);
+  });
+
+  it('hub-side sweep backfills eligible jobs without a device request', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    let noteExported = false;
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) {
+        return jsonResponse({ smartNotes: [{
+          name: `${record.name}/smartNotes/note1`,
+          ...(noteExported ? { docsDestination: { document: 'gemini-doc-1' } } : {}),
+        }] });
+      }
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      if (url.pathname === '/drive/v3/files/gemini-doc-1/export') return new Response('后台回补拿到的纪要');
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const options = { fetchImpl: fetchImpl as unknown as typeof fetch, grantedScopes: [DRIVE_READONLY_SCOPE] };
+
+    // 设备侧首拉落下空壳。
+    await fetchGoogleMeetingTranscript('token', { path }, { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime }, {
+      ...options, nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+    });
+
+    // hub 周期扫描（无设备请求）：Doc 已导出 → 回补正文。
+    noteExported = true;
+    const sweep = await backfillGoogleMeetSmartNotes('token', { path }, {
+      ...options, nowMs: Date.parse('2026-07-15T14:28:50.000Z'),
+    });
+    expect(sweep).toMatchObject({ scanned: 1, backfilled: 1, completed: 1, errors: [] });
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    const job = Object.values(stored.meetings)[0] as Record<string, unknown>;
+    expect(job.smart_note).toMatchObject({ text: '后台回补拿到的纪要' });
+    expect(job.status).toBe('ready');
+
+    // 正文到手后再扫不动它。
+    const idle = await backfillGoogleMeetSmartNotes('token', { path }, {
+      ...options, nowMs: Date.parse('2026-07-15T14:32:00.000Z'),
+    });
+    expect(idle).toMatchObject({ scanned: 0, backfilled: 0 });
+  });
+
+  it('stops smart-note backfill once the post-meeting window closes', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse({ smartNotes: [] });
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const options = {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    };
+    const input = { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime };
+
+    const first = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+    });
+    expect(first.status).toBe('ready');
+    const callsAfterFirst = fetchImpl.mock.calls.length;
+
+    // 会议结束一小时后窗口关闭：没有纪要就是没有，回缓存不再打 Google。
+    const closed = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options, nowMs: Date.parse('2026-07-15T15:30:00.000Z'),
+    });
+    expect(closed.status).toBe('ready');
+    expect(fetchImpl.mock.calls.length).toBe(callsAfterFirst);
   });
 
   it('normalizes smartNotes and recordings from the locked API fixtures', () => {

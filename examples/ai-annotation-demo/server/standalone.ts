@@ -14,7 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -50,19 +50,22 @@ import {
   resolveUserOAuthToken,
 } from './lark-oauth-state';
 import { fetchLarkMeetingSources, resolveLarkMeetingInstance } from './lark-meeting-sources';
+import { reconcileLarkLiveMeetings } from './lark-meeting-reconcile';
 import {
   beginGoogleDeviceOAuth,
   completeGoogleOAuthCallback,
   googleCalendarSyncPath,
   googleMeetRecordsPath,
   googleDeviceOAuthCompletion,
+  googleAuthRoot,
   googleOAuthErrorPayload,
+  resolveAnyUserGoogleToken,
   resolveGoogleOAuthStatus,
   resolveUserGoogleToken,
   type GoogleOAuthIdentity,
 } from './google-oauth-state';
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
-import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
+import { backfillGoogleMeetSmartNotes, fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
 import {
   currentMtlToken,
   mintMtlToken,
@@ -432,6 +435,21 @@ function feishuOpenIdFromUser(user: unknown): string | null {
 
 function inkloopUserIdFromFeishuOpenId(openId: string): string {
   return `feishu_${safeId(openId, 'user')}`;
+}
+
+/** 该 open_id 最近登录设备的 lark OAuth state 文件路径；无登录记录返回空串。 */
+function latestLarkAuthStatePath(openId: string): string {
+  const userDir = resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID, inkloopUserIdFromFeishuOpenId(openId));
+  let statePath = '';
+  try {
+    const files = readdirSync(userDir).filter((name) => name.endsWith('.json'));
+    let latest = -1;
+    for (const name of files) {
+      const mtime = statSync(resolve(userDir, name)).mtimeMs;
+      if (mtime > latest) { latest = mtime; statePath = resolve(userDir, name); }
+    }
+  } catch { /* 用户目录不存在 = 未登录 */ }
+  return statePath;
 }
 
 function shouldBootstrapLibraryForFeishuLogin(previousUserId: string, nextUserId: string): boolean {
@@ -2524,16 +2542,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 200, { ok: true, open_ids: openIds });
       return;
     }
-    const userDir = resolve(larkAuthRoot, inkloopUserIdFromFeishuOpenId(openIdParam));
-    let statePath = '';
-    try {
-      const files = readdirSync(userDir).filter((name) => name.endsWith('.json'));
-      let latest = -1;
-      for (const name of files) {
-        const mtime = statSync(resolve(userDir, name)).mtimeMs;
-        if (mtime > latest) { latest = mtime; statePath = resolve(userDir, name); }
-      }
-    } catch { /* 用户目录不存在 */ }
+    const statePath = latestLarkAuthStatePath(openIdParam);
     if (!statePath) { sendJson(res, 404, { ok: false, reason: 'oauth_not_logged_in' }); return; }
     const oauth = await resolveUserOAuthToken({ ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath });
     if (!oauth.usable || !oauth.token) {
@@ -2620,11 +2629,84 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
 const server = createServer(handleRequest);
 
+// WS end 事件可能丢（断线/重启窗口/同 app 多长连接抢路由），live 状态用 REST 周期对账兜底自愈。
+const LARK_MEETING_RECONCILE_MS = Math.max(0, Number(process.env.INKLOOP_LARK_MEETING_RECONCILE_MS ?? 120_000));
+let larkMeetingReconcileInFlight = false;
+async function runLarkMeetingReconcile(reason: string): Promise<void> {
+  if (larkMeetingReconcileInFlight || FEISHU_SERVICE_BASE) return;
+  larkMeetingReconcileInFlight = true;
+  try {
+    const result = await reconcileLarkLiveMeetings({
+      root: ROOT,
+      baseUrl: process.env.LARK_BASE_URL || process.env.FEISHU_BASE_URL || undefined,
+      resolveUserToken: async (openId) => {
+        const statePath = latestLarkAuthStatePath(openId);
+        if (!statePath) return '';
+        const oauth = await resolveUserOAuthToken({ ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath });
+        return oauth.usable && oauth.token ? oauth.token : '';
+      },
+      logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
+    });
+    if (result.checked > 0 || result.errors.length > 0) {
+      console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+    }
+  } catch (e) {
+    console.warn(`[inkloop proxy] lark meeting reconcile failed reason=${reason}: ${String((e as Error)?.message || e)}`);
+  } finally {
+    larkMeetingReconcileInFlight = false;
+  }
+}
+
+// Gemini 智能纪要在会议结束后几分钟才导出成 Doc，设备端请求不是可靠触发源（recap 可能一直开着或没开）。
+// hub 侧周期扫全部已连接用户的 meet-records，窗口内的空壳纪要主动回补。
+const GOOGLE_SMART_NOTE_BACKFILL_MS = Math.max(0, Number(process.env.INKLOOP_GOOGLE_SMART_NOTE_BACKFILL_MS ?? 120_000));
+let googleBackfillInFlight = false;
+async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
+  if (googleBackfillInFlight) return;
+  googleBackfillInFlight = true;
+  try {
+    const root = googleAuthRoot(process.env);
+    let identities: Array<{ tenantId: string; userId: string }> = [];
+    try {
+      identities = readdirSync(root, { withFileTypes: true })
+        .filter((tenant) => tenant.isDirectory())
+        .flatMap((tenant) => readdirSync(resolve(root, tenant.name), { withFileTypes: true })
+          .filter((user) => user.isDirectory())
+          .map((user) => ({ tenantId: tenant.name, userId: user.name })));
+    } catch { /* 目录不存在 = 无人连接 Google */ }
+    for (const identity of identities) {
+      const recordsPath = googleMeetRecordsPath(process.env, identity);
+      if (!existsSync(recordsPath)) continue;
+      const resolved = await resolveAnyUserGoogleToken(process.env, identity);
+      if (!resolved.usable || !resolved.token) continue;
+      const result = await backfillGoogleMeetSmartNotes(resolved.token, { path: recordsPath }, {
+        grantedScopes: resolved.scopes,
+      });
+      if (result.scanned > 0 || result.errors.length > 0) {
+        console.log(`[inkloop proxy] google smart-note backfill reason=${reason} user=${identity.userId} scanned=${result.scanned} backfilled=${result.backfilled} completed=${result.completed}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[inkloop proxy] google smart-note backfill failed reason=${reason}: ${String((e as Error)?.message || e)}`);
+  } finally {
+    googleBackfillInFlight = false;
+  }
+}
+
 const PORT = Number(process.env.PORT || 3000);
 server.listen(PORT, () => {
   console.log(`[inkloop proxy] :${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
   const wsStatus = startLarkWsMeetingEvents(ROOT, feishuBotRuntimeEnv(process.env));
   console.log(`[inkloop proxy] Lark meeting WS ${wsStatus.enabled ? wsStatus.state : 'disabled'} events=${wsStatus.registered_event_types.length}`);
+  if (LARK_MEETING_RECONCILE_MS > 0 && !FEISHU_SERVICE_BASE) {
+    setInterval(() => { void runLarkMeetingReconcile('interval'); }, LARK_MEETING_RECONCILE_MS).unref();
+    // 启动即对账一次（延迟给 WS 建连留窗口），把重启窗口/历史丢事件卡住的 live 清掉。
+    setTimeout(() => { void runLarkMeetingReconcile('boot'); }, 15_000).unref();
+  }
+  if (GOOGLE_SMART_NOTE_BACKFILL_MS > 0) {
+    setInterval(() => { void runGoogleSmartNoteBackfill('interval'); }, GOOGLE_SMART_NOTE_BACKFILL_MS).unref();
+    setTimeout(() => { void runGoogleSmartNoteBackfill('boot'); }, 20_000).unref();
+  }
 });
 
 const LARK_MEETING_CALLBACK_SERVER_PORT = Number(LARK_MEETING_CALLBACK_PORT);

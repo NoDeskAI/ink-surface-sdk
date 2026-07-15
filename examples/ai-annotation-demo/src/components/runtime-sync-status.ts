@@ -114,7 +114,10 @@ function ensureStyle(): void {
 function titleFor(detail: RuntimeSyncStatusDetail): string {
   const pending = detail.pending_event_count ?? 0;
   const deadLetters = detail.dead_letter_count ?? 0;
-  if (pending > 0 && detail.state === 'failed') return '标记同步失败';
+  // state 优先于计数：无本地积压的 pull 失败也是真失败，不能被双计数吃成"已同步"。
+  if (detail.state === 'failed') return '标记同步失败';
+  if (detail.state === 'syncing') return pending > 0 ? `标记同步中 ${pending}` : '标记同步中';
+  if (detail.state === 'pulling') return '正在检查标记';
   if (pending > 0) return `标记待同步 ${pending}`;
   if (deadLetters > 0) return `有 ${deadLetters} 条历史标记未同步`;
   return '标记已同步';
@@ -219,7 +222,8 @@ export function initRuntimeSyncStatus(): void {
       window.clearTimeout(hideTimer);
       hideTimer = null;
     }
-    if ((detail.pending_event_count ?? 0) > 0 || (detail.dead_letter_count ?? 0) > 0) return;
+    // 只有真 synced 且双计数归零才自动隐藏；failed/dead_letter 挂住等用户处理。
+    if (detail.state !== 'synced' || (detail.pending_event_count ?? 0) > 0 || (detail.dead_letter_count ?? 0) > 0) return;
     hideTimer = window.setTimeout(() => {
       node.hidden = true;
       hideTimer = null;
