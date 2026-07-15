@@ -690,6 +690,14 @@ function renderRecap(bodyEl: HTMLElement): void {
 function updateRecapNav(): void {
   if (!recapState) return; // 显隐交给 CSS(body[data-mtg="recap"])；无有效 recapState 时不瞎改高亮
   const view = recapState.view;
+  // 纪要入口标签随 provider：Google 会议别写「飞书纪要」（纪要=将来的 Gemini 智能纪要）。
+  const feishuNav = document.querySelector<HTMLElement>('#recap-sub [data-rc="feishu"]');
+  if (feishuNav) {
+    const label = meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript' ? '智能纪要' : '飞书纪要';
+    feishuNav.setAttribute('aria-label', label);
+    const lab = feishuNav.closest('.rl-item')?.querySelector<HTMLElement>('.rl-lab');
+    if (lab && lab.textContent !== label) lab.textContent = label;
+  }
   document.querySelectorAll<HTMLElement>('#recap-sub [data-rc]').forEach((b) => {
     // detail 是概览里「手写记录」的下钻，没有独立入口——停在 detail 时"概览"仍高亮。
     const on = b.dataset.rc === view || (b.dataset.rc === 'overview' && view === 'detail');
@@ -926,6 +934,11 @@ function wireFeishuSummaryImages(bodyEl: HTMLElement): void {
 /** 左侧 nav「飞书纪要」入口整页：飞书官方智能纪要原文，和文字记录/InkLoop 总结分开。 */
 function renderRecapFeishuPage(bodyEl: HTMLElement): void {
   if (!recapState) return;
+  if (meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript') {
+    bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>智能纪要</b><span class="mdl">Google Meet</span></div>`
+      + `<div class="empty">Google 智能纪要（Gemini）尚未接入；接入后这里会显示官方纪要原文。原始发言和 InkLoop 后处理不受影响。</div></div>`;
+    return;
+  }
   const rec = recapState.feishuSummary ?? recapState.meeting.feishu_note_summary ?? null;
   if (rec?.content.trim()) {
     const title = rec.title || '飞书智能纪要';
@@ -1381,26 +1394,29 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
   const markSource = recapState.markSourceMeeting && recapState.markSourceMeeting.meeting_id !== meeting.meeting_id
     ? ` · 来自${recapState.markSourceMeeting.feishu_topic || recapState.markSourceMeeting.title || '相近会议'}`
     : '';
+  const google = meetingTranscriptSource(meeting) === 'google_meet_transcript';
   const feishuReady = !!(recapState.feishuSummary?.content || meeting.feishu_note_summary?.content);
   const conclusions = overviewConclusionItems();
   const conclusionHtml = conclusions.length
     ? conclusions.map((item) => `<span class="rc-over-li">${esc(item)}</span>`).join('')
-    : `<span class="rc-over-empty">飞书原始发言或智能纪要同步后，这里会出现会议要点。</span>`;
+    : `<span class="rc-over-empty">${google ? '原始发言同步后，这里会出现会议要点。' : '飞书原始发言或智能纪要同步后，这里会出现会议要点。'}</span>`;
   const rawMeta = cues.length ? `${cues.length} 句 · ${speakerCount || '未知'} 人` : '待同步';
-  const rawBody = cues.length ? cueExcerpt(cues.slice(0, Math.min(cues.length, 8))) : '飞书原始发言还没有同步到本机。';
+  const rawBody = cues.length ? cueExcerpt(cues.slice(0, Math.min(cues.length, 8))) : `${google ? '' : '飞书'}原始发言还没有同步到本机。`;
   const inkBody = inkCount
     ? `共 ${inkCount} 处手写/圈画${markSource}，点击按屏查看原始发言和整页手写。`
     : '本场没有手写记录；如果会后补写，会自动归到这里。';
   const exportState = meeting.exported_at ? `已导出 ${fmtExportedAt(meeting.exported_at)}` : '未导出';
   bodyEl.innerHTML = `<div class="rc-overview">`
     + `<section class="rc-over-hero">`
-    + `<div><span class="rc-kicker">会后概览</span><h2>${esc(title)}</h2><p>${esc(fmtClock(meetingT0(meeting)) || fmtClock(Date.parse(meeting.scheduled_at)) || '时间未知')} · ${esc(meetingDurationLabel(meeting, cues))} · ${esc(meeting.align_state ? ALIGN_LABEL[meeting.align_state] : '约对齐')}</p></div>`
+    + `<div><span class="rc-kicker">会后概览</span><h2>${esc(title)}</h2><p>${esc(fmtClock(meetingT0(meeting)) || fmtClock(Date.parse(meeting.scheduled_at)) || '时间未知')} · ${esc(meetingDurationLabel(meeting, cues))} · ${esc(google && meeting.align_state === 'event' ? '场次真实时间对齐' : (meeting.align_state ? ALIGN_LABEL[meeting.align_state] : '约对齐'))}</p></div>`
     + `<div class="rc-metrics"><span><b>${cues.length || '-'}</b>句</span><span><b>${speakerCount || '-'}</b>人</span><span><b>${inkCount}</b>手写</span></div>`
     + `</section>`
     + `<section class="rc-over-focus"><div class="rc-sec-title"><b>会议要点</b><span>${esc(panelSummaryLabel())}</span></div><div class="rc-over-list">${conclusionHtml}</div></section>`
     + `<section class="rc-entry-grid">`
     + overviewCardHtml({ action: 'transcript', title: '原始发言', meta: rawMeta, body: rawBody, disabled: !cues.length })
-    + overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : '等待生成', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : '飞书官方智能纪要还没有同步。', disabled: !feishuReady })
+    + (google
+      ? overviewCardHtml({ action: 'feishu', title: '智能纪要', meta: '未接入', body: 'Google 智能纪要（Gemini）接入后会显示在这里。', disabled: true })
+      : overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : '等待生成', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : '飞书官方智能纪要还没有同步。', disabled: !feishuReady }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: inkCount ? `${inkCount} 处${markSource}` : '0 处', body: inkBody, disabled: inkPages.length === 0 })
     + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。' })
     + `</section>`
