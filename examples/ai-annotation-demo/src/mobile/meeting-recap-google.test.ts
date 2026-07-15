@@ -23,7 +23,9 @@ vi.mock('../integration/google-meet/client', async (importOriginal) => ({
 import {
   ensureGooglePanelSummary,
   googleSmartNoteCardState,
+  isFeishuReloginError,
   loadGoogleTranscript,
+  recapTranscriptMissingMessage,
   renderGoogleRecordingsHtml,
 } from './meeting-recap';
 
@@ -51,6 +53,24 @@ describe('meeting recap Google transcript branch', () => {
     mocks.updateMeeting.mockResolvedValue(null);
   });
   afterEach(() => vi.unstubAllGlobals());
+
+  it('preserves provider missing semantics instead of leaving a loading label', () => {
+    expect(recapTranscriptMissingMessage(googleMeeting({ provider_transcript_status: 'not_generated' })))
+      .toContain('provider_transcript_status=not_generated');
+    expect(recapTranscriptMissingMessage(googleMeeting({ provider_transcript_status: 'no_record' })))
+      .toContain('provider_transcript_status=no_record');
+    expect(recapTranscriptMissingMessage(googleMeeting({ provider_transcript_status: 'pending' })))
+      .toContain('尚未生成');
+    expect(recapTranscriptMissingMessage({
+      platform: 'lark',
+      feishu_meeting_id: 'om_1',
+    })).toContain('未检测到妙记');
+  });
+
+  it('recognizes the production panel 409 reauth response', () => {
+    expect(isFeishuReloginError({ status: 409, code: 'reauth_required' })).toBe(true);
+    expect(isFeishuReloginError({ status: 502, message: 'upstream unavailable' })).toBe(false);
+  });
 
   it('generates and persists a structured InkLoop panel summary through the hub', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({

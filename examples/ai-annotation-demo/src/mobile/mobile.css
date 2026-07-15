@@ -469,6 +469,8 @@
   .rc-entry-body{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;font:12px/1.5 var(--sans);color:var(--ink2);}
   .rc-entry-go{margin-top:auto;font:11px var(--mono);color:var(--ink);}
   .rc-entry.is-disabled .rc-entry-go{color:var(--mut2);}
+  .rc-entry-actions{margin-top:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .rc-entry-actions .hbtn{min-height:32px;}
   .rc-recordings{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--hair);font:11.5px var(--sans);}
   .rc-recordings>span{font-weight:650;color:var(--ink);}
   .rc-recordings a{color:var(--ink);text-decoration:underline;overflow-wrap:anywhere;}

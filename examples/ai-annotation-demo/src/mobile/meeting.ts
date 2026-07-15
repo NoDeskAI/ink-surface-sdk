@@ -1069,7 +1069,8 @@ function revalidateHome(beforeSig: string, wasEmpty: boolean): Promise<void> {
  *  opts.sync：false=纯本地重渲、不触发任何后台同步（调用方已经自己同步过）；'blocking'=旧行为、等同步完成再渲（目前没有调用点用，留给未来显式刷新入口）；
  *  默认(undefined/true)=local-first。 */
 async function renderHome(opts?: { sync?: boolean | 'blocking'; keepPage?: boolean }): Promise<void> {
-  if (opts?.sync !== false) await refreshCloudClock().catch(() => {});
+  if (opts?.sync === 'blocking') await refreshCloudClock().catch(() => {});
+  else if (opts?.sync !== false) void refreshCloudClock().catch(() => {});
   if (opts?.sync === 'blocking') await syncHomeData();
   const local = await readHomeLocal();
   lastMeetingSig = local.sig;

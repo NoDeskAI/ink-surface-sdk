@@ -10,7 +10,7 @@
  */
 import { getMeeting, addMeetingMaterialDocIds } from '../../local/store';
 import { importPdfFromUrl } from '../../surface/renderer';
-import { apiUrl } from '../../core/api';
+import { getJson } from '../../core/api';
 import type { PersistedMeeting } from '../../core/store-format';
 import type { FeishuDocxLinkItem } from './feishu-doc-links';
 
@@ -83,19 +83,20 @@ export interface ListFilesPage { files: FeishuFileItem[]; pageToken?: string; ha
 export async function listMeetingGroupMaterialFiles(opts: { chatId: string; feishuBase: string; limit?: number; pageToken?: string }): Promise<ListFilesPage> {
   const qs = new URLSearchParams({ limit: String(opts.limit ?? FILE_PAGE_SIZE) });
   if (opts.pageToken) qs.set('page_token', opts.pageToken);
-  // codex 扫描出的真 bug：裸 fetch 在安卓静态包下不会走 VITE_API_BASE_URL，必须过 apiUrl()。
-  const r = await fetch(apiUrl(`${opts.feishuBase}/api/feishu/workspaces/${encodeURIComponent(opts.chatId)}/files?${qs}`));
-  if (!r.ok) throw new Error(`拉取群文件失败：HTTP ${r.status}`);
-  const body = (await r.json()) as { files?: FeishuFileItem[]; page_token?: string; has_more?: boolean };
+  const body = await getJson<{ files?: FeishuFileItem[]; page_token?: string; has_more?: boolean }>(
+    `${opts.feishuBase}/api/feishu/workspaces/${encodeURIComponent(opts.chatId)}/files?${qs}`,
+    { auth: true },
+  );
   return { files: body.files || [], pageToken: body.page_token, hasMore: !!body.has_more };
 }
 
 /** 拉一个群文本消息里的妙记 docx 链接候选（不入库·供「添加资料 · 飞书群文件」手动挑选用，MVP 不自动扫描）。失败抛（调用方提示）。 */
 export async function listMeetingGroupDocxLinks(opts: { chatId: string; feishuBase: string; limit?: number }): Promise<FeishuDocxLinkItem[]> {
   const qs = new URLSearchParams({ limit: String(opts.limit ?? FILE_PAGE_SIZE) });
-  const r = await fetch(apiUrl(`${opts.feishuBase}/api/feishu/workspaces/${encodeURIComponent(opts.chatId)}/docx-links?${qs}`));
-  if (!r.ok) throw new Error(`拉取妙记文档链接失败：HTTP ${r.status}`);
-  const body = (await r.json()) as { links?: FeishuDocxLinkItem[] };
+  const body = await getJson<{ links?: FeishuDocxLinkItem[] }>(
+    `${opts.feishuBase}/api/feishu/workspaces/${encodeURIComponent(opts.chatId)}/docx-links?${qs}`,
+    { auth: true },
+  );
   return body.links || [];
 }
 

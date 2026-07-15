@@ -116,21 +116,95 @@ function localCloudHubHttpFallback(url: string): string | null {
   }
 }
 
-async function fetchWithLocalCloudHubFallback(input: string, init?: RequestInit): Promise<Response> {
+export const DEFAULT_API_TIMEOUT_MS = 30_000;
+
+export class ApiTimeoutError extends Error {
+  override name = 'TimeoutError';
+  readonly code = 'request_timeout';
+}
+
+export class ApiError extends Error {
+  override name = 'ApiError';
+
+  constructor(
+    readonly url: string,
+    readonly status: number,
+    readonly code: string,
+    detail?: string,
+  ) {
+    super(detail || code ? `${url} ${status}: ${detail || code}` : `${url} ${status}`);
+  }
+}
+
+interface RequestBudget {
+  signal?: AbortSignal;
+  timedOut: () => boolean;
+  cancel: () => void;
+}
+
+function createRequestBudget(signal: AbortSignal | undefined, timeoutMs: number | null): RequestBudget {
+  if (signal || timeoutMs == null) return { signal, timedOut: () => false, cancel: () => {} };
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    cancel: () => globalThis.clearTimeout(timer),
+  };
+}
+
+function normalizeRequestError(error: unknown, budget: RequestBudget, label: string): unknown {
+  if (!budget.timedOut()) return error;
+  return new ApiTimeoutError(`${label}超过请求时限`);
+}
+
+async function withRequestBudget<T>(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  label: string,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const budget = createRequestBudget(signal, timeoutMs);
   try {
-    return await fetch(input, init);
+    return await run(budget.signal!);
   } catch (error) {
-    if (init?.signal?.aborted) throw error;
-    const fallback = localCloudHubHttpFallback(input);
-    if (!fallback) throw error;
-    const resp = await fetch(fallback, init);
-    if (resp.ok) {
-      try {
-        const u = new URL(fallback);
-        API_BASE = `${u.protocol}//${u.host}`;
-      } catch { /* keep current route if URL parsing ever fails */ }
+    throw normalizeRequestError(error, budget, label);
+  } finally {
+    budget.cancel();
+  }
+}
+
+export async function fetchWithLocalCloudHubFallback(
+  input: string,
+  init?: RequestInit,
+  timeoutMs: number | null = DEFAULT_API_TIMEOUT_MS,
+): Promise<Response> {
+  const budget = createRequestBudget(init?.signal ?? undefined, timeoutMs);
+  const effectiveInit = { ...init, signal: budget.signal };
+  try {
+    try {
+      return await fetch(input, effectiveInit);
+    } catch (error) {
+      if (budget.signal?.aborted) throw error;
+      const fallback = localCloudHubHttpFallback(input);
+      if (!fallback) throw error;
+      const resp = await fetch(fallback, effectiveInit);
+      if (resp.ok) {
+        try {
+          const u = new URL(fallback);
+          API_BASE = `${u.protocol}//${u.host}`;
+        } catch { /* keep current route if URL parsing ever fails */ }
+      }
+      return resp;
     }
-    return resp;
+  } catch (error) {
+    throw normalizeRequestError(error, budget, `请求 ${input}`);
+  } finally {
+    budget.cancel();
   }
 }
 
@@ -166,8 +240,9 @@ export function apiUrlWithLocalHttpFallback(path: string): string {
 
 import { authHeaders, handleAuthFailure } from './auth';
 
-type ApiOpts = {
+export type ApiOpts = {
   signal?: AbortSignal;
+  timeoutMs?: number;
   acceptStatuses?: number[];
   auth?: boolean;
 };
@@ -184,32 +259,59 @@ function headersWithAuth(url: string, base?: Record<string, string>, opts?: ApiO
   return shouldSendAuth(url, opts) ? { ...(base || {}), ...authHeaders() } : { ...(base || {}) };
 }
 
-async function parseAuthErrorCode(resp: Response): Promise<string> {
+async function parseApiFailure(resp: Response): Promise<{ code: string; message: string }> {
   try {
-    const data = await resp.clone().json() as { error?: unknown; code?: unknown };
-    return String(data.error || data.code || '');
+    const data = await resp.clone().json() as {
+      error?: string | { code?: unknown; message?: unknown };
+      code?: unknown;
+      message?: unknown;
+    };
+    const nested = data.error && typeof data.error === 'object' ? data.error : null;
+    return {
+      code: String(nested?.code || (typeof data.error === 'string' ? data.error : '') || data.code || ''),
+      message: String(nested?.message || data.message || ''),
+    };
   } catch {
-    return '';
+    return { code: '', message: '' };
   }
 }
 
 /** 401/403 且能识别出"需要重新登录"的错误码时，清本地 session + 派发 `inkloop:reauth-required`
  *  （auth-login.ts 监听后重新弹二维码）。不抛错——调用方原有的状态码判断逻辑照常处理这次失败。 */
 async function notifyAuthFailureIfNeeded(resp: Response): Promise<void> {
-  if (resp.status !== 401 && resp.status !== 403) return;
-  const err = await parseAuthErrorCode(resp);
-  if (err === 'reauth_required' || err === 'missing_session_token' || err === 'invalid_session' || resp.status === 401) {
-    handleAuthFailure(err || 'reauth_required');
+  if (resp.status !== 401 && resp.status !== 403 && resp.status !== 409) return;
+  const failure = await parseApiFailure(resp);
+  if (
+    failure.code === 'reauth_required'
+    || failure.code === 'missing_session_token'
+    || failure.code === 'invalid_session'
+    || (resp.status === 401 && !failure.code)
+  ) {
+    handleAuthFailure(failure.code || 'reauth_required');
   }
+}
+
+async function throwForApiStatus(url: string, resp: Response, acceptStatuses?: number[]): Promise<void> {
+  if (resp.ok || acceptStatuses?.includes(resp.status)) return;
+  const failure = await parseApiFailure(resp);
+  throw new ApiError(url, resp.status, failure.code, failure.message);
 }
 
 /** 需要设备 session 但不走 JSON 收发的原始 fetch（如二进制下载）。 */
 export async function authFetch(path: string, init: RequestInit = {}, opts?: ApiOpts): Promise<Response> {
   const headers = new Headers(init.headers || undefined);
   for (const [k, v] of Object.entries(authHeaders())) headers.set(k, v);
-  const resp = await fetchWithLocalCloudHubFallback(apiUrl(path), { ...init, headers, signal: opts?.signal ?? init.signal });
-  await notifyAuthFailureIfNeeded(resp);
-  return resp;
+  const explicitSignal = opts?.signal ?? init.signal ?? undefined;
+  const budget = createRequestBudget(explicitSignal, opts?.timeoutMs ?? DEFAULT_API_TIMEOUT_MS);
+  try {
+    const resp = await fetchWithLocalCloudHubFallback(apiUrl(path), { ...init, headers, signal: budget.signal });
+    await notifyAuthFailureIfNeeded(resp);
+    if (!resp.body) budget.cancel();
+    return resp;
+  } catch (error) {
+    budget.cancel();
+    throw normalizeRequestError(error, budget, `请求 ${path}`);
+  }
 }
 
 /** 发后不管的 JSON POST（遥测/beacon）：失败静默、不阻塞、不抛。keepalive 让翻页/退出时也能送达。 */
@@ -218,7 +320,7 @@ export function postBeacon(url: string, body: unknown): void {
     void fetchWithLocalCloudHubFallback(apiUrl(url), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body), keepalive: true,
-    }).catch(() => { /* beacon 不在/出错都无所谓 */ });
+    }, null).catch(() => { /* beacon 不在/出错都无所谓 */ });
   } catch { /* 序列化出错也不连累 UI */ }
 }
 
@@ -230,15 +332,17 @@ export async function postJson<T>(
   body: unknown,
   opts?: ApiOpts,
 ): Promise<T> {
-  const resp = await fetchWithLocalCloudHubFallback(apiUrl(url), {
-    method: 'POST',
-    headers: headersWithAuth(url, { 'content-type': 'application/json' }, opts),
-    signal: opts?.signal,
-    body: JSON.stringify(body),
+  return withRequestBudget(opts?.signal, opts?.timeoutMs ?? DEFAULT_API_TIMEOUT_MS, `POST ${url}`, async (signal) => {
+    const resp = await fetchWithLocalCloudHubFallback(apiUrl(url), {
+      method: 'POST',
+      headers: headersWithAuth(url, { 'content-type': 'application/json' }, opts),
+      signal,
+      body: JSON.stringify(body),
+    });
+    await notifyAuthFailureIfNeeded(resp);
+    await throwForApiStatus(url, resp, opts?.acceptStatuses);
+    return (await resp.json()) as T;
   });
-  await notifyAuthFailureIfNeeded(resp);
-  if (!resp.ok && !opts?.acceptStatuses?.includes(resp.status)) throw new Error(`${url} ${resp.status}`);
-  return (await resp.json()) as T;
 }
 
 /**
@@ -246,10 +350,16 @@ export async function postJson<T>(
  * WS2-C panel-feishu client 走它，不裸 fetch('/api/...')（dev 同源 + 生产 VITE_API_BASE_URL 都覆盖）。
  */
 export async function getJson<T>(url: string, opts?: ApiOpts): Promise<T> {
-  const resp = await fetchWithLocalCloudHubFallback(apiUrl(url), { method: 'GET', signal: opts?.signal, headers: headersWithAuth(url, undefined, opts) });
-  await notifyAuthFailureIfNeeded(resp);
-  if (!resp.ok && !opts?.acceptStatuses?.includes(resp.status)) throw new Error(`${url} ${resp.status}`);
-  return (await resp.json()) as T;
+  return withRequestBudget(opts?.signal, opts?.timeoutMs ?? DEFAULT_API_TIMEOUT_MS, `GET ${url}`, async (signal) => {
+    const resp = await fetchWithLocalCloudHubFallback(apiUrl(url), {
+      method: 'GET',
+      signal,
+      headers: headersWithAuth(url, undefined, opts),
+    });
+    await notifyAuthFailureIfNeeded(resp);
+    await throwForApiStatus(url, resp, opts?.acceptStatuses);
+    return (await resp.json()) as T;
+  });
 }
 
 /**
@@ -267,7 +377,7 @@ export async function postNdjson<T>(
     headers: headersWithAuth(url, { 'content-type': 'application/json' }, opts),
     signal: opts?.signal,
     body: JSON.stringify(body),
-  });
+  }, null);
   await notifyAuthFailureIfNeeded(resp);
   if (!resp.ok) throw new Error(`${url} ${resp.status}`);
   const consume = (line: string): void => {

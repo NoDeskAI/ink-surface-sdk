@@ -72,6 +72,7 @@ export interface LibraryImportProgressOptions {
 const LOOP_MS = 8000;
 const STREAM_RECONNECT_MS = 5000;
 const CLOUD_DELETE_TIMEOUT_MS = 6000;
+const CLOUD_TRANSFER_TIMEOUT_MS = 5 * 60_000;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -195,7 +196,11 @@ async function postLibrarySourceFile(
   onUploadProgress?: (ratio: number) => void,
 ): Promise<CloudLibraryDocument> {
   if (typeof XMLHttpRequest === 'undefined') {
-    const response = await postJson<{ ok: boolean; document: CloudLibraryDocument }>('/v1/library/source-files', body, { auth: true });
+    const response = await postJson<{ ok: boolean; document: CloudLibraryDocument }>(
+      '/v1/library/source-files',
+      body,
+      { auth: true, timeoutMs: CLOUD_TRANSFER_TIMEOUT_MS },
+    );
     onUploadProgress?.(1);
     return response.document;
   }
@@ -203,12 +208,14 @@ async function postLibrarySourceFile(
   return await new Promise<CloudLibraryDocument>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', apiUrlWithLocalHttpFallback('/v1/library/source-files'));
+    xhr.timeout = CLOUD_TRANSFER_TIMEOUT_MS;
     xhr.setRequestHeader('content-type', 'application/json');
     for (const [key, value] of Object.entries(authHeaders())) xhr.setRequestHeader(key, value);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable && event.total > 0) onUploadProgress?.(Math.max(0, Math.min(1, event.loaded / event.total)));
     };
     xhr.onerror = () => reject(new Error('/v1/library/source-files network_error'));
+    xhr.ontimeout = () => reject(new Error('/v1/library/source-files timeout'));
     xhr.onload = () => {
       if (xhr.status < 200 || xhr.status >= 300) {
         reject(new Error(`/v1/library/source-files ${xhr.status}`));
@@ -399,9 +406,11 @@ export async function downloadCloudLibraryItem(item: LibraryShelfItem, opts?: Li
     cloud_revision: item.cloud_revision,
     error: undefined,
   });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), CLOUD_TRANSFER_TIMEOUT_MS);
   try {
     opts?.onProgress?.({ phase: 'downloading', filename: item.filename, documentId: item.document_id, percent: 0, indeterminate: true, detail: '连接 Cloud Hub' });
-    const response = await authFetch(path, { method: 'GET' });
+    const response = await authFetch(path, { method: 'GET', signal: controller.signal });
     if (!response.ok) throw new Error(`download_source_${response.status}`);
     const blob = await readDownloadBlob(response, item, opts?.onProgress);
     opts?.onProgress?.({ phase: 'local_opening', filename: item.filename, documentId: item.document_id, percent: 88, detail: '写入本机 Library' });
@@ -441,6 +450,8 @@ export async function downloadCloudLibraryItem(item: LibraryShelfItem, opts?: Li
       error: messageOf(error),
     });
     throw error;
+  } finally {
+    window.clearTimeout(timer);
   }
 }
 
