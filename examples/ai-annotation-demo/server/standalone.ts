@@ -95,6 +95,7 @@ import {
   type CloudKnowledgeObjectPatch,
 } from './cloud-knowledge-store';
 import { isMeetingRuntimeDocumentId, shouldPostprocessRuntimeAnnotation } from './runtime-postprocess-policy';
+import { prepareRuntimeAnnotationUpdate } from './runtime-annotation-postprocess';
 import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
 import {
   buildInkloopDocUri,
@@ -865,10 +866,9 @@ const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+
 // drive:export:readonly 用于 docx 官方 export_tasks；已有 token refresh 不会扩 scope，老用户需重新授权一次。
 // minutes:minutes:readonly 用于妙记信息/搜索；minutes:minutes.transcript:export 用于转写导出（飞书 99991679 点名，
 // 与 minutes:minute:download 二选一）。token 收编：panel sidecar 的独立 v1 OAuth 已废，妙记取数改用 hub 这份 token。
-const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.transcript:export';
-// 默认取「2026-07-13 已验证授予的权限集合 + offline_access(新版 OAuth 专用·换取 refresh_token)」。
-// 旧版授权端点会把 URL scope 当后台 API 权限逐项校验，offline_access 不在权限列表会直接报缺少权限——
-// 授权端点已随 vendor larkClient 切到新版 accounts.feishu.cn。需要增删 scope 用环境变量覆盖，别往回加 vc:meeting:readonly（已被细粒度权限取代）。
+// vc:meeting:readonly + vc:meeting.meetingevent:read 来自 production-baseline（会议信息/事件查询 API 点名要）。
+// merge 决议（2026-07-15）：两侧 scope 取并集；授权端点已是新版 accounts.feishu.cn，多余 scope 用环境变量覆盖收窄。
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.transcript:export';
 const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
 // 「已连接」判定只看核心功能 scope（会议/日历/docx）——授权请求 scope 每次扩容（drive:export、minutes 等）
 // 都会让老 token 被误判 connected=false、前端停拉日历。新增能力各自的端点自行校验所需 scope。
@@ -2305,17 +2305,9 @@ async function buildPostprocessProjection(input: {
 async function applyRuntimeAnnotationPostprocess(event: RuntimeSyncEvent, namespace: CloudKnowledgeNamespace): Promise<void> {
   if (event.operation !== 'annotation.add' && event.operation !== 'annotation.update') return;
   const payload = recordOf(event.payload);
+  const updateDisposition = await prepareRuntimeAnnotationUpdate(event, namespace, cloudKnowledgeStore);
+  if (updateDisposition === 'patched') return;
   const annotation = recordOf(event.operation === 'annotation.update' ? payload.patch : payload.annotation);
-  if (event.operation === 'annotation.update') {
-    // revision（几何修改/复活）：先清旧派生对象再按最新注解体重建，避免同 mark 派生卡片翻倍。
-    const markId = textOf(payload.mark_id, event.target?.id || event.event_id);
-    const koId = textOf(payload.ko_id, event.target?.id || '');
-    await cloudKnowledgeStore.deleteByRuntimeRefs(namespace, {
-      document_id: event.doc_id,
-      mark_ids: markId ? [markId] : [],
-      ko_ids: koId ? [koId] : [],
-    });
-  }
   const docTitle = await documentTitle(namespace, event.doc_id);
   const markText = postprocessSignalText({ annotation, payload, docTitle });
   const quoteText = postprocessQuoteText({ annotation, payload, docTitle }) || markText;

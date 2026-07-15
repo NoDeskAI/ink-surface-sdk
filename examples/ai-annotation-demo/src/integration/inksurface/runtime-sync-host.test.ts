@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { RuntimeAnnotation, RuntimeSurfaceBlock } from 'ink-surface-sdk/runtime-schema';
+import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeSurfaceBlock } from 'ink-surface-sdk/runtime-schema';
 import type { PersistedMark } from '../../core/store-format';
-import { outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeSourceContentHash, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
+import { outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeMarksToTombstoneForCanonicalRemote, runtimeSourceContentHash, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
 
 function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }): PersistedMark {
   return {
@@ -210,6 +210,30 @@ describe('staleRuntimeManagedMarksForCanonicalRemote', () => {
     });
 
     expect(staleRuntimeManagedMarksForCanonicalRemote([staleRemote], new Set())).toEqual([]);
+  });
+});
+
+describe('runtimeMarksToTombstoneForCanonicalRemote', () => {
+  it('selects a local mark from the minimal deleted annotation stub even when no active canonical marks remain', () => {
+    const deleted = mark({ mark_id: 'mark_deleted_after_bootstrap', seq: 1 });
+    const runtime: RuntimeDocumentSnapshot = {
+      doc_id: 'doc_test',
+      doc_dir: 'indexeddb://doc_test',
+      document: { doc_id: 'doc_test', title: 'Deleted mark test' },
+      source: { doc_id: 'doc_test', kind: 'browser_runtime_snapshot' },
+      blocks: [{
+        object_id: 'blk_deleted',
+        annotations: [{
+          ko_id: 'ko_deleted_after_bootstrap',
+          status: 'deleted',
+          deleted_at: '2026-07-15T00:00:02.000Z',
+          inkloop_mark: { mark_id: 'mark_deleted_after_bootstrap' },
+        }],
+      }],
+      nodes: [],
+    };
+
+    expect(runtimeMarksToTombstoneForCanonicalRemote([deleted], runtime)).toEqual([deleted]);
   });
 });
 
