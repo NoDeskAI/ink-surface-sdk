@@ -884,9 +884,10 @@ const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+
 // drive:export:readonly 用于 docx 官方 export_tasks；已有 token refresh 不会扩 scope，老用户需重新授权一次。
 // minutes:minutes:readonly 用于妙记信息/搜索；minutes:minutes.transcript:export 用于转写导出（飞书 99991679 点名，
 // 与 minutes:minute:download 二选一）。token 收编：panel sidecar 的独立 v1 OAuth 已废，妙记取数改用 hub 这份 token。
-// vc:meeting:readonly + vc:meeting.meetingevent:read 来自 production-baseline（会议信息/事件查询 API 点名要）。
-// merge 决议（2026-07-15）：两侧 scope 取并集；授权端点已是新版 accounts.feishu.cn，多余 scope 用环境变量覆盖收窄。
-const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.transcript:export';
+// vc:meeting.meetingevent:read 来自 production-baseline（会议信息/事件查询 API 点名"二选一"权限之一）。
+// ⚠️不要请求 vc:meeting:readonly：粗粒度权限已被细粒度取代、开放平台后台没有这项，带上它整个授权流程直接失败
+// （2026-07-14 c7a7d9e 教训；7-15 merge 并集误把它带回导致用户无法重新授权，再删）。
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.transcript:export';
 const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
 // 「已连接」判定只看核心功能 scope（会议/日历/docx）——授权请求 scope 每次扩容（drive:export、minutes 等）
 // 都会让老 token 被误判 connected=false、前端停拉日历。新增能力各自的端点自行校验所需 scope。
