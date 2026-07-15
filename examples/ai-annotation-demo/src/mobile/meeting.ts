@@ -37,8 +37,8 @@ import { notePanelSyncOk, notePanelSyncError } from './meeting-sync-status';
 import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
-import { effectiveMeetingEndIso, effectiveMeetingStatus, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
-import { findMeetingForProviderSource, meetingPlatformOf } from './meeting-platform';
+import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { findMeetingForProviderSource, meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
 import {
   getGoogleOAuthStatus,
@@ -273,6 +273,30 @@ function pageMbody(viewEl: HTMLElement, key: string, land: 'first' | 'keep' = 'f
 
 let meetingHomePage = 0;
 const MEETING_HOME_FILTER_KEY = 'inkloop.meeting.home.filter.v1';
+const MEETING_PROVIDER_KEY = 'inkloop.meeting.provider.v1';
+const MEETING_PROVIDER_LABELS: Record<MeetingPlatform, string> = {
+  lark: '飞书会议',
+  google_meet: 'Google Meet',
+  manual: '本地记录',
+};
+const MEETING_PROVIDER_ICONS: Record<MeetingPlatform, string> = {
+  lark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4L3 11l7 3 3 7 8-17z"/><path d="M10 14l11-10"/></svg>',
+  google_meet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="10" rx="2"/><path d="M15 10.5l6-3.5v10l-6-3.5"/></svg>',
+  manual: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+};
+const MEETING_PROVIDER_HINTS: Record<MeetingPlatform, string> = {
+  lark: '日程 · 妙记转写 · 群资料',
+  google_meet: '日历日程 · 会后转写',
+  manual: '手写记录 · 无需连接',
+};
+function normalizeMeetingProvider(value: unknown): MeetingPlatform {
+  return value === 'google_meet' || value === 'manual' ? value : 'lark';
+}
+let selectedMeetingProvider: MeetingPlatform = (() => {
+  try { return normalizeMeetingProvider(localStorage.getItem(MEETING_PROVIDER_KEY)); }
+  catch { return 'lark'; }
+})();
+let meetingProviderLeadVisible = true;
 let meetingHomeFilter: MeetingHomeFilter = (() => {
   try { return normalizeMeetingHomeFilter(localStorage.getItem(MEETING_HOME_FILTER_KEY)); }
   catch { return 'active'; }
@@ -282,6 +306,12 @@ function rememberMeetingHomeFilter(filter: MeetingHomeFilter): void {
   meetingHomeFilter = filter;
   meetingHomePage = 0;
   try { localStorage.setItem(MEETING_HOME_FILTER_KEY, filter); } catch { /* filter persistence is optional */ }
+}
+
+function rememberMeetingProvider(provider: MeetingPlatform): void {
+  selectedMeetingProvider = provider;
+  meetingHomePage = 0;
+  try { localStorage.setItem(MEETING_PROVIDER_KEY, provider); } catch { /* provider persistence is optional */ }
 }
 
 // ════ L1：panel 飞书会议同步（VC all_meeting_started/ended → 本地会议·带真 t0）════
@@ -610,6 +640,106 @@ function rememberGoogleCalendarConnection(connected: boolean): void {
 }
 let googleConnectedCache = googleCalendarConnectionHint();
 
+function feishuIdentityConnected(): boolean {
+  const session = getSession();
+  return !!(
+    fsIdentityCache?.oauth?.authenticated
+    || fsIdentityCache?.session?.feishu_open_id
+    || session?.userId?.startsWith('feishu_')
+  );
+}
+
+function providerStatusHtml(provider: MeetingPlatform): string {
+  if (provider === 'manual') return '<span class="mp-status">无需连接</span>';
+  const connected = provider === 'lark' ? feishuIdentityConnected() : googleConnectedCache;
+  if (!connected) return '<span class="mp-status">未连接</span>';
+  const id = provider === 'lark' ? ' id="mp-feishu-identity"' : ' id="mp-google-identity"';
+  return `<button class="mp-status is-connected" type="button"${id}><span class="d"></span>已连接</button>`;
+}
+
+async function enterMeetingProviderHome(provider: MeetingPlatform): Promise<void> {
+  rememberMeetingProvider(provider);
+  meetingProviderLeadVisible = false;
+  rememberMeetingHomeFilter('active');
+  setMtg('home');
+  await renderHome();
+}
+
+async function chooseMeetingProvider(provider: MeetingPlatform): Promise<void> {
+  rememberMeetingProvider(provider);
+  if (provider === 'lark' && !feishuIdentityConnected()) {
+    try { await startDeviceFeishuLogin(); }
+    catch (error) { await infoSheet({ title: '飞书登录失败', message: String((error as Error)?.message || error) }); }
+    return;
+  }
+  if (provider === 'google_meet' && !googleConnectedCache) {
+    await openGoogleCalendarConnection();
+    return;
+  }
+  await enterMeetingProviderHome(provider);
+}
+
+async function refreshMeetingProviderLeadConnections(): Promise<void> {
+  const [identity, googleStatus] = await Promise.all([
+    feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null),
+    googleCalendarConnectionHint() ? getGoogleOAuthStatus().catch(() => null) : Promise.resolve(null),
+  ]);
+  if (identity) fsIdentityCache = identity;
+  if (googleStatus) {
+    googleConnectedCache = googleStatus.connected;
+    rememberGoogleCalendarConnection(googleStatus.connected);
+  }
+  if (meetingProviderLeadVisible && document.body.dataset.mode === 'meet' && document.body.dataset.mtg === 'home') {
+    renderMeetingProviderLead(false);
+  }
+}
+
+function renderMeetingProviderLead(refresh = true): void {
+  meetingProviderLeadVisible = true;
+  mtgPagers.get('home')?.destroy();
+  mtgPagers.delete('home');
+  const root = el('mv-home');
+  root.classList.remove('has-vpages');
+  const providers: MeetingPlatform[] = ['lark', 'google_meet', 'manual'];
+  const rows = providers.map((provider) => {
+    const selected = provider === selectedMeetingProvider;
+    return `<div class="mp-option${selected ? ' is-default' : ''}" role="option" aria-selected="${selected}" tabindex="${selected ? '0' : '-1'}" data-meeting-provider="${provider}">`
+      + `<span class="mp-ico">${MEETING_PROVIDER_ICONS[provider]}</span>`
+      + `<span class="mp-main"><span class="mp-name">${MEETING_PROVIDER_LABELS[provider]}</span><span class="mp-hint">${MEETING_PROVIDER_HINTS[provider]}</span></span>`
+      + `<span class="mp-side">${providerStatusHtml(provider)}<span class="mp-go">${SVG_GO}</span></span>`
+      + `</div>`;
+  }).join('');
+  root.innerHTML = `<div class="vhead meeting-provider-head"><button class="book-back meeting-back" id="mp-books" type="button" aria-label="返回书架">${SVG_BACK}<span>书架</span></button><h1>要使用哪个会议服务</h1></div>`
+    + `<div class="mbody meeting-provider-body"><div class="mp-list" role="listbox" aria-label="会议服务">${rows}</div></div>`;
+  root.querySelector('#mp-books')?.addEventListener('click', () => exitToBookShelf());
+  root.querySelectorAll<HTMLElement>('[data-meeting-provider]').forEach((row) => {
+    const activate = (): void => { void chooseMeetingProvider(normalizeMeetingProvider(row.dataset.meetingProvider)); };
+    row.addEventListener('click', activate);
+    row.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    });
+  });
+  root.querySelector('#mp-feishu-identity')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void openFeishuIdentitySheet();
+  });
+  root.querySelector('#mp-google-identity')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void openGoogleCalendarConnection();
+  });
+  root.querySelector<HTMLElement>('.mp-option.is-default')?.focus({ preventScroll: true });
+  if (refresh) void refreshMeetingProviderLeadConnections();
+}
+
+function showMeetingProviderLead(): void {
+  teardownLive();
+  rememberMeetingHomeFilter('active');
+  setMtg('home');
+  renderMeetingProviderLead();
+}
+
 async function syncGoogleCalendarMeetings(): Promise<void> {
   // No connection hint means no Google request at all; the explicit connect control performs discovery/authentication.
   if (!googleCalendarConnectionHint()) return;
@@ -671,32 +801,25 @@ let homeSyncing = false; // 冷启动(本地无缓存)时 revalidateHome 在跑 
 
 /** 纯渲染：只读已经拿到的本地数据画 DOM，不做任何网络/IO。 */
 function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: PersistedMeeting[], opts?: { keepPage?: boolean }): void {
+  if (meetingProviderLeadVisible) {
+    renderMeetingProviderLead(false);
+    return;
+  }
+  const providerMeetings = filterMeetingsByPlatform(allMeetings, selectedMeetingProvider);
   const wsName = new Map(workspaces.map((w) => [w.workspace_id, w.name]));
   // M7·会议开始可感知：飞书 started 事件把某场会推成 live 且用户还没点开看过 → 顶部提醒（比总结更急，排最前）。
-  const liveUnread = allMeetings.filter((m) => m.live_unread && effectiveMeetingStatus(m) === 'live');
+  const liveUnread = providerMeetings.filter((m) => m.live_unread && effectiveMeetingStatus(m) === 'live');
   void refreshMeetNavBadge(); // 同一批数据顺手同步 nav 徽标，别等下一拍轮询（12s）才追上
 
   // #1 会后总结可感知：summary_ready 后台到达标了 panel_summary_unread → 顶部提醒（两子页都挂）。
-  const unread = allMeetings.filter((m) => m.panel_summary_unread);
+  const unread = providerMeetings.filter((m) => m.panel_summary_unread);
 
   {
     // 会议列表（meeting-flow 单状态机·点会议按 status 直达）：未结束（进行中+待开始·升序）+ 已结束历史（降序·最近 20）。
-    const buckets = meetingHomeBuckets(allMeetings, { nowMs: meetingNowMs() });
+    const buckets = meetingHomeBuckets(providerMeetings, { nowMs: meetingNowMs() });
     const sched = buckets.active;
     const ended = buckets.history;
     const historyTotal = buckets.historyTotal;
-    const localSession = getSession();
-    const fsIdentityOk = !!(
-      fsIdentityCache?.oauth?.authenticated
-      || fsIdentityCache?.session?.feishu_open_id
-      || localSession?.userId?.startsWith('feishu_')
-    );
-    const fsOk = fsIdentityOk
-      ? `<button class="fs-ok fs-ok-btn" id="mh-identity" type="button" title="飞书身份"><span class="d"></span>飞书身份</button>`
-      : `<button class="hbtn" id="mh-identity" type="button">登录飞书</button>`;
-    const googleCtl = googleConnectedCache
-      ? `<button class="fs-ok fs-ok-btn" id="mh-google-calendar" type="button" title="Google 日历"><span class="d"></span>Google 日历</button>`
-      : `<button class="hbtn" id="mh-google-calendar" type="button">连接 Google 日历</button>`;
     const items: string[] = [];
     if (meetingHomeFilter === 'active' && liveUnread.length) {
       items.push(`<button class="hbtn" id="mh-live" style="display:block;width:calc(100% - 36px);margin:10px 18px 0;text-align:left;font-weight:600">🔔 ${liveUnread.length === 1 ? `「${esc(liveUnread[0].title)}」现在开始了` : `${liveUnread.length} 场会议现在开始了`} · 点击参加 ›</button>`);
@@ -709,7 +832,7 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
     else if (meetingHomeFilter === 'active') {
       items.push(homeSyncing
         ? `<p class="empty">正在同步日程…</p>`
-        : `<p class="empty">${esc(fsCalendarIssue || '还没有待开始或进行中的会议。历史会议在右上方「历史」里查看。')}</p>`);
+        : `<p class="empty">${esc(selectedMeetingProvider === 'lark' && fsCalendarIssue ? fsCalendarIssue : `还没有${MEETING_PROVIDER_LABELS[selectedMeetingProvider]}的待开始或进行中会议。历史会议在右上方「历史」里查看。`)}</p>`);
     }
     // 已结束=历史：点进直达「会后时间轴对齐」(openMeeting→openRecap)。段头用裸 div（不包 mrow·避免超高单块被 pager 推成空首页）。
     if (meetingHomeFilter === 'history' && ended.length) {
@@ -728,8 +851,8 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
       : '';
     // 模拟会议仅 DEV 联调用、且需先有真飞书群（startSimMeeting 依赖群）→ 生产/无群时隐藏，空态才自洽（#6）
     const hasFeishuGroup = workspaces.some((w) => w.workspace_id !== 'ws_schedule' && w.source === 'feishu');
-    const simBtn = import.meta.env.DEV && hasFeishuGroup ? '<button class="hbtn" id="mh-sim">模拟会议</button>' : '';
-    const bindBtn = meetingHomeFilter === 'active' ? '<button class="hbtn" id="mh-bind-current" type="button">绑定当前会议</button>' : '';
+    const simBtn = selectedMeetingProvider === 'lark' && import.meta.env.DEV && hasFeishuGroup ? '<button class="hbtn" id="mh-sim">模拟会议</button>' : '';
+    const bindBtn = selectedMeetingProvider === 'lark' && meetingHomeFilter === 'active' ? '<button class="hbtn" id="mh-bind-current" type="button">绑定当前会议</button>' : '';
     const filterHtml =
       `<div class="mh-tabs" role="tablist" aria-label="会议筛选">`
       + `<button type="button" role="tab" data-mh-filter="active" aria-selected="${meetingHomeFilter === 'active'}" class="${meetingHomeFilter === 'active' ? 'on' : ''}"><span>进行中/待开始</span><b>${sched.length}</b></button>`
@@ -739,7 +862,7 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
     mtgPagers.delete('home');
     el('mv-home').classList.toggle('has-vpages', pageCount > 1);
     el('mv-home').innerHTML =
-      `<div class="vhead meeting-home-head"><button class="book-back meeting-back" id="mh-books" type="button" aria-label="返回书架">${SVG_BACK}<span>书架</span></button><h1>会议</h1>${filterHtml}<span class="sp"></span>${bindBtn}${googleCtl}${fsOk}${simBtn}</div>`
+      `<div class="vhead meeting-home-head"><button class="book-back meeting-back" id="mh-books" type="button" aria-label="返回书架">${SVG_BACK}<span>书架</span></button><h1>${MEETING_PROVIDER_LABELS[selectedMeetingProvider]}</h1>${filterHtml}<span class="sp"></span>${bindBtn}${simBtn}<button class="hbtn" id="mh-switch-provider" type="button">切换</button></div>`
       + `<div class="mbody">${visibleRows}</div>${pagerHtml}`;
     el('mv-home').querySelector('#mh-books')?.addEventListener('click', () => exitToBookShelf());
     el('mv-home').querySelectorAll<HTMLElement>('[data-mh-filter]').forEach((button) => button.addEventListener('click', () => {
@@ -757,8 +880,7 @@ function renderHomeFromData(workspaces: PersistedWorkspace[], allMeetings: Persi
       void openMeeting(m.workspace_id, m.meeting_id);
     });
     el('mv-home').querySelector('#mh-bind-current')?.addEventListener('click', () => { void bindCurrentFeishuMeeting(); });
-    el('mv-home').querySelector('#mh-google-calendar')?.addEventListener('click', () => { void openGoogleCalendarConnection(); });
-    el('mv-home').querySelector('#mh-identity')?.addEventListener('click', () => { void openFeishuIdentitySheet(); });
+    el('mv-home').querySelector('#mh-switch-provider')?.addEventListener('click', () => showMeetingProviderLead());
   }
   el('mv-home').querySelector('#mh-live')?.addEventListener('click', () => { // 跳第一场刚开始的会议（openMeeting 会清 live_unread）
     const first = liveUnread[0];
@@ -826,7 +948,7 @@ async function openGoogleCalendarConnection(): Promise<void> {
       googleConnectedCache = true;
       rememberGoogleCalendarConnection(true);
       await syncGoogleCalendarMeetings();
-      await renderHome({ keepPage: true });
+      await enterMeetingProviderHome('google_meet');
       await infoSheet({ title: 'Google 日历', message: 'Google 日历已连接，Meet 日程已刷新。' });
       return;
     }
@@ -856,7 +978,8 @@ async function openGoogleCalendarConnection(): Promise<void> {
         h.close();
         googleConnectedCache = true;
         rememberGoogleCalendarConnection(true);
-        await renderHome({ sync: 'blocking', keepPage: true });
+        await syncGoogleCalendarMeetings();
+        await enterMeetingProviderHome('google_meet');
         await infoSheet({ title: 'Google 日历已连接', message: '带 Google Meet 链接的日程已加入会议列表。' });
         return;
       }
@@ -908,7 +1031,8 @@ async function openFeishuIdentitySheet(): Promise<void> {
     catch (e) { await infoSheet({ title: '飞书登录失败', message: String((e as Error)?.message || e) }); }
     return;
   }
-  await renderHome({ sync: 'blocking', keepPage: true });
+  if (meetingProviderLeadVisible) renderMeetingProviderLead();
+  else await renderHome({ sync: 'blocking', keepPage: true });
 }
 
 let homeRevalidateInFlight: Promise<void> | null = null;
@@ -1748,17 +1872,17 @@ export function initMobileMeeting(opts: { readerCtx: SurfaceContext }): void {
 
   // 会议 rail 进入 → home（inline 已切 data-mode=meet + 高亮；这里补真数据）
   document.querySelector('.nav [data-mode="meet"]')?.addEventListener('click', () => {
-    teardownLive();
-    rememberMeetingHomeFilter('active');
-    setMtg('home');
-    void renderHome();
+    showMeetingProviderLead();
   });
   document.addEventListener('inkloop:feishu-oauth-complete', () => {
     if (document.body.dataset.mode !== 'meet') {
       void meetingPollTick();
       return;
     }
-    if (document.body.dataset.mtg === 'home') void renderHome({ sync: 'blocking', keepPage: true });
+    if (document.body.dataset.mtg === 'home') {
+      if (meetingProviderLeadVisible) renderMeetingProviderLead();
+      else void renderHome({ sync: 'blocking', keepPage: true });
+    }
     else if (document.body.dataset.mtg === 'detail') void renderDetail();
     else void meetingPollTick();
   });
