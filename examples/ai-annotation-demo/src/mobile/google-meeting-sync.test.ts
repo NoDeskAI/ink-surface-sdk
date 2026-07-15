@@ -195,25 +195,81 @@ describe('Google meeting source persistence', () => {
     });
   });
 
-  it('clears stale calendar timing when an ended occurrence is rescheduled', async () => {
+  it('clears stale instance artifacts but preserves Calendar identity when an ended occurrence is rescheduled', async () => {
     const google = meeting('google-rescheduled', {
       platform: 'google_meet',
       provider_calendar_event_id: 'rescheduled',
+      calendar_meeting_no: 'abc-defg-hij',
+      meeting_url: 'https://meet.google.com/abc-defg-hij',
       status: 'ended',
       started_at: '2026-07-13T01:00:00.000Z',
       ended_at: '2026-07-13T02:00:00.000Z',
-      t0_source: 'calendar',
-      align_state: 'estimated',
+      provider_meeting_id: 'conferenceRecords/old-record',
+      provider_space_name: 'spaces/old-space',
+      provider_transcript_ref: 'conferenceRecords/old-record/transcripts/old-transcript',
+      provider_transcript_status: 'ready',
+      google_smart_note: { text: 'Old Gemini notes', fetched_at: '2026-07-13T02:05:00.000Z' },
+      google_smart_note_scope_missing: true,
+      google_recordings: [{ export_uri: 'https://drive.google.com/file/d/old-recording/view', state: 'FILE_GENERATED' }],
+      vc_meeting_start_t0: Date.parse('2026-07-13T01:00:00.000Z'),
+      t0_source: 'provider_event',
+      align_offset_ms: 12_000,
+      align_state: 'manual',
+      summary: 'Old AI summary',
+      summary_generated_at: '2026-07-13T02:10:00.000Z',
+      summary_source: {
+        feishu_minute_token: 'google_meet:google-rescheduled',
+        align_offset_ms: 12_000,
+        mark_count: 2,
+        cue_count: 20,
+      },
+      panel_summary: {
+        minute_token: 'google_meet:google-rescheduled',
+        meeting_id: 'conferenceRecords/old-record',
+        generated_at: Date.parse('2026-07-13T02:10:00.000Z'),
+        summary: { conclusions: ['Old conclusion'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+      },
+      panel_summary_fetched_at: '2026-07-13T02:10:00.000Z',
+      panel_summary_status: 'ready',
+      panel_summary_unread: true,
+      exported_at: '2026-07-13T02:20:00.000Z',
     });
     const state = dependencies([google]);
 
     await syncGoogleMeetingSources([source('rescheduled')], state.deps);
 
-    expect(state.meetings[0]).toMatchObject({ status: 'upcoming' });
-    expect(state.meetings[0].started_at).toBeUndefined();
-    expect(state.meetings[0].ended_at).toBeUndefined();
-    expect(state.meetings[0].t0_source).toBeUndefined();
-    expect(state.meetings[0].align_state).toBeUndefined();
+    expect(state.meetings[0]).toMatchObject({
+      status: 'upcoming',
+      platform: 'google_meet',
+      source_kind: 'calendar',
+      provider_calendar_event_id: 'rescheduled',
+      calendar_meeting_no: 'abc-defg-hij',
+      meeting_url: 'https://meet.google.com/abc-defg-hij',
+      scheduled_at: '2026-07-15T01:00:00.000Z',
+    });
+    expect(state.updateMeeting).toHaveBeenCalledWith('google-rescheduled', expect.objectContaining({
+      started_at: undefined,
+      ended_at: undefined,
+      provider_meeting_id: undefined,
+      provider_space_name: undefined,
+      provider_transcript_ref: undefined,
+      provider_transcript_status: undefined,
+      google_smart_note: undefined,
+      google_smart_note_scope_missing: undefined,
+      google_recordings: undefined,
+      vc_meeting_start_t0: undefined,
+      t0_source: undefined,
+      align_offset_ms: undefined,
+      align_state: undefined,
+      summary: undefined,
+      summary_generated_at: undefined,
+      summary_source: undefined,
+      panel_summary: undefined,
+      panel_summary_fetched_at: undefined,
+      panel_summary_status: undefined,
+      panel_summary_unread: undefined,
+      exported_at: undefined,
+    }));
   });
 
   it('merges detector start/end windows into the matching Google Calendar card', async () => {

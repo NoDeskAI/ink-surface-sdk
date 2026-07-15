@@ -1,5 +1,14 @@
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -7,6 +16,12 @@ const GOOGLE_AUTHORIZE_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth'
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const DEFAULT_GOOGLE_AUTH_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../.inkloop/google-auth');
 const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
+const GOOGLE_OAUTH_REAUTH_ERROR_CODES = new Set([
+  'invalid_grant',
+  'invalid_client',
+  'unauthorized_client',
+  'access_denied',
+]);
 
 export const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/calendar.events.readonly',
@@ -103,12 +118,14 @@ export interface GoogleOAuthFetchOptions {
 class GoogleOAuthError extends Error {
   status: number;
   code: string;
+  oauthCode?: string;
 
-  constructor(code: string, status: number, message = code) {
+  constructor(code: string, status: number, message = code, oauthCode?: string) {
     super(message);
     this.name = 'GoogleOAuthError';
     this.status = status;
     this.code = code;
+    this.oauthCode = oauthCode;
   }
 }
 
@@ -211,8 +228,14 @@ async function tokenRequest(
     throw new GoogleOAuthError('google_oauth_invalid_response', 502);
   }
   if (!response.ok) {
-    const detail = clean(body.error_description) || clean(body.error) || `HTTP ${response.status}`;
-    throw new GoogleOAuthError('google_oauth_token_request_failed', response.status >= 500 ? 502 : 401, detail);
+    const oauthCode = clean(body.error).toLowerCase();
+    const detail = clean(body.error_description) || oauthCode || `HTTP ${response.status}`;
+    throw new GoogleOAuthError(
+      'google_oauth_token_request_failed',
+      response.status >= 500 ? 502 : 401,
+      detail,
+      oauthCode || undefined,
+    );
   }
   if (!clean(body.access_token)) throw new GoogleOAuthError('google_oauth_access_token_missing', 502);
   return body;
@@ -242,9 +265,33 @@ function readTokenState(path: string): GoogleTokenState | null {
   }
 }
 
+function writePrivateJson(path: string, value: unknown): void {
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  if (existsSync(path)) chmodSync(path, 0o600);
+
+  const temporaryPath = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(value, null, 2), {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The temporary file may not have been created or may already have been renamed.
+    }
+    throw error;
+  }
+}
+
 function writeTokenState(path: string, state: GoogleTokenState): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), 'utf8');
+  writePrivateJson(path, state);
 }
 
 function readPendingStore(env: GoogleOAuthEnv, nowMs = Date.now()): GooglePendingOAuthStore {
@@ -261,9 +308,13 @@ function readPendingStore(env: GoogleOAuthEnv, nowMs = Date.now()): GooglePendin
 }
 
 function writePendingStore(env: GoogleOAuthEnv, store: GooglePendingOAuthStore): void {
-  const path = pendingStorePath(env);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(store, null, 2), 'utf8');
+  writePrivateJson(pendingStorePath(env), store);
+}
+
+function writePendingEntry(env: GoogleOAuthEnv, entry: GooglePendingOAuthEntry, nowMs: number): void {
+  const latestStore = readPendingStore(env, nowMs);
+  latestStore.states[entry.state] = entry;
+  writePendingStore(env, latestStore);
 }
 
 function sameIdentity(entry: GooglePendingOAuthEntry, identity: GoogleOAuthIdentity): boolean {
@@ -301,8 +352,7 @@ export async function completeGoogleOAuthCallback(
   options: GoogleOAuthFetchOptions = {},
 ): Promise<{ identity: GoogleOAuthIdentity; status: GoogleOAuthStatus }> {
   const nowMs = options.nowMs ?? Date.now();
-  const store = readPendingStore(env, nowMs);
-  const pending = store.states[clean(input.state)];
+  const pending = readPendingStore(env, nowMs).states[clean(input.state)];
   if (!pending || pending.status !== 'pending') throw new GoogleOAuthError('google_oauth_state_invalid_or_expired', 400);
   const identity = { tenantId: pending.tenant_id, userId: pending.user_id, deviceId: pending.device_id };
   try {
@@ -325,14 +375,12 @@ export async function completeGoogleOAuthCallback(
     pending.status = 'complete';
     pending.completed_at = nowMs;
     delete pending.error;
-    store.states[pending.state] = pending;
-    writePendingStore(env, store);
+    writePendingEntry(env, pending, nowMs);
     return { identity, status: await resolveGoogleOAuthStatus(env, identity, nowMs, options) };
   } catch (error) {
     pending.status = 'failed';
     pending.error = error instanceof GoogleOAuthError ? error.code : 'google_oauth_callback_failed';
-    store.states[pending.state] = pending;
-    writePendingStore(env, store);
+    writePendingEntry(env, pending, nowMs);
     throw error;
   }
 }
@@ -441,14 +489,25 @@ export async function resolveUserGoogleToken(
       path,
     };
   } catch (error) {
-    const refreshError = error instanceof GoogleOAuthError ? error.code : String((error as Error)?.message || error);
+    const oauthCode = error instanceof GoogleOAuthError ? error.oauthCode : undefined;
+    const refreshError = oauthCode
+      || (error instanceof GoogleOAuthError ? error.code : String((error as Error)?.message || error));
+    const reauthRequired = error instanceof GoogleOAuthError
+      && !!oauthCode
+      && GOOGLE_OAUTH_REAUTH_ERROR_CODES.has(oauthCode);
     writeTokenState(path, {
       ...state,
-      reauth_required: true,
+      reauth_required: reauthRequired,
       refresh_error: refreshError,
       updated_at: new Date(nowMs).toISOString(),
     });
-    return { ...base, usable: false, reauthRequired: true, reason: 'reauth_required', refreshError };
+    return {
+      ...base,
+      usable: false,
+      reauthRequired,
+      reason: reauthRequired ? 'reauth_required' : 'google_oauth_refresh_transient_failure',
+      refreshError,
+    };
   }
 }
 

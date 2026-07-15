@@ -179,4 +179,96 @@ describe('MTL receiver', () => {
     expect(audit).not.toContain('PRIVATE_SPEAKER_LABEL');
     expect(audit).not.toContain('snapshot');
   });
+
+  it('rejects an end event whose normalized platform does not match the active meeting', async () => {
+    const { env, identity, token, ended, call } = await fixture();
+    const meetingId = 'shared-meeting-id';
+    await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: {
+        platform: 'google-meet',
+        meeting_id: meetingId,
+        start_time_ms: Date.parse('2026-07-15T03:00:00.000Z'),
+      },
+    });
+
+    const response = await call(`${token}/api/meeting-session/end`, {
+      method: 'POST',
+      body: {
+        platform: 'lark',
+        meeting_id: meetingId,
+        end_time_ms: Date.parse('2026-07-15T03:55:00.000Z'),
+      },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'mtl_active_meeting_mismatch',
+        current_meeting: { platform: 'google_meet', meeting_id: meetingId },
+      },
+    });
+    expect(ended).not.toHaveBeenCalled();
+    expect(listMtlMeetingWindows(identity, env)).toEqual([
+      expect.not.objectContaining({ ended_at_ms: expect.any(Number) }),
+    ]);
+    expect(readFileSync(mtlEventsAuditPath(identity, env), 'utf8')).toContain('meeting_session_end_mismatch');
+  });
+
+  it('ends the active meeting when the supplied platform normalizes to the active platform', async () => {
+    const { token, ended, call } = await fixture();
+    const meetingId = 'shared-meeting-id';
+    await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: {
+        platform: 'google-meet',
+        meeting_id: meetingId,
+        start_time_ms: Date.parse('2026-07-15T03:00:00.000Z'),
+      },
+    });
+
+    const response = await call(`${token}/api/meeting-session/end`, {
+      method: 'POST',
+      body: {
+        platform: 'Google-Meet',
+        meeting_id: meetingId,
+        end_time_ms: Date.parse('2026-07-15T03:55:00.000Z'),
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.json()).toMatchObject({
+      ok: true,
+      meeting: { platform: 'google_meet', meeting_id: meetingId, ended_at_ms: Date.parse('2026-07-15T03:55:00.000Z') },
+    });
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(1));
+  });
+
+  it('keeps accepting legacy end events without a platform', async () => {
+    const { token, ended, call } = await fixture();
+    const meetingId = 'shared-meeting-id';
+    await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: {
+        platform: 'google_meet',
+        meeting_id: meetingId,
+        start_time_ms: Date.parse('2026-07-15T03:00:00.000Z'),
+      },
+    });
+
+    const response = await call(`${token}/api/meeting-session/end`, {
+      method: 'POST',
+      body: {
+        meeting_id: meetingId,
+        end_time_ms: Date.parse('2026-07-15T03:55:00.000Z'),
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.json()).toMatchObject({
+      ok: true,
+      meeting: { platform: 'google_meet', meeting_id: meetingId, ended_at_ms: Date.parse('2026-07-15T03:55:00.000Z') },
+    });
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(1));
+  });
 });

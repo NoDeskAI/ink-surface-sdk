@@ -138,8 +138,12 @@ function canonicalUrl(value: unknown): string | undefined {
   }
 }
 
+function normalizeMtlPlatform(value: string): string {
+  return value.toLowerCase().replaceAll('-', '_');
+}
+
 export function meetingCodeFromMtlPayload(payload: Record<string, unknown>): string | undefined {
-  const platform = clean(payload.platform, 64).toLowerCase().replaceAll('-', '_');
+  const platform = normalizeMtlPlatform(clean(payload.platform, 64));
   if (platform !== 'google_meet') return undefined;
   const meetingUrl = canonicalUrl(payload.meeting_url);
   if (meetingUrl) {
@@ -190,7 +194,7 @@ function appendAudit(
 ): void {
   const path = mtlEventsAuditPath(identity, env);
   mkdirSync(dirname(path), { recursive: true });
-  const platform = clean(payload.platform, 64).toLowerCase().replaceAll('-', '_');
+  const platform = normalizeMtlPlatform(clean(payload.platform, 64));
   const meetingId = clean(payload.meeting_id, 256);
   const detectorSource = clean(payload.detector_source || payload.source, 256);
   const observerSurface = clean(payload.observer_surface, 128);
@@ -282,7 +286,7 @@ function startMeeting(
   payload: Record<string, unknown>,
   nowMs: number,
 ): { deduplicated: boolean; meeting: MtlLiveMeetingWindow } {
-  const platform = requiredText(payload, 'platform').toLowerCase().replaceAll('-', '_');
+  const platform = normalizeMtlPlatform(requiredText(payload, 'platform'));
   const meetingId = requiredText(payload, 'meeting_id');
   const startedAtMs = requiredTime(payload, 'start_time_ms');
   const state = readLiveStateFile(identity, env);
@@ -339,11 +343,14 @@ function endMeeting(
   nowMs: number,
 ): MtlLiveMeetingWindow {
   const meetingId = requiredText(payload, 'meeting_id');
+  const platform = payload.platform === undefined
+    ? undefined
+    : normalizeMtlPlatform(requiredText(payload, 'platform'));
   const endedAtMs = requiredTime(payload, 'end_time_ms');
   const state = readLiveStateFile(identity, env);
   const activeIndex = state.windows.findIndex((window) => window.ended_at_ms === undefined);
   const active = activeIndex >= 0 ? state.windows[activeIndex] : undefined;
-  if (!active || active.meeting_id !== meetingId) {
+  if (!active || active.meeting_id !== meetingId || (platform !== undefined && active.platform !== platform)) {
     appendAudit(identity, env, 'meeting_session_end_mismatch', payload, nowMs, {
       ...(active ? { current_platform: active.platform, current_meeting_id: active.meeting_id } : {}),
     });

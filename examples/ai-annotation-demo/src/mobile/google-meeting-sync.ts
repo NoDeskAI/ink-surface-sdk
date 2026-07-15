@@ -59,7 +59,29 @@ export function googleMeetingPatch(
       : {}),
     ...(status === 'ended' && endedAt ? { ended_at: endedAt } : {}),
     ...(rescheduled
-      ? { started_at: undefined, ended_at: undefined, vc_meeting_start_t0: undefined, t0_source: undefined, align_state: undefined }
+      ? {
+        started_at: undefined,
+        ended_at: undefined,
+        provider_meeting_id: undefined,
+        provider_space_name: undefined,
+        provider_transcript_ref: undefined,
+        provider_transcript_status: undefined,
+        google_smart_note: undefined,
+        google_smart_note_scope_missing: undefined,
+        google_recordings: undefined,
+        vc_meeting_start_t0: undefined,
+        t0_source: undefined,
+        align_offset_ms: undefined,
+        align_state: undefined,
+        summary: undefined,
+        summary_generated_at: undefined,
+        summary_source: undefined,
+        panel_summary: undefined,
+        panel_summary_fetched_at: undefined,
+        panel_summary_status: undefined,
+        panel_summary_unread: undefined,
+        exported_at: undefined,
+      }
       : {}),
   };
 }
