@@ -33,12 +33,34 @@ function canvasBlocked(): boolean {
 
 interface AreaRect { x: number; y: number; w: number; h: number; dpr: number }
 
+export interface OnyxPenAreaEligibility {
+  writable: boolean;
+  mode?: string;
+  read?: string;
+  meetingNoteOpen?: boolean;
+  tool: string;
+  blocked: boolean;
+}
+
+/** 只判页面状态；DOM 可见性与 bbox 在下一层处理，便于覆盖会议壳残留 data-read 的回归。 */
+export function shouldArmOnyxPenArea(input: OnyxPenAreaEligibility): boolean {
+  if (!input.writable) return false;
+  if (input.mode === 'read' && input.read === 'books') return false;
+  if (input.mode === 'meet' && !input.meetingNoteOpen) return false;
+  if (input.tool !== 'pen' && input.tool !== 'aipen') return false;
+  return !input.blocked;
+}
+
 /** 当前可见书写画布的矩形（host-local 物理 px）；非书写面/书架/非画笔工具/被遮挡 → null。 */
 function visibleCanvasRect(): AreaRect | null {
-  if (!document.body.classList.contains('writable')) return null;
-  if (document.body.dataset.read === 'books') return null;         // 书架
-  if (state.tool !== 'pen' && state.tool !== 'aipen') return null; // 非画笔工具（橡皮/手型/选择等）
-  if (canvasBlocked()) return null;
+  if (!shouldArmOnyxPenArea({
+    writable: document.body.classList.contains('writable'),
+    mode: document.body.dataset.mode,
+    read: document.body.dataset.read,
+    meetingNoteOpen: document.body.classList.contains('mtg-note-open'),
+    tool: state.tool,
+    blocked: canvasBlocked(),
+  })) return null;
   // getBoundingClientRect 是 CSS px（相对 viewport = WebView host-local）；× dpr = 物理 px。
   // OnyxPenBridge.setLimitRect 要的正是 host-local 物理 px（不减屏幕原点），两边同一把尺。
   const dpr = window.devicePixelRatio || 1;
