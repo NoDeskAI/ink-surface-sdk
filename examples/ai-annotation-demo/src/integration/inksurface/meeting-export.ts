@@ -64,6 +64,7 @@ export interface MeetingL1Export {
 const finiteMs = (...xs: Array<number | null | undefined>): number => { for (const x of xs) if (typeof x === 'number' && Number.isFinite(x)) return x; return 0; };
 const noteTranscriptCacheToken = (meetingId: string): string => `feishu_note_docx:${meetingId}`;
 export function meetingTranscriptCacheTokens(meeting: PersistedMeeting): string[] {
+  if (meeting.platform === 'google_meet') return [`google_meet:${meeting.meeting_id}`];
   return [
     meeting.feishu_minute_token,
     meeting.feishu_meeting_id ? noteTranscriptCacheToken(meeting.feishu_meeting_id) : undefined,

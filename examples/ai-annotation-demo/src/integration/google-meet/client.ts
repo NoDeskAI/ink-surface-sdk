@@ -57,6 +57,22 @@ export interface GoogleMeetingSourcesResponse {
   cursor_reset: boolean;
 }
 
+export interface GoogleMeetingTranscriptLine {
+  start_time: string;
+  end_time: string;
+  speaker_id: string;
+  speaker_name?: string;
+  text: string;
+}
+
+export interface GoogleMeetingTranscriptResponse {
+  status: 'ready' | 'pending' | 'not_generated' | 'no_record';
+  record?: { name: string; start_time?: string; end_time?: string };
+  transcript?: { name: string; lines: GoogleMeetingTranscriptLine[]; srt: string };
+  participants?: Array<Record<string, unknown>>;
+  next_check_at?: string;
+}
+
 export function getGoogleOAuthStatus(opts?: { signal?: AbortSignal }): Promise<GoogleOAuthStatusResponse> {
   return getJson<GoogleOAuthStatusResponse>(`${BASE}/oauth/status`, { ...opts, auth: true });
 }
@@ -71,4 +87,12 @@ export function pollGoogleDeviceOAuth(opts?: { signal?: AbortSignal }): Promise<
 
 export function listGoogleMeetingSources(opts?: { signal?: AbortSignal }): Promise<GoogleMeetingSourcesResponse> {
   return getJson<GoogleMeetingSourcesResponse>(`${BASE}/meeting-sources`, { ...opts, auth: true });
+}
+
+export function getGoogleMeetingTranscript(
+  input: { meetingCode: string; scheduledAt: string },
+  opts?: { signal?: AbortSignal },
+): Promise<GoogleMeetingTranscriptResponse> {
+  const query = new URLSearchParams({ meeting_code: input.meetingCode, scheduled_at: input.scheduledAt });
+  return getJson<GoogleMeetingTranscriptResponse>(`${BASE}/meeting-transcript?${query.toString()}`, { ...opts, auth: true });
 }

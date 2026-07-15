@@ -98,10 +98,10 @@ function meetingPayload(meeting: PersistedMeeting, t0AbsMs: number): Record<stri
   const end = safeTime(meeting.ended_at);
   return {
     platform: meetingPlatformOf(meeting),
-    meeting_id: meeting.feishu_meeting_id || meeting.feishu_meeting_no || meeting.meeting_id,
+    meeting_id: meeting.provider_meeting_id || meeting.feishu_meeting_id || meeting.feishu_meeting_no || meeting.meeting_id,
     external_meeting_id: meeting.feishu_meeting_no || meeting.calendar_meeting_no,
     title: meeting.feishu_topic || meeting.title || '会议',
-    minute_token: meeting.feishu_minute_token,
+    minute_token: meeting.provider_transcript_ref || meeting.feishu_minute_token,
     start_time_ms: start,
     end_time_ms: end,
   };

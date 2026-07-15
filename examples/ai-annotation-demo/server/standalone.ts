@@ -51,6 +51,7 @@ import {
   beginGoogleDeviceOAuth,
   completeGoogleOAuthCallback,
   googleCalendarSyncPath,
+  googleMeetRecordsPath,
   googleDeviceOAuthCompletion,
   googleOAuthErrorPayload,
   resolveGoogleOAuthStatus,
@@ -58,6 +59,7 @@ import {
   type GoogleOAuthIdentity,
 } from './google-oauth-state';
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
+import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import {
   larkRealtimeMeetingSources,
@@ -983,6 +985,36 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     } catch (error) {
       const failure = googleCalendarErrorPayload(error);
       sendJson(res, failure.status, { connected: false, sources: [], ...failure.body });
+    }
+    return;
+  }
+
+  if (path === '/api/google/meeting-transcript') {
+    try {
+      const meetingCode = url.searchParams.get('meeting_code') || '';
+      const scheduledAt = url.searchParams.get('scheduled_at') || '';
+      if (!meetingCode || !scheduledAt) {
+        sendJson(res, 400, { error: { code: 'google_meeting_transcript_input_missing', message: 'meeting_code and scheduled_at are required' } });
+        return;
+      }
+      const resolved = await resolveUserGoogleToken(process.env, identity);
+      if (!resolved.usable || !resolved.token) {
+        sendJson(res, 401, { error: { code: resolved.reason || 'google_oauth_unavailable', message: 'Google OAuth authorization is required' } });
+        return;
+      }
+      const result = await fetchGoogleMeetingTranscript(resolved.token, {
+        path: googleMeetRecordsPath(process.env, identity),
+      }, { meetingCode, scheduledAt }, {
+        refreshAccessToken: async () => {
+          const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
+          if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
+          return refreshed.token;
+        },
+      });
+      sendJson(res, 200, result);
+    } catch (error) {
+      const failure = googleMeetRecordsErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
     }
     return;
   }

@@ -171,6 +171,15 @@ export function googleCalendarSyncPath(env: GoogleOAuthEnv, identity: Pick<Googl
   );
 }
 
+export function googleMeetRecordsPath(env: GoogleOAuthEnv, identity: Pick<GoogleOAuthIdentity, 'tenantId' | 'userId'>): string {
+  return resolve(
+    authRoot(env),
+    safePathPart(identity.tenantId, 'tenant'),
+    safePathPart(identity.userId, 'user'),
+    'meet-records.json',
+  );
+}
+
 export function buildAuthorizeUrl(env: GoogleOAuthEnv, state: string): string {
   const config = requireGoogleConfig(env);
   if (!clean(state)) throw new GoogleOAuthError('google_oauth_state_missing', 400);

@@ -17,6 +17,8 @@ import { buildEpaperMeetingTimeline, type EpaperMeetingTimeline } from '../integ
 import { publishEntityToVault } from '../integration/inksurface/vault-publish-device';
 import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, FeishuNoteSummaryRecord } from '../core/store-format';
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
+import { getGoogleMeetingTranscript } from '../integration/google-meet/client';
+import { meetingTranscriptSource } from './meeting-platform';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
 
@@ -52,6 +54,18 @@ function fmtDiff(deltaMs: number): string {
 
 /** detail 里「会后记录」卡的 HTML（含关联状态）。 */
 export function renderRecapCard(m: PersistedMeeting): string {
+  if (meetingTranscriptSource(m) === 'google_meet_transcript') {
+    const status = m.provider_transcript_status === 'ready'
+      ? '转写已同步'
+      : m.provider_transcript_status === 'not_generated'
+        ? '未生成转写'
+        : m.provider_transcript_status === 'no_record'
+          ? '未找到场次'
+          : '等待会后转写';
+    return `<section class="msec" id="recap-sec"><div class="msec-h"><span class="mt">会后记录</span><span class="mb">${status}</span></div>`
+      + `<div class="matcard" id="recap-open"><span class="ic">${SVG_DOC}</span><div><div class="nm">Google Meet 转写</div>`
+      + `<div class="mt">点开读取会后转写和手写档案</div></div></div></section>`;
+  }
   // 放宽：有飞书会议(feishu_meeting_id)即可进 recap 看 panel 总结；妙记(token)绑了再补转写对轴。
   const associated = !!(m.feishu_meeting_id || m.feishu_minute_token);
   if (associated) {
@@ -220,7 +234,12 @@ function noteTranscriptCacheToken(meetingId: string): string {
   return `feishu_note_docx:${meetingId}`;
 }
 
+function googleTranscriptCacheToken(meetingId: string): string {
+  return `google_meet:${meetingId}`;
+}
+
 function transcriptSourceKey(m: PersistedMeeting): string {
+  if (meetingTranscriptSource(m) === 'google_meet_transcript') return googleTranscriptCacheToken(m.meeting_id);
   return m.feishu_minute_token || (m.feishu_meeting_id ? noteTranscriptCacheToken(m.feishu_meeting_id) : '');
 }
 
@@ -302,7 +321,54 @@ async function loadNoteTranscript(m: PersistedMeeting): Promise<LoadedTranscript
   }
 }
 
+export async function loadGoogleTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
+  if (meetingTranscriptSource(m) !== 'google_meet_transcript' || !m.calendar_meeting_no || !m.scheduled_at) return null;
+  const cacheToken = googleTranscriptCacheToken(m.meeting_id);
+  const cached = await getCachedMinute(cacheToken);
+  try {
+    const result = await getGoogleMeetingTranscript({ meetingCode: m.calendar_meeting_no, scheduledAt: m.scheduled_at });
+    const patch: Partial<PersistedMeeting> = {};
+    if (m.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
+    if (result.record?.name && result.record.name !== m.provider_meeting_id) patch.provider_meeting_id = result.record.name;
+    if (result.transcript?.name && result.transcript.name !== m.provider_transcript_ref) patch.provider_transcript_ref = result.transcript.name;
+    const startMs = feishuEpochMs(result.record?.start_time);
+    const endMs = feishuEpochMs(result.record?.end_time);
+    if (startMs > 0) {
+      if (m.vc_meeting_start_t0 !== startMs) patch.vc_meeting_start_t0 = startMs;
+      if (m.t0_source !== 'provider_event') patch.t0_source = 'provider_event';
+      if (m.align_state !== 'event') patch.align_state = 'event';
+      if (!m.started_at || Date.parse(m.started_at) !== startMs) patch.started_at = new Date(startMs).toISOString();
+    }
+    if (endMs > 0 && (!m.ended_at || Date.parse(m.ended_at) !== endMs)) patch.ended_at = new Date(endMs).toISOString();
+    if (Object.keys(patch).length) {
+      await updateMeeting(m.meeting_id, patch);
+      Object.assign(m, patch);
+    }
+    if (result.status === 'ready' && result.transcript?.srt.trim()) {
+      const srt = result.transcript.srt;
+      await putCachedMinute({
+        minute_token: cacheToken,
+        meeting_id: m.meeting_id,
+        srt,
+        duration_ms: startMs > 0 && endMs > startMs ? endMs - startMs : undefined,
+        fetched_at: new Date().toISOString(),
+      });
+      return { srt, cues: parseSrtTranscript(srt), sourceToken: cacheToken };
+    }
+    if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: cacheToken };
+    return { srt: '', cues: [], sourceToken: cacheToken };
+  } catch (error) {
+    if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: cacheToken };
+    throw error;
+  }
+}
+
 async function loadCachedTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
+  if (meetingTranscriptSource(m) === 'google_meet_transcript') {
+    const token = googleTranscriptCacheToken(m.meeting_id);
+    const cached = await getCachedMinute(token);
+    if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: token };
+  }
   if (m.feishu_minute_token) {
     const cached = await getCachedMinute(m.feishu_minute_token);
     if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: m.feishu_minute_token };
@@ -317,6 +383,7 @@ async function loadCachedTranscript(m: PersistedMeeting): Promise<LoadedTranscri
 
 /** 拉转写：**在线先拉最新**（妙记/飞书 note 可能后续补全/修订）→ 写缓存；离线/失败回退缓存。 */
 async function loadTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
+  if (meetingTranscriptSource(m) === 'google_meet_transcript') return loadGoogleTranscript(m);
   let minuteError: unknown = null;
   if (m.feishu_minute_token) {
     try {
@@ -510,14 +577,17 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   if (!recapAlive(seq, bodyEl)) return;
   if (!m) { bodyEl.innerHTML = '<p class="rc-note">会议不存在。</p>'; return; }
   titleEl.textContent = `${m.title || '会议'} · 会后记录`;
-  m = await resolveRealMeetingId(m); // 日历/周期会来源按需换真 VC meeting_id（会前预写/短号态）
+  if (meetingTranscriptSource(m) !== 'google_meet_transcript') {
+    m = await resolveRealMeetingId(m); // 飞书日历/周期会来源按需换真 VC meeting_id（会前预写/短号态）
+  }
   if (!recapAlive(seq, bodyEl)) return;
   if (m.panel_summary_unread) void updateMeeting(m.meeting_id, { panel_summary_unread: false }); // 进 recap 即「已读」·清 home/detail 提醒
   const hasPanelMeeting = !!m.feishu_meeting_id;
   const hasMinute = !!m.feishu_minute_token;
+  const hasGoogleTranscript = meetingTranscriptSource(m) === 'google_meet_transcript' && !!m.calendar_meeting_no;
   // codex 扫描出的真 bug：新版单页面 recap 没挂旧 detail 卡片的关联入口，日历来的会议一旦没关联上飞书会议就卡死在死文案、
   // 用户没有任何办法自救。这里直接把 recap 空态变成一个可操作的关联入口（复用 associate()，成功后原地重载 recap）。
-  if (!hasPanelMeeting && !hasMinute) {
+  if (!hasPanelMeeting && !hasMinute && !hasGoogleTranscript) {
     bodyEl.innerHTML = '<p class="rc-note">尚未关联飞书会议——关联后才能读飞书纪要、文字记录和 InkLoop 总结。</p>'
       + '<button class="hbtn pri" id="recap-assoc-empty" style="margin-top:2px">关联飞书会议</button>';
     bodyEl.querySelector<HTMLButtonElement>('#recap-assoc-empty')?.addEventListener('click', (ev) => {
@@ -544,10 +614,10 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
     return;
   }
 
-  // 有妙记 token 或飞书 meeting_id 都可拉转写；meeting_id 会走 SDK note/docx artifact 链路。
+  // Google meeting code、妙记 token 或飞书 meeting_id 都可拉转写。
   let loaded: { srt: string; cues: TranscriptCue[] } | null = null;
   let renderedFromCache = false;
-  if (hasMinute || hasPanelMeeting) {
+  if (hasGoogleTranscript || hasMinute || hasPanelMeeting) {
     const cached = await loadCachedTranscript(m);
     if (!recapAlive(seq, bodyEl)) return;
     if (cached) {
@@ -573,12 +643,23 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
     offsetMs: finiteMs(m.align_offset_ms),
   });
   // 转写与手写都空 → 无可展示；但**转写未就绪而有手写时仍要把手写档案露出来**（否则用户的手写被整页静默隐藏）。
-  if (!cues.length && !timeline.segmentMarks.length && !hasPanelMeeting) { bodyEl.innerHTML = '<p class="rc-note">转写为空或还在生成，本场也没有手写档案。</p>'; return; }
+  if (!cues.length && !timeline.segmentMarks.length && !hasPanelMeeting) {
+    const status = m.provider_transcript_status;
+    const message = status === 'not_generated'
+      ? 'Google Meet 已结束，但未生成转写。本场也没有手写档案。'
+      : status === 'no_record'
+        ? 'Google Meet 尚未找到对应的实际场次。本场也没有手写档案。'
+        : 'Google Meet 转写仍在生成，本场也没有手写档案。稍后重新进入会自动重试。';
+    bodyEl.innerHTML = `<p class="rc-note">${message}</p>`;
+    return;
+  }
 
   const segments = timeline.segments;
   recapState = { meeting: m, segments, cues, view: 'overview', detailIdx: 0, ovPage: 0, dtPage: 0, txPage: 0, bodyEl, transcriptMissing: !cues.length,
     feishuSummary: m.feishu_note_summary ?? null,
-    panelSummary: m.panel_summary ?? null, panelSummaryStatus: m.panel_summary ? 'ready' : (m.panel_summary_status ?? 'loading'), timeline,
+    panelSummary: m.panel_summary ?? null,
+    panelSummaryStatus: m.panel_summary ? 'ready' : (hasGoogleTranscript ? 'not_generated' : (m.panel_summary_status ?? 'loading')),
+    timeline,
     marksById: new Map(marks.map((mk) => [mk.mark_id, mk] as const)),
     markSourceMeeting: loadedMarks.sourceMeeting };
   renderRecap(bodyEl);
@@ -587,7 +668,7 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   updateRecapNav();
   wireRecapNav();
   if (renderedFromCache) void refreshTranscriptAfterInitialRender(seq, bodyEl, m.meeting_id);
-  void loadPanelSummary(seq, bodyEl, m); // L5：异步拉 panel 总结（不阻塞时间线·拉到后按当前 view 重渲）
+  if (!hasGoogleTranscript) void loadPanelSummary(seq, bodyEl, m); // L5：只对飞书异步拉 panel 总结
 }
 
 function renderRecap(bodyEl: HTMLElement): void {
@@ -865,8 +946,10 @@ function renderRecapFeishuPage(bodyEl: HTMLElement): void {
 function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
   if (!recapState) return;
   const cues = recapState.cues;
+  const google = meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript';
+  const sourceLabel = google ? 'Google Meet 逐句转写' : '飞书逐句转写';
   if (!cues.length) {
-    bodyEl.innerHTML = '<div class="rc-msum"><div class="rc-msum-h"><b>原始发言</b><span class="mdl">飞书逐句转写</span></div><div class="empty">飞书原始发言还没有同步到本机；稍后重新进入本页会自动重试。</div></div>';
+    bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>原始发言</b><span class="mdl">${sourceLabel}</span></div><div class="empty">原始发言还没有同步到本机；稍后重新进入本页会自动重试。</div></div>`;
     return;
   }
   const total = Math.max(1, Math.ceil(cues.length / TX_PAGE));
@@ -880,7 +963,7 @@ function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
   }).join('');
   bodyEl.innerHTML = `<div class="rc-transcript">`
     + `<div class="rc-msum-h"><b>原始发言</b><span class="mdl">${cues.length} 句 · ${speakerCount || '未知'} 人</span></div>`
-    + `<div class="rc-note">这里展示飞书会后记录里的逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。</div>`
+    + `<div class="rc-note">这里展示${google ? ' Google Meet' : '飞书会后记录里的'}逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。</div>`
     + `<div class="rc-tr-list">${rows}</div>`
     + pagerHtml('tx', p, total)
     + `</div>`;

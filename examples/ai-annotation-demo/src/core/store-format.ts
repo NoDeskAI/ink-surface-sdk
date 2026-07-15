@@ -347,6 +347,7 @@ export interface PersistedMeeting {
   provider_calendar_event_id?: string; // 平台日历实例 id；Google Meet 使用 Calendar event instance id
   provider_space_name?: string;        // 平台会议空间；Google Meet 使用 spaces/{id}
   provider_transcript_ref?: string;    // 平台转写工件引用；Google Meet 使用 transcripts/{id}
+  provider_transcript_status?: 'ready' | 'pending' | 'not_generated' | 'no_record';
   meeting_url?: string;                // 平台通用入会链接；飞书与 Google Meet 均可使用
   // ── WS2-C 飞书妙记对照（optional·零迁移；近似对照非精确对齐·见 integration/panel-feishu）──
   feishu_meeting_id?: string;       // 关联的飞书 VC 会议 id
