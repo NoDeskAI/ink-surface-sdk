@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  chooseGoogleMeetCandidate,
   chooseGoogleMeetRecord,
   fetchGoogleMeetingTranscript,
   googleMeetingLinesToSrt,
@@ -25,6 +26,23 @@ describe('google meet records', () => {
     roots.push(root);
     return join(root, 'meet-records.json');
   }
+
+  it('prefers the session with a ready transcript over a closer transcript-less rejoin', async () => {
+    // 真机事故还原：11:50 开的正主场次（转写已生成）离 12:00 计划时间反而比 11:58 的复进场次远，
+    // 纯时间就近会选中没转写的复进场次、永远 pending。
+    const scheduledAt = '2026-07-15T04:00:00.000Z';
+    const main = {
+      record: { name: 'conferenceRecords/main', startTime: '2026-07-15T03:50:48.000Z', endTime: '2026-07-15T03:57:00.000Z' },
+      transcripts: [{ name: 'conferenceRecords/main/transcripts/t1', state: 'FILE_GENERATED' }],
+    };
+    const rejoin = {
+      record: { name: 'conferenceRecords/rejoin', startTime: '2026-07-15T03:58:22.000Z', endTime: '2026-07-15T04:06:13.000Z' },
+      transcripts: [],
+    };
+    expect(chooseGoogleMeetCandidate([rejoin, main], scheduledAt)?.record.name).toBe('conferenceRecords/main');
+    // 都没转写时退回时间就近
+    expect(chooseGoogleMeetCandidate([rejoin, { ...main, transcripts: [] }], scheduledAt)?.record.name).toBe('conferenceRecords/rejoin');
+  });
 
   it('persists all record candidates and chooses the start nearest to the calendar schedule', async () => {
     const path = statePath();

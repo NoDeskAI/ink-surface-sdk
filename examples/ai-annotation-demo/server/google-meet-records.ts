@@ -247,6 +247,18 @@ export function chooseGoogleMeetRecord(records: GoogleMeetRecord[], scheduledAt:
   return chosen;
 }
 
+/** 选场：**有可用转写的场次绝对优先**（同一日程可能被反复进出产生多个场次，只有真开了转写的那场才是"正主"），
+ *  组内再按离计划时间最近取。真机踩过：计划时间离"复进无转写的第二场"更近，纯时间就近会选错。 */
+export function chooseGoogleMeetCandidate(
+  candidates: StoredRecordCandidate[],
+  scheduledAt: string,
+): StoredRecordCandidate | undefined {
+  const withTranscript = candidates.filter((candidate) => candidate.transcripts.some(transcriptReady));
+  const pool = withTranscript.length ? withTranscript : candidates;
+  const chosenRecord = chooseGoogleMeetRecord(pool.map((candidate) => candidate.record), scheduledAt);
+  return chosenRecord ? pool.find((candidate) => candidate.record.name === chosenRecord.name) : undefined;
+}
+
 function transcriptReady(transcript: GoogleMeetTranscript): boolean {
   return transcript.state === 'FILE_GENERATED' || transcript.state === 'ENDED';
 }
@@ -424,8 +436,8 @@ async function runCatchUp(
   };
   const auth = { token, refreshed: false };
   const records = await fetchCandidates(meetingCode, auth, requestOptions);
-  const chosenRecord = chooseGoogleMeetRecord(records.map((candidate) => candidate.record), scheduledAt);
-  const chosen = chosenRecord ? recordCandidatesByName(records).get(chosenRecord.name) : undefined;
+  const chosen = chooseGoogleMeetCandidate(records, scheduledAt);
+  const chosenRecord = chosen?.record;
   const anchorMs = pollAnchorMs(current || {
     meeting_code: meetingCode,
     scheduled_at: scheduledAt,
