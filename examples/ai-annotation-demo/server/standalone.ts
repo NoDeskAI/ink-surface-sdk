@@ -100,6 +100,7 @@ import {
 } from './cloud-knowledge-store';
 import { isMeetingRuntimeDocumentId, shouldPostprocessRuntimeAnnotation } from './runtime-postprocess-policy';
 import { prepareRuntimeAnnotationUpdate } from './runtime-annotation-postprocess';
+import { createDeadlineSingleFlight } from './background-worker';
 import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
 import {
   buildInkloopDocUri,
@@ -2701,67 +2702,85 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
 const server = createServer(handleRequest);
 
+function positiveTimeoutMs(value: string | undefined, fallbackMs: number): number {
+  const parsed = Number(value ?? fallbackMs);
+  return Number.isFinite(parsed) ? Math.max(1_000, parsed) : fallbackMs;
+}
+
 // WS end 事件可能丢（断线/重启窗口/同 app 多长连接抢路由），live 状态用 REST 周期对账兜底自愈。
 const LARK_MEETING_RECONCILE_MS = Math.max(0, Number(process.env.INKLOOP_LARK_MEETING_RECONCILE_MS ?? 120_000));
-let larkMeetingReconcileInFlight = false;
+const LARK_MEETING_RECONCILE_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_LARK_MEETING_RECONCILE_TIMEOUT_MS, 60_000);
+const larkMeetingReconcileGate = createDeadlineSingleFlight({
+  timeoutMs: LARK_MEETING_RECONCILE_TIMEOUT_MS,
+  label: 'Lark meeting reconcile',
+});
 async function runLarkMeetingReconcile(reason: string): Promise<void> {
-  if (larkMeetingReconcileInFlight || FEISHU_SERVICE_BASE) return;
-  larkMeetingReconcileInFlight = true;
+  if (FEISHU_SERVICE_BASE) return;
   try {
-    const result = await reconcileLarkLiveMeetings({
-      root: ROOT,
-      baseUrl: process.env.LARK_BASE_URL || process.env.FEISHU_BASE_URL || undefined,
-      resolveUserToken: async (openId) => {
-        const statePath = latestLarkAuthStatePath(openId);
-        if (!statePath) return '';
-        const oauth = await resolveUserOAuthToken({ ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath });
-        return oauth.usable && oauth.token ? oauth.token : '';
-      },
-      logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
+    await larkMeetingReconcileGate.run(async (signal) => {
+      const result = await reconcileLarkLiveMeetings({
+        root: ROOT,
+        baseUrl: process.env.LARK_BASE_URL || process.env.FEISHU_BASE_URL || undefined,
+        signal,
+        resolveUserToken: async (openId) => {
+          const statePath = latestLarkAuthStatePath(openId);
+          if (!statePath) return '';
+          const oauth = await resolveUserOAuthToken(
+            { ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath },
+            Date.now(),
+            { signal },
+          );
+          return oauth.usable && oauth.token ? oauth.token : '';
+        },
+        logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
+      });
+      if (result.checked > 0 || result.errors.length > 0) {
+        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      }
     });
-    if (result.checked > 0 || result.errors.length > 0) {
-      console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
-    }
   } catch (e) {
     console.warn(`[inkloop proxy] lark meeting reconcile failed reason=${reason}: ${String((e as Error)?.message || e)}`);
-  } finally {
-    larkMeetingReconcileInFlight = false;
   }
 }
 
 // Gemini 智能纪要在会议结束后几分钟才导出成 Doc，设备端请求不是可靠触发源（recap 可能一直开着或没开）。
 // hub 侧周期扫全部已连接用户的 meet-records，窗口内的空壳纪要主动回补。
 const GOOGLE_SMART_NOTE_BACKFILL_MS = Math.max(0, Number(process.env.INKLOOP_GOOGLE_SMART_NOTE_BACKFILL_MS ?? 120_000));
-let googleBackfillInFlight = false;
+const GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS, 60_000);
+const googleBackfillGate = createDeadlineSingleFlight({
+  timeoutMs: GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS,
+  label: 'Google meeting backfill',
+});
 async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
-  if (googleBackfillInFlight) return;
-  googleBackfillInFlight = true;
   try {
-    const root = googleAuthRoot(process.env);
-    let identities: Array<{ tenantId: string; userId: string }> = [];
-    try {
-      identities = readdirSync(root, { withFileTypes: true })
-        .filter((tenant) => tenant.isDirectory())
-        .flatMap((tenant) => readdirSync(resolve(root, tenant.name), { withFileTypes: true })
-          .filter((user) => user.isDirectory())
-          .map((user) => ({ tenantId: tenant.name, userId: user.name })));
-    } catch { /* 目录不存在 = 无人连接 Google */ }
-    for (const identity of identities) {
-      const recordsPath = googleMeetRecordsPath(process.env, identity);
-      if (!existsSync(recordsPath)) continue;
-      const resolved = await resolveAnyUserGoogleToken(process.env, identity);
-      if (!resolved.usable || !resolved.token) continue;
-      const result = await backfillGoogleMeetSmartNotes(resolved.token, { path: recordsPath }, {
-        grantedScopes: resolved.scopes,
-      });
-      if (result.scanned > 0 || result.errors.length > 0) {
-        console.log(`[inkloop proxy] google smart-note backfill reason=${reason} user=${identity.userId} scanned=${result.scanned} backfilled=${result.backfilled} completed=${result.completed}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+    await googleBackfillGate.run(async (signal) => {
+      const fetchImpl: typeof fetch = (input, init) => fetch(input, { ...init, signal });
+      const root = googleAuthRoot(process.env);
+      let identities: Array<{ tenantId: string; userId: string }> = [];
+      try {
+        identities = readdirSync(root, { withFileTypes: true })
+          .filter((tenant) => tenant.isDirectory())
+          .flatMap((tenant) => readdirSync(resolve(root, tenant.name), { withFileTypes: true })
+            .filter((user) => user.isDirectory())
+            .map((user) => ({ tenantId: tenant.name, userId: user.name })));
+      } catch { /* 目录不存在 = 无人连接 Google */ }
+      for (const identity of identities) {
+        if (signal.aborted) throw signal.reason;
+        const recordsPath = googleMeetRecordsPath(process.env, identity);
+        if (!existsSync(recordsPath)) continue;
+        const resolved = await resolveAnyUserGoogleToken(process.env, identity, Date.now(), { fetchImpl });
+        if (!resolved.usable || !resolved.token) continue;
+        const result = await backfillGoogleMeetSmartNotes(resolved.token, { path: recordsPath }, {
+          grantedScopes: resolved.scopes,
+          fetchImpl,
+        });
+        if (result.scanned > 0 || result.errors.length > 0) {
+          console.log(`[inkloop proxy] google smart-note backfill reason=${reason} user=${identity.userId} scanned=${result.scanned} backfilled=${result.backfilled} completed=${result.completed}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+        }
       }
-    }
+    });
   } catch (e) {
     console.warn(`[inkloop proxy] google smart-note backfill failed reason=${reason}: ${String((e as Error)?.message || e)}`);
-  } finally {
-    googleBackfillInFlight = false;
   }
 }
 

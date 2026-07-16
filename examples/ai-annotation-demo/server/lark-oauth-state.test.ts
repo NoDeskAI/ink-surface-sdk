@@ -53,6 +53,57 @@ describe('lark oauth state', () => {
     }
   });
 
+  it('aborts a hung refresh without writing stale state and releases the single-flight slot', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-refresh-timeout-'));
+    const authPath = join(tempDir, 'lark-auth.json');
+    const obtainedAt = Date.now() - 3 * 60 * 60 * 1000;
+    writeFileSync(authPath, JSON.stringify({
+      token: {
+        access_token: 'stale_token',
+        refresh_token: 'refresh_1',
+        expires_in: 7200,
+        refresh_expires_in: 30 * 24 * 60 * 60,
+        obtained_at_ms: obtainedAt,
+        scope: 'vc:meeting.search:read',
+      },
+    }));
+    const env = { LARK_APP_ID: 'cli_test', LARK_APP_SECRET: 'secret', LARK_MEETING_AUTH_STATE_PATH: authPath };
+    const controller = new AbortController();
+    let notifyStarted!: () => void;
+    const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const hung = resolveUserOAuthToken(env, Date.now(), {
+      signal: controller.signal,
+      createClient: () => ({
+        refreshOAuthToken: async () => {
+          notifyStarted();
+          return new Promise<Record<string, unknown>>(() => {});
+        },
+      }),
+    });
+
+    try {
+      await started;
+      controller.abort(new Error('worker deadline'));
+      await expect(hung).rejects.toThrow('worker deadline');
+      expect(JSON.parse(readFileSync(authPath, 'utf8')).token.access_token).toBe('stale_token');
+
+      const recovered = await resolveUserOAuthToken(env, Date.now(), {
+        createClient: () => ({
+          refreshOAuthToken: async () => ({
+            access_token: 'fresh_after_timeout',
+            refresh_token: 'refresh_2',
+            expires_in: 7200,
+            refresh_expires_in: 30 * 24 * 60 * 60,
+            scope: 'vc:meeting.search:read',
+          }),
+        }),
+      });
+      expect(recovered).toMatchObject({ usable: true, token: 'fresh_after_timeout', refreshed: true });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('starts and completes Cloud Hub-owned OAuth without depending on the SDK daemon', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-cloud-hub-oauth-'));
     const authPath = join(tempDir, 'lark-auth.json');

@@ -12,6 +12,7 @@ export interface LarkMeetingReconcileOptions {
   /** live 起始至今低于该时长的不查（刚开始的会查了也是"进行中"，白耗限额）。 */
   minLiveAgeMs?: number;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
   logger?: (event: string, details?: unknown) => void;
 }
 
@@ -79,6 +80,7 @@ export async function reconcileLarkLiveMeetings(options: LarkMeetingReconcileOpt
         const meetingId = encodeURIComponent(text(meeting.feishu_meeting_id));
         const res = await fetchImpl(`${baseUrl}/open-apis/vc/v1/meetings/${meetingId}?with_participants=false`, {
           headers: { authorization: `Bearer ${token}` },
+          signal: options.signal,
         });
         const json = obj(await res.json().catch(() => ({})));
         const code = Number(json.code);

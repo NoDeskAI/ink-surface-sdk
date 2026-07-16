@@ -100,6 +100,19 @@ function obj(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 }
 
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort);
+      rejectPromise(signal.reason ?? new Error('aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolvePromise, rejectPromise).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 export function tokenScopeList(value: unknown): string[] {
   return String(value ?? '')
     .split(/[\s,]+/)
@@ -341,6 +354,7 @@ const larkRefreshInflight = new Map<string, Promise<LarkUserOAuthState>>();
 
 export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(), options: {
   createClient?: (env: Record<string, unknown>) => unknown;
+  signal?: AbortSignal;
 } = {}): Promise<LarkUserOAuthState> {
   const candidates = authStatePaths(env);
   const path = candidates.find((candidate) => existsSync(candidate)) || candidates[0];
@@ -393,7 +407,7 @@ export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(
       ...(config.baseUrl ? { LARK_BASE_URL: config.baseUrl } : {}),
     })) as RefreshCapableClient;
     if (!client.refreshOAuthToken) return { ...base, usable: false, reason: 'oauth_refresh_unsupported' };
-    const refreshed = await client.refreshOAuthToken(refreshToken);
+    const refreshed = await abortable(client.refreshOAuthToken(refreshToken), options.signal);
     const refreshedState = obj(refreshed);
     const refreshedToken = text(refreshedState.access_token) || text(refreshedState.user_access_token);
     if (!refreshedToken) return { ...base, usable: false, reason: 'oauth_refresh_failed', refreshError: 'missing refreshed access_token' };
@@ -418,6 +432,7 @@ export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(
       refreshExpired: false,
     };
   } catch (e) {
+    if (options.signal?.aborted) throw options.signal.reason ?? e;
     // 竞态让位：失败前回读 state——若另一路并发刷新已成功写回新 token，用它的成果，不误报失败。
     try {
       const latestParsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;

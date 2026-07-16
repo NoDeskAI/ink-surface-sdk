@@ -43,11 +43,13 @@ describe('lark meeting reconcile', () => {
     try {
       seedLiveMeeting(root);
       const fetchImpl = vi.fn(async () => vcMeetingResponse(3, '1784299500'));
+      const controller = new AbortController();
       const result = await reconcileLarkLiveMeetings({
         root,
         nowMs: NOW_MS,
         resolveUserToken: async (openId) => (openId === 'ou_owner' ? 'token_owner' : ''),
         fetchImpl: fetchImpl as unknown as typeof fetch,
+        signal: controller.signal,
       });
 
       expect(result).toMatchObject({ checked: 1, ended: 1, still_live: 0, skipped: 0 });
@@ -55,6 +57,7 @@ describe('lark meeting reconcile', () => {
       const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
       expect(url).toContain('/open-apis/vc/v1/meetings/m_evening');
       expect((init.headers as Record<string, string>).authorization).toBe('Bearer token_owner');
+      expect(init.signal).toBe(controller.signal);
 
       const [record] = listLarkRealtimeMeetings(root, { nowMs: NOW_MS });
       expect(record.status).toBe('ended');
