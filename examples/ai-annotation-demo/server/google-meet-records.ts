@@ -107,6 +107,7 @@ export interface GoogleMeetJobState {
   smart_note_scope_missing?: boolean;
   recordings?: GoogleMeetRecordingArtifact[];
   artifacts_fetched_at?: string;
+  artifacts_retry_pending?: boolean; // 可选产物本轮有失败件（如录像 5xx）：窗口内继续回补，即使纪要正文已到手
   status: 'pending' | 'ready' | 'not_generated' | 'no_record';
   next_check_at?: string;
   attempt: number;
@@ -411,11 +412,14 @@ async function fetchChosenArtifacts(
   auth: { token: string; refreshed: boolean },
   options: RequestOptions,
   grantedScopes: readonly string[],
-): Promise<Pick<GoogleMeetJobState, 'smart_note' | 'smart_note_scope_missing' | 'recordings'>> {
-  // 纪要/录像互为可选：一件拉挂不连累另一件（review P1-3）。失败件留空，backfill 窗口内自动重试。
+): Promise<{ artifacts: Pick<GoogleMeetJobState, 'smart_note' | 'smart_note_scope_missing' | 'recordings'>; failed: boolean }> {
+  // 纪要/录像互为可选：一件拉挂不连累另一件（review P1-3）。失败件留空并标 failed——
+  // 只靠"留空"不够：纪要正文若已到手，backfillDue 会因 smart_note.text 直接终止，失败的录像永不补（review C6）。
+  let anyFailed = false;
   const optional = async <T>(what: string, run: () => Promise<T[]>): Promise<T[]> => {
     try { return await run(); } catch (e) {
       console.warn(`[google-meet-records] optional artifact ${what} fetch failed:`, String((e as Error)?.message || e));
+      anyFailed = true;
       return [];
     }
   };
@@ -450,14 +454,18 @@ async function fetchChosenArtifacts(
         } catch (e) {
           // Doc 导出瞬时失败：保留纪要壳（text 缺失→backfillDue 继续为真），窗口内重试补正文
           console.warn('[google-meet-records] smart note doc export failed:', String((e as Error)?.message || e));
+          anyFailed = true;
         }
       }
     }
   }
   return {
-    ...(smartNote ? { smart_note: smartNote } : {}),
-    ...(scopeMissing ? { smart_note_scope_missing: true } : {}),
-    ...(normalizedRecordings.length ? { recordings: normalizedRecordings } : {}),
+    artifacts: {
+      ...(smartNote ? { smart_note: smartNote } : {}),
+      ...(scopeMissing ? { smart_note_scope_missing: true } : {}),
+      ...(normalizedRecordings.length ? { recordings: normalizedRecordings } : {}),
+    },
+    failed: anyFailed,
   };
 }
 
@@ -619,7 +627,7 @@ function googleMeetArtifactBackfillDue(job: GoogleMeetJobState | undefined, nowM
   const fetchedAtMs = Date.parse(job.artifacts_fetched_at || '');
   if (!Number.isFinite(fetchedAtMs)) return true;
   if (job.smart_note_scope_missing) return false; // scope 缺失走 driveScopeAdded 专门路径
-  if (job.smart_note?.text) return false;
+  if (!job.artifacts_retry_pending && job.smart_note?.text) return false; // retry_pending=上轮有失败件（如录像），正文到手也要继续补
   const chosen = job.chosen_record_name ? recordCandidatesByName(job.records).get(job.chosen_record_name) : undefined;
   if (nowMs - pollAnchorMs(job, chosen?.record) > GOOGLE_MEET_ARTIFACT_BACKFILL_WINDOW_MS) return false;
   return nowMs - fetchedAtMs >= GOOGLE_MEET_ARTIFACT_BACKFILL_MIN_INTERVAL_MS;
@@ -635,7 +643,7 @@ async function backfillJobArtifacts(
 ): Promise<GoogleMeetJobState | null> {
   const chosen = job.chosen_record_name ? recordCandidatesByName(job.records).get(job.chosen_record_name) : undefined;
   if (!chosen?.record.name) return null;
-  const artifacts = await fetchChosenArtifacts(chosen.record.name, auth, requestOptions, grantedScopes);
+  const { artifacts, failed } = await fetchChosenArtifacts(chosen.record.name, auth, requestOptions, grantedScopes);
   const updated: GoogleMeetJobState = {
     ...job,
     ...(artifacts.smart_note ? { smart_note: artifacts.smart_note } : {}),
@@ -645,6 +653,8 @@ async function backfillJobArtifacts(
   };
   if (artifacts.smart_note_scope_missing) updated.smart_note_scope_missing = true;
   else delete updated.smart_note_scope_missing;
+  if (failed) updated.artifacts_retry_pending = true;
+  else delete updated.artifacts_retry_pending;
   return updated;
 }
 
@@ -652,6 +662,7 @@ export interface GoogleMeetSmartNoteBackfillResult {
   scanned: number;
   backfilled: number;
   completed: number;
+  advanced: number; // 离线推进的非终态 job 数（设备不在线也能把 pending 转写跑到 ready）
   errors: string[];
 }
 
@@ -663,7 +674,7 @@ export async function backfillGoogleMeetSmartNotes(
   options: GoogleMeetRecordsOptions = {},
 ): Promise<GoogleMeetSmartNoteBackfillResult> {
   const nowMs = options.nowMs ?? Date.now();
-  const result: GoogleMeetSmartNoteBackfillResult = { scanned: 0, backfilled: 0, completed: 0, errors: [] };
+  const result: GoogleMeetSmartNoteBackfillResult = { scanned: 0, backfilled: 0, completed: 0, advanced: 0, errors: [] };
   if (!String(token || '').trim()) return result;
   const state = loadState(recordsRef.path);
   const requestOptions: RequestOptions = {
@@ -673,23 +684,46 @@ export async function backfillGoogleMeetSmartNotes(
   };
   const auth = { token, refreshed: false };
   for (const [key, job] of Object.entries(state.meetings)) {
+    const lockKey = `${recordsRef.path}|${key}`;
+    // 离线推进（review I1）：设备不在线时非终态 job 由 hub 按 next_check_at 推进——
+    // 否则 pending 转写只能等设备回线打开 recap 才继续，Gemini 正文也进不了回补链
+    if (!job.terminal && job.status !== 'ready') {
+      const dueMs = Date.parse(job.next_check_at || '');
+      if (Number.isFinite(dueMs) && nowMs < dueMs) continue;
+      try {
+        await fetchGoogleMeetingTranscript(token, recordsRef, { meetingCode: job.meeting_code, scheduledAt: job.scheduled_at }, options);
+        result.advanced += 1;
+      } catch (e) {
+        result.errors.push(`${key}: ${String((e as Error)?.message || e)}`);
+      }
+      continue; // 推进到 ready 后由下一轮 sweep 做 artifact 回补
+    }
     if (!googleMeetArtifactBackfillDue(job, nowMs)) continue;
+    // 同 key 互斥（review C7）：设备请求在跑同一场时本轮跳过，否则两边从同一旧 job 派生、后写覆盖先拿到的纪要正文
+    if (jobsInFlight.has(lockKey) || sweepJobsInFlight.has(lockKey)) continue;
     result.scanned += 1;
-    try {
+    const task = (async (): Promise<void> => {
       const updated = await backfillJobArtifacts(job, auth, requestOptions, options.grantedScopes || [], nowMs);
-      if (!updated) continue;
+      if (!updated) return;
       // 逐条 persistJob（写时重读合并）：整轮扫完才 save 会用开头的旧快照冲掉扫描期间 runCatchUp 的并发写
       persistJob(recordsRef.path, key, updated);
       result.backfilled += 1;
       if (updated.smart_note?.text) result.completed += 1;
+    })();
+    sweepJobsInFlight.set(lockKey, task.then(() => undefined, () => undefined));
+    try {
+      await task;
     } catch (e) {
       result.errors.push(`${key}: ${String((e as Error)?.message || e)}`);
+    } finally {
+      sweepJobsInFlight.delete(lockKey);
     }
   }
   return result;
 }
 
 const jobsInFlight = new Map<string, Promise<GoogleMeetingTranscriptResult>>();
+const sweepJobsInFlight = new Map<string, Promise<void>>();
 
 async function runCatchUp(
   token: string,
@@ -771,7 +805,7 @@ async function runCatchUp(
 
   if (chosenRecord) {
     try {
-      const artifacts = await fetchChosenArtifacts(
+      const { artifacts, failed } = await fetchChosenArtifacts(
         chosenRecord.name,
         auth,
         requestOptions,
@@ -779,9 +813,11 @@ async function runCatchUp(
       );
       Object.assign(updated, artifacts);
       updated.artifacts_fetched_at = new Date(nowMs).toISOString();
+      if (failed) updated.artifacts_retry_pending = true;
     } catch (e) {
-      // 可选产物失败不连累转写主链（review P1-3）；不落 artifacts_fetched_at → backfillDue 视为待补，窗口内自动重试
+      // 可选产物失败不连累转写主链（review P1-3）；标 retry_pending，窗口内自动重试
       console.warn('[google-meet-records] artifacts fetch failed, transcript flow continues:', String((e as Error)?.message || e));
+      updated.artifacts_retry_pending = true;
     }
   }
 
@@ -820,7 +856,11 @@ export function fetchGoogleMeetingTranscript(
   const lockKey = `${recordsRef.path}|${input.meetingCode.trim()}|${scheduledKey}`;
   const existing = jobsInFlight.get(lockKey);
   if (existing) return existing;
-  const job = runCatchUp(token, recordsRef, input, options).finally(() => jobsInFlight.delete(lockKey));
+  // sweep 正在回补同一场：等它 persist 完再跑，避免从旧 job 派生互相覆盖（review C7·sweep 锁已吞错不会 reject）
+  const sweepLock = sweepJobsInFlight.get(lockKey) ?? Promise.resolve();
+  const job = sweepLock
+    .then(() => runCatchUp(token, recordsRef, input, options))
+    .finally(() => jobsInFlight.delete(lockKey));
   jobsInFlight.set(lockKey, job);
   return job;
 }
