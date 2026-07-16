@@ -260,8 +260,8 @@ export async function bindPanelMinute(meetingId: string, minuteToken: string, op
   }
 }
 
-/** L5 总结取数状态：ready=已生成 · not_generated=未生成(可触发) · missing_minute=没关联妙记 · not_found=panel 无此会议 · failed=出错。 */
-export type PanelMeetingSummaryStatus = 'ready' | 'not_generated' | 'missing_minute' | 'not_found' | 'failed';
+/** L5 总结取数状态：ready=已生成 · not_generated=未生成(可触发) · missing_minute=没关联妙记 · transcript_not_ready=妙记转写还在生成(可重试) · not_found=panel 无此会议 · failed=出错。 */
+export type PanelMeetingSummaryStatus = 'ready' | 'not_generated' | 'missing_minute' | 'transcript_not_ready' | 'not_found' | 'failed';
 
 /** GET 已生成的 panel 五要素总结（不触发生成·未生成时 summary=null·status 指示原因）。 */
 export async function getPanelMeetingSummary(meetingId: string, opts?: { signal?: AbortSignal }): Promise<{ status: PanelMeetingSummaryStatus; summary: PanelMeetingSummaryRecord | null }> {

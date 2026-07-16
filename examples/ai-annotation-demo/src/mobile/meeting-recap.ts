@@ -1206,6 +1206,7 @@ function wireRecapExportButton(): void {
 type StoredPanelSummaryStatus = NonNullable<PersistedMeeting['panel_summary_status']>;
 function toStoredPanelSummaryStatus(status: PanelMeetingSummaryStatus): StoredPanelSummaryStatus {
   if (status === 'ready' || status === 'not_generated' || status === 'missing_minute' || status === 'not_found') return status;
+  if (status === 'transcript_not_ready') return 'not_generated'; // 瞬态：落库当未生成，下次进来可再触发/等自动链补上
   return 'failed'; // 'failed' 外的取数态都落库，下次进 recap 直接显示而非永远 loading。
 }
 
@@ -1451,6 +1452,7 @@ function panelSummaryHtml(): string {
       + blk('结论', s.conclusions) + ai + blk('风险', s.risks) + blk('待决', s.open_questions) + blk('后续', s.next_steps));
   }
   if (status === 'missing_minute') return box('InkLoop 还没拿到这场会议的转写，暂时不能生成结构化总结；飞书转写绑定后会自动同步。');
+  if (status === 'transcript_not_ready') return box('纪要和原文转录还没就绪（飞书妙记还在生成）。就绪后会自动生成总结，也可以稍后手动重试。<button class="hbtn rc-psum-retry" id="ps-gen">重试</button>');
   if (status === 'loading' || status === 'generating') return box(status === 'generating' ? '正在生成 InkLoop 总结…（读取完整转写，稍候）' : '正在拉取 InkLoop 总结…');
   if (status === 'failed') return box('拉取 InkLoop 总结失败（网络/服务波动）。<button class="hbtn rc-psum-retry" id="ps-refresh">刷新重试</button>');
   if (status === 'auth_required') return box('需要重新登录飞书后才能读取 InkLoop 总结。<button class="hbtn rc-psum-retry" id="ps-login">重新登录飞书</button><button class="hbtn rc-psum-retry" id="ps-refresh">重试</button>');
@@ -1525,6 +1527,7 @@ function panelSummaryLabel(): string {
   if (recapState.panelSummaryStatus === 'auth_required') return '需重新登录';
   if (recapState.panelSummaryStatus === 'failed') return '待重试';
   if (recapState.panelSummaryStatus === 'not_generated') return '待生成';
+  if (recapState.panelSummaryStatus === 'transcript_not_ready') return '转写生成中';
   if (recapState.panelSummaryStatus === 'missing_minute') return '缺少转写';
   return '同步中';
 }
@@ -1650,7 +1653,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
       ? overviewCardHtml({ action: 'feishu', title: '智能纪要', meta: note.status === 'loading' ? '拉取中' : smartNoteCard.meta, body: note.message, disabled: note.status !== 'ready' && !noteActions, actions: noteActions })
       : overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : note.status === 'loading' ? '拉取中' : '无纪要', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : note.message, disabled: !feishuReady && !noteActions, actions: noteActions }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: marks.status === 'loading' ? '读取中' : inkCount ? `${inkCount} 处${markSource}` : '0 处', body: marks.status === 'ready' || marks.status === 'missing' ? inkBody : marks.message, disabled: inkPages.length === 0 && !marksActions, actions: marksActions })
-    + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: recapState.panelSummary ? '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。' : recapState.panelSummaryStatus === 'auth_required' ? '需要重新登录飞书后才能读取 InkLoop 总结。' : recapState.panelSummaryStatus === 'failed' ? '拉取 InkLoop 总结失败；进入后可重试。' : recapState.panelSummaryStatus === 'loading' ? '正在拉取 InkLoop 总结。' : '暂无 InkLoop 总结。' })
+    + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: recapState.panelSummary ? '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。' : recapState.panelSummaryStatus === 'auth_required' ? '需要重新登录飞书后才能读取 InkLoop 总结。' : recapState.panelSummaryStatus === 'failed' ? '拉取 InkLoop 总结失败；进入后可重试。' : recapState.panelSummaryStatus === 'transcript_not_ready' ? '纪要和原文转录还没就绪，就绪后会自动生成。' : recapState.panelSummaryStatus === 'loading' ? '正在拉取 InkLoop 总结。' : '暂无 InkLoop 总结。' })
     + `</section>`
     + `</div>`;
   bodyEl.querySelectorAll<HTMLElement>('[data-rc-open]').forEach((el) => el.addEventListener('click', () => {
