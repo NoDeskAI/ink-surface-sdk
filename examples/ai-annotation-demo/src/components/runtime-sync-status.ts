@@ -1,4 +1,6 @@
-export type RuntimeSyncUiState = 'queued' | 'syncing' | 'pulling' | 'synced' | 'failed';
+export type RuntimeSyncUiState = 'queued' | 'syncing' | 'pulling' | 'synced' | 'failed' | 'dead_letter';
+
+export const RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT = 'inkloop:runtime-sync-retry-dead-letters';
 
 export interface RuntimeSyncStatusDetail {
   state: RuntimeSyncUiState;
@@ -7,6 +9,7 @@ export interface RuntimeSyncStatusDetail {
   doc_id?: string;
   device_id?: string;
   pending_event_count?: number;
+  dead_letter_count?: number;
   pushed?: number;
   pulled?: number;
   error?: string;
@@ -55,6 +58,11 @@ function ensureStyle(): void {
       border-color: rgba(122, 31, 24, 0.28);
       background: rgba(255, 248, 246, 0.98);
     }
+    .runtime-sync-status[data-state="dead_letter"] {
+      color: #714c0b;
+      border-color: rgba(113, 76, 11, 0.28);
+      background: rgba(255, 251, 240, 0.98);
+    }
     .runtime-sync-status-title {
       font-weight: 650;
       white-space: nowrap;
@@ -73,7 +81,7 @@ function ensureStyle(): void {
       -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
     }
-    .runtime-sync-copy {
+    .runtime-sync-action {
       border: 1px solid currentColor;
       border-radius: 6px;
       background: transparent;
@@ -84,8 +92,11 @@ function ensureStyle(): void {
       pointer-events: auto;
       white-space: nowrap;
     }
-    .runtime-sync-copy[hidden] {
+    .runtime-sync-action[hidden] {
       display: none;
+    }
+    .runtime-sync-action:disabled {
+      opacity: 0.58;
     }
     body.eink-shell .runtime-sync-status {
       left: 8px;
@@ -102,10 +113,14 @@ function ensureStyle(): void {
 
 function titleFor(detail: RuntimeSyncStatusDetail): string {
   const pending = detail.pending_event_count ?? 0;
+  const deadLetters = detail.dead_letter_count ?? 0;
+  // state 优先于计数：无本地积压的 pull 失败也是真失败，不能被双计数吃成"已同步"。
   if (detail.state === 'failed') return '标记同步失败';
-  if (detail.state === 'queued') return pending > 0 ? `标记待同步 ${pending}` : '标记待同步';
   if (detail.state === 'syncing') return pending > 0 ? `标记同步中 ${pending}` : '标记同步中';
   if (detail.state === 'pulling') return '正在检查标记';
+  // 双计数同显：只报 pending 会把死信藏到 pending 清零才露头，用户看不到完整积压
+  if (pending > 0) return deadLetters > 0 ? `标记待同步 ${pending} · 另有 ${deadLetters} 条历史标记未同步` : `标记待同步 ${pending}`;
+  if (deadLetters > 0) return `有 ${deadLetters} 条历史标记未同步`;
   return '标记已同步';
 }
 
@@ -136,6 +151,7 @@ function errorReport(detail: RuntimeSyncStatusDetail): string {
     doc_id: detail.doc_id || '',
     device_id: detail.device_id || '',
     pending_event_count: detail.pending_event_count ?? 0,
+    dead_letter_count: detail.dead_letter_count ?? 0,
     pushed: detail.pushed ?? 0,
     pulled: detail.pulled ?? 0,
     api_base: detail.api_base || '',
@@ -185,13 +201,18 @@ export function initRuntimeSyncStatus(): void {
   const title = document.createElement('div');
   title.className = 'runtime-sync-status-title';
   const copy = document.createElement('button');
-  copy.className = 'runtime-sync-copy';
+  copy.className = 'runtime-sync-action runtime-sync-copy';
   copy.type = 'button';
   copy.textContent = '复制错误';
   copy.hidden = true;
+  const retry = document.createElement('button');
+  retry.className = 'runtime-sync-action runtime-sync-retry';
+  retry.type = 'button';
+  retry.textContent = '重试一次';
+  retry.hidden = true;
   const meta = document.createElement('div');
   meta.className = 'runtime-sync-status-meta';
-  row.append(title, copy);
+  row.append(title, retry, copy);
   node.append(row, meta);
   document.body.appendChild(node);
   let latest: RuntimeSyncStatusDetail | null = null;
@@ -202,7 +223,8 @@ export function initRuntimeSyncStatus(): void {
       window.clearTimeout(hideTimer);
       hideTimer = null;
     }
-    if (detail.state !== 'synced') return;
+    // 只有真 synced 且双计数归零才自动隐藏；failed/dead_letter 挂住等用户处理。
+    if (detail.state !== 'synced' || (detail.pending_event_count ?? 0) > 0 || (detail.dead_letter_count ?? 0) > 0) return;
     hideTimer = window.setTimeout(() => {
       node.hidden = true;
       hideTimer = null;
@@ -225,6 +247,14 @@ export function initRuntimeSyncStatus(): void {
     }
   });
 
+  retry.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    retry.disabled = true;
+    retry.textContent = '重试中';
+    document.dispatchEvent(new CustomEvent(RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT));
+  });
+
   document.addEventListener('inkloop:runtime-sync-status', (event) => {
     const detail = (event as CustomEvent<RuntimeSyncStatusDetail>).detail;
     if (!detail) return;
@@ -235,6 +265,9 @@ export function initRuntimeSyncStatus(): void {
     meta.textContent = metaFor(detail);
     meta.hidden = !meta.textContent;
     copy.hidden = detail.state !== 'failed' && !detail.error;
+    retry.disabled = false;
+    retry.textContent = '重试一次';
+    retry.hidden = (detail.pending_event_count ?? 0) > 0 || (detail.dead_letter_count ?? 0) === 0;
     (window as unknown as { __inkloopRuntimeSyncStatus?: RuntimeSyncStatusDetail }).__inkloopRuntimeSyncStatus = detail;
     scheduleHide(detail);
   });

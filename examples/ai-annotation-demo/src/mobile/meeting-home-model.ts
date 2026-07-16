@@ -1,4 +1,5 @@
 import type { MeetingStatus, PersistedMeeting } from '../core/store-format';
+import { meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
 
 export type MeetingHomeFilter = 'active' | 'history';
 
@@ -6,6 +7,10 @@ export interface MeetingHomeBuckets {
   active: PersistedMeeting[];
   history: PersistedMeeting[];
   historyTotal: number;
+}
+
+export function filterMeetingsByPlatform(meetings: PersistedMeeting[], platform: MeetingPlatform): PersistedMeeting[] {
+  return meetings.filter((meeting) => meetingPlatformOf(meeting) === platform);
 }
 
 const LIVE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;

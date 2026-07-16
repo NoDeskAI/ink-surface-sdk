@@ -116,7 +116,7 @@ function appConfig(env: LarkMeetingNotesEnv): AppConfig | null {
 }
 
 function permissionUrl(appId: string, scopes: string[]): string {
-  return `https://open.feishu.cn/app/${appId}/auth?q=${encodeURIComponent(scopes.join(','))}&op_from=openapi&token_type=tenant`;
+  return `https://open.feishu.cn/app/${appId}/auth?q=${encodeURIComponent(scopes.join(','))}&op_from=openapi&token_type=user`;
 }
 
 function hasScopes(actual: string[], required: string[]): boolean {
@@ -519,6 +519,22 @@ export async function fetchLarkMeetingNoteTranscript(meetingId: string, options:
   const enriched: Array<LarkMeetingNoteArtifact & { content?: string; segments?: FeishuDocxTranscriptSegment[] }> = [];
   for (const artifact of artifacts) {
     const raw = await requestJson(config.baseUrl, userOAuth.token, `/open-apis/docx/v1/documents/${encodeURIComponent(artifact.document_id)}/raw_content`);
+    if (raw.code !== undefined && raw.code !== 0) {
+      errors.push({
+        source: 'docx',
+        code: String(raw.code || 'raw_content_failed'),
+        message: feishuMsg(raw),
+        required_scope: 'docx:document:readonly',
+        permission_url: permissionUrl(config.appId, ['docx:document:readonly']),
+      });
+      enriched.push({
+        ...artifact,
+        content_length: 0,
+        segment_count: 0,
+        speaker_count: 0,
+      });
+      continue;
+    }
     const content = normalizeRawContent(raw);
     const segments = parseFeishuDocxTranscriptContent(content);
     enriched.push({
@@ -550,13 +566,15 @@ export async function fetchLarkMeetingNoteTranscript(meetingId: string, options:
       connected: true,
       configured: true,
       source: 'lark_meeting_note_transcript',
-      status: 'missing_transcript',
+      status: errors.length ? 'failed' : 'missing_transcript',
       meeting_id: meetingId,
       meeting,
       note: { note_id: meeting.note_id, artifact_count: artifacts.length },
       artifacts: enriched.map(({ content: _content, segments: _segments, ...artifact }) => artifact),
       ...(summary ? { summary } : {}),
-      errors: [{ source: 'docx', code: 'transcript_artifact_missing', message: '飞书纪要已生成，但没有可解析的文字记录 docx。' }],
+      errors: errors.length
+        ? errors
+        : [{ source: 'docx', code: 'transcript_artifact_missing', message: '飞书纪要已生成，但没有可解析的文字记录 docx。' }],
     };
   }
 

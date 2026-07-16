@@ -2,6 +2,7 @@ import { indexedDB } from 'fake-indexeddb';
 import { describe, expect, it } from 'vitest';
 import type { RuntimeDocumentSnapshot, RuntimeSyncEvent } from '../../runtime-schema/src/index';
 import { IndexedDbOfflineRuntimeStore, OFFLINE_STORE_SCHEMA_VERSION } from './index';
+import { RuntimeSyncRunner } from '../../sync-client/src/index';
 
 function snapshot(): RuntimeDocumentSnapshot {
   return {
@@ -57,6 +58,39 @@ function event(input: Partial<RuntimeSyncEvent> & { event_id: string; operation:
 }
 
 describe('IndexedDbOfflineRuntimeStore', () => {
+  it('keeps an event appended while a send is in flight when the ack update is persisted', async () => {
+    const store = new IndexedDbOfflineRuntimeStore({
+      dbName: `inksurface-test-${Date.now()}-${Math.random()}`,
+      factory: indexedDB,
+    });
+    const first = event({ event_id: 'evt_sending', operation: 'annotation.add', status: 'pending' });
+    const appended = event({ event_id: 'evt_appended_during_send', operation: 'annotation.add', status: 'pending' });
+    await store.appendSyncEvent(first);
+    let releaseSend!: () => void;
+    const sendCanFinish = new Promise<void>((resolve) => { releaseSend = resolve; });
+    let notifySendStarted!: () => void;
+    const sendStarted = new Promise<void>((resolve) => { notifySendStarted = resolve; });
+    const runner = new RuntimeSyncRunner(store, {
+      async send(events) {
+        notifySendStarted();
+        await sendCanFinish;
+        return events.map((item) => ({ event_id: item.event_id, ok: true, ack_id: 'ack_sending' }));
+      },
+    });
+
+    const sending = runner.runOnce();
+    await sendStarted;
+    await store.appendSyncEvent(appended);
+    releaseSend();
+    await sending;
+
+    expect(await store.listOutboxEvents()).toEqual([
+      expect.objectContaining({ event_id: 'evt_sending', status: 'sent', ack_id: 'ack_sending' }),
+      expect.objectContaining({ event_id: 'evt_appended_during_send', status: 'pending' }),
+    ]);
+    await store.close();
+  });
+
   it('stores runtime snapshots, mutations, cache records, and pending sync events in IndexedDB', async () => {
     const store = new IndexedDbOfflineRuntimeStore({
       dbName: `inksurface-test-${Date.now()}-${Math.random()}`,

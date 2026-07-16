@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { PersistedMeeting } from '../core/store-format';
-import { effectiveMeetingEndIso, effectiveMeetingStatus, meetingHomeBuckets, normalizeMeetingHomeFilter } from './meeting-home-model';
+import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingHomeBuckets, normalizeMeetingHomeFilter } from './meeting-home-model';
 
 function meeting(id: string, status: PersistedMeeting['status'], scheduledAt: string, startedAt?: string): PersistedMeeting {
   return {
@@ -68,5 +68,15 @@ describe('meeting home model', () => {
     expect(effectiveMeetingStatus(current, Date.parse('2026-07-09T07:14:00.000Z'))).toBe('live');
     expect(buckets.active[0]).toMatchObject({ meeting_id: 'weekly', status: 'live' });
     expect(buckets.history).toEqual([]);
+  });
+
+  it('filters provider meetings before applying active/history buckets', () => {
+    const lark = { ...meeting('lark', 'upcoming', '2026-07-09T07:00:00.000Z'), platform: 'lark' as const };
+    const google = { ...meeting('google', 'ended', '2026-07-08T07:00:00.000Z'), platform: 'google_meet' as const };
+    const manual = meeting('manual', 'live', '2026-07-09T07:00:00.000Z');
+
+    expect(filterMeetingsByPlatform([lark, google, manual], 'lark').map((item) => item.meeting_id)).toEqual(['lark']);
+    expect(filterMeetingsByPlatform([lark, google, manual], 'google_meet').map((item) => item.meeting_id)).toEqual(['google']);
+    expect(filterMeetingsByPlatform([lark, google, manual], 'manual').map((item) => item.meeting_id)).toEqual(['manual']);
   });
 });

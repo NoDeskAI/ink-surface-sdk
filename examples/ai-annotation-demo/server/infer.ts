@@ -330,6 +330,21 @@ const readingNoteRawSchema = z.object({
   body_md: z.string().catch(''),
   summary_md: z.string().catch(''),
 });
+const meetingPanelTextSchema = z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(600));
+const meetingPanelSummarySchema = z.object({
+  conclusions: z.array(meetingPanelTextSchema).max(8).catch([]),
+  action_items: z.array(z.object({
+    task: meetingPanelTextSchema,
+    owner: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).catch('未指定'),
+    due: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).optional(),
+    evidence: z.string().transform((value) => value.trim()).pipe(z.string().max(600)).optional(),
+  })).max(8).catch([]),
+  risks: z.array(meetingPanelTextSchema).max(6).catch([]),
+  open_questions: z.array(meetingPanelTextSchema).max(6).catch([]),
+  next_steps: z.array(meetingPanelTextSchema).max(8).catch([]),
+});
+
+export type MeetingPanelSummary = z.infer<typeof meetingPanelSummarySchema>;
 
 
 
@@ -413,6 +428,21 @@ export async function runReadingNotePostprocess(payload: any): Promise<{ title: 
     body_md: parsed.body_md.trim(),
     summary_md: parsed.summary_md.trim(),
   };
+}
+
+/** Google Meet 会后转写 → panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
+export async function runMeetingPanelSummary(payload: any): Promise<{ summary: MeetingPanelSummary; model: string }> {
+  const title = String(payload?.title || '').trim().slice(0, 300) || '(未命名会议)';
+  const transcript = String(payload?.transcript || '').trim();
+  const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
+  if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
+  if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
+  const model = String(payload?.model || cfg().model);
+  const user = JSON.stringify({ meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
+  const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
+  const summary = meetingPanelSummarySchema.parse(extractJson(raw));
+  if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
+  return { summary, model };
 }
 
 

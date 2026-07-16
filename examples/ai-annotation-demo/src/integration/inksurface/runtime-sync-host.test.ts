@@ -1,7 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeSurfaceBlock } from 'ink-surface-sdk/runtime-schema';
+import { describe, expect, it, vi } from 'vitest';
+import type { OfflineRuntimeStorePort } from 'ink-surface-sdk/offline-store';
+import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeSurfaceBlock, RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import type { PersistedMark } from '../../core/store-format';
-import { outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeMarksToTombstoneForCanonicalRemote, runtimeSourceContentHash, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
+import { bus, state } from '../../app/state';
+import { installWebRuntimeSyncHost, outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeMarksToTombstoneForCanonicalRemote, runtimeSourceContentHash, setRuntimeSyncHeld, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
 
 function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }): PersistedMark {
   return {
@@ -35,6 +37,296 @@ function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }):
     is_tombstone: input.is_tombstone ?? false,
   };
 }
+
+function syncEvent(eventId: string): RuntimeSyncEvent {
+  return {
+    schema_version: 'inkloop.runtime_sync_event.v1',
+    event_id: eventId,
+    source: 'inkloop_device',
+    doc_id: 'doc_historical',
+    operation: 'annotation.add',
+    target: { type: 'annotation', id: `ko_${eventId}` },
+    payload: { mark_id: `mark_${eventId}` },
+    status: 'pending',
+    dedupe_key: eventId,
+    created_at: '2026-07-15T00:00:00.000Z',
+    updated_at: '2026-07-15T00:00:00.000Z',
+    attempt_count: 0,
+  };
+}
+
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() { return values.size; },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => [...values.keys()][index] ?? null,
+    removeItem: (key) => { values.delete(key); },
+    setItem: (key, value) => { values.set(key, String(value)); },
+  };
+}
+
+function dirtyDocs(storage: Storage): string[] {
+  for (let index = 0; index < storage.length; index += 1) {
+    const key = storage.key(index) || '';
+    if (key.startsWith('inkloop.runtime-sync.dirty-docs::')) {
+      return JSON.parse(storage.getItem(key) || '[]') as string[];
+    }
+  }
+  return [];
+}
+
+function memoryRuntimeStore(options: {
+  beforeWriteDocument?: (writeCount: number, snapshot: RuntimeDocumentSnapshot) => void | Promise<void>;
+} = {}): { store: OfflineRuntimeStorePort; writeDocumentCount: () => number } {
+  let events: RuntimeSyncEvent[] = [];
+  let writeDocumentCount = 0;
+  const documents = new Map<string, RuntimeDocumentSnapshot>();
+  let cursor: { device_id: string; cursor: string; updated_at: string } | null = null;
+  const store = {
+    async listOutboxEvents() { return events.map((item) => ({ ...item })); },
+    async writeOutboxEvents(next: RuntimeSyncEvent[]) { events = next.map((item) => ({ ...item })); },
+    async updateOutboxEvents(updates: RuntimeSyncEvent[]) {
+      const byId = new Map(updates.map((item) => [item.event_id, item]));
+      events = events.map((item) => ({ ...(byId.get(item.event_id) ?? item) }));
+    },
+    async appendSyncEvent(next: RuntimeSyncEvent) { events.push({ ...next }); },
+    async loadDocument(docId: string) { return documents.get(docId) ?? null; },
+    async writeDocumentSnapshot(snapshot: RuntimeDocumentSnapshot) {
+      writeDocumentCount += 1;
+      await options.beforeWriteDocument?.(writeDocumentCount, snapshot);
+      documents.set(snapshot.doc_id, snapshot);
+    },
+    async getCacheRecord() { return null; },
+    async writeCacheRecord() {},
+    async listPendingEvents(docId?: string) {
+      return events.filter((item) => item.status !== 'sent' && (!docId || item.doc_id === docId));
+    },
+    async listAppliedEventIds() { return []; },
+    async applyRemoteEvent(next: RuntimeSyncEvent) { return { event_id: next.event_id, status: 'applied' as const }; },
+    async getDeviceCursor() { return cursor; },
+    async writeDeviceCursor(next: { device_id: string; cursor: string; updated_at: string }) { cursor = next; },
+    async listConflicts() { return []; },
+    async recordConflict() {},
+  } as unknown as OfflineRuntimeStorePort;
+  return { store, writeDocumentCount: () => writeDocumentCount };
+}
+
+function hostWindow(storage: Storage): EventTarget {
+  const target = new EventTarget();
+  Object.assign(target, {
+    localStorage: storage,
+    location: new URL('http://localhost:5173/'),
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+  });
+  return target;
+}
+
+function runtimeFetchMock(): ReturnType<typeof vi.fn> {
+  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { events: RuntimeSyncEvent[] };
+      return new Response(JSON.stringify({
+        acks: body.events.map((item) => ({ event_id: item.event_id, ok: true, ack_id: `ack_${item.event_id}` })),
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      schema_version: 'inkloop.runtime_sync_pull.v1',
+      events: [],
+      next_cursor: 'cursor_host_retry_test',
+    }), { status: 200 });
+  });
+}
+
+describe('installWebRuntimeSyncHost outbox lifecycle', () => {
+  it('drains historical pending events at boot without an active document and keeps polling single-flight', async () => {
+    vi.useFakeTimers();
+    const previousDocumentId = state.documentId;
+    state.documentId = '';
+    const storage = memoryStorage();
+    const windowTarget = new EventTarget();
+    const testLocation = new URL('http://localhost:5173/');
+    Object.assign(windowTarget, {
+      localStorage: storage,
+      location: testLocation,
+      setInterval: globalThis.setInterval,
+      clearInterval: globalThis.clearInterval,
+      setTimeout: globalThis.setTimeout,
+      clearTimeout: globalThis.clearTimeout,
+    });
+    vi.stubGlobal('window', windowTarget);
+    vi.stubGlobal('localStorage', storage);
+    vi.stubGlobal('location', testLocation);
+
+    let events = [syncEvent('evt_boot_pending')];
+    let cursor: { device_id: string; cursor: string; updated_at: string } | null = null;
+    const store = {
+      async listOutboxEvents() { return events.map((item) => ({ ...item })); },
+      async writeOutboxEvents(next: RuntimeSyncEvent[]) { events = next.map((item) => ({ ...item })); },
+      async updateOutboxEvents(updates: RuntimeSyncEvent[]) {
+        const byId = new Map(updates.map((item) => [item.event_id, item]));
+        events = events.map((item) => ({ ...(byId.get(item.event_id) ?? item) }));
+      },
+      async appendSyncEvent(next: RuntimeSyncEvent) { events.push({ ...next }); },
+      async listPendingEvents(docId?: string) {
+        return events.filter((item) => item.status !== 'sent' && (!docId || item.doc_id === docId));
+      },
+      async getDeviceCursor() { return cursor; },
+      async writeDeviceCursor(next: { device_id: string; cursor: string; updated_at: string }) { cursor = next; },
+    } as unknown as OfflineRuntimeStorePort;
+
+    let pullCalls = 0;
+    let releasePull!: () => void;
+    const pullCanFinish = new Promise<void>((resolve) => { releasePull = resolve; });
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { events: RuntimeSyncEvent[] };
+        return new Response(JSON.stringify({
+          acks: body.events.map((item) => ({ event_id: item.event_id, ok: true, ack_id: `ack_${item.event_id}` })),
+        }), { status: 200 });
+      }
+      pullCalls += 1;
+      await pullCanFinish;
+      return new Response(JSON.stringify({
+        schema_version: 'inkloop.runtime_sync_pull.v1',
+        events: [],
+        next_cursor: 'cursor_host_test',
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const host = installWebRuntimeSyncHost({
+      deviceId: 'device_host_test',
+      runtimeStore: store,
+      pollMs: 500,
+      reconcileMs: 0,
+      outboxDrainMs: 0,
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events[0], JSON.stringify(events[0])).toMatchObject({ status: 'sent', ack_id: 'ack_evt_boot_pending' });
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pullCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(pullCalls).toBe(1);
+      releasePull();
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      host.dispose();
+      state.documentId = previousDocumentId;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the dirty marker when the same document is scheduled during an active sync', async () => {
+    vi.useFakeTimers();
+    setRuntimeSyncHeld(false);
+    const storage = memoryStorage();
+    const windowTarget = hostWindow(storage);
+    const testLocation = new URL('http://localhost:5173/');
+    vi.stubGlobal('window', windowTarget);
+    vi.stubGlobal('localStorage', storage);
+    vi.stubGlobal('location', testLocation);
+    const fetchMock = runtimeFetchMock();
+    vi.stubGlobal('fetch', fetchMock);
+
+    let signalFirstWrite!: () => void;
+    let releaseFirstWrite!: () => void;
+    const firstWriteStarted = new Promise<void>((resolve) => { signalFirstWrite = resolve; });
+    const firstWriteCanFinish = new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+    const memory = memoryRuntimeStore({
+      async beforeWriteDocument(writeCount) {
+        if (writeCount !== 1) return;
+        signalFirstWrite();
+        await firstWriteCanFinish;
+      },
+    });
+    const host = installWebRuntimeSyncHost({
+      deviceId: 'device_dirty_race',
+      runtimeStore: memory.store,
+      debounceMs: 100,
+      pollMs: 0,
+      reconcileMs: 0,
+      outboxDrainMs: 0,
+    });
+
+    try {
+      bus.emit('aiturn:appended', 'doc_dirty_race');
+      await vi.advanceTimersByTimeAsync(100);
+      await firstWriteStarted;
+
+      bus.emit('aiturn:appended', 'doc_dirty_race');
+      releaseFirstWrite();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(dirtyDocs(storage)).toContain('doc_dirty_race');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(memory.writeDocumentCount()).toBe(2);
+      expect(dirtyDocs(storage)).not.toContain('doc_dirty_race');
+    } finally {
+      host.dispose();
+      setRuntimeSyncHeld(false);
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('requeues a document after the first bridge failure and succeeds on the retry timer', async () => {
+    vi.useFakeTimers();
+    setRuntimeSyncHeld(false);
+    const storage = memoryStorage();
+    const windowTarget = hostWindow(storage);
+    const testLocation = new URL('http://localhost:5173/');
+    vi.stubGlobal('window', windowTarget);
+    vi.stubGlobal('localStorage', storage);
+    vi.stubGlobal('location', testLocation);
+    const fetchMock = runtimeFetchMock();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const memory = memoryRuntimeStore({
+      beforeWriteDocument(writeCount) {
+        if (writeCount === 1) throw new Error('first bridge write failed');
+      },
+    });
+    const logs: Array<{ event: string; details: unknown }> = [];
+    const host = installWebRuntimeSyncHost({
+      deviceId: 'device_bridge_retry',
+      runtimeStore: memory.store,
+      debounceMs: 100,
+      retryDelayMs: 250,
+      pollMs: 0,
+      reconcileMs: 0,
+      outboxDrainMs: 0,
+      logger: (event, details) => logs.push({ event, details }),
+    });
+
+    try {
+      bus.emit('aiturn:appended', 'doc_bridge_retry');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(memory.writeDocumentCount()).toBe(1);
+      expect(dirtyDocs(storage)).toContain('doc_bridge_retry');
+      expect(logs.some((entry) => entry.event === 'runtime-sync:error')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(250);
+      expect(memory.writeDocumentCount()).toBe(2);
+      expect(dirtyDocs(storage)).not.toContain('doc_bridge_retry');
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    } finally {
+      host.dispose();
+      setRuntimeSyncHeld(false);
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe('runtimeSourceContentHash', () => {
   it('uses the projection body hash instead of the generated envelope hash', () => {

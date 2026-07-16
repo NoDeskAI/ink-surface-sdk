@@ -187,6 +187,32 @@ describe('fetchLarkMeetingSources', () => {
     expect(fetchImpl.mock.calls.some(([url]) => String(url).includes('container_id=oc_other'))).toBe(false);
   });
 
+  it('skips bot calendar/chat/VC sources entirely when caller requires filtering but requester has no identity', async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/open-apis/auth/v3/tenant_access_token/internal')) {
+        return jsonResponse({ code: 0, tenant_access_token: 'tenant_token', expire: 7200 });
+      }
+      return jsonResponse({ code: 999, msg: `should not be called: ${url}` }, 500);
+    });
+    vi.stubGlobal('fetch', fetchImpl);
+
+    const result = await fetchLarkMeetingSources({
+      nowMs: Date.parse('2026-07-07T00:00:00+08:00'),
+      env: {
+        FEISHU_APP_ID: 'cli_test',
+        FEISHU_APP_SECRET: 'secret',
+        LARK_MEETING_AUTH_STATE_PATH: join(tmpdir(), 'inkloop-no-oauth-identityless.json'),
+      },
+      userOpenIds: [],
+      createClient: () => ({}),
+    });
+
+    expect(result.sources).toEqual([]);
+    // 无身份=[] 时 bot 日历/群聊一次都不该发起（undefined 才是 demo 全量语义）
+    expect(fetchImpl.mock.calls.some(([url]) => String(url).includes('/calendar/'))).toBe(false);
+    expect(fetchImpl.mock.calls.some(([url]) => String(url).includes('/im/v1/chats'))).toBe(false);
+  });
+
   it('uses the SDK OAuth user token for VC search without batch meeting lookup', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-auth-'));
     const authPath = join(tempDir, 'auth-state.json');

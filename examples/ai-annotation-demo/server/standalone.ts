@@ -14,15 +14,15 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { assertNonEmptyVaultRelease, guardPanelVaultReqUrl, panelVaultGuardPayload, resolvePanelVaultGuardUser } from './panel-vault-guard';
 import {
   runReflow, runReflowAi, reflowAiStream, chatStream,
-  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runReflowVlm,
+  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
 } from './infer';
 import { runOcrLayout } from './ocr-layout-dev.mjs';
 import { createRuntimeSyncDevHandler } from './runtime-sync-dev';
@@ -34,7 +34,9 @@ import { createCloudDeviceHandler } from './cloud-device-handler';
 import { JsonCloudDeviceStore } from './cloud-device-store';
 import { fetchFeishuBotCalendarEvents } from './feishu-bot-calendar';
 import {
+  fetchFeishuBotMessageResource,
   fetchFeishuBotWorkspaces,
+  fetchFeishuBotWorkspaceDocxLinks,
   fetchFeishuBotWorkspaceFiles,
   fetchFeishuBotWorkspaceMembers,
   fetchFeishuBotWorkspaceMessages,
@@ -45,9 +47,38 @@ import {
   completeLarkOAuthCallback,
   larkOAuthAuthStatePath,
   resolveLarkOAuthPublicStatus,
+  resolveUserOAuthToken,
 } from './lark-oauth-state';
 import { fetchLarkMeetingSources, resolveLarkMeetingInstance } from './lark-meeting-sources';
+import { reconcileLarkLiveMeetings } from './lark-meeting-reconcile';
+import {
+  beginGoogleDeviceOAuth,
+  completeGoogleOAuthCallback,
+  failGoogleDeviceOAuthCallback,
+  googleCalendarSyncPath,
+  googleMeetRecordsPath,
+  googleDeviceOAuthCompletion,
+  googleAuthRoot,
+  googleOAuthErrorPayload,
+  resolveAnyUserGoogleToken,
+  resolveGoogleOAuthStatus,
+  resolveUserGoogleToken,
+  type GoogleOAuthIdentity,
+} from './google-oauth-state';
+import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
+import { backfillGoogleMeetSmartNotes, fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
+import {
+  currentMtlToken,
+  mintMtlToken,
+  mtlReceiverBaseUrl,
+  revokeMtlToken,
+  type MtlReceiverIdentity,
+} from './mtl-receiver-auth';
+import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
+import { exportLarkDocxToPdf } from './lark-docx-export';
+import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
+import { resolvePanelAuthBase, rewriteLegacyConvertSource } from './standalone-service-config';
 import {
   larkRealtimeMeetingSources,
   larkRealtimeMeetingStoreStatus,
@@ -69,6 +100,7 @@ import {
 } from './cloud-knowledge-store';
 import { isMeetingRuntimeDocumentId, shouldPostprocessRuntimeAnnotation } from './runtime-postprocess-policy';
 import { prepareRuntimeAnnotationUpdate } from './runtime-annotation-postprocess';
+import { createDeadlineSingleFlight } from './background-worker';
 import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
 import {
   buildInkloopDocUri,
@@ -159,8 +191,8 @@ function setCors(req: IncomingMessage, res: ServerResponse): void {
 //    与 vite.config.ts panelFeishuProxy 同构，让安卓/生产包也能拉妙记转写。──
 const PANEL_FEISHU_BASE = (process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
 const INKLOOP_SHARED_SECRET = process.env.INKLOOP_SHARED_SECRET || '';
-// 阶段C：二维码设备登录代理 + session introspection 校验（复用 PANEL_FEISHU_BASE 当 panel 地址，未来可用独立 PANEL_AUTH_BASE 覆盖）。
-const PANEL_AUTH_BASE = (process.env.PANEL_AUTH_BASE || process.env.PANEL_FEISHU_BASE || '').replace(/\/+$/, '');
+// 阶段C：二维码设备登录代理 + session introspection 校验。会议 sidecar 不提供 auth，禁止从 PANEL_FEISHU_BASE 隐式继承。
+const PANEL_AUTH_BASE = resolvePanelAuthBase(process.env);
 const LOCAL_DEVICE_AUTH = process.env.INKLOOP_LOCAL_DEVICE_AUTH === '1';
 const LOCAL_DEVICE_AUTH_AUTO_APPROVE = process.env.INKLOOP_LOCAL_DEVICE_AUTH_AUTO_APPROVE === '1';
 const LOCAL_AUTH_STORE = process.env.INKLOOP_LOCAL_AUTH_STORE || resolve(ROOT, '.inkloop/auth-sessions.json');
@@ -407,6 +439,21 @@ function inkloopUserIdFromFeishuOpenId(openId: string): string {
   return `feishu_${safeId(openId, 'user')}`;
 }
 
+/** 该 open_id 最近登录设备的 lark OAuth state 文件路径；无登录记录返回空串。 */
+function latestLarkAuthStatePath(openId: string): string {
+  const userDir = resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID, inkloopUserIdFromFeishuOpenId(openId));
+  let statePath = '';
+  try {
+    const files = readdirSync(userDir).filter((name) => name.endsWith('.json'));
+    let latest = -1;
+    for (const name of files) {
+      const mtime = statSync(resolve(userDir, name)).mtimeMs;
+      if (mtime > latest) { latest = mtime; statePath = resolve(userDir, name); }
+    }
+  } catch { /* 用户目录不存在 = 未登录 */ }
+  return statePath;
+}
+
 function shouldBootstrapLibraryForFeishuLogin(previousUserId: string, nextUserId: string): boolean {
   if (previousUserId === nextUserId) return false;
   if (previousUserId === LOCAL_AUTH_USER_ID) return true;
@@ -592,7 +639,7 @@ async function resolveDeviceSession(req: IncomingMessage): Promise<InkLoopSessio
   const localSession = localDeviceSessionFromToken(token);
   if (localSession) return localSession;
   if (LOCAL_DEVICE_AUTH && !PANEL_AUTH_BASE) throw Object.assign(new Error('reauth_required'), { status: 401 });
-  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) throw Object.assign(new Error('PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置'), { status: 503 });
+  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) throw Object.assign(new Error('PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置'), { status: 503 });
   const r = await fetch(`${PANEL_AUTH_BASE}/api/internal/inkloop/sessions/introspect`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-inkloop-secret': INKLOOP_SHARED_SECRET },
@@ -628,7 +675,7 @@ async function handleInkLoopAuth(req: IncomingMessage, res: ServerResponse): Pro
     return;
   }
   const send = (code: number, obj: unknown): void => sendJson(res, code, obj);
-  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'PANEL_AUTH_BASE/PANEL_FEISHU_BASE / INKLOOP_SHARED_SECRET 未配置' });
+  if (!PANEL_AUTH_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'PANEL_AUTH_BASE / INKLOOP_SHARED_SECRET 未配置' });
   const method = req.method || 'GET';
   const rest = (req.url || '').replace(/^\/api\/inkloop\/auth/, '');
   const apath = (rest || '/').split('?')[0];
@@ -836,8 +883,20 @@ async function handlePanelVault(req: IncomingMessage, res: ServerResponse): Prom
 const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+$/, '');
 // offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
 // 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
-const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+// drive:export:readonly 用于 docx 官方 export_tasks；已有 token refresh 不会扩 scope，老用户需重新授权一次。
+// minutes:minutes:readonly 用于妙记信息/搜索；minutes:minutes.transcript:export 用于转写导出（飞书 99991679 点名，
+// 与 minutes:minute:download 二选一）。token 收编：panel sidecar 的独立 v1 OAuth 已废，妙记取数改用 hub 这份 token。
+// vc:meeting.meetingevent:read 来自 production-baseline（会议信息/事件查询 API 点名"二选一"权限之一）。
+// ⚠️不要请求 vc:meeting:readonly：粗粒度权限已被细粒度取代、开放平台后台没有这项，带上它整个授权流程直接失败
+// （2026-07-14 c7a7d9e 教训；7-15 merge 并集误把它带回导致用户无法重新授权，再删）。
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access auth:user.id:read vc:meeting.search:read vc:meeting.meetingid:read vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download drive:export:readonly minutes:minutes:readonly minutes:minutes.search:read minutes:minutes.transcript:export';
 const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
+// 「已连接」判定只看核心功能 scope（会议/日历/docx）——授权请求 scope 每次扩容（drive:export、minutes 等）
+// 都会让老 token 被误判 connected=false、前端停拉日历。新增能力各自的端点自行校验所需 scope。
+// vc:meeting.meetingevent:read 是刻意的例外：hub 侧 REST 对账（清卡 live 会议）靠它，且缺它时没有任何
+// 401/409 会触发前端的重新授权提示——只能靠 core-required 判缺口，把身份面板的按钮翻成「重新授权」。
+const LARK_CORE_REQUIRED_SCOPE = (process.env.LARK_CORE_REQUIRED_SCOPE
+  || 'vc:meeting.search:read vc:meeting.meetingid:read vc:meeting.meetingevent:read minutes:minutes.search:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download').trim();
 const LARK_MEETING_CALLBACK_PORT = String(process.env.LARK_MEETING_SDK_PORT || process.env.LARK_SDK_PORT || '8789').trim() || '8789';
 const LARK_MEETING_CALLBACK_PATH = '/api/auth/lark/callback';
 const CONVERT_SERVICE_BASE = (process.env.CONVERT_SERVICE_BASE || '').replace(/\/+$/, '');
@@ -849,6 +908,238 @@ function escapeHtml(value: unknown): string {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function googleOAuthIdentity(session: InkLoopSessionContext): GoogleOAuthIdentity {
+  return {
+    tenantId: session.tenant_id || LOCAL_AUTH_TENANT_ID,
+    userId: session.user_id || LOCAL_AUTH_USER_ID,
+    deviceId: session.device_id || session.session_id || 'device',
+  };
+}
+
+function mtlReceiverIdentity(session: InkLoopSessionContext): MtlReceiverIdentity {
+  return {
+    tenant_id: session.tenant_id || LOCAL_AUTH_TENANT_ID,
+    user_id: session.user_id || LOCAL_AUTH_USER_ID,
+  };
+}
+
+function googleOAuthDisabled(): boolean {
+  return !String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim();
+}
+
+function sendGoogleHtml(res: ServerResponse, status: number, title: string, message: string): void {
+  res.statusCode = status;
+  res.setHeader('content-type', 'text/html; charset=utf-8');
+  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:28px;line-height:1.6"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></body>`);
+}
+
+async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url || '/api/google', 'http://inkloop.local');
+  const path = url.pathname;
+  if (path === '/api/google/meeting-summary') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'POST only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    try {
+      const payload = JSON.parse(await readBody(req, 64 * 1024));
+      sendJson(res, 200, await runMeetingPanelSummary(payload));
+    } catch (error) {
+      const status = Number((error as { status?: number })?.status) || 502;
+      sendJson(res, status, { error: { code: String((error as Error)?.message || error), message: 'Google meeting summary generation failed' } });
+    }
+    return;
+  }
+  if (path === '/api/google/mtl-token') {
+    if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'DELETE') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET/POST/DELETE only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    res.setHeader('cache-control', 'no-store');
+    const identity = mtlReceiverIdentity(session);
+    if (req.method === 'DELETE') {
+      const current = currentMtlToken(identity);
+      const revoked = current ? revokeMtlToken(current.token, identity) : false;
+      sendJson(res, 200, { ok: true, revoked });
+      return;
+    }
+    const current = req.method === 'POST' ? mintMtlToken(identity) : currentMtlToken(identity);
+    sendJson(res, 200, current ? {
+      token: current.token,
+      base_url: mtlReceiverBaseUrl(current.token),
+      created_at: current.record.created_at,
+      ...(req.method === 'POST' && 'created' in current ? { created: current.created } : {}),
+    } : { token: null, base_url: null });
+    return;
+  }
+  if (path === '/api/google/meeting-live-state') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
+      return;
+    }
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    res.setHeader('cache-control', 'no-store');
+    const identity = mtlReceiverIdentity(session);
+    const configured = !!currentMtlToken(identity);
+    sendJson(res, 200, {
+      connected: configured,
+      source: 'mtl_receiver',
+      windows: configured ? listMtlMeetingWindows(identity) : [],
+    });
+    return;
+  }
+  const callback = path === '/api/google/oauth/callback';
+  if (googleOAuthDisabled()) {
+    if (callback) sendGoogleHtml(res, 503, 'Google 日历未启用', 'google_oauth_disabled');
+    else sendJson(res, 503, { error: { code: 'google_oauth_disabled', message: 'Google OAuth is disabled' } });
+    return;
+  }
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
+    return;
+  }
+
+  if (callback) {
+    const providerError = url.searchParams.get('error');
+    if (providerError) {
+      // 用户在授权页点了拒绝（access_denied 等）：把 pending 标 failed，设备轮询立即拿到终态而不是干等 TTL
+      failGoogleDeviceOAuthCallback(process.env, { state: url.searchParams.get('state') || '', error: providerError });
+      sendGoogleHtml(res, 400, 'Google 授权失败', providerError);
+      return;
+    }
+    try {
+      const result = await completeGoogleOAuthCallback(process.env, {
+        code: url.searchParams.get('code') || '',
+        state: url.searchParams.get('state') || '',
+      });
+      const scopeMessage = result.status.connected
+        ? 'Google 日历已连接，可以回到 InkLoop。'
+        : `授权已写入，但仍缺少权限：${result.status.missing_scopes.join(', ')}`;
+      sendGoogleHtml(res, 200, 'Google 授权完成', scopeMessage);
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendGoogleHtml(res, failure.status, 'Google 授权失败', `${failure.body.error.code}: ${failure.body.error.message}`);
+    }
+    return;
+  }
+
+  const session = await requireDeviceSession(req, res);
+  if (!session) return;
+  const identity = googleOAuthIdentity(session);
+
+  if (path === '/api/google/oauth/device/start') {
+    try {
+      const payload = beginGoogleDeviceOAuth(process.env, identity);
+      sendJson(res, 200, { ...payload, auth_mode: 'device_oauth', data_isolation: 'inkloop_session_namespace' });
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/oauth/device/complete') {
+    const completion = googleDeviceOAuthCompletion(process.env, identity);
+    if (completion.status !== 'complete') {
+      sendJson(res, 200, completion);
+      return;
+    }
+    try {
+      const status = await resolveGoogleOAuthStatus(process.env, identity);
+      sendJson(res, 200, { ...completion, connected: status.connected, oauth: status });
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/oauth/status') {
+    try {
+      sendJson(res, 200, await resolveGoogleOAuthStatus(process.env, identity));
+    } catch (error) {
+      const failure = googleOAuthErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  if (path === '/api/google/meeting-sources') {
+    try {
+      const resolved = await resolveUserGoogleToken(process.env, identity);
+      if (!resolved.usable || !resolved.token) {
+        sendJson(res, 401, {
+          connected: false,
+          sources: [],
+          error: { code: resolved.reason || 'google_oauth_unavailable', message: 'Google OAuth authorization is required' },
+        });
+        return;
+      }
+      const result = await fetchGoogleMeetingSources(resolved.token, {
+        path: googleCalendarSyncPath(process.env, identity),
+      }, {
+        refreshAccessToken: async () => {
+          const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
+          if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
+          return refreshed.token;
+        },
+      });
+      sendJson(res, 200, {
+        connected: true,
+        configured: true,
+        mtl_token_configured: !!currentMtlToken(mtlReceiverIdentity(session)),
+        ...result,
+      });
+    } catch (error) {
+      const failure = googleCalendarErrorPayload(error);
+      sendJson(res, failure.status, { connected: false, sources: [], ...failure.body });
+    }
+    return;
+  }
+
+  if (path === '/api/google/meeting-transcript') {
+    try {
+      const meetingCode = url.searchParams.get('meeting_code') || '';
+      const scheduledAt = url.searchParams.get('scheduled_at') || '';
+      if (!meetingCode || !scheduledAt) {
+        sendJson(res, 400, { error: { code: 'google_meeting_transcript_input_missing', message: 'meeting_code and scheduled_at are required' } });
+        return;
+      }
+      const resolved = await resolveUserGoogleToken(process.env, identity);
+      if (!resolved.usable || !resolved.token) {
+        sendJson(res, 401, { error: { code: resolved.reason || 'google_oauth_unavailable', message: 'Google OAuth authorization is required' } });
+        return;
+      }
+      const result = await fetchGoogleMeetingTranscript(resolved.token, {
+        path: googleMeetRecordsPath(process.env, identity),
+      }, {
+        meetingCode,
+        scheduledAt,
+        attendance: mtlAttendanceWindows(mtlReceiverIdentity(session), meetingCode),
+      }, {
+        grantedScopes: resolved.scopes,
+        refreshAccessToken: async () => {
+          const refreshed = await resolveUserGoogleToken(process.env, identity, Date.now(), { forceRefresh: true });
+          if (!refreshed.usable || !refreshed.token) throw Object.assign(new Error('reauth_required'), { status: 401 });
+          return refreshed.token;
+        },
+      });
+      sendJson(res, 200, result);
+    } catch (error) {
+      const failure = googleMeetRecordsErrorPayload(error);
+      sendJson(res, failure.status, failure.body);
+    }
+    return;
+  }
+
+  sendJson(res, 404, { error: { code: 'google_route_not_found', message: 'Google API route not found' } });
 }
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {
   const configured = String(process.env.LARK_CLOUD_HUB_REDIRECT_URI || process.env.INKLOOP_LARK_REDIRECT_URI || process.env.LARK_REDIRECT_URI || '').trim();
@@ -978,6 +1269,37 @@ async function relayBinary(res: ServerResponse, r: Response): Promise<void> {
   const cd = r.headers.get('content-disposition'); if (cd) res.setHeader('content-disposition', cd);
   res.end(buf);
 }
+
+async function relayStreamingBinary(res: ServerResponse, r: Response): Promise<void> {
+  res.statusCode = r.status;
+  res.setHeader('content-type', r.headers.get('content-type') || 'application/octet-stream');
+  const contentLength = r.headers.get('content-length');
+  if (contentLength) res.setHeader('content-length', contentLength);
+  const contentDisposition = r.headers.get('content-disposition');
+  if (contentDisposition) res.setHeader('content-disposition', contentDisposition);
+  if (!r.body) { res.end(); return; }
+  const reader = r.body.getReader();
+  try {
+    while (!res.destroyed) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      if (!res.write(Buffer.from(chunk.value))) {
+        await new Promise<void>((resolveDrain) => {
+          const done = (): void => {
+            res.off('drain', done);
+            res.off('close', done);
+            resolveDrain();
+          };
+          res.once('drain', done);
+          res.once('close', done);
+        });
+      }
+    }
+    if (!res.destroyed) res.end();
+  } finally {
+    if (res.destroyed) await reader.cancel().catch(() => undefined);
+  }
+}
 // 阶段D：这几条端点要「我本人」的飞书用户身份（走 panel 统一 token 店），需要有效设备 session 才能拿到
 // tenant_id/user_id/feishu_open_id 转发给 feishu-service；其余群/文件/应用日历端点走 tenant 身份，不需要 session。
 const FEISHU_NEEDS_USER_CONTEXT = /^\/api\/feishu\/(oauth\/status|my\/events|meetings\/[^/]+\/note-transcript|docx\/[^/]+\/(meta|raw-content|pdf)|docx\/[^/]+\/media\/[^/]+)$/;
@@ -1003,6 +1325,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
     || (localBotConfigRoute && (req.method === 'POST' || req.method === 'DELETE'));
   if (req.method !== 'GET' && !allowedWrite) return send(405, { error: 'GET only' });
   const botWorkspaceMatch = apath.match(/^\/api\/feishu\/workspaces\/([^/]+)\/(members|messages|files)$/);
+  const localMaterialRoute = matchLocalFeishuMaterialRoute(apath);
   if (localBotConfigRoute) {
     const session = await requireDeviceSession(req, res);
     if (!session) return;
@@ -1055,8 +1378,14 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         lookbackSeconds,
         lookaheadSeconds,
         pageSize: Number(u.searchParams.get('page_size') || '') || undefined,
-        userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : undefined,
-        extraSources: larkRealtimeMeetingSources(ROOT, { lookbackSeconds, lookaheadSeconds }),
+        // 与 extraSources 同契约：无飞书身份=[]（bot 日历/群聊/VC 搜索全跳过），不再 undefined 走全量
+        userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : [],
+        // 三态过滤：有飞书身份=按身份过滤；无身份=[]（什么都不给·否则反而看到全量=泄漏）
+        extraSources: larkRealtimeMeetingSources(ROOT, {
+          lookbackSeconds,
+          lookaheadSeconds,
+          userOpenIds: session?.feishu_open_id ? [session.feishu_open_id] : [],
+        }),
         env: feishuBotRuntimeEnv(larkEnvForSession(session)),
       });
       return send(200, result);
@@ -1109,6 +1438,8 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
         meeting_url: body.meeting_url || body.url,
         meeting_no: body.meeting_no,
         feishu_meeting_id: body.feishu_meeting_id || body.meeting_id,
+        // 手动绑定必须落归属，否则创建者自己按身份过滤后立刻看不到这条记录
+        owner_open_id: session.feishu_open_id || undefined,
         source_event_type: 'manual_bind_current_meeting',
         source_event_id: body.source_event_id,
         source_transport: 'manual',
@@ -1272,7 +1603,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
   if (!FEISHU_SERVICE_BASE && apath === '/api/feishu/oauth/status') {
     try {
       const session = await optionalDeviceSession(req);
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE);
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE);
       return send(200, {
         ...status,
         redirect_uri: larkOAuthRedirectUri(req),
@@ -1290,7 +1621,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
       const sessionToken = localSessionTokenFor(req);
       const session = await requireDeviceSession(req, res);
       if (!session) return;
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE);
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE);
       const openId = session.feishu_open_id || status.user_open_ids[0] || null;
       if (openId && !session.feishu_open_id) await persistSessionFeishuIdentity(sessionToken, session, openId);
       const teamAccess = await fetchFeishuTeamAccess({ env: feishuBotRuntimeEnv(), userOpenId: openId });
@@ -1323,7 +1654,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
   if (!FEISHU_SERVICE_BASE && apath === '/api/feishu/oauth/refresh') {
     try {
       const session = await optionalDeviceSession(req);
-      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_MEETING_OAUTH_SCOPE, Date.now());
+      const status = await resolveLarkOAuthPublicStatus(feishuBotRuntimeEnv(larkEnvForSession(session)), LARK_CORE_REQUIRED_SCOPE, Date.now());
       return send(200, {
         ...status,
         redirect_uri: larkOAuthRedirectUri(req),
@@ -1376,6 +1707,67 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
       return send(502, { connected: false, configured: true, source: 'feishu_bot_im', auth_mode: 'tenant_access_token', workspaces: [], error: { code: 'bot_workspaces_failed', message: String((e as Error)?.message || e) } });
     }
   }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'workspace_docx_links') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    try {
+      const u = new URL(rest, 'http://inkloop.local');
+      const limit = Number(u.searchParams.get('limit') || u.searchParams.get('page_size') || '') || undefined;
+      return send(200, await fetchFeishuBotWorkspaceDocxLinks(localMaterialRoute.chatId, { pageSize: limit, env: feishuBotRuntimeEnv() }));
+    } catch (e) {
+      return send(502, { connected: false, configured: true, source: 'feishu_bot_im', auth_mode: 'tenant_access_token', links: [], error: { code: 'bot_docx_links_failed', message: String((e as Error)?.message || e) } });
+    }
+  }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'message_file') {
+    // convert sidecar 服务端抓取源文件时带 x-inkloop-secret（老 feishu-service 的服务间鉴权约定），
+    // 没有设备 session——放行 secret 命中的服务间请求，其余仍走设备 session 门。
+    const secretHeader = String(req.headers['x-inkloop-secret'] || '');
+    const serviceAuthed = !!INKLOOP_SHARED_SECRET && secretHeader.length === INKLOOP_SHARED_SECRET.length
+      && timingSafeEqual(Buffer.from(secretHeader), Buffer.from(INKLOOP_SHARED_SECRET));
+    if (!serviceAuthed) {
+      const session = await requireDeviceSession(req, res);
+      if (!session) return;
+    }
+    const u = new URL(rest, 'http://inkloop.local');
+    const type = u.searchParams.get('type') || 'file';
+    if (type !== 'file' && type !== 'image') return send(400, { error: { code: 'invalid_resource_type', message: 'type must be file or image' } });
+    try {
+      const result = await fetchFeishuBotMessageResource(localMaterialRoute.messageId, localMaterialRoute.resourceKey, type, { env: feishuBotRuntimeEnv() });
+      if (!result.ok || !result.response) return send(result.status || 502, { error: result.error });
+      const name = u.searchParams.get('name');
+      if (name && !result.response.headers.has('content-disposition')) {
+        res.setHeader('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(name)}`);
+      }
+      await relayStreamingBinary(res, result.response);
+      return;
+    } catch (e) {
+      if (!res.headersSent) return send(502, { error: { code: 'resource_download_failed', message: String((e as Error)?.message || e) } });
+      res.destroy(e as Error);
+      return;
+    }
+  }
+  if (!FEISHU_SERVICE_BASE && localMaterialRoute?.kind === 'docx_pdf') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    if (!session.tenant_id || !session.user_id || !session.feishu_open_id) return send(409, { error: { code: 'reauth_required', message: '当前 session 未绑定飞书身份' } });
+    const documentId = localMaterialRoute.documentId;
+    try {
+      const result = await exportLarkDocxToPdf(documentId, {
+        env: feishuBotRuntimeEnv(larkEnvForSession(session)),
+        expectedOpenId: session.feishu_open_id,
+      });
+      if (!result.ok || !result.response) return send(result.status || 502, { error: result.error });
+      if (!result.response.headers.has('content-disposition')) {
+        res.setHeader('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(result.file_name || `${documentId}.pdf`)}`);
+      }
+      await relayStreamingBinary(res, result.response);
+      return;
+    } catch (e) {
+      if (!res.headersSent) return send(Number((e as { status?: number })?.status) || 502, { error: { code: 'docx_pdf_failed', message: String((e as Error)?.message || e) } });
+      res.destroy(e as Error);
+      return;
+    }
+  }
   if (!FEISHU_SERVICE_BASE && botWorkspaceMatch) {
     try {
       const u = new URL(rest, 'http://inkloop.local');
@@ -1395,7 +1787,7 @@ async function handleFeishuService(req: IncomingMessage, res: ServerResponse): P
             image_key: message.image_key,
             resource_key: message.image_key || message.file_key || message.message_id,
             create_time: message.create_time,
-            download_path: `/api/feishu/messages/${encodeURIComponent(message.message_id)}/file/${encodeURIComponent(message.image_key || message.file_key || '')}?type=${message.msg_type === 'image' ? 'image' : 'file'}&name=${encodeURIComponent(message.file_name || (message.msg_type === 'image' ? '［图片］' : '文件'))}`,
+            download_path: `/api/feishu/workspaces/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(message.message_id)}/file/${encodeURIComponent(message.image_key || message.file_key || '')}?type=${message.msg_type === 'image' ? 'image' : 'file'}&name=${encodeURIComponent(message.file_name || (message.msg_type === 'image' ? '［图片］' : '文件'))}`,
           })),
         });
       }
@@ -1458,7 +1850,8 @@ async function handleConvertService(req: IncomingMessage, res: ServerResponse): 
   const send = (code: number, obj: unknown): void => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
   if (req.method !== 'GET') return send(405, { error: 'GET only' });
   if (!CONVERT_SERVICE_BASE || !INKLOOP_SHARED_SECRET) return send(503, { error: 'CONVERT_SERVICE_BASE / INKLOOP_SHARED_SECRET 未配置' });
-  const rest = (req.url || '').replace(/^\/api\/convert/, '');
+  const selfFeishuBase = (process.env.CONVERT_FEISHU_SOURCE_BASE || `http://127.0.0.1:${PORT}/api/feishu-svc`).replace(/\/+$/, '');
+  const rest = rewriteLegacyConvertSource((req.url || '').replace(/^\/api\/convert/, ''), selfFeishuBase);
   const apath = (rest || '/').split('?')[0];
   if (apath !== '/to-pdf') return send(403, { error: 'path not allowed' });
   const sourceUrl = new URL(req.url || '/', 'http://inkloop.local').searchParams.get('url') || '';
@@ -2102,6 +2495,19 @@ const cloudDeviceHandler = createCloudDeviceHandler({
   requireSession: process.env.INKLOOP_DEVICE_REQUIRE_SESSION === '1',
 });
 
+function isAuthorizedInternalLoopbackRequest(req: IncomingMessage): boolean {
+  // 内部端点必须同时满足直连 loopback 和共享密钥；forwarded 头说明请求经过代理，一律按外部处理。
+  const forwarded = req.headers.forwarded || req.headers['x-forwarded-for'];
+  const remote = String(req.socket.remoteAddress || '');
+  const isLoopback = !forwarded
+    && (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1');
+  const actual = Buffer.from(String(req.headers['x-inkloop-secret'] || ''));
+  const expected = Buffer.from(INKLOOP_SHARED_SECRET);
+  return isLoopback && expected.length > 0
+    && actual.length === expected.length
+    && timingSafeEqual(actual, expected);
+}
+
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = (req.url || '/').split('?')[0];
   setCors(req, res);
@@ -2127,6 +2533,98 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     });
     return;
   }
+  // 妙记 token 收编：panel meeting sidecar 从 hub 取 user_access_token（loopback + shared secret 双门）。
+  // 背景：sidecar 原有独立 v1 OAuth token 库已死（refresh_token 被 hub 侧重授权顶掉·2026-07-15），
+  // 妙记取数的 token 真相源收编到 hub 这份 v2 OAuth state（resolveUserOAuthToken 自带懒刷新）。
+  if (url === '/api/internal/lark-user-token') {
+    if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+    res.setHeader('cache-control', 'no-store');
+    if (!isAuthorizedInternalLoopbackRequest(req)) { sendJson(res, 403, { ok: false, reason: 'forbidden' }); return; }
+    // hub 的 lark auth state 按 `.inkloop/lark-auth/<tenant>/feishu_<open_id>/<device>.json` 分桶（见 sessionScopedLarkAuthPath）。
+    // 带 open_id：取该用户最近登录设备的 state 走 resolveUserOAuthToken（自带懒刷新）；不带：枚举可用 open_id（不发 token）。
+    const larkAuthRoot = resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID);
+    const openIdParam = new URL(req.url || '/', 'http://inkloop.local').searchParams.get('open_id')?.trim() || '';
+    if (!openIdParam) {
+      let openIds: string[] = [];
+      try {
+        openIds = readdirSync(larkAuthRoot)
+          .filter((name) => name.startsWith('feishu_'))
+          .map((name) => name.slice('feishu_'.length));
+      } catch { /* 目录不存在 = 无人登录 */ }
+      sendJson(res, 200, { ok: true, open_ids: openIds });
+      return;
+    }
+    const statePath = latestLarkAuthStatePath(openIdParam);
+    if (!statePath) { sendJson(res, 404, { ok: false, reason: 'oauth_not_logged_in' }); return; }
+    const oauth = await resolveUserOAuthToken({ ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath });
+    if (!oauth.usable || !oauth.token) {
+      sendJson(res, 409, { ok: false, reason: oauth.reason || 'oauth_unusable', ...(oauth.refreshError ? { refresh_error: oauth.refreshError } : {}) });
+      return;
+    }
+    sendJson(res, 200, { ok: true, access_token: oauth.token, open_ids: oauth.userOpenIds.length ? oauth.userOpenIds : [openIdParam], scopes: oauth.scopes });
+    return;
+  }
+  if (url === '/api/internal/lark-note-transcript') {
+    if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+    res.setHeader('cache-control', 'no-store');
+    if (!isAuthorizedInternalLoopbackRequest(req)) {
+      sendJson(res, 403, { ok: false, reason: 'forbidden' });
+      return;
+    }
+
+    const query = new URL(req.url || '/', 'http://inkloop.local').searchParams;
+    const meetingId = query.get('meeting_id')?.trim() || '';
+    const openId = query.get('open_id')?.trim() || '';
+    if (!meetingId || !openId || meetingId.length > 256 || openId.length > 256) {
+      sendJson(res, 400, { ok: false, reason: 'meeting_id_and_open_id_required' });
+      return;
+    }
+
+    const statePath = latestLarkAuthStatePath(openId);
+    if (!statePath) {
+      sendJson(res, 404, {
+        ok: false,
+        status: 'oauth_unavailable',
+        meeting_id: meetingId,
+        reason: 'oauth_not_logged_in',
+      });
+      return;
+    }
+
+    try {
+      // 这里没有 device/session，只能从已解析的用户 statePath 叠加本机飞书应用配置。
+      const env = feishuBotRuntimeEnv({
+        ...process.env,
+        LARK_MEETING_AUTH_STATE_PATH: statePath,
+      });
+      const result = await fetchLarkMeetingNoteTranscript(meetingId, { env });
+      const transcript = result.transcript?.segments
+        .map((segment) => `${segment.speaker}：${segment.text.replace(/\s*\n+\s*/g, ' ').trim()}`)
+        .filter(Boolean)
+        .join('\n') || '';
+      // panel summarizer 只需逐行正文；禁止在内部 JSON 重复携带 raw/segments/srt/summary/artifacts。
+      sendJson(res, 200, {
+        ok: true,
+        status: result.status,
+        meeting_id: meetingId,
+        topic: result.meeting?.topic || '',
+        transcript_source: result.transcript?.source || null,
+        transcript_ref: result.transcript?.document_id || null,
+        transcript,
+        content_length: transcript.length,
+        errors: result.errors.map(({ source, code, message }) => ({ source, code, message })),
+      });
+    } catch (error) {
+      sendJson(res, 502, {
+        ok: false,
+        status: 'failed',
+        meeting_id: meetingId,
+        reason: 'note_transcript_failed',
+        error: String((error as Error)?.message || error),
+      });
+    }
+    return;
+  }
   if (url.startsWith('/v1/runtime/')) {
     const handled = await runtimeSyncHandler(req, res);
     if (handled) return;
@@ -2145,6 +2643,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
   // 阶段C：二维码设备登录（在 POST-only 闸之前·create/status/ack 都有 POST/GET 混合）
   if (url.startsWith('/api/inkloop/auth')) { await handleInkLoopAuth(req, res); return; }
+  // Google Calendar OAuth + meeting sources；callback 由 Google 直连，其余子路由在 handler 内校验设备 session。
+  if (url.startsWith('/api/google')) { await handleGoogleApi(req, res); return; }
+  // MTL browser extension receiver uses a per-user secret path and includes GET /api/state.
+  if (url.startsWith('/api/mtl/')) { await handleMtlReceiver(req, res); return; }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/panel-feishu')) { await handlePanelFeishu(req, res); return; }
   // 交付路线 Y：vault release GET/POST 代理（在 POST-only 闸之前·因含 GET latest/blob）
@@ -2200,11 +2702,102 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
 const server = createServer(handleRequest);
 
+function positiveTimeoutMs(value: string | undefined, fallbackMs: number): number {
+  const parsed = Number(value ?? fallbackMs);
+  return Number.isFinite(parsed) ? Math.max(1_000, parsed) : fallbackMs;
+}
+
+// WS end 事件可能丢（断线/重启窗口/同 app 多长连接抢路由），live 状态用 REST 周期对账兜底自愈。
+const LARK_MEETING_RECONCILE_MS = Math.max(0, Number(process.env.INKLOOP_LARK_MEETING_RECONCILE_MS ?? 120_000));
+const LARK_MEETING_RECONCILE_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_LARK_MEETING_RECONCILE_TIMEOUT_MS, 60_000);
+const larkMeetingReconcileGate = createDeadlineSingleFlight({
+  timeoutMs: LARK_MEETING_RECONCILE_TIMEOUT_MS,
+  label: 'Lark meeting reconcile',
+});
+async function runLarkMeetingReconcile(reason: string): Promise<void> {
+  if (FEISHU_SERVICE_BASE) return;
+  try {
+    await larkMeetingReconcileGate.run(async (signal) => {
+      const result = await reconcileLarkLiveMeetings({
+        root: ROOT,
+        baseUrl: process.env.LARK_BASE_URL || process.env.FEISHU_BASE_URL || undefined,
+        signal,
+        resolveUserToken: async (openId) => {
+          const statePath = latestLarkAuthStatePath(openId);
+          if (!statePath) return '';
+          const oauth = await resolveUserOAuthToken(
+            { ...process.env, LARK_MEETING_AUTH_STATE_PATH: statePath },
+            Date.now(),
+            { signal },
+          );
+          return oauth.usable && oauth.token ? oauth.token : '';
+        },
+        logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
+      });
+      if (result.checked > 0 || result.errors.length > 0) {
+        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      }
+    });
+  } catch (e) {
+    console.warn(`[inkloop proxy] lark meeting reconcile failed reason=${reason}: ${String((e as Error)?.message || e)}`);
+  }
+}
+
+// Gemini 智能纪要在会议结束后几分钟才导出成 Doc，设备端请求不是可靠触发源（recap 可能一直开着或没开）。
+// hub 侧周期扫全部已连接用户的 meet-records，窗口内的空壳纪要主动回补。
+const GOOGLE_SMART_NOTE_BACKFILL_MS = Math.max(0, Number(process.env.INKLOOP_GOOGLE_SMART_NOTE_BACKFILL_MS ?? 120_000));
+const GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS, 60_000);
+const googleBackfillGate = createDeadlineSingleFlight({
+  timeoutMs: GOOGLE_SMART_NOTE_BACKFILL_TIMEOUT_MS,
+  label: 'Google meeting backfill',
+});
+async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
+  try {
+    await googleBackfillGate.run(async (signal) => {
+      const fetchImpl: typeof fetch = (input, init) => fetch(input, { ...init, signal });
+      const root = googleAuthRoot(process.env);
+      let identities: Array<{ tenantId: string; userId: string }> = [];
+      try {
+        identities = readdirSync(root, { withFileTypes: true })
+          .filter((tenant) => tenant.isDirectory())
+          .flatMap((tenant) => readdirSync(resolve(root, tenant.name), { withFileTypes: true })
+            .filter((user) => user.isDirectory())
+            .map((user) => ({ tenantId: tenant.name, userId: user.name })));
+      } catch { /* 目录不存在 = 无人连接 Google */ }
+      for (const identity of identities) {
+        if (signal.aborted) throw signal.reason;
+        const recordsPath = googleMeetRecordsPath(process.env, identity);
+        if (!existsSync(recordsPath)) continue;
+        const resolved = await resolveAnyUserGoogleToken(process.env, identity, Date.now(), { fetchImpl });
+        if (!resolved.usable || !resolved.token) continue;
+        const result = await backfillGoogleMeetSmartNotes(resolved.token, { path: recordsPath }, {
+          grantedScopes: resolved.scopes,
+          fetchImpl,
+        });
+        if (result.scanned > 0 || result.errors.length > 0) {
+          console.log(`[inkloop proxy] google smart-note backfill reason=${reason} user=${identity.userId} scanned=${result.scanned} backfilled=${result.backfilled} completed=${result.completed}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+        }
+      }
+    });
+  } catch (e) {
+    console.warn(`[inkloop proxy] google smart-note backfill failed reason=${reason}: ${String((e as Error)?.message || e)}`);
+  }
+}
+
 const PORT = Number(process.env.PORT || 3000);
 server.listen(PORT, () => {
   console.log(`[inkloop proxy] :${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
   const wsStatus = startLarkWsMeetingEvents(ROOT, feishuBotRuntimeEnv(process.env));
   console.log(`[inkloop proxy] Lark meeting WS ${wsStatus.enabled ? wsStatus.state : 'disabled'} events=${wsStatus.registered_event_types.length}`);
+  if (LARK_MEETING_RECONCILE_MS > 0 && !FEISHU_SERVICE_BASE) {
+    setInterval(() => { void runLarkMeetingReconcile('interval'); }, LARK_MEETING_RECONCILE_MS).unref();
+    // 启动即对账一次（延迟给 WS 建连留窗口），把重启窗口/历史丢事件卡住的 live 清掉。
+    setTimeout(() => { void runLarkMeetingReconcile('boot'); }, 15_000).unref();
+  }
+  if (GOOGLE_SMART_NOTE_BACKFILL_MS > 0) {
+    setInterval(() => { void runGoogleSmartNoteBackfill('interval'); }, GOOGLE_SMART_NOTE_BACKFILL_MS).unref();
+    setTimeout(() => { void runGoogleSmartNoteBackfill('boot'); }, 20_000).unref();
+  }
 });
 
 const LARK_MEETING_CALLBACK_SERVER_PORT = Number(LARK_MEETING_CALLBACK_PORT);

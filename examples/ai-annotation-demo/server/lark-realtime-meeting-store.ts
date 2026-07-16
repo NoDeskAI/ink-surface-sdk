@@ -12,9 +12,11 @@ export interface LarkRealtimeMeetingRecord {
   meeting_url?: string;
   meeting_no?: string;
   feishu_meeting_id?: string;
+  owner_open_id?: string;
+  participant_open_ids?: string[];
   source_event_type?: string;
   source_event_id?: string;
-  source_transport?: 'lark_ws_event' | 'lark_http_event' | 'manual';
+  source_transport?: 'lark_ws_event' | 'lark_http_event' | 'lark_rest_reconcile' | 'manual';
   created_at: string;
   updated_at: string;
 }
@@ -34,6 +36,8 @@ export interface LarkRealtimeMeetingInput {
   meeting_url?: unknown;
   meeting_no?: unknown;
   feishu_meeting_id?: unknown;
+  owner_open_id?: unknown;
+  participant_open_ids?: unknown;
   source_event_type?: unknown;
   source_event_id?: unknown;
   source_transport?: LarkRealtimeMeetingRecord['source_transport'];
@@ -41,6 +45,11 @@ export interface LarkRealtimeMeetingInput {
 
 function text(value: unknown): string {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function uniqueText(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(text).filter(Boolean))];
 }
 
 function parseMs(value: unknown): number {
@@ -124,6 +133,11 @@ export function upsertLarkRealtimeMeeting(root: string, input: LarkRealtimeMeeti
   const sourceEventId = text(input.source_event_id);
   const id = recordIdentity({ feishuMeetingId, meetingNo, meetingUrl, sourceEventId, scheduledAt });
   const existing = store.meetings.find((item) => item.id === id);
+  const resolvedOwnerOpenId = text(input.owner_open_id) || text(existing?.owner_open_id);
+  const participantOpenIds = [...new Set([
+    ...uniqueText(existing?.participant_open_ids),
+    ...uniqueText(input.participant_open_ids),
+  ])];
   const record: LarkRealtimeMeetingRecord = {
     id,
     title: text(input.title) || existing?.title || '飞书即时会议',
@@ -134,6 +148,8 @@ export function upsertLarkRealtimeMeeting(root: string, input: LarkRealtimeMeeti
     ...(meetingUrl || existing?.meeting_url ? { meeting_url: meetingUrl || existing?.meeting_url } : {}),
     ...(meetingNo || existing?.meeting_no ? { meeting_no: meetingNo || existing?.meeting_no } : {}),
     ...(feishuMeetingId || existing?.feishu_meeting_id ? { feishu_meeting_id: feishuMeetingId || existing?.feishu_meeting_id } : {}),
+    ...(resolvedOwnerOpenId ? { owner_open_id: resolvedOwnerOpenId } : {}),
+    ...(participantOpenIds.length ? { participant_open_ids: participantOpenIds } : {}),
     ...(text(input.source_event_type) || existing?.source_event_type ? { source_event_type: text(input.source_event_type) || existing?.source_event_type } : {}),
     ...(sourceEventId || existing?.source_event_id ? { source_event_id: sourceEventId || existing?.source_event_id } : {}),
     ...(input.source_transport || existing?.source_transport ? { source_transport: input.source_transport || existing?.source_transport } : {}),
@@ -157,8 +173,18 @@ export function listLarkRealtimeMeetings(root: string, options: { nowMs?: number
   });
 }
 
-export function larkRealtimeMeetingSources(root: string, options: { nowMs?: number; lookbackSeconds?: number; lookaheadSeconds?: number } = {}): LarkMeetingSource[] {
-  return listLarkRealtimeMeetings(root, options).map((item) => ({
+export function larkRealtimeMeetingSources(root: string, options: { nowMs?: number; lookbackSeconds?: number; lookaheadSeconds?: number; userOpenIds?: string[] } = {}): LarkMeetingSource[] {
+  // 过滤契约两态：undefined=不过滤（demo/内部调用）；数组=严格按 owner/participant 命中放行——
+  // 空数组（请求者无飞书身份）自然什么都不给（否则无身份反而看到全量=泄漏），
+  // 无归属的存量记录对有身份用户同样隐藏（手动绑定已改为落 owner，老记录随回看窗口自然淘汰）。
+  const filterByUser = Array.isArray(options.userOpenIds);
+  const userOpenIds = new Set(uniqueText(options.userOpenIds));
+  return listLarkRealtimeMeetings(root, options).filter((item) => {
+    if (!filterByUser) return true;
+    const owner = text(item.owner_open_id);
+    const participants = uniqueText(item.participant_open_ids);
+    return (!!owner && userOpenIds.has(owner)) || participants.some((openId) => userOpenIds.has(openId));
+  }).map((item) => ({
     source_id: `realtime:${item.id}`,
     source: 'lark_meeting_timeline',
     title: item.title,

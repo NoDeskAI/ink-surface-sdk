@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "source": {
+    "commit": "fd13d52a67a915f4afb9a2a7383beedba623114a",
+    "payload_builders": "packages/meeting-timeline-sdk/index.mjs",
+    "live_acceptance_core": "scripts/three-platform-live-acceptance-core.mjs",
+    "live_acceptance_runner": "scripts/start-three-platform-live-acceptance.mjs"
+  },
+  "live_acceptance_core_sha256": "2b55a623f3fcb5e3b2e6e5e062e0e761a9b5d2c7c0d8a4843ed1b4b5bc524af3",
+  "payload_source_hashes": {
+    "firstNonEmpty": "08873d722a08834c65d423f433b683201d29ac7e141c06b2fbe5d1560032c7e7",
+    "isPlainObject": "d7ab6c4b8090ab9ade0da32e9438e24e5a8bfafcd9e6155c555bdaaf77056db8",
+    "compactObject": "777c46715d563777393858f147a3d8326def82bd4528b98edfc536922262003b",
+    "normalizeAbsoluteMs": "3ac20c4c8127649a2cef51faf97a1d92e355db3cdc711255cde4bb3c12996be0",
+    "maybeAbsoluteMs": "d058372b5605a60d0f3a1d9f339701836a675685dd6c7017e904ad5e716581e4",
+    "normalizeCandidates": "e8c841b6219e301c040f589a4e4c29c5e5c6f485dc929475be8b5d66431d3e18",
+    "buildMeetingStartPayload": "1bb8f686008c2ecce9e12fa99a0fd3dd3b092b35f3594c400103728d1dc19989",
+    "buildMeetingEndPayload": "1be7284676296b07e000eeb9a7a155e6ec17c9944c70d0b473b644ff96dd3611",
+    "buildTimelineMark": "260653645e92b3c48e0ac96d11ac3de8ae7ff9ecae732d2d40c5e83670da2b26"
+  },
+  "payload_keys": {
+    "buildMeetingStartPayload": [
+      "platform",
+      "meeting_id",
+      "external_meeting_id",
+      "meeting_url",
+      "minute_token",
+      "title",
+      "timezone",
+      "start_time_ms",
+      "end_time",
+      "detector_source",
+      "note",
+      "force",
+      "keep_segments",
+      "suppress_auto_annotations",
+      "suppress_demo_annotations",
+      "observer_surface",
+      "run_id",
+      "meeting_app_record"
+    ],
+    "buildMeetingEndPayload": [
+      "meeting_id",
+      "end_time_ms",
+      "time_ms",
+      "detector_source",
+      "observer_surface",
+      "run_id",
+      "meeting_app_record"
+    ],
+    "buildTimelineMark": [
+      "id",
+      "source",
+      "device_id",
+      "captured_at_ms",
+      "time_ms",
+      "kind",
+      "label",
+      "text",
+      "text_candidates",
+      "intent",
+      "mark",
+      "target",
+      "strokes",
+      "device",
+      "payload",
+      "realtime",
+      "live",
+      "meeting_session",
+      "start_meeting_session",
+      "force_meeting_session"
+    ]
+  },
+  "live_acceptance": {
+    "platforms": ["google_meet", "microsoft_teams", "zoom"],
+    "core_check_ids": [
+      "supported_platform",
+      "meeting_identity",
+      "real_active_snapshot",
+      "real_ended_snapshot",
+      "realtime_acceptance_annotation",
+      "event_order",
+      "fresh_run",
+      "annotation_visible_latency",
+      "annotation_timeline_alignment",
+      "start_observer_latency",
+      "end_observer_latency",
+      "cross_meeting_isolation",
+      "no_duplicate_annotation"
+    ],
+    "speaker_check_ids": ["stable_speaker_marker", "speaker_marker_visible_latency"],
+    "http_response_checkpoints": ["response.ok", "response.status", "annotation.ack.accepted"]
+  },
+  "payload_cases": {
+    "start": {
+      "builder": "buildMeetingStartPayload",
+      "input": {
+        "platform": "google-meet",
+        "meetingId": "abc-defg-hij",
+        "externalMeetingId": "provider-meeting-42",
+        "meetingUrl": "https://meet.google.com/abc-defg-hij?authuser=0",
+        "minuteToken": "minute-token-fixture",
+        "topic": "Protocol contract review",
+        "timezone": "Asia/Shanghai",
+        "startedAt": "2026-07-15T03:00:00.000Z",
+        "endTime": "2026-07-15T04:00:00.000Z",
+        "detectorSource": "meeting_app_extension",
+        "note": "sdk-contract-fixture",
+        "forceMeetingSession": false,
+        "keepSegments": true,
+        "suppressAutoAnnotations": true,
+        "suppressDemoAnnotations": false,
+        "observerSurface": "browser_extension",
+        "runId": "google_meet:abc-defg-hij",
+        "meetingAppRecord": { "phase": "active", "captured_at_ms": 1784084400000 }
+      },
+      "defaults": {
+        "platform": "lark",
+        "timezone": "UTC",
+        "detectorSource": "fixture-default"
+      },
+      "expected": {
+        "platform": "google-meet",
+        "meeting_id": "abc-defg-hij",
+        "external_meeting_id": "provider-meeting-42",
+        "meeting_url": "https://meet.google.com/abc-defg-hij?authuser=0",
+        "minute_token": "minute-token-fixture",
+        "title": "Protocol contract review",
+        "timezone": "Asia/Shanghai",
+        "start_time_ms": 1784084400000,
+        "end_time": "2026-07-15T04:00:00.000Z",
+        "detector_source": "meeting_app_extension",
+        "note": "sdk-contract-fixture",
+        "force": false,
+        "keep_segments": true,
+        "suppress_auto_annotations": true,
+        "suppress_demo_annotations": false,
+        "observer_surface": "browser_extension",
+        "run_id": "google_meet:abc-defg-hij",
+        "meeting_app_record": { "phase": "active", "captured_at_ms": 1784084400000 }
+      }
+    },
+    "end": {
+      "builder": "buildMeetingEndPayload",
+      "input": {
+        "meetingId": "abc-defg-hij",
+        "endedAt": "2026-07-15T03:55:00.000Z",
+        "timeMs": 3300000,
+        "detectorSource": "meeting_app_extension_leave",
+        "observerSurface": "browser_extension",
+        "runId": "google_meet:abc-defg-hij",
+        "meetingAppRecord": { "phase": "ended", "captured_at_ms": 1784087700000 }
+      },
+      "defaults": { "detectorSource": "fixture-default" },
+      "expected": {
+        "meeting_id": "abc-defg-hij",
+        "end_time_ms": 1784087700000,
+        "time_ms": 3300000,
+        "detector_source": "meeting_app_extension_leave",
+        "observer_surface": "browser_extension",
+        "run_id": "google_meet:abc-defg-hij",
+        "meeting_app_record": { "phase": "ended", "captured_at_ms": 1784087700000 }
+      }
+    },
+    "annotation": {
+      "builder": "buildTimelineMark",
+      "input": {
+        "annotationId": "three-platform-live-acceptance-google_meet-1784085600000",
+        "source": "three_platform_live_acceptance",
+        "capturedAt": "2026-07-15T03:20:00.000Z",
+        "timeMs": 1200000,
+        "type": "handwriting_trigger",
+        "textCandidates": ["why?", "why"],
+        "intent": "question",
+        "mark": { "action": "circle", "target_text": "decision" },
+        "targetRegion": { "page": 1, "x": 0.2, "y": 0.3 },
+        "strokePoints": [[{ "x": 0.1, "y": 0.2, "t": 1784085599800 }]],
+        "payload": {
+          "acceptance": "three_platform_live",
+          "meeting": { "platform": "google_meet", "meeting_id": "abc-defg-hij" }
+        },
+        "startMeetingSession": false,
+        "forceMeetingSession": false
+      },
+      "defaults": {
+        "source": "fixture-default-source",
+        "deviceId": "fixture-device",
+        "requireCapturedAt": true,
+        "realtime": true,
+        "live": true
+      },
+      "expected": {
+        "id": "three-platform-live-acceptance-google_meet-1784085600000",
+        "source": "three_platform_live_acceptance",
+        "device_id": "fixture-device",
+        "captured_at_ms": 1784085600000,
+        "time_ms": 1200000,
+        "kind": "handwriting_trigger",
+        "label": "why?",
+        "text": "why?",
+        "text_candidates": ["why?", "why"],
+        "intent": "question",
+        "mark": { "action": "circle", "target_text": "decision" },
+        "target": { "page": 1, "x": 0.2, "y": 0.3 },
+        "strokes": [[{ "x": 0.1, "y": 0.2, "t": 1784085599800 }]],
+        "device": { "id": "fixture-device" },
+        "payload": {
+          "acceptance": "three_platform_live",
+          "meeting": { "platform": "google_meet", "meeting_id": "abc-defg-hij" }
+        },
+        "realtime": true,
+        "live": true,
+        "start_meeting_session": false,
+        "force_meeting_session": false
+      }
+    }
+  }
+}

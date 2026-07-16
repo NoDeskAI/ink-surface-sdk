@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { RuntimeOutboxPort, RuntimeSyncEvent } from '../../runtime-schema/src/index';
 import {
   HttpRuntimeSyncTransport,
+  isRuntimeDeadLetter,
+  rearmDeadLettersOnce,
   RuntimeSyncRunner,
   type RuntimeDeviceCursor,
   type RuntimeInboxApplyResult,
@@ -18,6 +20,11 @@ class MemoryOutbox implements RuntimeOutboxPort {
 
   async writeOutboxEvents(events: RuntimeSyncEvent[]): Promise<void> {
     this.events = events.map((event) => ({ ...event }));
+  }
+
+  async updateOutboxEvents(updates: RuntimeSyncEvent[]): Promise<void> {
+    const updatesById = new Map(updates.map((event) => [event.event_id, event]));
+    this.events = this.events.map((event) => ({ ...(updatesById.get(event.event_id) ?? event) }));
   }
 
   async appendSyncEvent(event: RuntimeSyncEvent): Promise<void> {
@@ -110,11 +117,103 @@ describe('sync client', () => {
     expect(events[1].deduped_by_event_id).toBe('evt_1');
   });
 
+  it('only sends the retryable pending event when terminal events share its dedupe key', async () => {
+    const outbox = new MemoryOutbox([
+      event({ event_id: 'evt_sent', dedupe_key: 'same-change', status: 'sent', attempt_count: 1 }),
+      event({ event_id: 'evt_dead', dedupe_key: 'same-change', status: 'failed', attempt_count: 25 }),
+      event({ event_id: 'evt_pending', dedupe_key: 'same-change', status: 'pending', attempt_count: 0 }),
+    ]);
+    const send = vi.fn(async (events: RuntimeSyncEvent[]) => events.map((item) => ({ event_id: item.event_id, ok: true })));
+
+    const result = await new RuntimeSyncRunner(outbox, { send }, { maxAttempts: 25 }).runOnce();
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].map((item) => item.event_id)).toEqual(['evt_pending']);
+    expect(result).toMatchObject({ scanned: 3, eligible: 1, sent: 1, deduped: 0, skipped: 2 });
+    expect((await outbox.listOutboxEvents()).map((item) => item.status)).toEqual(['sent', 'failed', 'sent']);
+  });
+
+  it('rearms each dead letter for exactly one attempt before it becomes sent or dead again', async () => {
+    const maxAttempts = 25;
+    const dead = event({
+      event_id: 'evt_dead_once',
+      status: 'failed',
+      attempt_count: maxAttempts,
+      next_retry_at: '2099-01-01T00:00:00.000Z',
+    });
+    const rearmed = rearmDeadLettersOnce([dead], maxAttempts, '2026-07-15T00:00:00.000Z');
+    expect(rearmed[0]).toMatchObject({ status: 'pending', attempt_count: 24 });
+    expect(rearmed[0].next_retry_at).toBeUndefined();
+
+    const failedOutbox = new MemoryOutbox(rearmed);
+    const failedSend = vi.fn(async (events: RuntimeSyncEvent[]) => events.map((item) => ({ event_id: item.event_id, ok: false, error: 'still offline' })));
+    const failedRunner = new RuntimeSyncRunner(failedOutbox, { send: failedSend }, {
+      maxAttempts,
+      retryDelayMs: 0,
+      now: () => '2026-07-15T00:00:01.000Z',
+    });
+
+    await failedRunner.runOnce();
+    await failedRunner.runOnce();
+    const failedAgain = (await failedOutbox.listOutboxEvents())[0];
+    expect(failedSend).toHaveBeenCalledOnce();
+    expect(failedAgain).toMatchObject({ status: 'failed', attempt_count: maxAttempts, last_error: 'still offline' });
+    expect(isRuntimeDeadLetter(failedAgain, maxAttempts)).toBe(true);
+
+    const successOutbox = new MemoryOutbox(rearmDeadLettersOnce([dead], maxAttempts, '2026-07-15T00:00:02.000Z'));
+    await new RuntimeSyncRunner(successOutbox, {
+      async send(events) {
+        return events.map((item) => ({ event_id: item.event_id, ok: true, ack_id: 'ack_manual_retry' }));
+      },
+    }, { maxAttempts, now: () => '2026-07-15T00:00:03.000Z' }).runOnce();
+    expect((await successOutbox.listOutboxEvents())[0]).toMatchObject({
+      status: 'sent',
+      attempt_count: maxAttempts,
+      ack_id: 'ack_manual_retry',
+    });
+  });
+
+  it('does not rewrite the outbox when no event is eligible', async () => {
+    const outbox = new MemoryOutbox([
+      event({ event_id: 'evt_already_sent', status: 'sent' }),
+      event({ event_id: 'evt_exhausted', status: 'failed', attempt_count: 25 }),
+    ]);
+    const write = vi.spyOn(outbox, 'writeOutboxEvents');
+    const update = vi.spyOn(outbox, 'updateOutboxEvents');
+    const send = vi.fn(async () => []);
+
+    const result = await new RuntimeSyncRunner(outbox, { send }, { maxAttempts: 25 }).runOnce();
+
+    expect(result).toMatchObject({ scanned: 2, eligible: 0, skipped: 2 });
+    expect(send).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it('does not mark events sent when the transport response is malformed', async () => {
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ batch_id: 'missing_acks' }), { status: 200 }));
     const transport = new HttpRuntimeSyncTransport({ endpoint: 'https://example.test/runtime-sync', deviceId: 'device_http' });
 
     await expect(transport.send([event({ event_id: 'evt_http' })])).rejects.toThrow(/acks array/);
+  });
+
+  it('preserves the send timeout error when headers arrive but the response body never ends', async () => {
+    vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    }) as Response);
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: 'https://example.test/runtime-sync',
+      deviceId: 'device_send_body_timeout',
+      sendTimeoutMs: 10,
+    });
+
+    await expect(transport.send([event({ event_id: 'evt_send_body_timeout' })]))
+      .rejects.toThrow('runtime sync request timed out after 10ms');
   });
 
   it('sends the device id required by the runtime sync push contract', async () => {
@@ -292,6 +391,26 @@ describe('sync client', () => {
     });
 
     await expect(transport.pull({ device_id: 'device_http' })).rejects.toThrow(/schema_version/);
+  });
+
+  it('preserves the pull timeout error when headers arrive but the response body never ends', async () => {
+    vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    }) as Response);
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: 'https://example.test/runtime-sync',
+      deviceId: 'device_pull_body_timeout',
+      pullEndpoint: 'https://example.test/runtime-sync/pull',
+      requestTimeoutMs: 10,
+    });
+
+    await expect(transport.pull({ device_id: 'device_pull_body_timeout' }))
+      .rejects.toThrow('runtime sync request timed out after 10ms');
   });
 
   it('supports relative pull endpoints used by browser and WebView hosts', async () => {

@@ -14,8 +14,9 @@ interface SheetHandle {
   close: () => void;
 }
 
-/** 挂载一个 sheet 骨架，返回容器引用 + 关闭函数（带退场动画后移除 DOM）。 */
-function mountSheet(titleHtml: string, bodyHtml: string, okText: string | null): SheetHandle {
+/** 挂载一个 sheet 骨架，返回容器引用 + 关闭函数（带退场动画后移除 DOM）。
+ *  导出给需要自定义内容 + 程序化关闭的调用方（如 Google 授权二维码 sheet），四个标准 API 覆盖不了时用。 */
+export function mountSheet(titleHtml: string, bodyHtml: string, okText: string | null): SheetHandle {
   const scrim = document.createElement('div');
   scrim.className = 'msheet-scrim';
   scrim.innerHTML =

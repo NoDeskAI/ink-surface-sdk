@@ -65,6 +65,13 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     }))).toEqual(['minute_tok', 'feishu_note_docx:7659677460199738340']);
   });
 
+  it('Google Meet 导出读取通用转写缓存 token', () => {
+    expect(meetingTranscriptCacheTokens(meeting({
+      platform: 'google_meet',
+      meeting_id: 'local-google-meeting',
+    }))).toEqual(['google_meet:local-google-meeting']);
+  });
+
   it('手写零丢失：每笔 → 一条 annotation KO', async () => {
     const out = await assembleMeetingL1Export(input(), OPTS);
     const anns = out.knowledgeExport.objects.filter((k) => k.kind === 'annotation');

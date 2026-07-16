@@ -195,6 +195,109 @@ describe('lark meeting note transcript', () => {
     }
   });
 
+  it('reports a docx raw_content Feishu error as failed instead of missing_transcript', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-note-'));
+    const authPath = join(tempDir, 'auth-state.json');
+    writeFileSync(authPath, JSON.stringify({
+      token: {
+        access_token: 'user_token',
+        expires_in: 24 * 60 * 60,
+        obtained_at_ms: Date.parse('2026-07-07T00:00:00+08:00'),
+        scope: 'vc:note:read docx:document:readonly vc:meeting.meetingid:read',
+      },
+    }));
+
+    try {
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.endsWith('/open-apis/vc/v1/notes/note_1')) {
+          return jsonResponse({
+            code: 0,
+            data: { note: { artifacts: [{ artifact_type: 2, document_id: 'transcript_doc', title: '文字记录' }] } },
+          });
+        }
+        if (url.endsWith('/open-apis/docx/v1/documents/transcript_doc/raw_content')) {
+          return jsonResponse({ code: 99991672, msg: 'Forbidden: missing document permission' }, 403);
+        }
+        return jsonResponse({ code: 999, msg: `unexpected ${url}` }, 500);
+      }));
+
+      const result = await fetchLarkMeetingNoteTranscript('meeting_1', {
+        nowMs: Date.parse('2026-07-07T16:50:00+08:00'),
+        env: { FEISHU_APP_ID: 'cli_test', FEISHU_APP_SECRET: 'secret', LARK_MEETING_AUTH_STATE_PATH: authPath },
+        createClient: () => ({
+          fetchMeetingDetailWithToken: vi.fn(async () => ({
+            code: 0,
+            data: { meeting: { id: 'meeting_1', topic: '权限测试', note_id: 'note_1' } },
+          })),
+        }),
+      });
+
+      expect(result.status).toBe('failed');
+      expect(result.transcript).toBeUndefined();
+      expect(result.errors).toEqual([expect.objectContaining({
+        source: 'docx',
+        code: '99991672',
+        required_scope: 'docx:document:readonly',
+      })]);
+      expect(result.errors[0].permission_url).toContain('token_type=user');
+      expect(result.artifacts[0]).toMatchObject({
+        document_id: 'transcript_doc',
+        content_length: 0,
+        segment_count: 0,
+        speaker_count: 0,
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps missing_transcript for a readable docx with no parseable speaker segments', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-note-'));
+    const authPath = join(tempDir, 'auth-state.json');
+    writeFileSync(authPath, JSON.stringify({
+      token: {
+        access_token: 'user_token',
+        expires_in: 24 * 60 * 60,
+        obtained_at_ms: Date.parse('2026-07-07T00:00:00+08:00'),
+        scope: 'vc:note:read docx:document:readonly vc:meeting.meetingid:read',
+      },
+    }));
+
+    try {
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.endsWith('/open-apis/vc/v1/notes/note_1')) {
+          return jsonResponse({
+            code: 0,
+            data: { note: { artifacts: [{ artifact_type: 2, document_id: 'transcript_doc', title: '文字记录' }] } },
+          });
+        }
+        if (url.endsWith('/open-apis/docx/v1/documents/transcript_doc/raw_content')) {
+          return jsonResponse({ code: 0, data: { content: '文字记录仍在生成，请稍后再试。' } });
+        }
+        return jsonResponse({ code: 999, msg: `unexpected ${url}` }, 500);
+      }));
+
+      const result = await fetchLarkMeetingNoteTranscript('meeting_1', {
+        nowMs: Date.parse('2026-07-07T16:50:00+08:00'),
+        env: { FEISHU_APP_ID: 'cli_test', FEISHU_APP_SECRET: 'secret', LARK_MEETING_AUTH_STATE_PATH: authPath },
+        createClient: () => ({
+          fetchMeetingDetailWithToken: vi.fn(async () => ({
+            code: 0,
+            data: { meeting: { id: 'meeting_1', topic: '生成中测试', note_id: 'note_1' } },
+          })),
+        }),
+      });
+
+      expect(result.status).toBe('missing_transcript');
+      expect(result.errors).toEqual([expect.objectContaining({
+        source: 'docx',
+        code: 'transcript_artifact_missing',
+      })]);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('refreshes expired OAuth before reading meeting note artifacts', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'inkloop-lark-note-'));
     const authPath = join(tempDir, 'auth-state.json');
@@ -281,6 +384,7 @@ describe('lark meeting note transcript', () => {
         required_scope: 'vc:note:read,docx:document:readonly',
       });
       expect(result.errors[0].permission_url).toContain('cli_test');
+      expect(result.errors[0].permission_url).toContain('token_type=user');
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

@@ -38,11 +38,13 @@ object OnyxPenBridge {
     @Volatile private var active = false
     @Volatile private var armed = false
     @Volatile private var lastArea = ""
+    @Volatile private var lastExclude = ""
     @Volatile private var initialized = false
     @Volatile private var lastError = ""
 
-    // 前端上报的「当前书写画布矩形」(WebView host-local 物理 px)；null=非书写面→disarm。
-    private var requestedArea: Rect? = null
+    // 前端上报的「当前书写画布 + 浮动控件排除区」(WebView host-local 物理 px)；null=非书写面→disarm。
+    private data class WritingArea(val limit: Rect, val excludes: List<Rect>)
+    private var requestedArea: WritingArea? = null
 
     private val currentStroke = ArrayList<OnyxPt>(512)
     private val completedStrokes = ArrayDeque<OnyxStroke>()
@@ -166,32 +168,50 @@ object OnyxPenBridge {
     // 把当前 requestedArea 应用到 TouchHelper（有画区→limitRect+enable+armed；null→disable）。onResume 也调它恢复。
     private fun applyRequestedArea() {
         runCatching {
-            val rect = requestedArea
-            if (rect != null) {
-                touchHelper?.setLimitRect(rect, emptyList())
+            val area = requestedArea
+            if (area != null) {
+                // onyxsdk-pen 1.5.4 实签名：setLimitRect(Rect, List<Rect>)；exclude 会下沉到
+                // nativeSetExcludeRegion / setScreenHandWritingRegionExclude，在浮动笔触栏处给 raw 区挖洞。
+                touchHelper?.setLimitRect(area.limit, area.excludes)
                 touchHelper?.setRawDrawingRenderEnabled(true)
                 setRawDrawingEnabled(true)
                 armed = true
-                lastArea = "${rect.left},${rect.top},${rect.right},${rect.bottom}"
+                lastArea = "${area.limit.left},${area.limit.top},${area.limit.right},${area.limit.bottom}"
+                lastExclude = area.excludes.joinToString(";") { "${it.left},${it.top},${it.right},${it.bottom}" }
             } else {
                 setRawDrawingEnabled(false)
                 armed = false
                 lastArea = "null"
+                lastExclude = ""
             }
         }.onFailure { recordError("applyRequestedArea", it) }
     }
 
-    private fun parseWritingRect(rectJson: String?): Rect? {
+    private fun parseWritingRect(rectJson: String?): WritingArea? {
         val raw = rectJson?.trim().orEmpty()
         if (raw.isEmpty() || raw == "null") return null
         return runCatching {
             val o = JSONObject(raw)
-            val x = o.getDouble("x").toInt()
-            val y = o.getDouble("y").toInt()
-            val w = o.getDouble("w").toInt()
-            val h = o.getDouble("h").toInt()
-            if (w <= 0 || h <= 0) null else Rect(x, y, x + w, y + h)
+            val limit = parseRect(o) ?: return@runCatching null
+            val excludes = ArrayList<Rect>()
+            o.optJSONArray("exclude")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val candidate = arr.optJSONObject(i)?.let(::parseRect) ?: continue
+                    val clipped = Rect(candidate)
+                    if (clipped.intersect(limit)) excludes.add(clipped)
+                }
+            }
+            WritingArea(limit, excludes)
         }.getOrNull()
+    }
+
+    private fun parseRect(o: JSONObject): Rect? {
+        val x = o.optDouble("x", Double.NaN)
+        val y = o.optDouble("y", Double.NaN)
+        val w = o.optDouble("w", Double.NaN)
+        val h = o.optDouble("h", Double.NaN)
+        if (!x.isFinite() || !y.isFinite() || !w.isFinite() || !h.isFinite() || w <= 0.0 || h <= 0.0) return null
+        return Rect(x.toInt(), y.toInt(), (x + w).toInt(), (y + h).toInt())
     }
 
     private fun setRawDrawingEnabled(enabled: Boolean) {
@@ -299,6 +319,8 @@ object OnyxPenBridge {
         .put("active", active)
         .put("armed", armed)
         .put("last_area", lastArea)
+        .put("last_exclude", lastExclude)
+        .put("exclude_count", requestedArea?.excludes?.size ?: 0)
         .put("last_error", lastError)
         .put("attach_count", attachCount)
         .put("enter_count", enterCount)

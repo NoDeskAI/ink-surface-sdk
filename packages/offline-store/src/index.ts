@@ -75,6 +75,7 @@ export interface OfflineRemoteEventApplyResult {
 }
 
 export interface OfflineRuntimeStorePort extends RuntimeStorePort {
+  updateOutboxEvents?(updates: RuntimeSyncEvent[]): Promise<void>;
   writeDocumentSnapshot(snapshot: RuntimeDocumentSnapshot): Promise<void>;
   getCacheRecord(docId: string): Promise<OfflineDocumentCacheRecord | null>;
   writeCacheRecord(record: OfflineDocumentCacheRecord): Promise<void>;

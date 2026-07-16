@@ -55,6 +55,9 @@ class MainActivity : ComponentActivity() {
         private const val META_DISPLAY_MODE = "com.inkloop.DISPLAY_MODE"
         // 2026-07-01 重新打开：画区收窄(InkLoopHqHwArea) + 原生输入分类覆盖(InputSourceBridge) 都已接上。
         private const val HQHW_BRIDGE_ENABLED = true
+        // 2026-07-16 BOOX 回退 WebView 慢速墨迹：三个原生桥(InputSource/OnyxPen/OnyxEpd)整体不 attach，
+        // 恢复真·纯 WebView 环境（详见 onCreate 里 BOOX 分支的注释）。pen 线原生方案就绪后翻 true。
+        private const val ONYX_NATIVE_BRIDGES_ENABLED = false
     }
 
     private lateinit var webView: WebView
@@ -130,11 +133,18 @@ class MainActivity : ComponentActivity() {
         if (displayMode == DisplayMode.IT8951) {
             com.example.hmpocrpoc.EinkBridge.attach(webView, this)
         } else if (isOnyxBooxDevice()) {
-            // T10/BOOX：没有 M103 的 hq.hw 独立墨迹层；先接原生 Wacom 输入分类和 Onyx EPD 快刷诊断桥。
-            // 前端据 `onyx-t10` 设备身份启用 pen/touch 权威分流，并在落笔期间尝试 transient fast update。
-            com.example.hmpocrpoc.InputSourceBridge.attach(webView)
-            com.example.hmpocrpoc.OnyxPenBridge.attach(webView)
-            com.example.hmpocrpoc.OnyxEpdBridge.attach(webView)
+            // T10/BOOX：2026-07-16 用户拍板整体回退 WebView 慢速墨迹后，三个原生桥默认不 attach——
+            // codex 深挖（cx_webview_feel_out.md）证实仅靠 JS 侧不 arm 并没有恢复纯 WebView 环境：
+            // InputSourceBridge 仍在 UI 线程逐事件观察+复制 historical 点、ink.ts 每个 pointermove 仍跨桥
+            // classifyLast()、抬笔仍取整笔 JSON 镜像、OnyxPenBridge attach 即 openRawDrawing+EAC+改
+            // 默认刷新模式、OnyxEpdBridge 每次落笔/抬笔同步切 transient——这些叠加正是「回退后比
+            // 引入原生路径之前更卡」的来源。桥不注入后前端全部消费点走可空 getter 自然 no-op。
+            // pen 线摸清原生路径后翻回 true 重启快速路径实验。
+            if (ONYX_NATIVE_BRIDGES_ENABLED) {
+                com.example.hmpocrpoc.InputSourceBridge.attach(webView)
+                com.example.hmpocrpoc.OnyxPenBridge.attach(webView)
+                com.example.hmpocrpoc.OnyxEpdBridge.attach(webView)
+            }
             injectDeviceProfile(webView, onyxDeviceProfile())
         } else if (isRkNativeEinkDevice()) {
             com.example.hmpocrpoc.RkEinkBridge.attach()
@@ -443,7 +453,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (hqHwEnabled) com.example.hmpocrpoc.HqHwBridge.onResume()
-        if (isOnyxBooxDevice()) {
+        if (ONYX_NATIVE_BRIDGES_ENABLED && isOnyxBooxDevice()) {
             com.example.hmpocrpoc.OnyxPenBridge.onResume()
             com.example.hmpocrpoc.OnyxEpdBridge.onResume()
         }
@@ -455,7 +465,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        if (isOnyxBooxDevice()) {
+        if (ONYX_NATIVE_BRIDGES_ENABLED && isOnyxBooxDevice()) {
             com.example.hmpocrpoc.OnyxPenBridge.onPause()
             com.example.hmpocrpoc.OnyxEpdBridge.onPause()
         }
@@ -468,7 +478,7 @@ class MainActivity : ComponentActivity() {
             com.example.hmpocrpoc.HqHwBridge.forceResetFastInk()
             com.example.hmpocrpoc.HqHwBridge.destroy()
         }
-        if (isOnyxBooxDevice()) com.example.hmpocrpoc.OnyxPenBridge.destroy()
+        if (ONYX_NATIVE_BRIDGES_ENABLED && isOnyxBooxDevice()) com.example.hmpocrpoc.OnyxPenBridge.destroy()
         com.example.hmpocrpoc.InkLoopLanImportBridge.shutdown()
         if (this::webView.isInitialized) webView.destroy()
         super.onDestroy()
