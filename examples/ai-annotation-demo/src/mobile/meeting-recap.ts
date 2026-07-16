@@ -804,6 +804,16 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   void loadRecapMarksAfterInitialRender(seq, bodyEl, m);
   void (async () => {
     let resolved = m;
+    const applyCached = (cached: LoadedTranscript | null): void => {
+      if (!cached || !recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+      recapState.cues = cached.cues;
+      recapState.transcriptLoad = { status: 'ready', cached: true, message: '当前显示本机缓存，正在后台刷新。' };
+      rebuildRecapTimeline(recapState);
+      refreshRecapOverviewBlocks(bodyEl, ['#rc-over-hero', '#rc-over-focus', '#rc-transcript-block']);
+    };
+    // 本地缓存先行：缓存 key（minute_token/meeting_id）就在本地会议记录上，不该排在网络 resolve 之后——
+    // 慢网时那一等就是「原始发言卡按不动」的等待窗口。
+    applyCached(await recapDeadline(loadCachedTranscript(m), RECAP_LOCAL_TIMEOUT_MS, '读取转写缓存').catch(() => null));
     if (meetingTranscriptSource(resolved) !== 'google_meet_transcript') {
       resolved = await recapDeadline(resolveRealMeetingId(resolved), RECAP_REMOTE_BLOCK_TIMEOUT_MS, '解析飞书场次').catch(() => resolved);
     }
@@ -815,12 +825,9 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
       refreshRecapOverviewBlocks(bodyEl, ['#rc-transcript-block', '#rc-feishu-block']);
       return;
     }
-    const cached = await recapDeadline(loadCachedTranscript(resolved), RECAP_LOCAL_TIMEOUT_MS, '读取转写缓存').catch(() => null);
-    if (cached && recapAlive(seq, bodyEl) && recapState) {
-      recapState.cues = cached.cues;
-      recapState.transcriptLoad = { status: 'ready', cached: true, message: '当前显示本机缓存，正在后台刷新。' };
-      rebuildRecapTimeline(recapState);
-      refreshRecapOverviewBlocks(bodyEl, ['#rc-over-hero', '#rc-over-focus', '#rc-transcript-block']);
+    // resolve 补出新 id 才可能命中的缓存：早读没中时再试一次
+    if (!recapState.cues.length) {
+      applyCached(await recapDeadline(loadCachedTranscript(resolved), RECAP_LOCAL_TIMEOUT_MS, '读取转写缓存').catch(() => null));
     }
     if (resolved.feishu_meeting_id) void loadPanelSummary(seq, bodyEl, resolved);
     void refreshTranscriptAfterInitialRender(seq, bodyEl, meetingId);
@@ -1131,7 +1138,12 @@ function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
   const google = meetingTranscriptSource(recapState.meeting) === 'google_meet_transcript';
   const sourceLabel = google ? 'Google Meet 逐句转写' : '飞书逐句转写';
   if (!cues.length) {
-    bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>原始发言</b><span class="mdl">${sourceLabel}</span></div><div class="empty">原始发言还没有同步到本机；稍后重新进入本页会自动重试。</div></div>`;
+    // 加载中允许进入（卡片不再封死）：这里给拉取中提示，拉完 refreshTranscriptAfterInitialRender 会重渲本页
+    const load = recapState.transcriptLoad;
+    const hint = load.status === 'loading'
+      ? (load.message || '正在拉取原始发言…')
+      : '原始发言还没有同步到本机；稍后重新进入本页会自动重试。';
+    bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>原始发言</b><span class="mdl">${sourceLabel}</span></div><div class="empty">${esc(hint)}</div></div>`;
     return;
   }
   const total = Math.max(1, Math.ceil(cues.length / TX_PAGE));
@@ -1648,56 +1660,63 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     + `</section>`
     + `<section class="rc-over-focus" id="rc-over-focus"><div class="rc-sec-title"><b>会议要点</b><span>${esc(panelSummaryLabel())}</span></div><div class="rc-over-list">${conclusionHtml}</div></section>`
     + `<section class="rc-entry-grid">`
-    + overviewCardHtml({ action: 'transcript', title: '原始发言', meta: rawMeta, body: rawBody, disabled: !cues.length && !transcriptActions, actions: transcriptActions })
+    + overviewCardHtml({ action: 'transcript', title: '原始发言', meta: rawMeta, body: rawBody, disabled: !cues.length && !transcriptActions && transcript.status !== 'loading', actions: transcriptActions })
     + (google
       ? overviewCardHtml({ action: 'feishu', title: '智能纪要', meta: note.status === 'loading' ? '拉取中' : smartNoteCard.meta, body: note.message, disabled: note.status !== 'ready' && !noteActions, actions: noteActions })
-      : overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : note.status === 'loading' ? '拉取中' : '无纪要', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : note.message, disabled: !feishuReady && !noteActions, actions: noteActions }))
+      : overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : note.status === 'loading' ? '拉取中' : '无纪要', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : note.message, disabled: !feishuReady && !noteActions && note.status !== 'loading', actions: noteActions }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: marks.status === 'loading' ? '读取中' : inkCount ? `${inkCount} 处${markSource}` : '0 处', body: marks.status === 'ready' || marks.status === 'missing' ? inkBody : marks.message, disabled: inkPages.length === 0 && !marksActions, actions: marksActions })
     + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: recapState.panelSummary ? '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。' : recapState.panelSummaryStatus === 'auth_required' ? '需要重新登录飞书后才能读取 InkLoop 总结。' : recapState.panelSummaryStatus === 'failed' ? '拉取 InkLoop 总结失败；进入后可重试。' : recapState.panelSummaryStatus === 'transcript_not_ready' ? '纪要和原文转录还没就绪，就绪后会自动生成。' : recapState.panelSummaryStatus === 'loading' ? '正在拉取 InkLoop 总结。' : '暂无 InkLoop 总结。' })
     + `</section>`
     + `</div>`;
-  bodyEl.querySelectorAll<HTMLElement>('[data-rc-open]').forEach((el) => el.addEventListener('click', () => {
-    if (!recapState || el.hasAttribute('disabled')) return;
-    const action = el.dataset.rcOpen;
-    if (action === 'handwriting') {
-      if (!meetingNotePages(recapState).length) return;
-      recapState.view = 'detail'; recapState.detailIdx = 0; recapState.dtPage = 0;
-    } else if (action === 'transcript' || action === 'feishu' || action === 'panel' || action === 'summary') {
-      recapState.view = action;
-    } else return;
-    renderRecap(bodyEl);
-    bodyEl.scrollTop = 0;
-    updateRecapNav();
-  }));
-  wireRecapBlockCommands(bodyEl);
+  // 事件委托：一个 listener 挂在 .rc-overview 根上（局部块替换只换子块、不换根）。
+  // 原来 per-卡片接线，加载期各异步完成不断 replaceWith 卡片节点：电纸屏上按下慢、
+  // 恰好按在被替换节点上的点按会整个丢失（down 在旧节点、up 在新节点，click 派发不到卡片）——
+  // 这就是「点卡片没反应」的来源之一。委托到不被替换的根上后点按稳定命中。
+  const root = bodyEl.querySelector<HTMLElement>('.rc-overview');
+  root?.addEventListener('click', (ev) => {
+    const target = ev.target instanceof Element ? ev.target : null;
+    const opener = target?.closest<HTMLElement>('[data-rc-open]');
+    if (opener) { handleRecapCardOpen(opener, bodyEl); return; }
+    const commandEl = target?.closest<HTMLElement>('[data-rc-command]');
+    if (commandEl?.dataset.rcCommand) handleRecapBlockCommand(commandEl.dataset.rcCommand, bodyEl);
+  });
 }
 
-function wireRecapBlockCommands(bodyEl: HTMLElement): void {
-  bodyEl.querySelectorAll<HTMLElement>('[data-rc-command]').forEach((button) => {
-    button.addEventListener('click', () => {
-      if (!recapState) return;
-      const command = button.dataset.rcCommand;
-      if (command === 'feishu-login') {
-        void promptFeishuRelogin('当前飞书身份不可用。');
-      } else if (command === 'retry-transcript') {
-        recapState.transcriptLoad = { status: 'loading', message: '正在重新拉取转写…' };
-        recapState.noteLoad = { status: 'loading', message: '正在重新拉取官方纪要…' };
-        refreshRecapOverviewBlocks(bodyEl, ['#rc-transcript-block', '#rc-feishu-block']);
-        void refreshTranscriptAfterInitialRender(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
-      } else if (command === 'retry-marks') {
-        recapState.marksLoad = { status: 'loading', message: '正在重新读取本机手写档案…' };
-        refreshRecapOverviewBlocks(bodyEl, ['#rc-handwriting-block']);
-        void loadRecapMarksAfterInitialRender(recapLoadSeq, bodyEl, recapState.meeting);
-      } else if (command === 'associate') {
-        const meeting = recapState.meeting;
-        void (async () => {
-          if (await associate(meeting) && recapAlive(recapLoadSeq, bodyEl)) {
-            void loadRecapView(meeting.meeting_id, bodyEl, document.getElementById('recap-title') as HTMLElement);
-          }
-        })();
+function handleRecapCardOpen(el: HTMLElement, bodyEl: HTMLElement): void {
+  if (!recapState || el.hasAttribute('disabled')) return;
+  const action = el.dataset.rcOpen;
+  if (action === 'handwriting') {
+    if (!meetingNotePages(recapState).length) return;
+    recapState.view = 'detail'; recapState.detailIdx = 0; recapState.dtPage = 0;
+  } else if (action === 'transcript' || action === 'feishu' || action === 'panel' || action === 'summary') {
+    recapState.view = action;
+  } else return;
+  renderRecap(bodyEl);
+  bodyEl.scrollTop = 0;
+  updateRecapNav();
+}
+
+function handleRecapBlockCommand(command: string, bodyEl: HTMLElement): void {
+  if (!recapState) return;
+  if (command === 'feishu-login') {
+    void promptFeishuRelogin('当前飞书身份不可用。');
+  } else if (command === 'retry-transcript') {
+    recapState.transcriptLoad = { status: 'loading', message: '正在重新拉取转写…' };
+    recapState.noteLoad = { status: 'loading', message: '正在重新拉取官方纪要…' };
+    refreshRecapOverviewBlocks(bodyEl, ['#rc-transcript-block', '#rc-feishu-block']);
+    void refreshTranscriptAfterInitialRender(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
+  } else if (command === 'retry-marks') {
+    recapState.marksLoad = { status: 'loading', message: '正在重新读取本机手写档案…' };
+    refreshRecapOverviewBlocks(bodyEl, ['#rc-handwriting-block']);
+    void loadRecapMarksAfterInitialRender(recapLoadSeq, bodyEl, recapState.meeting);
+  } else if (command === 'associate') {
+    const meeting = recapState.meeting;
+    void (async () => {
+      if (await associate(meeting) && recapAlive(recapLoadSeq, bodyEl)) {
+        void loadRecapView(meeting.meeting_id, bodyEl, document.getElementById('recap-title') as HTMLElement);
       }
-    });
-  });
+    })();
+  }
 }
 
 function refreshRecapOverviewBlocks(bodyEl: HTMLElement, selectors: string[]): void {
@@ -1707,7 +1726,8 @@ function refreshRecapOverviewBlocks(bodyEl: HTMLElement, selectors: string[]): v
   for (const selector of selectors) {
     const current = bodyEl.querySelector(selector);
     const replacement = draft.querySelector(selector);
-    if (current && replacement) current.replaceWith(replacement);
+    // 内容没变就不动 DOM：少一次节点替换=少一次丢点按窗口+少一次电纸屏闪刷
+    if (current && replacement && current.outerHTML !== replacement.outerHTML) current.replaceWith(replacement);
   }
 }
 
