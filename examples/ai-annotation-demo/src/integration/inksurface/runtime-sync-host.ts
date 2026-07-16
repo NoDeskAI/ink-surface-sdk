@@ -610,6 +610,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   const deviceId = options.deviceId || getSession()?.deviceId || stableDeviceId();
   const store = options.runtimeStore || new IndexedDbOfflineRuntimeStore({ dbName: 'inkloop-runtime-store' });
   const maxAttempts = Math.max(1, options.maxAttempts ?? 25);
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_000);
   const createRunner = (): RuntimeSyncRunner => {
     const transport = new HttpRuntimeSyncTransport({
       endpoint: options.pushEndpoint || runtimeSyncUrl('/v1/runtime/events:push'),
@@ -623,7 +624,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       inbox: new RuntimeStoreInbox(store, { deviceId, advanceCursorOnRecoverableConflicts: true }),
       batchSize: Math.max(1, options.batchSize ?? 25),
       maxAttempts,
-      retryDelayMs: Math.max(0, options.retryDelayMs ?? 2_000),
+      retryDelayMs,
       pullLimit: 100,
     });
   };
@@ -779,7 +780,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     if (disposed || syncHeld) return Promise.resolve();
     if (drainInFlight) return drainInFlight;
     const run = enqueue(async () => {
-      if (disposed) return;
+      if (disposed || syncHeld) return;
       const before = await outboxCounts();
       if (before.retryable === 0 && reason !== 'boot-outbox-drain') return;
       if (before.retryable > 0) {
@@ -790,6 +791,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
           dead_letter_count: before.dead,
         });
       }
+      if (disposed || syncHeld) return;
       const result = await createRunner().runOnce();
       await publishOutboxStatus(await outboxCounts(), reason, result);
       log('runtime-sync:outbox-drain', { reason, result });
@@ -812,8 +814,9 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   }
 
   function retryDeadLettersOnce(reason = 'manual-dead-letter-retry'): Promise<void> {
+    if (disposed || syncHeld) return Promise.resolve();
     return enqueue(async () => {
-      if (disposed) return;
+      if (disposed || syncHeld) return;
       const events = await store.listOutboxEvents();
       const rearmedEvents = rearmDeadLettersOnce(events, maxAttempts, nowIso());
       const updates = rearmedEvents.filter((event, index) => event !== events[index]);
@@ -830,6 +833,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
           dead_letter_count: before.dead,
         });
       }
+      if (disposed || syncHeld) return;
       const result = await createRunner().runOnce();
       await publishOutboxStatus(await outboxCounts(), reason, result);
       log('runtime-sync:dead-letters-rearmed', { reason, rearmed: updates.length, result });
@@ -896,6 +900,12 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       buildSnapshot: snapshotForSync,
       now: () => generatedAt,
     });
+    if (disposed) return;
+    if (syncHeld) {
+      pendingDocs.add(documentId);
+      pendingReasons.set(documentId, reason);
+      return;
+    }
     const alignment = shouldAlignVisibleMarks(reason)
       ? await requeueVisibleRuntimeMarksForCloudAlignment({
           docId: runtimeDocumentId,
@@ -908,6 +918,12 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
           now: () => generatedAt,
         })
       : undefined;
+    if (disposed) return;
+    if (syncHeld) {
+      pendingDocs.add(documentId);
+      pendingReasons.set(documentId, reason);
+      return;
+    }
     const sync = await createRunner().syncOnce();
     if (sync.pull) await applyPulledRemoteDocs(sync.pull, reason);
     const counts = await outboxCounts();
@@ -931,7 +947,8 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       log('runtime-sync:local-visible-aligned', { reason, alignment });
     }
     log('runtime-sync:document', { reason, bridge: result, alignment, sync });
-    clearDirtyDoc(documentId); // 走到这=本轮桥接+推送完成（失败会 throw 走不到），脏集保险可撤
+    // 同步期间同一文档可能又落了新账；只有没有下一轮 pending 时才能撤掉崩溃保险。
+    if (!pendingDocs.has(documentId)) clearDirtyDoc(documentId);
   }
 
   async function syncDocument(documentId: string, reason = 'mark-ledger'): Promise<void> {
@@ -944,11 +961,19 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     const docs = [...pendingDocs];
     pendingDocs.clear();
     for (const docId of docs) {
+      const docReason = pendingReasons.get(docId) || reason;
+      pendingReasons.delete(docId);
       try {
-        const docReason = pendingReasons.get(docId) || reason;
-        pendingReasons.delete(docId);
         await syncDocument(docId, docReason);
       } catch (error) {
+        pendingDocs.add(docId);
+        pendingReasons.set(docId, docReason);
+        if (!disposed && !syncHeld && timer === null) {
+          timer = window.setTimeout(() => {
+            timer = null;
+            void flush('sync-retry');
+          }, retryDelayMs);
+        }
         const message = errorMessage(error);
         const counts = await outboxCounts();
         publishStatus({
@@ -990,6 +1015,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
         dead_letter_count: counts.dead,
       });
     }
+    if (disposed || syncHeld) return;
     try {
       const result = await createRunner().pullOnce();
       await applyPulledRemoteDocs(result, reason);
@@ -1087,20 +1113,24 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   });
   // 落笔期间跳过周期性同步（500ms pull / 3s reconcile 在书写中造成规律性掉帧·电纸屏 WebView 尤显，
   // codex cx_webview_feel P0）。capture 阶段被动观察 pointer 事件、不侵入 ink.ts；只错峰、不改同步语义——
-  // 抬笔/取消/切后台即恢复，最坏卡死一个 penActive 也会被下一次 pointerup 清掉。
-  // 按 pointerId 记账：手指 pointerup 不会误清还压着的笔；pen-up 丢失（驱动抖动）由 hidden/blur/cancel 兜底清空
+  // 抬笔/取消/切后台即恢复。按 pointerId 记账：手指 pointerup 不会误清还压着的笔；
+  // pen-up 丢失（驱动抖动）由 buttons=0 move / lost capture / hidden / blur 兜底清空。
   const activePenPointers = new Set<number>();
   const penStrokeActiveNow = (): boolean => activePenPointers.size > 0;
   const onHostPenDown = (e: PointerEvent): void => { if (e.pointerType === 'pen') activePenPointers.add(e.pointerId); };
   const onHostPenUp = (e: PointerEvent): void => { activePenPointers.delete(e.pointerId); };
+  const onHostPenMove = (e: PointerEvent): void => { if (e.pointerType === 'pen' && e.buttons === 0) activePenPointers.delete(e.pointerId); };
   const onHostPenReset = (): void => { activePenPointers.clear(); };
+  const onHostPenVisibilityChange = (): void => { if (document.visibilityState === 'hidden') onHostPenReset(); };
   if (typeof window !== 'undefined') {
     window.addEventListener('pointerdown', onHostPenDown, { capture: true, passive: true });
     window.addEventListener('pointerup', onHostPenUp, { capture: true, passive: true });
     window.addEventListener('pointercancel', onHostPenUp, { capture: true, passive: true });
+    window.addEventListener('pointermove', onHostPenMove, { capture: true, passive: true });
+    window.addEventListener('lostpointercapture', onHostPenUp, { capture: true, passive: true });
     window.addEventListener('blur', onHostPenReset);
     if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') onHostPenReset(); });
+      document.addEventListener('visibilitychange', onHostPenVisibilityChange);
     }
   }
   if (pollMs > 0 && typeof window !== 'undefined') {
@@ -1176,14 +1206,18 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       if (reconcileTimer !== null) window.clearInterval(reconcileTimer);
       if (outboxDrainTimer !== null) window.clearInterval(outboxDrainTimer);
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onHostPenVisibilityChange);
       if (typeof document !== 'undefined') document.removeEventListener(RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, onDeadLetterRetry);
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', onOnline);
         window.removeEventListener('pointerdown', onHostPenDown, { capture: true } as EventListenerOptions);
         window.removeEventListener('pointerup', onHostPenUp, { capture: true } as EventListenerOptions);
         window.removeEventListener('pointercancel', onHostPenUp, { capture: true } as EventListenerOptions);
+        window.removeEventListener('pointermove', onHostPenMove, { capture: true } as EventListenerOptions);
+        window.removeEventListener('lostpointercapture', onHostPenUp, { capture: true } as EventListenerOptions);
         window.removeEventListener('blur', onHostPenReset);
       }
+      activePenPointers.clear();
     },
   };
 }

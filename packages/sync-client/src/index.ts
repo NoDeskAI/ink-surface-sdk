@@ -464,7 +464,10 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`Runtime sync failed: HTTP ${response.status}`);
-      const payload = await response.json().catch(() => ({})) as { acks?: unknown };
+      const payload = await response.json().catch((error: unknown) => {
+        if (controller.signal.aborted) throw controller.signal.reason ?? error;
+        return {};
+      }) as { acks?: unknown };
       if (!Array.isArray(payload.acks)) throw new Error('Runtime sync response must include an acks array.');
       if (!payload.acks.every(isRuntimeSyncAck)) throw new Error('Runtime sync response contains malformed acks.');
       return payload.acks;
@@ -491,7 +494,10 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`Runtime sync pull failed: HTTP ${response.status}`);
-      const payload = await response.json().catch(() => ({}));
+      const payload = await response.json().catch((error: unknown) => {
+        if (controller.signal.aborted) throw controller.signal.reason ?? error;
+        return {};
+      });
       assertRuntimeSyncPullResponse(payload);
       return payload;
     } finally {

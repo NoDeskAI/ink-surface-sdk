@@ -2494,6 +2494,19 @@ const cloudDeviceHandler = createCloudDeviceHandler({
   requireSession: process.env.INKLOOP_DEVICE_REQUIRE_SESSION === '1',
 });
 
+function isAuthorizedInternalLoopbackRequest(req: IncomingMessage): boolean {
+  // 内部端点必须同时满足直连 loopback 和共享密钥；forwarded 头说明请求经过代理，一律按外部处理。
+  const forwarded = req.headers.forwarded || req.headers['x-forwarded-for'];
+  const remote = String(req.socket.remoteAddress || '');
+  const isLoopback = !forwarded
+    && (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1');
+  const actual = Buffer.from(String(req.headers['x-inkloop-secret'] || ''));
+  const expected = Buffer.from(INKLOOP_SHARED_SECRET);
+  return isLoopback && expected.length > 0
+    && actual.length === expected.length
+    && timingSafeEqual(actual, expected);
+}
+
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = (req.url || '/').split('?')[0];
   setCors(req, res);
@@ -2525,15 +2538,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (url === '/api/internal/lark-user-token') {
     if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
     res.setHeader('cache-control', 'no-store');
-    // 带 forwarded 头=经过了反向代理，即便 socket 是 loopback 也视为外部请求
-    const forwarded = req.headers.forwarded || req.headers['x-forwarded-for'];
-    const remote = String(req.socket.remoteAddress || '');
-    const isLoopback = !forwarded && (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1');
-    const actual = Buffer.from(String(req.headers['x-inkloop-secret'] || ''));
-    const expected = Buffer.from(INKLOOP_SHARED_SECRET);
-    const authed = isLoopback && expected.length > 0
-      && actual.length === expected.length && timingSafeEqual(actual, expected);
-    if (!authed) { sendJson(res, 403, { ok: false, reason: 'forbidden' }); return; }
+    if (!isAuthorizedInternalLoopbackRequest(req)) { sendJson(res, 403, { ok: false, reason: 'forbidden' }); return; }
     // hub 的 lark auth state 按 `.inkloop/lark-auth/<tenant>/feishu_<open_id>/<device>.json` 分桶（见 sessionScopedLarkAuthPath）。
     // 带 open_id：取该用户最近登录设备的 state 走 resolveUserOAuthToken（自带懒刷新）；不带：枚举可用 open_id（不发 token）。
     const larkAuthRoot = resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID);
@@ -2556,6 +2561,67 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
     sendJson(res, 200, { ok: true, access_token: oauth.token, open_ids: oauth.userOpenIds.length ? oauth.userOpenIds : [openIdParam], scopes: oauth.scopes });
+    return;
+  }
+  if (url === '/api/internal/lark-note-transcript') {
+    if (req.method !== 'GET') { res.statusCode = 405; res.end('GET only'); return; }
+    res.setHeader('cache-control', 'no-store');
+    if (!isAuthorizedInternalLoopbackRequest(req)) {
+      sendJson(res, 403, { ok: false, reason: 'forbidden' });
+      return;
+    }
+
+    const query = new URL(req.url || '/', 'http://inkloop.local').searchParams;
+    const meetingId = query.get('meeting_id')?.trim() || '';
+    const openId = query.get('open_id')?.trim() || '';
+    if (!meetingId || !openId || meetingId.length > 256 || openId.length > 256) {
+      sendJson(res, 400, { ok: false, reason: 'meeting_id_and_open_id_required' });
+      return;
+    }
+
+    const statePath = latestLarkAuthStatePath(openId);
+    if (!statePath) {
+      sendJson(res, 404, {
+        ok: false,
+        status: 'oauth_unavailable',
+        meeting_id: meetingId,
+        reason: 'oauth_not_logged_in',
+      });
+      return;
+    }
+
+    try {
+      // 这里没有 device/session，只能从已解析的用户 statePath 叠加本机飞书应用配置。
+      const env = feishuBotRuntimeEnv({
+        ...process.env,
+        LARK_MEETING_AUTH_STATE_PATH: statePath,
+      });
+      const result = await fetchLarkMeetingNoteTranscript(meetingId, { env });
+      const transcript = result.transcript?.segments
+        .map((segment) => `${segment.speaker}：${segment.text.replace(/\s*\n+\s*/g, ' ').trim()}`)
+        .filter(Boolean)
+        .join('\n') || '';
+      // panel summarizer 只需逐行正文；禁止在内部 JSON 重复携带 raw/segments/srt/summary/artifacts。
+      sendJson(res, 200, {
+        ok: true,
+        status: result.status,
+        meeting_id: meetingId,
+        topic: result.meeting?.topic || '',
+        transcript_source: result.transcript?.source || null,
+        transcript_ref: result.transcript?.document_id || null,
+        transcript,
+        content_length: transcript.length,
+        errors: result.errors.map(({ source, code, message }) => ({ source, code, message })),
+      });
+    } catch (error) {
+      sendJson(res, 502, {
+        ok: false,
+        status: 'failed',
+        meeting_id: meetingId,
+        reason: 'note_transcript_failed',
+        error: String((error as Error)?.message || error),
+      });
+    }
     return;
   }
   if (url.startsWith('/v1/runtime/')) {

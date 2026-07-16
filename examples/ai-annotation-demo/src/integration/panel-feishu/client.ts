@@ -260,7 +260,7 @@ export async function bindPanelMinute(meetingId: string, minuteToken: string, op
   }
 }
 
-/** L5 总结取数状态：ready=已生成 · not_generated=未生成(可触发) · missing_minute=没关联妙记 · transcript_not_ready=妙记转写还在生成(可重试) · not_found=panel 无此会议 · failed=出错。 */
+/** L5 总结取数状态。missing_minute 仅保留一个版本兼容旧 panel，设备收到后归一为 not_generated。 */
 export type PanelMeetingSummaryStatus = 'ready' | 'not_generated' | 'missing_minute' | 'transcript_not_ready' | 'not_found' | 'failed';
 
 /** GET 已生成的 panel 五要素总结（不触发生成·未生成时 summary=null·status 指示原因）。 */
@@ -272,8 +272,7 @@ export async function getPanelMeetingSummary(meetingId: string, opts?: { signal?
 }
 
 /** POST 触发 panel 现总结并落库（用户点「生成总结」时·panel 侧 in-flight 去重·M3 一次几秒~十几秒）。
- *  ⚠️panel 缺妙记时用 409 携带 {status:'missing_minute',...}（不是真失败），必须 acceptStatuses:[409] 让 postJson
- *  正常解析这份 body——不传的话 body 整个被丢弃、UI 里写好的"还没有妙记"友好提示永远走不到（codex 扫描出的真 bug）。 */
+ *  409 用于转写仍在生成等可重试状态；旧 panel 也可能返回 legacy missing_minute，必须保留 body 供设备归一。 */
 export async function generatePanelMeetingSummary(meetingId: string, opts?: { signal?: AbortSignal }): Promise<{ status: PanelMeetingSummaryStatus; summary: PanelMeetingSummaryRecord | null }> {
   return postJson<{ status: PanelMeetingSummaryStatus; summary: PanelMeetingSummaryRecord | null }>(
     `${BASE}/meetings/${encodeURIComponent(meetingId)}/summary`,

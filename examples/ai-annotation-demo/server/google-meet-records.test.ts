@@ -434,6 +434,119 @@ describe('google meet records', () => {
     expect(fetchImpl.mock.calls.length).toBe(callsAfterBackfill);
   });
 
+  it('keeps a smart note from the first pending round when the second smartNotes request fails', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    let round = 1;
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) {
+        return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'STARTED' }] });
+      }
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) {
+        if (round === 2) return jsonResponse({ error: { message: 'temporary smartNotes outage' } }, 500);
+        return jsonResponse({ smartNotes: [{
+          name: `${record.name}/smartNotes/note1`,
+          docsDestination: { document: 'gemini-doc-pending' },
+        }] });
+      }
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ recordings: [] });
+      if (url.pathname === '/drive/v3/files/gemini-doc-pending/export') return new Response('第一轮已拿到的智能纪要');
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const input = { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime };
+    const options = {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleepImpl: async () => {},
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    };
+
+    const first = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options,
+      nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+    });
+    expect(first).toMatchObject({ status: 'pending', smart_note: { text: '第一轮已拿到的智能纪要' } });
+
+    round = 2;
+    const second = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options,
+      nowMs: Date.parse('2026-07-15T14:27:10.000Z'),
+    });
+    expect(second).toMatchObject({ status: 'pending', smart_note: { text: '第一轮已拿到的智能纪要' } });
+    const job = Object.values(JSON.parse(readFileSync(path, 'utf8')).meetings)[0] as Record<string, unknown>;
+    expect(job.smart_note).toMatchObject({ text: '第一轮已拿到的智能纪要' });
+    expect(job.artifacts_retry_pending).toBe(true);
+  });
+
+  it('keeps backfilling a STARTED recording until FILE_GENERATED provides an export URI', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    let recordingReady = false;
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) {
+        return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      }
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) {
+        return jsonResponse({ smartNotes: [{
+          name: `${record.name}/smartNotes/note1`,
+          docsDestination: { document: 'gemini-doc-recording' },
+        }] });
+      }
+      if (url.pathname.endsWith('/recordings')) {
+        return jsonResponse({ recordings: [{
+          name: `${record.name}/recordings/recording1`,
+          state: recordingReady ? 'FILE_GENERATED' : 'STARTED',
+          ...(recordingReady ? { driveDestination: { exportUri: 'https://drive.google.com/file/d/recording1/view' } } : {}),
+        }] });
+      }
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      if (url.pathname === '/drive/v3/files/gemini-doc-recording/export') return new Response('智能纪要已完成');
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const input = { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime };
+    const options = {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    };
+
+    const first = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options,
+      nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+    });
+    expect(first.status).toBe('ready');
+    let job = Object.values(JSON.parse(readFileSync(path, 'utf8')).meetings)[0] as Record<string, unknown>;
+    expect(job.recordings).toEqual([expect.objectContaining({ state: 'STARTED' })]);
+    expect(job.artifacts_retry_pending).toBe(true);
+    const callsAfterFirst = fetchImpl.mock.calls.length;
+
+    recordingReady = true;
+    const backfilled = await fetchGoogleMeetingTranscript('token', { path }, input, {
+      ...options,
+      nowMs: Date.parse('2026-07-15T14:28:50.000Z'),
+    });
+    expect(backfilled.recordings).toEqual([{
+      state: 'FILE_GENERATED',
+      export_uri: 'https://drive.google.com/file/d/recording1/view',
+    }]);
+    const backfillPaths = fetchImpl.mock.calls.slice(callsAfterFirst).map(([urlValue]) => new URL(String(urlValue)).pathname);
+    expect(backfillPaths.some((pathname) => pathname === '/v2/conferenceRecords' || pathname.endsWith('/transcripts'))).toBe(false);
+    job = Object.values(JSON.parse(readFileSync(path, 'utf8')).meetings)[0] as Record<string, unknown>;
+    expect(job).not.toHaveProperty('artifacts_retry_pending');
+  });
+
   it('hub-side sweep backfills eligible jobs without a device request', async () => {
     const path = statePath();
     const record = {

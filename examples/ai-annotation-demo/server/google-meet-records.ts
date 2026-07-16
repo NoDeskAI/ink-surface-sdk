@@ -442,6 +442,10 @@ async function fetchChosenArtifacts(
   const normalizedRecordings = recordings
     .map(normalizeGoogleMeetRecording)
     .filter((recording): recording is GoogleMeetRecordingArtifact => !!recording);
+  // list 成功不等于产物就绪：STARTED 或尚无导出地址都要在窗口内继续回补。
+  if (normalizedRecordings.some((recording) => recording.state !== 'FILE_GENERATED' || !recording.export_uri)) {
+    anyFailed = true;
+  }
   let scopeMissing = false;
   if (smartNote?.document) {
     if (!grantedScopes.includes(GOOGLE_DRIVE_READONLY_SCOPE)) {
@@ -792,6 +796,9 @@ async function runCatchUp(
     meeting_code: meetingCode,
     scheduled_at: scheduledAt,
     records,
+    // 全量 pending 轮也必须继承上一轮已拿到的可选产物；本轮新值在下方成功取回后覆盖。
+    ...(current?.smart_note ? { smart_note: current.smart_note } : {}),
+    ...(current?.recordings ? { recordings: current.recordings } : {}),
     ...(chosenRecord ? { chosen_record_name: chosenRecord.name } : {}),
     ...(transcript?.name ? { transcript_name: transcript.name } : {}),
     ...(transcript?.state ? { transcript_state: transcript.state } : {}),
@@ -814,6 +821,7 @@ async function runCatchUp(
       Object.assign(updated, artifacts);
       updated.artifacts_fetched_at = new Date(nowMs).toISOString();
       if (failed) updated.artifacts_retry_pending = true;
+      else delete updated.artifacts_retry_pending;
     } catch (e) {
       // 可选产物失败不连累转写主链（review P1-3）；标 retry_pending，窗口内自动重试
       console.warn('[google-meet-records] artifacts fetch failed, transcript flow continues:', String((e as Error)?.message || e));

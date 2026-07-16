@@ -285,8 +285,10 @@ export interface PanelMeetingSummaryFive {
   next_steps: string[];
 }
 export interface PanelMeetingSummaryRecord {
-  minute_token: string;
+  minute_token?: string | null;
   meeting_id?: string;
+  transcript_source?: 'feishu_minutes' | 'feishu_note_docx';
+  transcript_ref?: string;
   topic?: string;
   generated_at: number;        // epoch ms
   model?: string;

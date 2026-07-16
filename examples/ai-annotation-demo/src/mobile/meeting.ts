@@ -1945,13 +1945,17 @@ export function initMobileMeeting(opts: { readerCtx: SurfaceContext }): void {
 
   // 基岩 lease 配套：用户会议中手动设过基岩 → 标记 override（退出别误关）；切后台/关页 flush 并按 lease 处理。
   bus.on('bedrock:user-set', () => { if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) bedrockUserOverride = true; }); // 仅飞书已判 live 的会议里用户手动设过才接管（会前/已结束不接管·M1）
+  // TODO(WAL)：pointerup 先持久化 raw pending region，并让 flushRegion/flushContentPen 返回写入 Promise；
+  // 当前只做同步收口，pagehide 的异步 resolveRegion 仍无法覆盖进程被立即强杀的窗口。
   window.addEventListener('pagehide', () => { flushRegion('manual'); stopMeetingBedrock(); });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
       flushRegion('manual'); // 在途区域先收口落账本（quiet 定时器切后台会被节流，强杀前这是最后机会）
       stopMeetingBedrock();  // 内含解除画板挂起+落库基岩缓冲
-    } else if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) {
-      startMeetingBedrock(); // 切回前台且在飞书已判 live 的会议 → 续租（会前不录·M1）
+    } else {
+      if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) {
+        startMeetingBedrock(); // 切回前台且在飞书已判 live 的会议 → 续租（会前不录·M1）
+      }
       if (document.body.classList.contains('mtg-note-open')) { // 用户还站在画板上 → 重新挂起（hidden 时解除过）
         setBedrockDeferred(true);
         setRuntimeSyncHeld(true);

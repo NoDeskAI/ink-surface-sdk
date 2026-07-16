@@ -212,7 +212,7 @@ interface RecapV2 {
   transcriptMissing: boolean;   // 转写为空/未就绪但仍展示手写档案（提示用·防误以为没内容）
   feishuSummary: FeishuNoteSummaryRecord | null; // 飞书官方智能纪要，和转写/InkLoop 总结分开展示。
   panelSummary: PanelMeetingSummaryRecord | null; // L5：panel 五要素总结（独立整页·和时间脊互补）
-  panelSummaryStatus: string;   // loading / ready / not_generated / missing_minute / generating / failed
+  panelSummaryStatus: string;   // loading / ready / not_generated / generating / failed（missing_minute 仅兼容旧缓存）
   timeline: EpaperMeetingTimeline;
   marksById: Map<string, PersistedMark>; // 详情页需要完整 strokes；时间线只保留轻量 SegmentMark。
   markSourceMeeting: PersistedMeeting | null; // 手写可能来自同系列会议的本地手记，用于恢复未重新关联的笔迹。
@@ -785,7 +785,9 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   recapState = { meeting: m, segments: timeline.segments, cues: [], view: 'overview', detailIdx: 0, ovPage: 0, dtPage: 0, txPage: 0, bodyEl, transcriptMissing: true,
     feishuSummary: m.feishu_note_summary ?? null,
     panelSummary: m.panel_summary ?? null,
-    panelSummaryStatus: m.panel_summary ? 'ready' : (m.panel_summary_status ?? (m.feishu_meeting_id ? 'loading' : 'missing_minute')),
+    panelSummaryStatus: m.panel_summary ? 'ready' : (m.panel_summary_status === 'missing_minute'
+      ? 'not_generated'
+      : m.panel_summary_status ?? (m.feishu_meeting_id ? 'loading' : 'not_generated')),
     timeline,
     marksById: new Map(),
     markSourceMeeting: null,
@@ -1220,8 +1222,13 @@ function wireRecapExportButton(): void {
 }
 
 type StoredPanelSummaryStatus = NonNullable<PersistedMeeting['panel_summary_status']>;
+function normalizePanelSummaryStatus(status: PanelMeetingSummaryStatus): PanelMeetingSummaryStatus {
+  return status === 'missing_minute' ? 'not_generated' : status;
+}
+
 function toStoredPanelSummaryStatus(status: PanelMeetingSummaryStatus): StoredPanelSummaryStatus {
-  if (status === 'ready' || status === 'not_generated' || status === 'missing_minute' || status === 'transcript_not_ready' || status === 'not_found') return status;
+  const normalized = normalizePanelSummaryStatus(status);
+  if (normalized === 'ready' || normalized === 'not_generated' || normalized === 'transcript_not_ready' || normalized === 'not_found') return normalized;
   return 'failed'; // 'failed' 外的取数态都落库，下次进 recap 直接显示而非永远 loading。
 }
 
@@ -1231,14 +1238,15 @@ function toStoredPanelSummaryStatus(status: PanelMeetingSummaryStatus): StoredPa
  */
 export async function refreshPanelSummaryCache(m: PersistedMeeting): Promise<{ status: PanelMeetingSummaryStatus; summary: PanelMeetingSummaryRecord | null }> {
   if (!m.feishu_meeting_id) {
-    await updateMeeting(m.meeting_id, { panel_summary_status: 'missing_minute' });
-    return { status: 'missing_minute', summary: null };
+    await updateMeeting(m.meeting_id, { panel_summary_status: 'not_generated' });
+    return { status: 'not_generated', summary: null };
   }
   const r = await getPanelMeetingSummary(m.feishu_meeting_id);
+  const normalized = { ...r, status: normalizePanelSummaryStatus(r.status) };
   const fetchedAt = new Date().toISOString();
-  if (r.summary) await updateMeeting(m.meeting_id, { panel_summary: r.summary, panel_summary_fetched_at: fetchedAt, panel_summary_status: 'ready' });
-  else await updateMeeting(m.meeting_id, { panel_summary_fetched_at: fetchedAt, panel_summary_status: toStoredPanelSummaryStatus(r.status) });
-  return r;
+  if (normalized.summary) await updateMeeting(m.meeting_id, { panel_summary: normalized.summary, panel_summary_fetched_at: fetchedAt, panel_summary_status: 'ready' });
+  else await updateMeeting(m.meeting_id, { panel_summary_fetched_at: fetchedAt, panel_summary_status: toStoredPanelSummaryStatus(normalized.status) });
+  return normalized;
 }
 
 /** L5：recap 内异步拉 panel 总结、拉到后按当前 view 重渲。失败标 failed（best-effort·不影响时间线）。 */
@@ -1452,7 +1460,7 @@ function panelSummaryHtml(): string {
   if (!recapState) return '';
   const fallback = buildLocalPanelSummaryPreview();
   const rec = recapState.panelSummary ?? fallback;
-  const status = recapState.panelSummaryStatus;
+  const status = recapState.panelSummaryStatus === 'missing_minute' ? 'not_generated' : recapState.panelSummaryStatus;
   const box = (inner: string): string => `<div class="rc-psum">${inner}</div>`;
   if (rec?.summary) {
     const local = rec === fallback && !recapState.panelSummary;
@@ -1466,8 +1474,7 @@ function panelSummaryHtml(): string {
       + (local ? '<div class="rc-local-note">Panel 后处理服务当前不可用，先基于飞书智能纪要与原始文字记录生成本地结构化预览；服务恢复后会替换为正式结果。</div>' : '')
       + blk('结论', s.conclusions) + ai + blk('风险', s.risks) + blk('待决', s.open_questions) + blk('后续', s.next_steps));
   }
-  if (status === 'missing_minute') return box('InkLoop 还没拿到这场会议的转写，暂时不能生成结构化总结；飞书转写绑定后会自动同步。');
-  if (status === 'transcript_not_ready') return box('用于生成总结的转写还在生成中（飞书妙记转写未就绪）。就绪后会自动生成 InkLoop 总结，也可以稍后手动重试。<button class="hbtn rc-psum-retry" id="ps-gen">重试</button>');
+  if (status === 'transcript_not_ready') return box('用于生成总结的转写还在生成中（飞书会后文字记录或妙记还在生成）。就绪后会自动生成 InkLoop 总结，也可以稍后手动重试。<button class="hbtn rc-psum-retry" id="ps-gen">重试</button>');
   if (status === 'loading' || status === 'generating') return box(status === 'generating' ? '正在生成 InkLoop 总结…（读取完整转写，稍候）' : '正在拉取 InkLoop 总结…');
   if (status === 'failed') return box('拉取 InkLoop 总结失败（网络/服务波动）。<button class="hbtn rc-psum-retry" id="ps-refresh">刷新重试</button>');
   if (status === 'auth_required') return box('需要重新登录飞书后才能读取 InkLoop 总结。<button class="hbtn rc-psum-retry" id="ps-login">重新登录飞书</button><button class="hbtn rc-psum-retry" id="ps-refresh">重试</button>');
@@ -1541,9 +1548,8 @@ function panelSummaryLabel(): string {
   if (recapState.panelSummaryStatus === 'generating') return '生成中';
   if (recapState.panelSummaryStatus === 'auth_required') return '需重新登录';
   if (recapState.panelSummaryStatus === 'failed') return '待重试';
-  if (recapState.panelSummaryStatus === 'not_generated') return '待生成';
+  if (recapState.panelSummaryStatus === 'not_generated' || recapState.panelSummaryStatus === 'missing_minute') return '待生成';
   if (recapState.panelSummaryStatus === 'transcript_not_ready') return '转写生成中';
-  if (recapState.panelSummaryStatus === 'missing_minute') return '缺少转写';
   return '同步中';
 }
 

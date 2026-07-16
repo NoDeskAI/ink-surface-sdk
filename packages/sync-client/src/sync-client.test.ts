@@ -197,6 +197,25 @@ describe('sync client', () => {
     await expect(transport.send([event({ event_id: 'evt_http' })])).rejects.toThrow(/acks array/);
   });
 
+  it('preserves the send timeout error when headers arrive but the response body never ends', async () => {
+    vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    }) as Response);
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: 'https://example.test/runtime-sync',
+      deviceId: 'device_send_body_timeout',
+      sendTimeoutMs: 10,
+    });
+
+    await expect(transport.send([event({ event_id: 'evt_send_body_timeout' })]))
+      .rejects.toThrow('runtime sync request timed out after 10ms');
+  });
+
   it('sends the device id required by the runtime sync push contract', async () => {
     let requestBody: unknown;
     vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => {
@@ -372,6 +391,26 @@ describe('sync client', () => {
     });
 
     await expect(transport.pull({ device_id: 'device_http' })).rejects.toThrow(/schema_version/);
+  });
+
+  it('preserves the pull timeout error when headers arrive but the response body never ends', async () => {
+    vi.stubGlobal('fetch', async (_url: string | URL | Request, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    }) as Response);
+    const transport = new HttpRuntimeSyncTransport({
+      endpoint: 'https://example.test/runtime-sync',
+      deviceId: 'device_pull_body_timeout',
+      pullEndpoint: 'https://example.test/runtime-sync/pull',
+      requestTimeoutMs: 10,
+    });
+
+    await expect(transport.pull({ device_id: 'device_pull_body_timeout' }))
+      .rejects.toThrow('runtime sync request timed out after 10ms');
   });
 
   it('supports relative pull endpoints used by browser and WebView hosts', async () => {
