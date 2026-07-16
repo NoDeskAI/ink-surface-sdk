@@ -6,6 +6,7 @@ import {
   GOOGLE_OAUTH_SCOPES,
   beginGoogleDeviceOAuth,
   completeGoogleOAuthCallback,
+  failGoogleDeviceOAuthCallback,
   googleDeviceOAuthCompletion,
   googleOAuthTokenPath,
   resolveAnyUserGoogleToken,
@@ -86,6 +87,20 @@ describe('google oauth state', () => {
     beginGoogleDeviceOAuth(runtimeEnv, identity, { state: 'expired-state', nowMs });
 
     expect(googleDeviceOAuthCompletion(runtimeEnv, identity, nowMs + 1_001)).toEqual({ status: 'idle', connected: false });
+  });
+
+  it('marks the pending state failed when the user denies consent (callback ?error=access_denied)', () => {
+    // review P2：拒绝授权只回 HTML 不落状态 → 设备轮询 /device/complete 干等 TTL。现在应立即终态。
+    const runtimeEnv = env();
+    const nowMs = Date.parse('2026-07-16T08:00:00.000Z');
+    beginGoogleDeviceOAuth(runtimeEnv, identity, { state: 'state-denied', nowMs });
+    expect(googleDeviceOAuthCompletion(runtimeEnv, identity, nowMs + 1)).toMatchObject({ status: 'pending' });
+
+    failGoogleDeviceOAuthCallback(runtimeEnv, { state: 'state-denied', error: 'access_denied' }, nowMs + 2);
+    expect(googleDeviceOAuthCompletion(runtimeEnv, identity, nowMs + 3)).toMatchObject({ status: 'failed', error: 'access_denied', connected: false });
+
+    // 无效/未知 state 静默不抛（callback 可被重放/伪造）
+    expect(() => failGoogleDeviceOAuthCallback(runtimeEnv, { state: 'no-such-state', error: 'access_denied' }, nowMs + 4)).not.toThrow();
   });
 
   it('atomically persists pending and token files with private permissions', async () => {

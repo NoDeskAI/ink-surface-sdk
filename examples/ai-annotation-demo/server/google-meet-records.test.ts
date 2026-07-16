@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -518,6 +518,68 @@ describe('google meet records', () => {
     });
     expect(closed.status).toBe('ready');
     expect(fetchImpl.mock.calls.length).toBe(callsAfterFirst);
+  });
+
+  it('does not clobber a concurrent job written to the file mid-flight (review P1-2)', async () => {
+    const path = statePath();
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') {
+        // 模拟另一场会议的 runCatchUp 在本请求的网络等待期间完成写盘
+        writeFileSync(path, JSON.stringify({
+          schema_version: 'inkloop.google_meet_records.v1',
+          meetings: {
+            'other-meeting|2026-07-15T00:00:00.000Z': {
+              meeting_code: 'other-meeting', scheduled_at: '2026-07-15T00:00:00.000Z',
+              records: [], status: 'ready', attempt: 1, terminal: true, updated_at: '2026-07-15T00:10:00.000Z',
+            },
+          },
+        }), 'utf8');
+        return jsonResponse({ conferenceRecords: [] });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    await fetchGoogleMeetingTranscript('token', { path }, { meetingCode: 'abc-defg-hij', scheduledAt: '2026-07-15T01:00:00.000Z' }, {
+      nowMs: Date.parse('2026-07-15T01:05:00.000Z'),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    // 旧实现：本请求开头的旧快照整文件覆盖 → other-meeting 丢失。现在写时重读合并，两个都在。
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.keys(stored.meetings).sort()).toEqual([
+      'abc-defg-hij|2026-07-15T01:00:00.000Z',
+      'other-meeting|2026-07-15T00:00:00.000Z',
+    ]);
+  });
+
+  it('keeps the transcript ready when optional artifacts fail to fetch (review P1-3)', async () => {
+    const path = statePath();
+    const record = {
+      name: 'conferenceRecords/main',
+      startTime: '2026-07-15T14:20:00.000Z',
+      endTime: '2026-07-15T14:25:00.000Z',
+    };
+    const fetchImpl = vi.fn(async (urlValue: string) => {
+      const url = new URL(urlValue);
+      if (url.pathname === '/v2/conferenceRecords') return jsonResponse({ conferenceRecords: [record] });
+      if (url.pathname.endsWith('/transcripts')) return jsonResponse({ transcripts: [{ name: `${record.name}/transcripts/tx1`, state: 'FILE_GENERATED' }] });
+      if (url.pathname.endsWith('/participants')) return jsonResponse({ participants: [] });
+      if (url.pathname.endsWith('/smartNotes')) return jsonResponse({ error: { message: 'boom' } }, 500);
+      if (url.pathname.endsWith('/recordings')) return jsonResponse({ error: { message: 'boom' } }, 500);
+      if (url.pathname.endsWith('/entries')) return jsonResponse({ transcriptEntries: [] });
+      throw new Error(`unexpected ${url.pathname}`);
+    });
+    const result = await fetchGoogleMeetingTranscript('token', { path }, { meetingCode: 'abc-defg-hij', scheduledAt: record.startTime }, {
+      nowMs: Date.parse('2026-07-15T14:25:40.000Z'),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleepImpl: async () => {},
+      grantedScopes: [DRIVE_READONLY_SCOPE],
+    });
+    // 可选产物 5xx 不连累主链：转写照常 ready；纪要留空由 backfill 窗口内重试
+    expect(result.status).toBe('ready');
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    const job = Object.values(stored.meetings)[0] as Record<string, unknown>;
+    expect(job.status).toBe('ready');
+    expect(job.smart_note).toBeUndefined();
   });
 
   it('normalizes smartNotes and recordings from the locked API fixtures', () => {

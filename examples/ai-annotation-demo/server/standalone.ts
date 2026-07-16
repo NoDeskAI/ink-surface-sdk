@@ -54,6 +54,7 @@ import { reconcileLarkLiveMeetings } from './lark-meeting-reconcile';
 import {
   beginGoogleDeviceOAuth,
   completeGoogleOAuthCallback,
+  failGoogleDeviceOAuthCallback,
   googleCalendarSyncPath,
   googleMeetRecordsPath,
   googleDeviceOAuthCompletion,
@@ -1007,6 +1008,8 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
   if (callback) {
     const providerError = url.searchParams.get('error');
     if (providerError) {
+      // 用户在授权页点了拒绝（access_denied 等）：把 pending 标 failed，设备轮询立即拿到终态而不是干等 TTL
+      failGoogleDeviceOAuthCallback(process.env, { state: url.searchParams.get('state') || '', error: providerError });
       sendGoogleHtml(res, 400, 'Google 授权失败', providerError);
       return;
     }

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { normalizeGoogleMeetTranscriptEntries } from '../vendor/meeting-timeline-sdk/adapters/transcript.mjs';
 import { normalizeAbsoluteMs } from '../vendor/meeting-timeline-sdk/time.mjs';
@@ -168,7 +168,20 @@ function loadState(path: string): GoogleMeetRecordsFile {
 
 function saveState(path: string, state: GoogleMeetRecordsFile): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), 'utf8');
+  // tmp+rename 原子落盘：进程中途挂掉不会留半截 JSON（loadState 解析失败=整库清空）
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  renameSync(tmp, path);
+}
+
+/** 写入点统一走这里：写时重新 load、只合并自己的 key、立即落盘。
+ * runCatchUp/backfill 都是「函数开头 load → 长 await → 结尾 save 整文件」，两个不同会议的
+ * 请求并发时后写的会用自己手里的旧快照把先写的更新整个冲掉（review P1-2）。Node 单线程下
+ * 这段同步 load-merge-save 不可能被打断，天然免锁。 */
+function persistJob(path: string, key: string, job: GoogleMeetJobState): void {
+  const fresh = loadState(path);
+  fresh.meetings[key] = job;
+  saveState(path, fresh);
 }
 
 function absoluteMs(value: string | number | Date | undefined, field: string): number {
@@ -399,18 +412,25 @@ async function fetchChosenArtifacts(
   options: RequestOptions,
   grantedScopes: readonly string[],
 ): Promise<Pick<GoogleMeetJobState, 'smart_note' | 'smart_note_scope_missing' | 'recordings'>> {
-  const smartNotes = await listAll<GoogleMeetSmartNote>({
+  // 纪要/录像互为可选：一件拉挂不连累另一件（review P1-3）。失败件留空，backfill 窗口内自动重试。
+  const optional = async <T>(what: string, run: () => Promise<T[]>): Promise<T[]> => {
+    try { return await run(); } catch (e) {
+      console.warn(`[google-meet-records] optional artifact ${what} fetch failed:`, String((e as Error)?.message || e));
+      return [];
+    }
+  };
+  const smartNotes = await optional('smartNotes', () => listAll<GoogleMeetSmartNote>({
     resource: `${recordName}/smartNotes`,
     collection: 'smartNotes',
     auth,
     options,
-  });
-  const recordings = await listAll<GoogleMeetRecording>({
+  }));
+  const recordings = await optional('recordings', () => listAll<GoogleMeetRecording>({
     resource: `${recordName}/recordings`,
     collection: 'recordings',
     auth,
     options,
-  });
+  }));
   const smartNote = smartNotes
     .map(normalizeGoogleMeetSmartNote)
     .filter((note): note is GoogleMeetSmartNoteArtifact => !!note)
@@ -424,7 +444,14 @@ async function fetchChosenArtifacts(
       scopeMissing = true;
     } else {
       const exportUrl = driveExportUrl(smartNote.document);
-      if (exportUrl) smartNote.text = capUtf8(await fetchText(exportUrl, auth, options), SMART_NOTE_TEXT_MAX_BYTES);
+      if (exportUrl) {
+        try {
+          smartNote.text = capUtf8(await fetchText(exportUrl, auth, options), SMART_NOTE_TEXT_MAX_BYTES);
+        } catch (e) {
+          // Doc 导出瞬时失败：保留纪要壳（text 缺失→backfillDue 继续为真），窗口内重试补正文
+          console.warn('[google-meet-records] smart note doc export failed:', String((e as Error)?.message || e));
+        }
+      }
     }
   }
   return {
@@ -645,22 +672,20 @@ export async function backfillGoogleMeetSmartNotes(
     refreshAccessToken: options.refreshAccessToken,
   };
   const auth = { token, refreshed: false };
-  let changed = false;
   for (const [key, job] of Object.entries(state.meetings)) {
     if (!googleMeetArtifactBackfillDue(job, nowMs)) continue;
     result.scanned += 1;
     try {
       const updated = await backfillJobArtifacts(job, auth, requestOptions, options.grantedScopes || [], nowMs);
       if (!updated) continue;
-      state.meetings[key] = updated;
-      changed = true;
+      // 逐条 persistJob（写时重读合并）：整轮扫完才 save 会用开头的旧快照冲掉扫描期间 runCatchUp 的并发写
+      persistJob(recordsRef.path, key, updated);
       result.backfilled += 1;
       if (updated.smart_note?.text) result.completed += 1;
     } catch (e) {
       result.errors.push(`${key}: ${String((e as Error)?.message || e)}`);
     }
   }
-  if (changed) saveState(recordsRef.path, state);
   return result;
 }
 
@@ -701,13 +726,18 @@ async function runCatchUp(
   // 不重拉 conference records/transcripts/entries——全量重跑一旦 Google 列表瞬时抖空，
   // 已到手的 ready 转写会被降级覆盖成 pending/no_record。
   if (current?.status === 'ready' && (artifactBackfillDue || driveScopeAdded)) {
-    const refreshed = await backfillJobArtifacts(current, auth, requestOptions, options.grantedScopes || [], nowMs);
-    if (refreshed) {
-      state.meetings[key] = refreshed;
-      saveState(recordsRef.path, state);
-      return responseFromJob(refreshed);
+    try {
+      const refreshed = await backfillJobArtifacts(current, auth, requestOptions, options.grantedScopes || [], nowMs);
+      if (refreshed) {
+        persistJob(recordsRef.path, key, refreshed);
+        return responseFromJob(refreshed);
+      }
+      // chosen record 异常缺失才会走到这：退回全量路径自愈。
+    } catch (e) {
+      // 纪要/录像是可选产物：回补失败不能把已 ready 的转写响应打成 5xx（review P1-3），窗口内下次再试
+      console.warn('[google-meet-records] artifact backfill failed, keep ready transcript:', String((e as Error)?.message || e));
+      return responseFromJob(current);
     }
-    // chosen record 异常缺失才会走到这：退回全量路径自愈。
   }
 
   const records = await fetchCandidates(meetingCode, auth, requestOptions);
@@ -740,14 +770,19 @@ async function runCatchUp(
   };
 
   if (chosenRecord) {
-    const artifacts = await fetchChosenArtifacts(
-      chosenRecord.name,
-      auth,
-      requestOptions,
-      options.grantedScopes || [],
-    );
-    Object.assign(updated, artifacts);
-    updated.artifacts_fetched_at = new Date(nowMs).toISOString();
+    try {
+      const artifacts = await fetchChosenArtifacts(
+        chosenRecord.name,
+        auth,
+        requestOptions,
+        options.grantedScopes || [],
+      );
+      Object.assign(updated, artifacts);
+      updated.artifacts_fetched_at = new Date(nowMs).toISOString();
+    } catch (e) {
+      // 可选产物失败不连累转写主链（review P1-3）；不落 artifacts_fetched_at → backfillDue 视为待补，窗口内自动重试
+      console.warn('[google-meet-records] artifacts fetch failed, transcript flow continues:', String((e as Error)?.message || e));
+    }
   }
 
   if (chosenRecord && transcript?.name && transcriptReady(transcript)) {
@@ -768,8 +803,7 @@ async function runCatchUp(
     delete updated.next_check_at;
   }
 
-  state.meetings[key] = updated;
-  saveState(recordsRef.path, state);
+  persistJob(recordsRef.path, key, updated);
   return responseFromJob(updated);
 }
 

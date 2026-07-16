@@ -351,6 +351,20 @@ export function beginGoogleDeviceOAuth(
   return { auth_url: buildAuthorizeUrl(env, state), state, expires_at: expiresAt, scopes: [...GOOGLE_OAUTH_SCOPES] };
 }
 
+/** 授权页用户拒绝/供应商报错（callback 带 ?error=）时把 pending 标 failed——
+ * 否则设备轮询 /device/complete 只能干等 TTL（10min）超时，一直显示等待授权。 */
+export function failGoogleDeviceOAuthCallback(
+  env: GoogleOAuthEnv,
+  input: { state: string; error: string },
+  nowMs = Date.now(),
+): void {
+  const pending = readPendingStore(env, nowMs).states[clean(input.state)];
+  if (!pending || pending.status !== 'pending') return; // state 无效/已终态：静默（callback 可能被重放）
+  pending.status = 'failed';
+  pending.error = clean(input.error) || 'access_denied';
+  writePendingEntry(env, pending, nowMs);
+}
+
 export async function completeGoogleOAuthCallback(
   env: GoogleOAuthEnv,
   input: { code: string; state: string },
