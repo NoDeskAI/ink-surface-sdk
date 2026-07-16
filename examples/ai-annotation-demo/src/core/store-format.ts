@@ -344,11 +344,11 @@ export interface PersistedMeeting {
   material_links?: PersistedMeetingMaterialLink[]; // 链接型资料（妙记 docx 等·不强求可批注·见 PersistedMeetingMaterialLink）
   summary?: string;                 // 会后「思路总结」（AI 综合，先空）
   // ── 多平台会议标识（optional·零迁移；缺省按存量飞书字段推断）──
-  platform?: 'lark' | 'google_meet' | 'manual'; // 会议平台；存量飞书会议可不写
-  provider_meeting_id?: string;        // 平台会议场次主键；Google Meet 使用 conferenceRecord.name
-  provider_calendar_event_id?: string; // 平台日历实例 id；Google Meet 使用 Calendar event instance id
-  provider_space_name?: string;        // 平台会议空间；Google Meet 使用 spaces/{id}
-  provider_transcript_ref?: string;    // 平台转写工件引用；Google Meet 使用 transcripts/{id}
+  platform?: 'lark' | 'google_meet' | 'zoom' | 'microsoft_teams' | 'manual'; // 会议平台；存量飞书会议可不写
+  provider_meeting_id?: string;        // 平台会议场次 ID；Google conferenceRecord.name，Teams attendanceReport.id
+  provider_calendar_event_id?: string; // 平台日历实例 ID；Google Calendar event instance id，Teams Outlook immutable event id
+  provider_space_name?: string;        // 平台逻辑会议容器 ID；Google space.name，Teams onlineMeeting.id，Zoom meeting id
+  provider_transcript_ref?: string;    // 平台转写工件 ID；Google transcript.name，Teams callTranscript.id
   provider_transcript_status?: 'ready' | 'pending' | 'not_generated' | 'no_record';
   google_smart_note?: { text: string; export_uri?: string; fetched_at: string }; // Gemini 官方智能纪要纯文本（Drive export）
   google_smart_note_scope_missing?: boolean; // 旧 OAuth token 缺 drive.readonly，提示用户重授权
@@ -368,7 +368,15 @@ export interface PersistedMeeting {
   align_state?: 'uncalibrated' | 'approx' | 'estimated' | 'event' | 'manual'; // 校准状态（event=会议事件 t0·录音残差未消除·UI 明示防假精确）
   feishu_match_confirmed_at?: string; // 用户确认关联的时刻
   summary_generated_at?: string;    // summary 生成时刻（防 stale）
-  summary_source?: { feishu_minute_token?: string; align_offset_ms?: number; mark_count: number; cue_count: number; transcript_truncated?: boolean; used_cue_count?: number };
+  summary_source?: {
+    transcript_cache_token?: string;
+    feishu_minute_token?: string; // 兼容旧记录；新写入统一使用 transcript_cache_token
+    align_offset_ms?: number;
+    mark_count: number;
+    cue_count: number;
+    transcript_truncated?: boolean;
+    used_cue_count?: number;
+  };
   // ── L5 panel 总结缓存（recap 顶部显示·离线不丢·optional 零迁移）──
   panel_summary?: PanelMeetingSummaryRecord;
   panel_summary_fetched_at?: string;

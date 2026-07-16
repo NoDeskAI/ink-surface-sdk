@@ -33,6 +33,7 @@ import {
 } from 'ink-surface-sdk/knowledge-schema';
 import type { InkLoopAnnotation, InkLoopVisualBlock, InkLoopVisualModel } from 'ink-surface-sdk/surface-model';
 import { stampExportId, stableToken } from './export-ids';
+import { meetingPlatformOf, providerTranscriptCacheToken } from '../../mobile/meeting-platform';
 
 const DOC_PROJECTION_SCHEMA_VERSION = 'inkloop.document_projection.v1' as const;
 const KO_EXPORT_SCHEMA_VERSION = 'inkloop.knowledge_export.v1' as const;
@@ -62,13 +63,21 @@ export interface MeetingL1Export {
 }
 
 const finiteMs = (...xs: Array<number | null | undefined>): number => { for (const x of xs) if (typeof x === 'number' && Number.isFinite(x)) return x; return 0; };
-const noteTranscriptCacheToken = (meetingId: string): string => `feishu_note_docx:${meetingId}`;
 export function meetingTranscriptCacheTokens(meeting: PersistedMeeting): string[] {
-  if (meeting.platform === 'google_meet') return [`google_meet:${meeting.meeting_id}`];
-  return [
-    meeting.feishu_minute_token,
-    meeting.feishu_meeting_id ? noteTranscriptCacheToken(meeting.feishu_meeting_id) : undefined,
-  ].filter((token, index, tokens): token is string => !!token && tokens.indexOf(token) === index);
+  const platform = meetingPlatformOf(meeting);
+  switch (platform) {
+    case 'lark':
+      return [
+        meeting.feishu_minute_token,
+        meeting.feishu_meeting_id ? providerTranscriptCacheToken('lark', meeting.feishu_meeting_id) : undefined,
+      ].filter((token, index, tokens): token is string => !!token && tokens.indexOf(token) === index);
+    case 'google_meet':
+    case 'zoom':
+    case 'microsoft_teams':
+      return [providerTranscriptCacheToken(platform, meeting.meeting_id)];
+    case 'manual':
+      return [];
+  }
 }
 const meetingT0 = (m: PersistedMeeting): number =>
   m.t0_source === 'recording_event' && Number.isFinite(m.feishu_recording_t0)

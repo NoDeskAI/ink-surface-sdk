@@ -72,6 +72,19 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     }))).toEqual(['google_meet:local-google-meeting']);
   });
 
+  it('Zoom 与 Teams 导出只读取各自平台缓存 token', () => {
+    expect(meetingTranscriptCacheTokens(meeting({
+      platform: 'zoom',
+      meeting_id: 'local-zoom-meeting',
+      feishu_minute_token: 'must-not-leak',
+    }))).toEqual(['zoom:local-zoom-meeting']);
+    expect(meetingTranscriptCacheTokens(meeting({
+      platform: 'microsoft_teams',
+      meeting_id: 'local-teams-meeting',
+      feishu_minute_token: 'must-not-leak',
+    }))).toEqual(['microsoft_teams:local-teams-meeting']);
+  });
+
   it('手写零丢失：每笔 → 一条 annotation KO', async () => {
     const out = await assembleMeetingL1Export(input(), OPTS);
     const anns = out.knowledgeExport.objects.filter((k) => k.kind === 'annotation');

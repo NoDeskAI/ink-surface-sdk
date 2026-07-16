@@ -25,7 +25,9 @@ import {
   googleSmartNoteCardState,
   isFeishuReloginError,
   loadGoogleTranscript,
+  meetingSummaryTranscriptCacheToken,
   recapTranscriptMissingMessage,
+  renderRecapCard,
   renderGoogleRecordingsHtml,
 } from './meeting-recap';
 
@@ -65,11 +67,29 @@ describe('meeting recap Google transcript branch', () => {
       platform: 'lark',
       feishu_meeting_id: 'om_1',
     })).toContain('未检测到妙记');
+    expect(recapTranscriptMissingMessage({ platform: 'zoom' })).toBe('该来源暂不支持转写拉取。');
+    expect(recapTranscriptMissingMessage({ platform: 'microsoft_teams' })).toBe('该来源暂不支持转写拉取。');
+    expect(renderRecapCard(googleMeeting({ platform: 'zoom' }))).not.toContain('飞书');
+    expect(renderRecapCard(googleMeeting({ platform: 'microsoft_teams' }))).not.toContain('飞书');
   });
 
   it('recognizes the production panel 409 reauth response', () => {
     expect(isFeishuReloginError({ status: 409, code: 'reauth_required' })).toBe(true);
     expect(isFeishuReloginError({ status: 502, message: 'upstream unavailable' })).toBe(false);
+  });
+
+  it('reads the renamed summary transcript token before the legacy field', () => {
+    expect(meetingSummaryTranscriptCacheToken({
+      summary_source: {
+        transcript_cache_token: 'google_meet:new',
+        feishu_minute_token: 'legacy',
+        mark_count: 1,
+        cue_count: 2,
+      },
+    })).toBe('google_meet:new');
+    expect(meetingSummaryTranscriptCacheToken({
+      summary_source: { feishu_minute_token: 'legacy', mark_count: 1, cue_count: 2 },
+    })).toBe('legacy');
   });
 
   it('generates and persists a structured InkLoop panel summary through the hub', async () => {

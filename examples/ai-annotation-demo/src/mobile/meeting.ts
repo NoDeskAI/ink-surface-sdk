@@ -39,7 +39,13 @@ import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
 import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
-import { findMeetingForProviderSource, meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
+import {
+  createMeetingKeyLock,
+  findMeetingForProviderSource,
+  meetingPlatformOf,
+  providerMeetingLockKey,
+  type MeetingPlatform,
+} from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
 import {
   getMeetingLiveState,
@@ -279,20 +285,28 @@ const MEETING_PROVIDER_KEY = 'inkloop.meeting.provider.v1';
 const MEETING_PROVIDER_LABELS: Record<MeetingPlatform, string> = {
   lark: '飞书会议',
   google_meet: 'Google Meet',
+  zoom: 'Zoom',
+  microsoft_teams: 'Teams',
   manual: '本地记录',
 };
 const MEETING_PROVIDER_ICONS: Record<MeetingPlatform, string> = {
   lark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4L3 11l7 3 3 7 8-17z"/><path d="M10 14l11-10"/></svg>',
   google_meet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="10" rx="2"/><path d="M15 10.5l6-3.5v10l-6-3.5"/></svg>',
+  zoom: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="10" rx="2"/><path d="M15 10l6-3v10l-6-3z"/></svg>',
+  microsoft_teams: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="11" height="12" rx="2"/><path d="M8 10h7M11.5 10v6"/><circle cx="18.5" cy="8" r="2"/></svg>',
   manual: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
 };
 const MEETING_PROVIDER_HINTS: Record<MeetingPlatform, string> = {
   lark: '日程 · 妙记转写 · 群资料',
   google_meet: '日历日程 · 会后转写',
+  zoom: '会议 · 会后转写',
+  microsoft_teams: '日历日程 · 会后转写',
   manual: '手写记录 · 无需连接',
 };
+const MEETING_PROVIDERS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'zoom', 'microsoft_teams', 'manual'];
+const MEETING_PROVIDER_LEAD_OPTIONS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'manual'];
 function normalizeMeetingProvider(value: unknown): MeetingPlatform {
-  return value === 'google_meet' || value === 'manual' ? value : 'lark';
+  return MEETING_PROVIDERS.includes(value as MeetingPlatform) ? value as MeetingPlatform : 'lark';
 }
 let selectedMeetingProvider: MeetingPlatform = (() => {
   try { return normalizeMeetingProvider(localStorage.getItem(MEETING_PROVIDER_KEY)); }
@@ -320,16 +334,8 @@ function rememberMeetingProvider(provider: MeetingPlatform): void {
 const PANEL_CURSOR_KEY = 'inkloop.panelMeeting.cursor.v1';
 // 按会议 key 串行的共享锁：panel 事件路(upsertPanelMeeting)和 meeting-sources 路(syncMeetingSources)
 // 共用同一把——两路各自「查无此会→建卡」的 check-then-create 不原子，短会(started/ended 同窗口到达)
-// 实测撞出同 fid 两张卡（2026-07-16·55 秒测试会）。key=feishu_meeting_id（两路同值域）。
-const meetingKeyLocks = new Map<string, Promise<void>>();
-async function withMeetingKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = meetingKeyLocks.get(key) ?? Promise.resolve();
-  const job = prev.catch(() => {}).then(fn);
-  const tail = job.then(() => undefined, () => undefined);
-  meetingKeyLocks.set(key, tail);
-  void tail.finally(() => { if (meetingKeyLocks.get(key) === tail) meetingKeyLocks.delete(key); });
-  return job;
-}
+// 实测撞出同 fid 两张卡（2026-07-16·55 秒测试会）。key=<platform>:<provider id>（两路同值域）。
+const withMeetingKeyLock = createMeetingKeyLock();
 type PanelMeetingUpsertType = 'started' | 'ended' | 'metadata'; // metadata=minute_bound/summary_ready 带来的元数据更新·不改 status/时间
 
 /** 事件内嵌会议上的当前妙记 token（顶层 minute_token 优先·回退 match.minute_token）。 */
@@ -343,7 +349,7 @@ async function findLocalPanelMeeting(panelMeetingId: string): Promise<PersistedM
 /** panel 会议 → 落成本地会议。靠 feishu_meeting_id 幂等去重·同一 meeting_id 串行（防并发重复建）。本地写失败会抛 → 上层不推 cursor。 */
 async function upsertPanelMeeting(mt: PanelFeishuMeeting, type: PanelMeetingUpsertType, occurredAt = 0): Promise<void> {
   if (!mt.meeting_id) return;
-  await withMeetingKeyLock(mt.meeting_id, () => upsertPanelMeetingInner(mt, type, occurredAt));
+  await withMeetingKeyLock(providerMeetingLockKey('lark', mt.meeting_id), () => upsertPanelMeetingInner(mt, type, occurredAt));
 }
 
 /** 归群「两条腿」：① group_ids 自动归真群 → ② 认领映射 → ③ 已在真飞书群保持 → ④ 日历会议无群保持日程占位 → ⑤ 无群桶。 */
@@ -529,7 +535,7 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
   for (const source of sources) {
     const meetingNo0 = source.meeting_no || meetingNoFromUrl(source.meeting_url);
     // 与 panel 事件路共锁 + 锁内重查：check-then-create 必须在同一把锁里原子，否则短会两路并发各建一张卡。
-    const lockKey = String(source.feishu_meeting_id || source.calendar_event_id || meetingNo0 || source.source_id || source.meeting_url);
+    const lockKey = providerMeetingLockKey('lark', String(source.feishu_meeting_id || source.calendar_event_id || meetingNo0 || source.source_id || source.meeting_url));
     await withMeetingKeyLock(lockKey, async () => {
     const existing = existingMeetingForSource(await listAllMeetings(), source);
     const ws = await sourceWorkspace(source, existing);
@@ -660,11 +666,21 @@ function feishuIdentityConnected(): boolean {
 }
 
 function providerStatusHtml(provider: MeetingPlatform): string {
-  if (provider === 'manual') return '<span class="mp-status">无需连接</span>';
-  const connected = provider === 'lark' ? feishuIdentityConnected() : googleConnectedCache;
-  if (!connected) return '<span class="mp-status">未连接</span>';
-  const id = provider === 'lark' ? ' id="mp-feishu-identity"' : ' id="mp-google-identity"';
-  return `<button class="mp-status is-connected" type="button"${id}><span class="d"></span>已连接</button>`;
+  switch (provider) {
+    case 'manual':
+      return '<span class="mp-status">无需连接</span>';
+    case 'lark':
+      return feishuIdentityConnected()
+        ? '<button class="mp-status is-connected" type="button" id="mp-feishu-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
+    case 'google_meet':
+      return googleConnectedCache
+        ? '<button class="mp-status is-connected" type="button" id="mp-google-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
+    case 'zoom':
+    case 'microsoft_teams':
+      return '<span class="mp-status">暂未接入</span>';
+  }
 }
 
 async function enterMeetingProviderHome(provider: MeetingPlatform): Promise<void> {
@@ -677,14 +693,24 @@ async function enterMeetingProviderHome(provider: MeetingPlatform): Promise<void
 
 async function chooseMeetingProvider(provider: MeetingPlatform): Promise<void> {
   rememberMeetingProvider(provider);
-  if (provider === 'lark' && !feishuIdentityConnected()) {
-    try { await startDeviceFeishuLogin(); }
-    catch (error) { await infoSheet({ title: '飞书登录失败', message: String((error as Error)?.message || error) }); }
-    return;
-  }
-  if (provider === 'google_meet' && !googleConnectedCache) {
-    await openGoogleCalendarConnection();
-    return;
+  switch (provider) {
+    case 'lark':
+      if (!feishuIdentityConnected()) {
+        try { await startDeviceFeishuLogin(); }
+        catch (error) { await infoSheet({ title: '飞书登录失败', message: String((error as Error)?.message || error) }); }
+        return;
+      }
+      break;
+    case 'google_meet':
+      if (!googleConnectedCache) {
+        await openGoogleCalendarConnection();
+        return;
+      }
+      break;
+    case 'zoom':
+    case 'microsoft_teams':
+    case 'manual':
+      break;
   }
   await enterMeetingProviderHome(provider);
 }
@@ -710,7 +736,7 @@ function renderMeetingProviderLead(refresh = true): void {
   mtgPagers.delete('home');
   const root = el('mv-home');
   root.classList.remove('has-vpages');
-  const providers: MeetingPlatform[] = ['lark', 'google_meet', 'manual'];
+  const providers = MEETING_PROVIDER_LEAD_OPTIONS;
   const rows = providers.map((provider) => {
     const selected = provider === selectedMeetingProvider;
     return `<div class="mp-option${selected ? ' is-default' : ''}" role="option" aria-selected="${selected}" tabindex="${selected ? '0' : '-1'}" data-meeting-provider="${provider}">`
