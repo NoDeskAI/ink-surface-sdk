@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { RuntimeAnnotation, RuntimeSurfaceBlock } from 'ink-surface-sdk/runtime-schema';
+import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeSurfaceBlock } from 'ink-surface-sdk/runtime-schema';
 import type { PersistedMark } from '../../core/store-format';
-import { outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeSourceContentHash, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
+import { outboundRuntimeMarksForCloudPush, runtimeAnnotationToMark, runtimeMarksToTombstoneForCanonicalRemote, runtimeSourceContentHash, shouldAdoptRemoteMarkRevision, staleRuntimeManagedMarksForCanonicalRemote, visibleRuntimeMarksForCloudAlignment } from './runtime-sync-host';
 
 function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }): PersistedMark {
   return {
@@ -213,8 +213,32 @@ describe('staleRuntimeManagedMarksForCanonicalRemote', () => {
   });
 });
 
+describe('runtimeMarksToTombstoneForCanonicalRemote', () => {
+  it('selects a local mark from the minimal deleted annotation stub even when no active canonical marks remain', () => {
+    const deleted = mark({ mark_id: 'mark_deleted_after_bootstrap', seq: 1 });
+    const runtime: RuntimeDocumentSnapshot = {
+      doc_id: 'doc_test',
+      doc_dir: 'indexeddb://doc_test',
+      document: { doc_id: 'doc_test', title: 'Deleted mark test' },
+      source: { doc_id: 'doc_test', kind: 'browser_runtime_snapshot' },
+      blocks: [{
+        object_id: 'blk_deleted',
+        annotations: [{
+          ko_id: 'ko_deleted_after_bootstrap',
+          status: 'deleted',
+          deleted_at: '2026-07-15T00:00:02.000Z',
+          inkloop_mark: { mark_id: 'mark_deleted_after_bootstrap' },
+        }],
+      }],
+      nodes: [],
+    };
+
+    expect(runtimeMarksToTombstoneForCanonicalRemote([deleted], runtime)).toEqual([deleted]);
+  });
+});
+
 describe('outboundRuntimeMarksForCloudPush', () => {
-  it('does not push remote runtime marks or local duplicates already covered by Cloud Hub', () => {
+  it('keeps local-origin revisions outbound even when canonical already knows the mark, while never echoing remote marks', () => {
     const remote = mark({
       mark_id: 'mark_remote',
       seq: 1,
@@ -237,10 +261,12 @@ describe('outboundRuntimeMarksForCloudPush', () => {
       device_id: 'web_current',
     });
 
+    // canonical 已含 mark_already_canonical，但本地 origin 的 revision（如精确擦/移动/撤销复活）仍必须出站；
+    // canonical 集合只用于 bridge 侧 add/update 判定，不再作出站排除（否则几何修改/tombstone 永远漏同步）。
     expect(outboundRuntimeMarksForCloudPush(
       [remote, localDuplicate, newLocal],
       new Set(['mark_already_canonical']),
-    )).toEqual([newLocal]);
+    )).toEqual([localDuplicate, newLocal]);
   });
 });
 

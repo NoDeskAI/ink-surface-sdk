@@ -100,7 +100,11 @@ describe('runtime sync bridge', () => {
 
     expect(first).toMatchObject({ bridged: 1, last_mark_seq: 1 });
     expect(second).toMatchObject({ bridged: 0, skipped: 0, last_mark_seq: 1 });
-    expect((await store.loadDocument('doc_bridge'))?.blocks[0].annotations).toBeUndefined();
+    // push 侧本地 materialization：本机 canonical cache 应即时反映自己的 annotation.add
+    //（否则删除/移动别机 mark 后，自己 pull 因同 device echo 被跳过，hydrate 会恢复旧版本）。
+    const bridgedAnnotations = (await store.loadDocument('doc_bridge'))?.blocks[0].annotations;
+    expect(bridgedAnnotations).toHaveLength(1);
+    expect(bridgedAnnotations?.[0]).toMatchObject({ ko_id: 'ko_mark_1' });
     expect((await store.listPendingEvents('doc_bridge')).map((event) => event.operation)).toEqual(['runtime.bootstrap', 'annotation.add']);
     await store.close();
   });
@@ -528,6 +532,51 @@ describe('runtime sync bridge', () => {
     })).rejects.toThrow(/append failed/);
 
     expect(await watermarks.read('doc_bridge')).toBeNull();
+    await store.close();
+  });
+});
+
+describe('runtime sync bridge · revision 级事件身份（P0 前置修复）', () => {
+  it('bridges add → delete → resurrection update for the same mark as three distinct events', async () => {
+    const store = new IndexedDbOfflineRuntimeStore({ dbName: `bridge-revision-${Date.now()}-${Math.random()}`, factory: indexedDB });
+    const watermarks = createMemoryRuntimeBridgeWatermarks();
+    const base = { mark_id: 'mark_rev', pointer_type: 'pen' as const, kind_source: 'local_board' };
+
+    const run = (marks: PersistedMark[], at: string, knownMarkIds?: ReadonlySet<string>) => bridgeRuntimeLedgerToStore({
+      documentId: 'doc_bridge',
+      documentTitle: 'Bridge Doc',
+      runtimeStore: store,
+      watermarkStore: watermarks,
+      knownMarkIds,
+      loadMarks: async () => marks,
+      buildSnapshot: async () => snapshot(),
+      now: () => at,
+    });
+
+    // seq=1 首见 → annotation.add
+    const first = await run([mark({ ...base, seq: 1 })], '2026-07-13T00:00:01.000Z');
+    expect(first.bridged).toBe(1);
+
+    // seq=2 tombstone（bbox 零面积不许拦） → annotation.delete
+    const second = await run(
+      [mark({ ...base, seq: 2, is_tombstone: true, bbox: [0, 0, 0, 0], strokes: [] })],
+      '2026-07-13T00:00:02.000Z',
+    );
+    expect(second.bridged).toBe(1);
+
+    // seq=3 复活（同 id 非 tombstone·canonical 已知） → annotation.update
+    const third = await run(
+      [mark({ ...base, seq: 3 })],
+      '2026-07-13T00:00:03.000Z',
+      new Set(['mark_rev']),
+    );
+    expect(third.bridged).toBe(1);
+
+    const events = (await store.listOutboxEvents()).filter((event) => event.payload.mark_id === 'mark_rev');
+    expect(events.map((event) => event.operation)).toEqual(['annotation.add', 'annotation.delete', 'annotation.update']);
+    // 三个 revision 三个独立 event_id：outbox 主键不互相覆盖，云端不误去重
+    expect(new Set(events.map((event) => event.event_id)).size).toBe(3);
+    expect(events.map((event) => event.payload.mark_seq)).toEqual([1, 2, 3]);
     await store.close();
   });
 });

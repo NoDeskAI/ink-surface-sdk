@@ -222,6 +222,24 @@ function stripBootstrapAnnotationsFromBlock(block: unknown): unknown {
   return clean;
 }
 
+/** 兼容旧客户端：老版本发的 `evt_bridge_<mark>`（无 seq）与新版 `evt_bridge_<mark>:<seq>` 会被当成
+ *  两个事件各入库各跑后处理。入库前按 payload.mark_seq / dedupe_key 里的 seq 正规化成 revision 级 id——
+ *  同一 revision 新旧格式收敛到同一 event_id。旧客户端不会发 tombstone，编辑功能仍要求 writer 升级。 */
+function normalizeLegacyBridgeRevisionId(event: RuntimeSyncEvent): RuntimeSyncEvent {
+  if (!event.operation.startsWith('annotation.')) return event;
+  const markId = stringValue(event.payload.mark_id);
+  if (!markId || event.event_id !== `evt_bridge_${markId}`) return event;
+  const direct = Number(event.payload.mark_seq);
+  const suffix = Number(event.dedupe_key.match(/:(\d+)$/)?.[1]);
+  const seq = Number.isSafeInteger(direct) ? direct : suffix;
+  if (!Number.isSafeInteger(seq)) return event;
+  return {
+    ...event,
+    event_id: `${event.event_id}:${seq}`,
+    payload: { ...event.payload, mark_seq: seq },
+  };
+}
+
 function sanitizeRuntimeBootstrapEvent(event: RuntimeSyncEvent): RuntimeSyncEvent {
   const snapshot = runtimeBootstrapSnapshot(event);
   if (!snapshot) return event;
@@ -342,16 +360,24 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
     return { tenant_id: session?.tenant_id, user_id: session?.user_id };
   }
 
+  const sideEffectTails = new Map<string, Promise<void>>();
+
+  /** 后处理按 doc 串行：并发 fire-and-forget 下，耗时 add 后处理可能在 delete 完成后才落——
+   *  把已删对象重新写回。同一 doc 的 side effect 串成链保证与事件接收同序。 */
   function runAcceptedEventSideEffect(event: RuntimeSyncEvent, namespace: RuntimeSyncNamespace): void {
     if (!options.onAcceptedEvent) return;
     const report = (error: unknown): void => {
       console.error('[runtime-sync:onAcceptedEvent]', String((error as Error)?.message || error));
     };
-    try {
-      void Promise.resolve(options.onAcceptedEvent(event, namespace)).catch(report);
-    } catch (error) {
-      report(error);
-    }
+    const key = eventLockKey(namespace, `side-effect:${event.doc_id}`);
+    const previous = sideEffectTails.get(key) ?? Promise.resolve();
+    const work = previous
+      .then(async () => { await options.onAcceptedEvent!(event, namespace); })
+      .catch(report);
+    sideEffectTails.set(key, work);
+    void work.finally(() => {
+      if (sideEffectTails.get(key) === work) sideEffectTails.delete(key);
+    });
   }
 
   async function acceptEventOnce(event: RuntimeSyncEvent, namespace: RuntimeSyncNamespace, session: RuntimeSyncSessionContext | null): Promise<{ record: StoredRuntimeEvent; inserted: boolean }> {
@@ -450,7 +476,7 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
             });
             continue;
           }
-          const eventToStore = sanitizeRuntimeBootstrapEvent(event);
+          const eventToStore = sanitizeRuntimeBootstrapEvent(normalizeLegacyBridgeRevisionId(event));
           try {
             const { record, inserted } = await acceptEventOnce(eventToStore, namespace, session);
             if (inserted) accepted.push(eventToStore);

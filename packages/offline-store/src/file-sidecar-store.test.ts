@@ -256,6 +256,49 @@ describe('SidecarRuntimeStore', () => {
     expect(blocks[0]?.projection?.knowledge_object_ids).toEqual([]);
   });
 
+  it('retains a deleted annotation stub when delete follows an annotation-stripping bootstrap', async () => {
+    const { store, blocksPath } = await makeVault();
+    const current = await store.loadDocument(DOC_ID);
+    if (!current) throw new Error('test setup missing runtime doc');
+    const emptyBootstrap: RuntimeDocumentSnapshot = {
+      ...current,
+      blocks: current.blocks.map((block) => ({
+        ...block,
+        annotations: [],
+        projection: { ...(block.projection || {}), knowledge_object_ids: [] },
+      })),
+    };
+    expect((await store.applyRemoteEvent(runtimeEvent({
+      event_id: 'evt_delete_chain_bootstrap_sidecar',
+      operation: 'runtime.bootstrap',
+      payload: { snapshot: emptyBootstrap },
+    }))).status).toBe('applied');
+    expect((await readJsonLines<RuntimeSurfaceBlock>(blocksPath))[0].annotations).toEqual([]);
+
+    const deletion = runtimeEvent({
+      event_id: 'evt_delete_chain_sidecar',
+      operation: 'annotation.delete',
+      target: { type: 'annotation', id: EXISTING_KO_ID, block_id: 'blk_first' },
+      payload: {
+        ko_id: EXISTING_KO_ID,
+        mark_id: 'mark_deleted_after_bootstrap',
+        block_id: 'blk_first',
+        deleted_at: '2026-07-15T00:00:02.000Z',
+      },
+    });
+    expect((await store.applyRemoteEvent(deletion)).status).toBe('applied');
+    expect((await store.applyRemoteEvent(deletion)).status).toBe('skipped');
+    expect((await readJsonLines<RuntimeSurfaceBlock>(blocksPath))[0].annotations).toEqual([
+      {
+        ko_id: EXISTING_KO_ID,
+        status: 'deleted',
+        deleted_at: '2026-07-15T00:00:02.000Z',
+        inkloop_mark: { mark_id: 'mark_deleted_after_bootstrap' },
+      },
+    ]);
+    expect(await store.listOutboxEvents()).toEqual([]);
+  });
+
   it('applies and dedupes remote annotation events through the sidecar inbox', async () => {
     const { store, blocksPath } = await makeVault();
     const remote = runtimeEvent({

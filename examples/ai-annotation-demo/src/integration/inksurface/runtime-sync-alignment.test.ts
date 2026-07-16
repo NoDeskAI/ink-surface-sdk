@@ -90,7 +90,7 @@ describe('runtime sync visible mark alignment', () => {
     const store = memoryOutbox([
       event({ event_id: 'evt_bootstrap_old', operation: 'runtime.bootstrap', status: 'sent', payload: { snapshot: { doc_id: 'doc_align' } } }),
       event({
-        event_id: runtimeSyncEventIdForMarkId(visible.mark_id),
+        event_id: runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
         status: 'sent',
         payload: { mark_id: visible.mark_id },
         attempt_count: 1,
@@ -98,7 +98,7 @@ describe('runtime sync visible mark alignment', () => {
         ack_id: 'ack_visible',
       }),
       event({
-        event_id: runtimeSyncEventIdForMarkId(failed.mark_id),
+        event_id: runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq),
         status: 'failed',
         payload: { mark_id: failed.mark_id },
         attempt_count: 5,
@@ -106,7 +106,7 @@ describe('runtime sync visible mark alignment', () => {
         next_retry_at: '2099-01-01T00:00:00.000Z',
       }),
       event({
-        event_id: runtimeSyncEventIdForMarkId(hidden.mark_id),
+        event_id: runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq),
         status: 'sent',
         payload: { mark_id: hidden.mark_id },
         ack_id: 'ack_hidden',
@@ -125,22 +125,22 @@ describe('runtime sync visible mark alignment', () => {
     expect(result).toMatchObject({
       visible_marks: 3,
       requeued: 3,
-      missing_event_ids: [runtimeSyncEventIdForMarkId(missing.mark_id)],
+      missing_event_ids: [runtimeSyncEventIdForMarkId(missing.mark_id, missing.seq)],
       requeued_event_ids: [
-        runtimeSyncEventIdForMarkId(visible.mark_id),
-        runtimeSyncEventIdForMarkId(failed.mark_id),
+        runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
+        runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq),
         'evt_bootstrap_latest',
       ],
     });
     const byId = new Map(store.events.map((item) => [item.event_id, item]));
-    expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id))).toMatchObject({
+    expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq))).toMatchObject({
       status: 'pending',
       attempt_count: 0,
       updated_at: '2026-07-08T00:00:10.000Z',
     });
-    expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id))?.ack_id).toBeUndefined();
-    expect(byId.get(runtimeSyncEventIdForMarkId(failed.mark_id))?.next_retry_at).toBeUndefined();
-    expect(byId.get(runtimeSyncEventIdForMarkId(hidden.mark_id))).toMatchObject({ status: 'sent', ack_id: 'ack_hidden' });
+    expect(byId.get(runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq))?.ack_id).toBeUndefined();
+    expect(byId.get(runtimeSyncEventIdForMarkId(failed.mark_id, failed.seq))?.next_retry_at).toBeUndefined();
+    expect(byId.get(runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq))).toMatchObject({ status: 'sent', ack_id: 'ack_hidden' });
     expect(byId.get('evt_bootstrap_old')).toMatchObject({ status: 'sent' });
     expect(byId.get('evt_other_doc')).toMatchObject({ status: 'sent', ack_id: 'ack_other' });
     expect(byId.get('evt_bootstrap_latest')).toMatchObject({ status: 'pending', attempt_count: 0 });
@@ -182,7 +182,7 @@ describe('runtime sync visible mark alignment', () => {
       runtimeStore: store,
       buildEvents: async () => [
         event({
-          event_id: runtimeSyncEventIdForMarkId(visible.mark_id),
+          event_id: runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
           status: 'sent',
           payload: { mark_id: visible.mark_id },
           attempt_count: 2,
@@ -190,7 +190,7 @@ describe('runtime sync visible mark alignment', () => {
           ack_id: 'stale_ack',
         }),
         event({
-          event_id: runtimeSyncEventIdForMarkId(hidden.mark_id),
+          event_id: runtimeSyncEventIdForMarkId(hidden.mark_id, hidden.seq),
           status: 'sent',
           payload: { mark_id: hidden.mark_id },
         }),
@@ -202,11 +202,11 @@ describe('runtime sync visible mark alignment', () => {
       visible_marks: 1,
       requeued: 0,
       missing_event_ids: [],
-      created_event_ids: [runtimeSyncEventIdForMarkId(visible.mark_id)],
+      created_event_ids: [runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq)],
     });
     expect(store.events).toHaveLength(1);
     expect(store.events[0]).toMatchObject({
-      event_id: runtimeSyncEventIdForMarkId(visible.mark_id),
+      event_id: runtimeSyncEventIdForMarkId(visible.mark_id, visible.seq),
       status: 'pending',
       attempt_count: 0,
       updated_at: '2026-07-08T00:00:10.000Z',
@@ -220,7 +220,7 @@ describe('runtime sync visible mark alignment', () => {
     const invalid = mark({ mark_id: 'mark_invalid', seq: 2, bbox: [-0.403, -5.222, 1.819, 61.111] });
     const store = memoryOutbox([
       event({
-        event_id: runtimeSyncEventIdForMarkId(invalid.mark_id),
+        event_id: runtimeSyncEventIdForMarkId(invalid.mark_id, invalid.seq),
         status: 'sent',
         payload: { mark_id: invalid.mark_id },
         ack_id: 'ack_invalid',
@@ -236,7 +236,7 @@ describe('runtime sync visible mark alignment', () => {
 
     expect(result).toMatchObject({
       visible_marks: 1,
-      missing_event_ids: [runtimeSyncEventIdForMarkId(valid.mark_id)],
+      missing_event_ids: [runtimeSyncEventIdForMarkId(valid.mark_id, valid.seq)],
       requeued_event_ids: [],
     });
     expect(store.events[0]).toMatchObject({ status: 'sent', ack_id: 'ack_invalid' });

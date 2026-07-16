@@ -246,6 +246,21 @@ describe('mark ledger folding', () => {
       { mark_id: 'evt_revised', marked_text: 'v2', is_tombstone: false },
     ]);
   });
+
+  it('foldMarkRevisions keeps the latest tombstone visible for the sync chain', async () => {
+    const store = await import('./store');
+    const base = { mark_id: 'evt_synced_delete', document_id: 'doc_marks' };
+    const entries = [
+      markRecord({ ...base, seq: 1, is_tombstone: false, marked_text: 'stroke' }),
+      markRecord({ ...base, seq: 2, is_tombstone: true }),
+    ];
+
+    // UI 视图不见 tombstone；同步视图必须见到，否则 delete 事件永远发不出去。
+    expect(store.foldMarks(entries)).toEqual([]);
+    expect(store.foldMarkRevisions(entries)).toMatchObject([
+      { mark_id: 'evt_synced_delete', seq: 2, is_tombstone: true },
+    ]);
+  });
 });
 
 describe('mark ledger runtime hook', () => {

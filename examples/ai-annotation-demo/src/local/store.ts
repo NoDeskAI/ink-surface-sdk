@@ -783,14 +783,19 @@ export function appendAiTurnEntry(t: Omit<PersistedAiTurn, 'entry_id' | 'seq' | 
   });
 }
 
-/** 折叠 mark：每个 mark_id 只看最新账本条目；最新是 tombstone 才视为删除。 */
-export function foldMarks(all: PersistedMark[]): PersistedMark[] {
+/** 每个 mark_id 保留最新账本条目（含 tombstone）：同步链需要看到删除 revision，别喂给 UI。 */
+export function foldMarkRevisions(all: PersistedMark[]): PersistedMark[] {
   const latest = new Map<string, PersistedMark>();
   for (const e of all) {
     const prev = latest.get(e.mark_id);
     if (!prev || e.seq >= prev.seq) latest.set(e.mark_id, e);
   }
-  return [...latest.values()].filter((e) => !e.is_tombstone).sort((a, b) => a.seq - b.seq);
+  return [...latest.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/** 折叠 mark：每个 mark_id 只看最新账本条目；最新是 tombstone 才视为删除。UI/投影只消费可见 mark。 */
+export function foldMarks(all: PersistedMark[]): PersistedMark[] {
+  return foldMarkRevisions(all).filter((e) => !e.is_tombstone);
 }
 
 /** 折叠 mark（按 document）：单个 surface 的标注。 */
@@ -798,10 +803,20 @@ export async function getFoldedMarks(documentId: string): Promise<PersistedMark[
   return foldMarks(await entriesByDoc<PersistedMark>(MARKS, documentId));
 }
 
+/** 最新 revision（按 document·含 tombstone）：同步链专用。 */
+export async function getLatestMarkRevisions(documentId: string): Promise<PersistedMark[]> {
+  return foldMarkRevisions(await entriesByDoc<PersistedMark>(MARKS, documentId));
+}
+
 /** 折叠 mark（按 context_id，走 by_context 索引）：会议时间脊用——把一场会议里跨 surface（白板 + 各资料）
  *  的所有标注按「落笔时活跃实例」聚合。会中保持 meetingCtx 活跃 → 白板与资料上的笔都带 context_id='mtg_<id>'。 */
 export async function getFoldedMarksByContext(contextId: string): Promise<PersistedMark[]> {
   return foldMarks(await entriesByContext<PersistedMark>(MARKS, contextId));
+}
+
+/** 最新 revision（按 context_id·含 tombstone）：同步链专用。 */
+export async function getLatestMarkRevisionsByContext(contextId: string): Promise<PersistedMark[]> {
+  return foldMarkRevisions(await entriesByContext<PersistedMark>(MARKS, contextId));
 }
 
 /** 未综合的 mark（seq > 当前书水位线）：reload 重建 pending session。

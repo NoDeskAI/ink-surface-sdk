@@ -150,6 +150,7 @@ function enrichedRemoteAnnotation(event: RuntimeSyncEvent, annotation: RuntimeAn
   const bbox = normBbox(event.payload.bbox) ?? normBbox(existingMeta.bbox) ?? normBbox(annotation.visual_bbox);
   const metaEntries = Object.entries({
     mark_id: event.payload.mark_id,
+    mark_seq: event.payload.mark_seq,
     marked_text: event.payload.marked_text,
     kind: event.payload.kind,
     feature_type: event.payload.feature_type,
@@ -187,6 +188,26 @@ function fallbackAnnotationBlockIndex(blocks: RuntimeSurfaceBlock[], event: Runt
     if (pageMatch >= 0) return pageMatch;
   }
   return blocks.length ? 0 : -1;
+}
+
+function remoteDeleteBlockIndex(blocks: RuntimeSurfaceBlock[], event: RuntimeSyncEvent): number {
+  const targetBlockId = String(event.payload.block_id || event.target.block_id || '');
+  const targetIndex = targetBlockId ? blocks.findIndex((block) => blockId(block) === targetBlockId) : -1;
+  return targetIndex >= 0 ? targetIndex : (blocks.length ? 0 : -1);
+}
+
+function remoteDeletedAt(event: RuntimeSyncEvent): string {
+  const payloadDeletedAt = typeof event.payload.deleted_at === 'string' ? event.payload.deleted_at.trim() : '';
+  return payloadDeletedAt || event.updated_at;
+}
+
+function remoteDeletedAnnotationStub(event: RuntimeSyncEvent, koIdValue: string, markId: string): RuntimeAnnotation {
+  return {
+    ko_id: koIdValue,
+    status: 'deleted',
+    deleted_at: remoteDeletedAt(event),
+    ...(markId ? { inkloop_mark: { mark_id: markId } } : {}),
+  };
 }
 
 function eventDedupeKey(event: Omit<RuntimeSyncEvent, 'dedupe_key'>): string {
@@ -588,16 +609,38 @@ export class SidecarRuntimeStore implements OfflineRuntimeStorePort {
     if (event.operation === 'annotation.update' || event.operation === 'annotation.delete') {
       const ko = String(event.payload.ko_id || event.target.id || '');
       if (!ko) throw new Error('Remote annotation event is missing ko_id.');
+      // ko_id 不等于 mark_id，tombstone 构造时常拿不到原 KO —— 允许按 mark_id 兜底定位。
+      const markId = String(event.payload.mark_id || '');
+      const rawPatch = isRecord(event.payload.patch) ? event.payload.patch : {};
+      const enrichedPatch = event.operation === 'annotation.update' && typeof rawPatch.ko_id === 'string'
+        ? enrichedRemoteAnnotation(event, rawPatch as RuntimeAnnotation)
+        : rawPatch;
+      const { ko_id: _patchKoId, ...patch } = enrichedPatch as Record<string, unknown>;
       let didUpdate = false;
       const blocks = runtime.blocks.map((block) => {
         const annotations = (block.annotations || []).flatMap((annotation) => {
-          if (annotation.ko_id !== ko) return [annotation];
+          const matchesKo = annotation.ko_id === ko;
+          const matchesMark = !!markId && runtimeAnnotationMarkId(annotation) === markId;
+          if (!matchesKo && !matchesMark) return [annotation];
           didUpdate = true;
-          if (event.operation === 'annotation.delete') return [{ ...annotation, status: 'deleted', deleted_at: event.updated_at }];
-          return [{ ...annotation, ...(event.payload.patch as Record<string, unknown> | undefined), updated_at: event.updated_at }];
+          if (event.operation === 'annotation.delete') return [{ ...annotation, status: 'deleted', deleted_at: remoteDeletedAt(event) }];
+          return [{ ...annotation, ...patch, updated_at: event.updated_at }];
         });
         return { ...block, annotations };
       });
+      if (!didUpdate && event.operation === 'annotation.delete') {
+        const targetIndex = remoteDeleteBlockIndex(blocks, event);
+        // A blockless snapshot has nowhere to retain a tombstone; delete remains idempotent.
+        if (targetIndex === -1) return;
+        const targetBlock = blocks[targetIndex];
+        blocks[targetIndex] = {
+          ...targetBlock,
+          annotations: [...(targetBlock.annotations || []), remoteDeletedAnnotationStub(event, ko, markId)],
+        };
+        await this.writeRuntimeBlocks(runtime, blocks);
+        await this.touchDocument(runtime, nowIso());
+        return;
+      }
       if (!didUpdate) throw new Error(`Remote annotation was not found: ${ko}`);
       await this.writeRuntimeBlocks(runtime, blocks);
       await this.touchDocument(runtime, nowIso());

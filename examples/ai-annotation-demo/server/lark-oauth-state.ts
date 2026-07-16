@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createLarkClient } from '../Lark-Meeting-Timeline-main/src/larkClient.mjs';
+import { buildLarkOAuthAuthorizeUrl, withLarkOAuthAuthorizeUrl } from './lark-oauth-client-config';
 
 const DEFAULT_AUTH_STATE_PATHS = [
   resolve(dirname(fileURLToPath(import.meta.url)), '../Lark-Meeting-Timeline-main/data/lark-auth.json'),
@@ -16,6 +17,10 @@ export interface LarkOAuthEnv {
   LARK_APP_SECRET?: string;
   FEISHU_BASE_URL?: string;
   LARK_BASE_URL?: string;
+  FEISHU_OAUTH_AUTHORIZE_URL?: string;
+  FEISHU_OAUTH_AUTHORIZE_PATH?: string;
+  LARK_OAUTH_AUTHORIZE_URL?: string;
+  LARK_OAUTH_AUTHORIZE_PATH?: string;
   LARK_MEETING_AUTH_STATE_PATH?: string;
 }
 
@@ -230,14 +235,14 @@ function oauthStateMatches(env: LarkOAuthEnv, receivedState: string | null | und
 function configuredClient(env: LarkOAuthEnv, overrides: Record<string, unknown> = {}, createClient?: (env: Record<string, unknown>) => unknown): LarkOAuthClient {
   const config = appConfig(env);
   if (!config) throw new Error('lark_oauth_app_not_configured');
-  return (createClient || createLarkClient)({
+  return (createClient || createLarkClient)(withLarkOAuthAuthorizeUrl({
     ...process.env,
     ...env,
     LARK_APP_ID: config.appId,
     LARK_APP_SECRET: config.appSecret,
     ...(config.baseUrl ? { LARK_BASE_URL: config.baseUrl } : {}),
     ...overrides,
-  }) as LarkOAuthClient;
+  })) as LarkOAuthClient;
 }
 
 export async function resolveLarkOAuthPublicStatus(env: LarkOAuthEnv, requiredScopeValue = '', nowMs = Date.now(), options: {
@@ -280,13 +285,24 @@ export function beginLarkOAuthLogin(env: LarkOAuthEnv, input: {
   const state = input.state || randomBytes(16).toString('hex');
   const scope = tokenScopeList(input.scope).join(' ');
   rememberOAuthState(env, state, input.nowMs || Date.now());
-  const client = configuredClient(env, {
+  const config = appConfig(env);
+  if (!config) throw new Error('lark_oauth_app_not_configured');
+  const clientEnv = withLarkOAuthAuthorizeUrl({
+    ...process.env,
+    ...env,
+    LARK_APP_ID: config.appId,
+    LARK_APP_SECRET: config.appSecret,
+    ...(config.baseUrl ? { LARK_BASE_URL: config.baseUrl } : {}),
     LARK_REDIRECT_URI: input.redirectUri,
     LARK_OAUTH_SCOPES: scope,
-  }, input.createClient);
-  if (!client.createAuthorizeUrl) throw new Error('lark_oauth_authorize_unsupported');
+  });
   return {
-    auth_url: client.createAuthorizeUrl(state, { scope, ignoreDefaultScopes: true }),
+    auth_url: buildLarkOAuthAuthorizeUrl(clientEnv, {
+      clientId: config.appId,
+      redirectUri: input.redirectUri,
+      state,
+      scope,
+    }),
     state,
     redirect_uri: input.redirectUri,
     scope,
@@ -360,13 +376,13 @@ export async function resolveUserOAuthToken(env: LarkOAuthEnv, nowMs = Date.now(
   if (!config) return { ...base, usable: false, reason: 'oauth_refresh_not_configured' };
 
   try {
-    const client = (options.createClient || createLarkClient)({
+    const client = (options.createClient || createLarkClient)(withLarkOAuthAuthorizeUrl({
       ...process.env,
       ...env,
       LARK_APP_ID: config.appId,
       LARK_APP_SECRET: config.appSecret,
       ...(config.baseUrl ? { LARK_BASE_URL: config.baseUrl } : {}),
-    }) as RefreshCapableClient;
+    })) as RefreshCapableClient;
     if (!client.refreshOAuthToken) return { ...base, usable: false, reason: 'oauth_refresh_unsupported' };
     const refreshed = await client.refreshOAuthToken(refreshToken);
     const refreshedState = obj(refreshed);

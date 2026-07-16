@@ -3,7 +3,7 @@ import { HttpRuntimeSyncTransport, RuntimeSyncRunner } from 'ink-surface-sdk/syn
 import type { RuntimeAnnotation, RuntimeDocumentSnapshot, RuntimeDocumentSourceKind, RuntimeStrokePoint, RuntimeSurfaceBlock, RuntimeVisualStroke } from 'ink-surface-sdk/runtime-schema';
 import { apiBase, apiUrlWithLocalHttpFallback } from '../../core/api';
 import { authHeaders, getSession, onAuthChange, runtimeTenantId, runtimeUserId } from '../../core/auth';
-import { appendMarkEntry, getDoc, getFoldedMarks, getFoldedMarksByContext, getMeeting, setAiTurnAppendHook, setRuntimeLedgerAppendHook } from '../../local/store';
+import { appendMarkEntry, getDoc, getFoldedMarks, getLatestMarkRevisions, getLatestMarkRevisionsByContext, getMeeting, setAiTurnAppendHook, setRuntimeLedgerAppendHook } from '../../local/store';
 import type { PersistedDoc, PersistedMark } from '../../core/store-format';
 import { bus, getActiveContext, state, strokeMarkIds, type Stroke, type Tool } from '../../app/state';
 import { pageIdFor } from '../../core/ids';
@@ -394,11 +394,43 @@ export function staleRuntimeManagedMarksForCanonicalRemote(
   return localMarks.filter((mark) => isRuntimeManagedLocalMark(mark) && !canonicalMarkIds.has(mark.mark_id));
 }
 
+function canonicalDeletedRuntimeMarkIds(runtime: RuntimeDocumentSnapshot): Set<string> {
+  const ids = new Set<string>();
+  for (const block of runtime.blocks) {
+    for (const annotation of block.annotations ?? []) {
+      if (annotation.status !== 'deleted') continue;
+      const meta = isRecord(annotation.inkloop_mark) ? annotation.inkloop_mark : {};
+      ids.add(markIdFromRuntimeAnnotation(annotation, meta));
+    }
+  }
+  return ids;
+}
+
+/** 远端删除要落回本地账本：canonical 里显式 status=deleted 的 annotation（B 删了 A 的本地 origin mark，
+ *  annotation.delete 事件把 A 端 canonical 标 deleted）+ 从 canonical 消失的 runtime-managed mark，
+ *  两类都 tombstone 本地账本——否则 A 端 mark 永久可见、两端分叉。 */
+export function runtimeMarksToTombstoneForCanonicalRemote(
+  localMarks: PersistedMark[],
+  runtime: RuntimeDocumentSnapshot,
+): PersistedMark[] {
+  const activeIds = canonicalRuntimeMarkIds(runtime);
+  const explicitDeletedIds = canonicalDeletedRuntimeMarkIds(runtime);
+  const absentManaged = staleRuntimeManagedMarksForCanonicalRemote(localMarks, activeIds);
+  const tombstoneIds = new Set([
+    ...explicitDeletedIds,
+    ...absentManaged.map((mark) => mark.mark_id),
+  ]);
+  return localMarks.filter((mark) => tombstoneIds.has(mark.mark_id));
+}
+
+/** 出站过滤只按 origin 信号防回环（remote/runtime-sync 来源不回推）。
+ *  不再按 canonicalMarkIds 整体排除——那会吞掉本地对 canonical mark 的后续 revision/tombstone；
+ *  canonical 集合改经 knownMarkIds 传给 bridge 用于 add/update 判定。 */
 export function outboundRuntimeMarksForCloudPush(
   localMarks: PersistedMark[],
-  canonicalMarkIds: Set<string>,
+  _canonicalMarkIds: Set<string>,
 ): PersistedMark[] {
-  return localMarks.filter((mark) => !isRuntimeManagedLocalMark(mark) && !canonicalMarkIds.has(mark.mark_id));
+  return localMarks.filter((mark) => !isRuntimeManagedLocalMark(mark));
 }
 
 export function visibleRuntimeMarksForCloudAlignment(localMarks: PersistedMark[]): PersistedMark[] {
@@ -444,8 +476,7 @@ export async function hydrateRuntimeAnnotationsToActiveCanvas(store: OfflineRunt
   clearHydratedRuntimeStrokes(docId);
 
   let localMarks = (await getFoldedMarks(docId)).filter((mark) => !isRuntimeInvalidPageNormMark(mark));
-  const canonicalMarkIds = canonicalRuntimeMarkIds(runtime);
-  const staleRuntimeMarks = staleRuntimeManagedMarksForCanonicalRemote(localMarks, canonicalMarkIds);
+  const staleRuntimeMarks = runtimeMarksToTombstoneForCanonicalRemote(localMarks, runtime);
   if (staleRuntimeMarks.length) {
     for (const staleMark of staleRuntimeMarks) {
       await appendMarkEntry(runtimeReconcileTombstoneDraft(staleMark), { notifyRuntime: false });
@@ -541,7 +572,10 @@ async function buildMeetingSnapshot(meetingId: string, generatedAt = nowIso()): 
 
 async function loadRuntimeMarks(documentId: string): Promise<PersistedMark[]> {
   const meetingId = meetingIdFromRuntimeDocumentId(documentId);
-  return meetingId ? getFoldedMarksByContext(meetingContextId(meetingId)) : getFoldedMarks(documentId);
+  // 用含 tombstone 的 revision 视图：同步链必须看到删除，否则 delete 事件永远发不出去。
+  return meetingId
+    ? getLatestMarkRevisionsByContext(meetingContextId(meetingId))
+    : getLatestMarkRevisions(documentId);
 }
 
 async function canonicalRuntimeMarkIdsFromStore(store: OfflineRuntimeStorePort, documentId: string): Promise<Set<string>> {
@@ -682,7 +716,8 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       runtimeMarks,
       canonicalMarkIds,
     );
-    const alignmentRuntimeMarks = visibleRuntimeMarksForCloudAlignment(runtimeMarks);
+    // alignment 只看出站集合：pulled remote mark 若进 alignment，会因本机新 seq 生成新事件形成回环。
+    const alignmentRuntimeMarks = visibleRuntimeMarksForCloudAlignment(outboundRuntimeMarks);
     let snapshotPromise: Promise<RuntimeDocumentSnapshot> | null = null;
     const snapshotForSync = (): Promise<RuntimeDocumentSnapshot> => {
       snapshotPromise ||= buildSnapshot(runtimeDocumentId, generatedAt);
@@ -694,6 +729,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       runtimeStore: store,
       watermarkStore: watermarks,
       originDeviceId: deviceId,
+      knownMarkIds: canonicalMarkIds,
       loadMarks: async () => outboundRuntimeMarks,
       buildSnapshot: snapshotForSync,
       now: () => generatedAt,

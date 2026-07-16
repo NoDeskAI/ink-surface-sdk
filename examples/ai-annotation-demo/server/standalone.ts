@@ -68,6 +68,7 @@ import {
   type CloudKnowledgeObjectPatch,
 } from './cloud-knowledge-store';
 import { isMeetingRuntimeDocumentId, shouldPostprocessRuntimeAnnotation } from './runtime-postprocess-policy';
+import { prepareRuntimeAnnotationUpdate } from './runtime-annotation-postprocess';
 import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
 import {
   buildInkloopDocUri,
@@ -835,7 +836,8 @@ async function handlePanelVault(req: IncomingMessage, res: ServerResponse): Prom
 const FEISHU_SERVICE_BASE = (process.env.FEISHU_SERVICE_BASE || '').replace(/\/+$/, '');
 // offline_access：飞书据此签发 refresh_token；无它则 access_token(~2h)过期只能重新扫码登录。
 // 刷新机制已就绪（resolveUserOAuthToken 自动 refreshOAuthToken）——只差在授权时申请这个 scope。
-const LARK_MEETING_OAUTH_SCOPE = 'offline_access vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+const DEFAULT_LARK_MEETING_OAUTH_SCOPE = 'offline_access vc:meeting.search:read vc:meeting.meetingid:read vc:meeting:readonly vc:meeting.meetingevent:read calendar:calendar:read calendar:calendar.event:read vc:note:read docx:document:readonly docs:document.media:download';
+const LARK_MEETING_OAUTH_SCOPE = (process.env.LARK_MEETING_OAUTH_SCOPE || DEFAULT_LARK_MEETING_OAUTH_SCOPE).trim();
 const LARK_MEETING_CALLBACK_PORT = String(process.env.LARK_MEETING_SDK_PORT || process.env.LARK_SDK_PORT || '8789').trim() || '8789';
 const LARK_MEETING_CALLBACK_PATH = '/api/auth/lark/callback';
 const CONVERT_SERVICE_BASE = (process.env.CONVERT_SERVICE_BASE || '').replace(/\/+$/, '');
@@ -1933,9 +1935,11 @@ async function buildPostprocessProjection(input: {
   return { ...base, content_hash: await computeDocumentProjectionHash(base) };
 }
 async function applyRuntimeAnnotationPostprocess(event: RuntimeSyncEvent, namespace: CloudKnowledgeNamespace): Promise<void> {
-  if (event.operation !== 'annotation.add') return;
+  if (event.operation !== 'annotation.add' && event.operation !== 'annotation.update') return;
   const payload = recordOf(event.payload);
-  const annotation = recordOf(payload.annotation);
+  const updateDisposition = await prepareRuntimeAnnotationUpdate(event, namespace, cloudKnowledgeStore);
+  if (updateDisposition === 'patched') return;
+  const annotation = recordOf(event.operation === 'annotation.update' ? payload.patch : payload.annotation);
   const docTitle = await documentTitle(namespace, event.doc_id);
   const markText = postprocessSignalText({ annotation, payload, docTitle });
   const quoteText = postprocessQuoteText({ annotation, payload, docTitle }) || markText;
