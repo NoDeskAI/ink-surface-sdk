@@ -11,7 +11,7 @@ import { SurfaceContext } from '../app/surface-context';
 import { renderBlankSurface, renderBlankPage, resizeBlankSurface, reopenBook, openPdfFromUrl, importPdfFromUrl, cancelActiveRender } from '../surface/renderer';
 import { redrawInk } from '../capture/ink';
 import { flushRegion } from '../app/annotation-loop';
-import { flushBedrock } from '../local/bedrock-recorder';
+import { flushBedrock, setBedrockDeferred } from '../local/bedrock-recorder';
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
@@ -1438,6 +1438,7 @@ async function openMaterialInMeeting(docId: string, name: string, convUrl?: stri
   document.body.classList.remove('side-open'); // 收起资料抽屉
   document.body.classList.remove('mtg-note-open'); // 资料态隐手记 bar（翻页/标题是手记的，不是资料的）
   document.body.classList.remove('mtg-note-empty');
+  setBedrockDeferred(false); // 离开画板：把画板期间攒的基岩缓冲落库
   el('mlive-title').textContent = `正在打开：${name}`; // 即时反馈：电纸屏无 loading 动画，先让用户知道在加载
   try {
     if (convUrl) {
@@ -1473,6 +1474,7 @@ function stopMeetingBedrock(): void {
   if (bedrockLeased && bedrockAutoEnabled && !bedrockUserOverride && settings.bedrock) settings.bedrock = false; // 只关「我们替它开的、且用户没手动接管的」；override 用模块级标志（跨 visibility 收租仍记得）
   bedrockLeased = false;
   bedrockAutoEnabled = false;
+  setBedrockDeferred(false);                                         // 退会兜底：解除画板延迟模式并落库（内含 flush）
   void flushBedrock();                                               // 落库 500ms 定时缓冲（raw_ref 已写进 mark，chunk 别迟到）
 }
 
@@ -1524,6 +1526,7 @@ async function openMeetingNote(mtgId: string): Promise<void> {
   meetingCtx.loadGeneration++;                      // latest-wins：抢占在途资料载入（renderer fresh() 判此值），慢资料迟到不再覆盖手记
   liveNoteDoc = doc;
   document.body.classList.add('mtg-note-open');     // 露手记标题/翻页 bar
+  setBedrockDeferred(true); // 画板期间基岩只攒内存不写库（IDB 事务落在笔画中间会顿·BOOX 尤显），关板/退会时统一落库
   document.body.classList.remove('side-open');
   el('mtg-note-title').textContent = doc.filename || `${decodeMeetingTitle(m.title)} 手记`;
   el('mlive-title').textContent = decodeMeetingTitle(m.title);          // 顶栏回会议名（资料态被覆成资料名，回手记复位）

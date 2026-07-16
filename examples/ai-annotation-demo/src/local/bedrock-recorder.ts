@@ -31,6 +31,8 @@ export interface SampleIn {
 let seg: { id: string; docId: string; surface: string; seq: number } | null = null;
 let buf: InkSample[] = [];
 let timer: ReturnType<typeof setTimeout> | null = null;
+let deferred = false;      // 会议画板等高频书写面打开期间：只攒内存、不触发写库（BOOX WebView 上 IDB 事务落在笔画中间会顿）
+const DEFER_BUF_MAX = 8192; // 内存保险：≈近 1 分钟连续接触采样，超了仍强制落一次库
 let lastMarkSeq = 0; // 上次 mark 收口时的 seq（raw_ref 回链用，per-segment·起段清零）
 let pruned = false;  // 每 app 会话只裁一次旧录像（首次起段时）
 
@@ -92,9 +94,24 @@ export function recordInkSample(s: SampleIn): void {
     };
     if (s.pressure && s.pressure > 0) sample.dynamics = { pressure: s.pressure };
     buf.push(sample);
+    if (deferred) { if (buf.length >= DEFER_BUF_MAX) void flushBedrock(); return; }
     if (buf.length >= FLUSH_N) void flushBedrock();
     else scheduleFlush();
   } catch { /* 录制不可影响主流程 */ }
+}
+
+/** 画板期间延迟落库开关：true=只攒内存（数据不丢·写库时机挪到关板）；false=立即 flush 积压。
+ *  raw_ref 回链（bedrockMarkBoundary）只读 seq 计数、与 flush 无关，延迟期照常精确。 */
+export function setBedrockDeferred(on: boolean): void {
+  deferred = on;
+  if (!on) void flushBedrock();
+}
+
+// 切后台/被杀前把延迟缓冲抢救落库（deferred 期间无定时器兜底，这是唯一保险）
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void flushBedrock();
+  });
 }
 
 /** 标注收口时调：返回"上次收口以来"录的 seq 区间（= 这个 mark 那几笔的采样；笔间无采样故精确）。
