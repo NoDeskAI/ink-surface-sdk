@@ -157,7 +157,9 @@ export function disarmOnyxPenAreaNow(): void {
 let installed = false;
 /** 安装 ONYX 画区上报。非 ONYX 直接跳过（no-op）。mobile-main 一行注册即可。 */
 export function initOnyxPenArea(): void {
-  if (installed || !channel()) return;
+  // 回退期连 observer 都不装：raw 不启用时 MutationObserver 全 body 监听纯属白跑
+  //（原生桥现默认也不注入，此门控为桥在、raw 关的实验组合兜底）
+  if (installed || !onyxRawEnabled() || !channel()) return;
   installed = true;
   // 业务事件触发重算（经签名门；写字后 mark 重绘也发这些但几何不变→跳过）
   bus.on('page:rendered', scheduleReport);

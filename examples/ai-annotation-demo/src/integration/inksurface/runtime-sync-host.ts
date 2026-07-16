@@ -1043,14 +1043,25 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     schedule(docId, 'document-bootstrap');
     void reconcileNow(docId, 'document-visible-reconcile');
   });
+  // 落笔期间跳过周期性同步（500ms pull / 3s reconcile 在书写中造成规律性掉帧·电纸屏 WebView 尤显，
+  // codex cx_webview_feel P0）。capture 阶段被动观察 pointer 事件、不侵入 ink.ts；只错峰、不改同步语义——
+  // 抬笔/取消/切后台即恢复，最坏卡死一个 penActive 也会被下一次 pointerup 清掉。
+  let penStrokeActive = false;
+  const onHostPenDown = (e: PointerEvent): void => { if (e.pointerType === 'pen') penStrokeActive = true; };
+  const onHostPenClear = (): void => { penStrokeActive = false; };
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pointerdown', onHostPenDown, { capture: true, passive: true });
+    window.addEventListener('pointerup', onHostPenClear, { capture: true, passive: true });
+    window.addEventListener('pointercancel', onHostPenClear, { capture: true, passive: true });
+  }
   if (pollMs > 0 && typeof window !== 'undefined') {
-    pollTimer = window.setInterval(() => void pullNow(), pollMs);
+    pollTimer = window.setInterval(() => { if (!penStrokeActive) void pullNow(); }, pollMs);
   }
   if (reconcileMs > 0 && typeof window !== 'undefined') {
-    reconcileTimer = window.setInterval(() => void reconcileNow(), reconcileMs);
+    reconcileTimer = window.setInterval(() => { if (!penStrokeActive) void reconcileNow(); }, reconcileMs);
   }
   if (outboxDrainMs > 0 && typeof window !== 'undefined') {
-    outboxDrainTimer = window.setInterval(() => void drainOutbox('outbox-retry'), outboxDrainMs);
+    outboxDrainTimer = window.setInterval(() => { if (!penStrokeActive) void drainOutbox('outbox-retry'); }, outboxDrainMs);
   }
   const onVisibilityChange = (): void => {
     if (document.visibilityState === 'hidden') return;
@@ -1107,7 +1118,12 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       if (outboxDrainTimer !== null) window.clearInterval(outboxDrainTimer);
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
       if (typeof document !== 'undefined') document.removeEventListener(RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, onDeadLetterRetry);
-      if (typeof window !== 'undefined') window.removeEventListener('online', onOnline);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', onOnline);
+        window.removeEventListener('pointerdown', onHostPenDown, { capture: true } as EventListenerOptions);
+        window.removeEventListener('pointerup', onHostPenClear, { capture: true } as EventListenerOptions);
+        window.removeEventListener('pointercancel', onHostPenClear, { capture: true } as EventListenerOptions);
+      }
     },
   };
 }
