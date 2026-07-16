@@ -635,6 +635,32 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     : undefined;
   const pendingDocs = new Set<string>();
   const pendingReasons = new Map<string, string>();
+  // 待推文档脏集持久化（localStorage·按命名空间）：挂起期强杀后 pendingDocs 内存即失，
+  // 而 reconcile 只看当前打开文档——不回灌的话账本里的 mark 要等用户重开那本书才会被桥接推送（review P0）。
+  const dirtyDocsKey = (): string => `inkloop.runtime-sync.dirty-docs::${runtimeNamespace}`;
+  const readDirtyDocs = (): string[] => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const parsed: unknown = JSON.parse(window.localStorage.getItem(dirtyDocsKey()) || '[]');
+      return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+    } catch { return []; }
+  };
+  const persistDirtyDoc = (documentId: string): void => {
+    if (typeof window === 'undefined') return;
+    try {
+      const current = readDirtyDocs();
+      if (current.includes(documentId)) return;
+      window.localStorage.setItem(dirtyDocsKey(), JSON.stringify([...current, documentId]));
+    } catch { /* 满/隐私模式：脏集只是保险，丢了退回旧行为 */ }
+  };
+  const clearDirtyDoc = (documentId: string): void => {
+    if (typeof window === 'undefined') return;
+    try {
+      const current = readDirtyDocs();
+      const next = current.filter((d) => d !== documentId);
+      if (next.length !== current.length) window.localStorage.setItem(dirtyDocsKey(), JSON.stringify(next));
+    } catch { /* no-op */ }
+  };
   const pendingBootstrapDocs = new Set<string>();
   const bootstrappedDocs = new Set<string>();
   const debounceMs = Math.max(100, options.debounceMs ?? MAGIC_SYNC_DEBOUNCE_MS);
@@ -750,7 +776,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   }
 
   function drainOutbox(reason: string): Promise<void> {
-    if (disposed) return Promise.resolve();
+    if (disposed || syncHeld) return Promise.resolve();
     if (drainInFlight) return drainInFlight;
     const run = enqueue(async () => {
       if (disposed) return;
@@ -842,6 +868,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
 
   async function syncDocumentNow(documentId: string, reason = 'mark-ledger'): Promise<void> {
     if (disposed) return;
+    if (syncHeld) { pendingDocs.add(documentId); pendingReasons.set(documentId, reason); return; } // 硬门：直呼路径也拦，放回 pending 等 release
     const runtimeDocumentId = runtimeDocumentIdForSyncRequest(documentId);
     await publishDocStatus('syncing', runtimeDocumentId, reason);
     const generatedAt = nowIso();
@@ -904,6 +931,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       log('runtime-sync:local-visible-aligned', { reason, alignment });
     }
     log('runtime-sync:document', { reason, bridge: result, alignment, sync });
+    clearDirtyDoc(documentId); // 走到这=本轮桥接+推送完成（失败会 throw 走不到），脏集保险可撤
   }
 
   async function syncDocument(documentId: string, reason = 'mark-ledger'): Promise<void> {
@@ -912,6 +940,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
 
   async function flush(reason = 'scheduled'): Promise<void> {
     if (disposed) return;
+    if (syncHeld) return; // 硬门：挂起前已排的 debounce/visible flush 也不放行，docs 留在 pendingDocs 等 release
     const docs = [...pendingDocs];
     pendingDocs.clear();
     for (const docId of docs) {
@@ -939,6 +968,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     if (disposed) return;
     pendingDocs.add(documentId);
     pendingReasons.set(documentId, reason);
+    persistDirtyDoc(documentId); // 崩溃保险：成功推完由 syncDocumentNow 清除
     if (syncHeld) return; // 画板挂起：进 pending 集即可，推送等 setRuntimeSyncHeld(false) 统一补
     void publishDocStatus('queued', runtimeDocumentIdForSyncRequest(documentId), reason);
     if (timer !== null) window.clearTimeout(timer);
@@ -949,7 +979,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   }
 
   async function pullNowInternal(reason: string): Promise<void> {
-    if (disposed) return;
+    if (disposed || syncHeld) return;
     const visibleStatus = reason !== 'poll';
     if (visibleStatus) {
       const counts = await outboxCounts();
@@ -1009,7 +1039,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   }
 
   async function reconcileNow(documentId = state.documentId || '', reason = 'local-visible-reconcile'): Promise<void> {
-    if (disposed || !documentId) return;
+    if (disposed || syncHeld || !documentId) return;
     try {
       const runtimeDocumentId = runtimeDocumentIdForSyncRequest(documentId);
       const runtimeMarks = await loadRuntimeMarks(runtimeDocumentId);
@@ -1058,22 +1088,29 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   // 落笔期间跳过周期性同步（500ms pull / 3s reconcile 在书写中造成规律性掉帧·电纸屏 WebView 尤显，
   // codex cx_webview_feel P0）。capture 阶段被动观察 pointer 事件、不侵入 ink.ts；只错峰、不改同步语义——
   // 抬笔/取消/切后台即恢复，最坏卡死一个 penActive 也会被下一次 pointerup 清掉。
-  let penStrokeActive = false;
-  const onHostPenDown = (e: PointerEvent): void => { if (e.pointerType === 'pen') penStrokeActive = true; };
-  const onHostPenClear = (): void => { penStrokeActive = false; };
+  // 按 pointerId 记账：手指 pointerup 不会误清还压着的笔；pen-up 丢失（驱动抖动）由 hidden/blur/cancel 兜底清空
+  const activePenPointers = new Set<number>();
+  const penStrokeActiveNow = (): boolean => activePenPointers.size > 0;
+  const onHostPenDown = (e: PointerEvent): void => { if (e.pointerType === 'pen') activePenPointers.add(e.pointerId); };
+  const onHostPenUp = (e: PointerEvent): void => { activePenPointers.delete(e.pointerId); };
+  const onHostPenReset = (): void => { activePenPointers.clear(); };
   if (typeof window !== 'undefined') {
     window.addEventListener('pointerdown', onHostPenDown, { capture: true, passive: true });
-    window.addEventListener('pointerup', onHostPenClear, { capture: true, passive: true });
-    window.addEventListener('pointercancel', onHostPenClear, { capture: true, passive: true });
+    window.addEventListener('pointerup', onHostPenUp, { capture: true, passive: true });
+    window.addEventListener('pointercancel', onHostPenUp, { capture: true, passive: true });
+    window.addEventListener('blur', onHostPenReset);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') onHostPenReset(); });
+    }
   }
   if (pollMs > 0 && typeof window !== 'undefined') {
-    pollTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void pullNow(); }, pollMs);
+    pollTimer = window.setInterval(() => { if (!penStrokeActiveNow() && !syncHeld) void pullNow(); }, pollMs);
   }
   if (reconcileMs > 0 && typeof window !== 'undefined') {
-    reconcileTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void reconcileNow(); }, reconcileMs);
+    reconcileTimer = window.setInterval(() => { if (!penStrokeActiveNow() && !syncHeld) void reconcileNow(); }, reconcileMs);
   }
   if (outboxDrainMs > 0 && typeof window !== 'undefined') {
-    outboxDrainTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void drainOutbox('outbox-retry'); }, outboxDrainMs);
+    outboxDrainTimer = window.setInterval(() => { if (!penStrokeActiveNow() && !syncHeld) void drainOutbox('outbox-retry'); }, outboxDrainMs);
   }
   // 画板挂起解除：把挂起期攒的 pending 文档补推 + 排空 outbox + 拉一轮远端
   const onSyncHeldRelease = (): void => {
@@ -1119,6 +1156,8 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
   });
 
   void drainOutbox('boot-outbox-drain');
+  // 挂起期强杀恢复：上次没推完的文档从持久化脏集回灌（此刻未挂起，schedule 正常走 debounce→flush→桥接）
+  for (const dirtyDoc of readDirtyDocs()) schedule(dirtyDoc, 'boot-dirty-doc');
 
   return {
     deviceId,
@@ -1141,8 +1180,9 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', onOnline);
         window.removeEventListener('pointerdown', onHostPenDown, { capture: true } as EventListenerOptions);
-        window.removeEventListener('pointerup', onHostPenClear, { capture: true } as EventListenerOptions);
-        window.removeEventListener('pointercancel', onHostPenClear, { capture: true } as EventListenerOptions);
+        window.removeEventListener('pointerup', onHostPenUp, { capture: true } as EventListenerOptions);
+        window.removeEventListener('pointercancel', onHostPenUp, { capture: true } as EventListenerOptions);
+        window.removeEventListener('blur', onHostPenReset);
       }
     },
   };

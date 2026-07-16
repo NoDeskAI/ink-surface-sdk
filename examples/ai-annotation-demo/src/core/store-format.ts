@@ -370,7 +370,7 @@ export interface PersistedMeeting {
   // ── L5 panel 总结缓存（recap 顶部显示·离线不丢·optional 零迁移）──
   panel_summary?: PanelMeetingSummaryRecord;
   panel_summary_fetched_at?: string;
-  panel_summary_status?: 'ready' | 'not_generated' | 'missing_minute' | 'not_found' | 'failed';
+  panel_summary_status?: 'ready' | 'not_generated' | 'missing_minute' | 'transcript_not_ready' | 'not_found' | 'failed';
   panel_summary_unread?: boolean;   // 总结由 summary_ready 事件后台到达、用户还没进 recap 看过（home/detail 提醒用·进 recap 即清）
   feishu_note_summary?: FeishuNoteSummaryRecord; // 飞书官方智能纪要原文（独立于转写、panel_summary、本地 summary）
   feishu_note_summary_status?: 'ready' | 'missing' | 'failed';

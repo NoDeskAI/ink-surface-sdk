@@ -167,6 +167,11 @@ function retryAt(now: string, retryDelayMs: number): string {
 // 弱网上传必超时且重试永远整批失败。按累计字节切批后每个请求都在可完成的量级；超上限的巨型事件单独成批。
 const DEFAULT_MAX_BATCH_BYTES = 600_000;
 
+const utf8Encoder = new TextEncoder();
+function utf8ByteLength(value: string): number {
+  return utf8Encoder.encode(value).byteLength;
+}
+
 function chunkByBytes<T>(items: T[], maxCount: number, maxBytes: number, sizeOf: (item: T) => number): T[][] {
   const batches: T[][] = [];
   let current: T[] = [];
@@ -281,7 +286,8 @@ export class RuntimeSyncRunner {
       };
     }
 
-    for (const batch of chunkByBytes(representatives, this.batchSize, this.maxBatchBytes, (item) => JSON.stringify(item.event).length)) {
+    // 用真 UTF-8 字节数计量（.length 是 UTF-16 码元数，中文≈3 bytes/字，600KB 上限会被低估到 1/3 → 实际请求超限反复失败）
+    for (const batch of chunkByBytes(representatives, this.batchSize, this.maxBatchBytes, (item) => utf8ByteLength(JSON.stringify(item.event)))) {
       const batchEvents = batch.map(({ event }) => event);
       attemptedEventIds.push(...batchEvents.map((event) => event.event_id));
       let acks: RuntimeSyncAck[];
@@ -441,9 +447,10 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
   async send(events: RuntimeSyncEvent[]): Promise<RuntimeSyncAck[]> {
     const controller = new AbortController();
     const timeout = timeoutAbort(controller, Math.max(1, this.config.sendTimeoutMs ?? 120_000));
-    let response: Response;
+    // 超时必须盖住响应体读取：fetch 收到响应头就 resolve，若服务端/代理只发头不结束 body，
+    // response.json() 永不返回——提前清 timer 会让 host 的 syncQueue 永久卡死（review P0）。
     try {
-      response = await fetch(this.config.endpoint, {
+      const response = await fetch(this.config.endpoint, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -456,15 +463,14 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
         }),
         signal: controller.signal,
       });
+      if (!response.ok) throw new Error(`Runtime sync failed: HTTP ${response.status}`);
+      const payload = await response.json().catch(() => ({})) as { acks?: unknown };
+      if (!Array.isArray(payload.acks)) throw new Error('Runtime sync response must include an acks array.');
+      if (!payload.acks.every(isRuntimeSyncAck)) throw new Error('Runtime sync response contains malformed acks.');
+      return payload.acks;
     } finally {
       clearTimeout(timeout);
     }
-
-    if (!response.ok) throw new Error(`Runtime sync failed: HTTP ${response.status}`);
-    const payload = await response.json().catch(() => ({})) as { acks?: unknown };
-    if (!Array.isArray(payload.acks)) throw new Error('Runtime sync response must include an acks array.');
-    if (!payload.acks.every(isRuntimeSyncAck)) throw new Error('Runtime sync response contains malformed acks.');
-    return payload.acks;
   }
 
   async pull(request: RuntimeSyncPullRequest): Promise<RuntimeSyncPullResponse> {
@@ -478,21 +484,19 @@ export class HttpRuntimeSyncTransport implements RuntimeSyncTransportPort {
 
     const controller = new AbortController();
     const timeout = timeoutAbort(controller, Math.max(1, this.config.requestTimeoutMs ?? 15_000));
-    let response: Response;
     try {
-      response = await fetch(endpoint, {
+      const response = await fetch(endpoint, {
         method: 'GET',
         headers: this.headers(),
         signal: controller.signal,
       });
+      if (!response.ok) throw new Error(`Runtime sync pull failed: HTTP ${response.status}`);
+      const payload = await response.json().catch(() => ({}));
+      assertRuntimeSyncPullResponse(payload);
+      return payload;
     } finally {
       clearTimeout(timeout);
     }
-
-    if (!response.ok) throw new Error(`Runtime sync pull failed: HTTP ${response.status}`);
-    const payload = await response.json().catch(() => ({}));
-    assertRuntimeSyncPullResponse(payload);
-    return payload;
   }
 }
 

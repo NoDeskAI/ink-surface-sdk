@@ -1945,10 +1945,18 @@ export function initMobileMeeting(opts: { readerCtx: SurfaceContext }): void {
 
   // 基岩 lease 配套：用户会议中手动设过基岩 → 标记 override（退出别误关）；切后台/关页 flush 并按 lease 处理。
   bus.on('bedrock:user-set', () => { if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) bedrockUserOverride = true; }); // 仅飞书已判 live 的会议里用户手动设过才接管（会前/已结束不接管·M1）
-  window.addEventListener('pagehide', stopMeetingBedrock);
+  window.addEventListener('pagehide', () => { flushRegion('manual'); stopMeetingBedrock(); });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') stopMeetingBedrock();
-    else if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) startMeetingBedrock(); // 切回前台且在飞书已判 live 的会议 → 续租（会前不录·M1）
+    if (document.visibilityState === 'hidden') {
+      flushRegion('manual'); // 在途区域先收口落账本（quiet 定时器切后台会被节流，强杀前这是最后机会）
+      stopMeetingBedrock();  // 内含解除画板挂起+落库基岩缓冲
+    } else if (liveMtg && liveMtg.status === 'live' && !liveMtg.frozenAt) {
+      startMeetingBedrock(); // 切回前台且在飞书已判 live 的会议 → 续租（会前不录·M1）
+      if (document.body.classList.contains('mtg-note-open')) { // 用户还站在画板上 → 重新挂起（hidden 时解除过）
+        setBedrockDeferred(true);
+        setRuntimeSyncHeld(true);
+      }
+    }
   });
 
   // 标注账本变化 → 从折叠后的真实账本刷新计数。擦除也会落 mark 事件，不能乐观 +1。

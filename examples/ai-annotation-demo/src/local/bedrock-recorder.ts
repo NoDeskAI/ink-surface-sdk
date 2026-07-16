@@ -104,6 +104,7 @@ export function recordInkSample(s: SampleIn): void {
  *  raw_ref 回链（bedrockMarkBoundary）只读 seq 计数、与 flush 无关，延迟期照常精确。 */
 export function setBedrockDeferred(on: boolean): void {
   deferred = on;
+  if (on && timer) { clearTimeout(timer); timer = null; } // 进画板前已排的 500ms flush 别在画板期触发
   if (!on) void flushBedrock();
 }
 

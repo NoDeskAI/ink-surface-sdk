@@ -118,7 +118,8 @@ function titleFor(detail: RuntimeSyncStatusDetail): string {
   if (detail.state === 'failed') return '标记同步失败';
   if (detail.state === 'syncing') return pending > 0 ? `标记同步中 ${pending}` : '标记同步中';
   if (detail.state === 'pulling') return '正在检查标记';
-  if (pending > 0) return `标记待同步 ${pending}`;
+  // 双计数同显：只报 pending 会把死信藏到 pending 清零才露头，用户看不到完整积压
+  if (pending > 0) return deadLetters > 0 ? `标记待同步 ${pending} · 另有 ${deadLetters} 条历史标记未同步` : `标记待同步 ${pending}`;
   if (deadLetters > 0) return `有 ${deadLetters} 条历史标记未同步`;
   return '标记已同步';
 }
