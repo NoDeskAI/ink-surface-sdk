@@ -1168,6 +1168,20 @@ export function listAllMeetings(): Promise<PersistedMeeting[]> {
 export function getMeeting(id: string): Promise<PersistedMeeting | null> {
   return getOneFrom<PersistedMeeting>(MEETINGS, id);
 }
+/** 删除一场会议记录（重复卡自愈合并用·只删 meetings 行，不碰手记/资料 doc——调用方负责先把引用并给保留者）。 */
+export async function deleteMeeting(id: string): Promise<void> {
+  const db = await openDB();
+  if (!db) return;
+  return new Promise<void>((resolve, reject) => {
+    try {
+      const tx = db.transaction(MEETINGS, 'readwrite');
+      tx.objectStore(MEETINGS).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB deleteMeeting failed: ${id}`));
+      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB deleteMeeting aborted: ${id}`));
+    } catch (e) { reject(e); }
+  });
+}
 /** 局部更新一场会议（合并 patch + 刷新 updated_at）。单个 readwrite 事务内 get→spread→put，
  *  防两次并发 updateMeeting（如 M7 openMeeting 清 live_unread 撞上后台 panel 轮询刷新其它字段）
  *  各自基于旧快照写回、后写者用旧值覆盖先写者的改动（lost update·真机 12s 轮询下实测触发过）。 */

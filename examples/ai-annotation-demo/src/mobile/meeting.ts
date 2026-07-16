@@ -16,7 +16,7 @@ import { setRuntimeSyncHeld } from '../integration/inksurface/runtime-sync-host'
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
-  createMeeting, getMeeting, updateMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
+  createMeeting, getMeeting, updateMeeting, deleteMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
   createDiaryDoc, renameDiary, setActiveDoc, setLastReadPage, getDoc, upsertPanelWorkspace, upsertScheduleWorkspace,
   appendMarkEntry,
 } from '../local/store';
@@ -318,7 +318,18 @@ function rememberMeetingProvider(provider: MeetingPlatform): void {
 
 // ════ L1：panel 飞书会议同步（VC all_meeting_started/ended → 本地会议·带真 t0）════
 const PANEL_CURSOR_KEY = 'inkloop.panelMeeting.cursor.v1';
-const panelUpserts = new Map<string, Promise<void>>(); // 按 meeting_id 串行·防 events+active 并发同一会议重复建
+// 按会议 key 串行的共享锁：panel 事件路(upsertPanelMeeting)和 meeting-sources 路(syncMeetingSources)
+// 共用同一把——两路各自「查无此会→建卡」的 check-then-create 不原子，短会(started/ended 同窗口到达)
+// 实测撞出同 fid 两张卡（2026-07-16·55 秒测试会）。key=feishu_meeting_id（两路同值域）。
+const meetingKeyLocks = new Map<string, Promise<void>>();
+async function withMeetingKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = meetingKeyLocks.get(key) ?? Promise.resolve();
+  const job = prev.catch(() => {}).then(fn);
+  const tail = job.then(() => undefined, () => undefined);
+  meetingKeyLocks.set(key, tail);
+  void tail.finally(() => { if (meetingKeyLocks.get(key) === tail) meetingKeyLocks.delete(key); });
+  return job;
+}
 type PanelMeetingUpsertType = 'started' | 'ended' | 'metadata'; // metadata=minute_bound/summary_ready 带来的元数据更新·不改 status/时间
 
 /** 事件内嵌会议上的当前妙记 token（顶层 minute_token 优先·回退 match.minute_token）。 */
@@ -332,13 +343,7 @@ async function findLocalPanelMeeting(panelMeetingId: string): Promise<PersistedM
 /** panel 会议 → 落成本地会议。靠 feishu_meeting_id 幂等去重·同一 meeting_id 串行（防并发重复建）。本地写失败会抛 → 上层不推 cursor。 */
 async function upsertPanelMeeting(mt: PanelFeishuMeeting, type: PanelMeetingUpsertType, occurredAt = 0): Promise<void> {
   if (!mt.meeting_id) return;
-  const key = mt.meeting_id;
-  const prev = panelUpserts.get(key) ?? Promise.resolve();
-  const job = prev.catch(() => {}).then(() => upsertPanelMeetingInner(mt, type, occurredAt)).finally(() => {
-    if (panelUpserts.get(key) === job) panelUpserts.delete(key);
-  });
-  panelUpserts.set(key, job);
-  await job;
+  await withMeetingKeyLock(mt.meeting_id, () => upsertPanelMeetingInner(mt, type, occurredAt));
 }
 
 /** 归群「两条腿」：① group_ids 自动归真群 → ② 认领映射 → ③ 已在真飞书群保持 → ④ 日历会议无群保持日程占位 → ⑤ 无群桶。 */
@@ -520,12 +525,15 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
   const res = await feishuGet<FeishuMeetingSourcesResponse>('/api/feishu/meeting-sources?lookback_days=30&lookahead_days=14&page_size=10');
   if (!res) return { connected: false, imported: 0 };
   const sources = (res.sources || []).filter((source) => source.scheduled_at && (source.feishu_meeting_id || source.meeting_no || source.calendar_event_id || source.meeting_url));
-  let all = await listAllMeetings();
   let imported = 0;
   for (const source of sources) {
-    const existing = existingMeetingForSource(all, source);
+    const meetingNo0 = source.meeting_no || meetingNoFromUrl(source.meeting_url);
+    // 与 panel 事件路共锁 + 锁内重查：check-then-create 必须在同一把锁里原子，否则短会两路并发各建一张卡。
+    const lockKey = String(source.feishu_meeting_id || source.calendar_event_id || meetingNo0 || source.source_id || source.meeting_url);
+    await withMeetingKeyLock(lockKey, async () => {
+    const existing = existingMeetingForSource(await listAllMeetings(), source);
     const ws = await sourceWorkspace(source, existing);
-    const meetingNo = source.meeting_no || meetingNoFromUrl(source.meeting_url);
+    const meetingNo = meetingNo0;
     const patch: Partial<PersistedMeeting> = {
       workspace_id: ws.workspace_id,
       title: source.title || existing?.title || '飞书会议',
@@ -547,14 +555,14 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
       ...(ws.source === 'feishu' ? { group_claimed_at: new Date().toISOString() } : {}),
     };
     if (existing) {
-      if (existing.source_kind === 'vc' && source.source !== 'lark_meeting_timeline' && source.status !== 'ended') continue;
+      if (existing.source_kind === 'vc' && source.source !== 'lark_meeting_timeline' && source.status !== 'ended') return;
       await updateMeeting(existing.meeting_id, patch);
     } else {
       const created = await createMeeting(ws.workspace_id, { title: patch.title || '飞书会议', scheduled_at: source.scheduled_at, status: patch.status || 'upcoming' });
       await updateMeeting(created.meeting_id, patch);
       imported += 1;
-      all = [...all, { ...created, ...patch, updated_at: new Date().toISOString() } as PersistedMeeting];
     }
+    });
   }
   const issue = res.errors?.find((error) => error.source === 'lark_meeting_timeline_search' || error.source === 'lark_meeting_timeline_lookup')?.message;
   return { connected: !!res.connected, imported, issue };
@@ -762,6 +770,51 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
   await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
 }
 
+// ════ 重复卡自愈：历史竞态给同一场飞书会建过两张卡（锁上线前的存量+万一的漏网）。════
+// 合并原则：手记 doc 挂本地 meeting_id（noteIdOf），删错会孤儿化用户笔迹——有手记的必留；
+// 双方都有手记直接跳过（宁可重复不可丢数据）。字段并给保留者后删多余卡。幂等，每轮同步末尾跑。
+const DUP_MERGE_FIELDS: Array<keyof PersistedMeeting> = [
+  'ended_at', 'started_at', 'vc_meeting_start_t0', 't0_source', 'align_state', 'panel_meeting_start',
+  'feishu_meeting_no', 'calendar_meeting_no', 'feishu_topic', 'feishu_calendar_event_id',
+  'feishu_minute_token', 'feishu_minute_url', 'source_kind',
+];
+async function healDuplicateLarkMeetings(): Promise<void> {
+  const groups = new Map<string, PersistedMeeting[]>();
+  for (const m of await listAllMeetings()) {
+    if (meetingPlatformOf(m) !== 'lark' || !m.feishu_meeting_id) continue;
+    groups.set(m.feishu_meeting_id, [...(groups.get(m.feishu_meeting_id) ?? []), m]);
+  }
+  for (const [fid, dupes] of groups) {
+    if (dupes.length < 2) continue;
+    const scored = await Promise.all(dupes.map(async (m) => ({ m, note: !!(await getDoc(noteIdOf(m.meeting_id))) })));
+    if (scored.filter((x) => x.note).length > 1) {
+      devEmit('meeting', () => ({ ev: 'dup_heal_skipped', fid, reason: 'both_have_note', ids: dupes.map((d) => d.meeting_id) }));
+      continue;
+    }
+    const score = (x: { m: PersistedMeeting; note: boolean }): number =>
+      (x.note ? 8 : 0) + (x.m.panel_summary ? 4 : 0) + ((x.m.material_doc_ids?.length ?? 0) > 0 ? 2 : 0) + (x.m.ended_at ? 1 : 0);
+    scored.sort((a, b) => score(b) - score(a) || (a.m.created_at || '').localeCompare(b.m.created_at || ''));
+    const keeper = scored[0].m;
+    if (liveMtg && dupes.some((d) => d.meeting_id === liveMtg?.id) && keeper.meeting_id !== liveMtg.id) continue; // 正开着的会这轮不动
+    const losers = scored.slice(1).map((x) => x.m);
+    const patch: Partial<PersistedMeeting> = {};
+    for (const loser of losers) {
+      for (const k of DUP_MERGE_FIELDS) {
+        if (keeper[k] == null && loser[k] != null && patch[k] == null) {
+          (patch as Record<keyof PersistedMeeting, unknown>)[k] = loser[k];
+        }
+      }
+      if (loser.status === 'ended' && keeper.status !== 'ended') { patch.status = 'ended'; if (patch.ended_at == null) patch.ended_at = loser.ended_at; }
+      if (!keeper.panel_summary && loser.panel_summary) { patch.panel_summary = loser.panel_summary; patch.panel_summary_status = loser.panel_summary_status; }
+      const extraDocs = (loser.material_doc_ids || []).filter((d) => !(keeper.material_doc_ids || []).includes(d));
+      if (extraDocs.length) await addMeetingMaterialDocIds(keeper.meeting_id, extraDocs);
+    }
+    if (Object.keys(patch).length) await updateMeeting(keeper.meeting_id, patch);
+    for (const loser of losers) await deleteMeeting(loser.meeting_id);
+    devEmit('meeting', () => ({ ev: 'dup_heal_merged', fid, keeper: keeper.meeting_id, removed: losers.map((l) => l.meeting_id) }));
+  }
+}
+
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */
 async function syncHomeData(): Promise<void> {
   fsIdentityCache = await feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null);
@@ -777,6 +830,7 @@ async function syncHomeData(): Promise<void> {
   fsConnectedCache = fsConnectedCache || meetingSources.connected;
   if (!fsCalendarIssue && meetingSources.issue) fsCalendarIssue = meetingSources.issue;
   await syncGoogleCalendarMeetings().catch(() => {});
+  await healDuplicateLarkMeetings().catch(() => {}); // 重复卡自愈（存量清理+锁的漏网兜底）·幂等
 }
 
 /** home 数据签名：workspace 名称/来源 + 会议状态/标题/时间/未读标记，任一变化才值得重渲（电纸屏免无谓刷新）。

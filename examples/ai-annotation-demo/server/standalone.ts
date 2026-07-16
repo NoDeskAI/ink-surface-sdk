@@ -2732,10 +2732,18 @@ async function runLarkMeetingReconcile(reason: string): Promise<void> {
           );
           return oauth.usable && oauth.token ? oauth.token : '';
         },
+        // 参会人兜底候选：owner/参会人都无 token 时（同事主持+参会人未采集）用全部已登录用户挨个试。
+        listFallbackOpenIds: () => {
+          try {
+            return readdirSync(resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID))
+              .filter((name) => name.startsWith('feishu_'))
+              .map((name) => name.slice('feishu_'.length));
+          } catch { return []; }
+        },
         logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
       });
-      if (result.checked > 0 || result.errors.length > 0) {
-        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      if (result.checked > 0 || result.errors.length > 0 || result.enriched > 0) {
+        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped} enriched=${result.enriched}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
       }
     });
   } catch (e) {
