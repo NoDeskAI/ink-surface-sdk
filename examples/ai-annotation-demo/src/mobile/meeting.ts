@@ -12,6 +12,7 @@ import { renderBlankSurface, renderBlankPage, resizeBlankSurface, reopenBook, op
 import { redrawInk } from '../capture/ink';
 import { flushRegion } from '../app/annotation-loop';
 import { flushBedrock, setBedrockDeferred } from '../local/bedrock-recorder';
+import { setRuntimeSyncHeld } from '../integration/inksurface/runtime-sync-host';
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
@@ -1439,6 +1440,7 @@ async function openMaterialInMeeting(docId: string, name: string, convUrl?: stri
   document.body.classList.remove('mtg-note-open'); // 资料态隐手记 bar（翻页/标题是手记的，不是资料的）
   document.body.classList.remove('mtg-note-empty');
   setBedrockDeferred(false); // 离开画板：把画板期间攒的基岩缓冲落库
+  setRuntimeSyncHeld(false); // 离开画板：恢复同步并补推挂起期的标记
   el('mlive-title').textContent = `正在打开：${name}`; // 即时反馈：电纸屏无 loading 动画，先让用户知道在加载
   try {
     if (convUrl) {
@@ -1475,6 +1477,7 @@ function stopMeetingBedrock(): void {
   bedrockLeased = false;
   bedrockAutoEnabled = false;
   setBedrockDeferred(false);                                         // 退会兜底：解除画板延迟模式并落库（内含 flush）
+  setRuntimeSyncHeld(false);                                         // 退会兜底：恢复同步并补推挂起期标记
   void flushBedrock();                                               // 落库 500ms 定时缓冲（raw_ref 已写进 mark，chunk 别迟到）
 }
 
@@ -1527,6 +1530,7 @@ async function openMeetingNote(mtgId: string): Promise<void> {
   liveNoteDoc = doc;
   document.body.classList.add('mtg-note-open');     // 露手记标题/翻页 bar
   setBedrockDeferred(true); // 画板期间基岩只攒内存不写库（IDB 事务落在笔画中间会顿·BOOX 尤显），关板/退会时统一落库
+  setRuntimeSyncHeld(true); // 画板期间标记同步整体挂起（落账本即 120ms 网络推送会打进书写间隙），退出画板一次性同步
   document.body.classList.remove('side-open');
   el('mtg-note-title').textContent = doc.filename || `${decodeMeetingTitle(m.title)} 手记`;
   el('mlive-title').textContent = decodeMeetingTitle(m.title);          // 顶栏回会议名（资料态被覆成资料名，回手记复位）

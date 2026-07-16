@@ -17,6 +17,17 @@ import { requeueVisibleRuntimeMarksForCloudAlignment, visibleRuntimeMarkSignatur
 import { RuntimeStoreInbox } from './runtime-inbox';
 import { RUNTIME_SYNC_RETRY_DEAD_LETTERS_EVENT, type RuntimeSyncStatusDetail, type RuntimeSyncUiState } from '../../components/runtime-sync-status';
 
+// ── 高频书写面（会议画板）同步挂起：落账本只进 pending 集不推送、周期任务全停；解除时补一轮 ──
+// 「落账本即 120ms 推送」在 BOOX WebView 上意味着书写停顿间隙不断有 IDB+网络+横幅 DOM 活动打进笔画，
+// 画板打开期间整体挂起、退出画板一次性同步（用户 2026-07-16 指定方案）。事件都在 outbox/账本里，不丢。
+let syncHeld = false;
+const syncHeldReleases = new Set<() => void>();
+export function setRuntimeSyncHeld(on: boolean): void {
+  if (syncHeld === on) return;
+  syncHeld = on;
+  if (!on) for (const release of [...syncHeldReleases]) release();
+}
+
 const MAGIC_SYNC_DEBOUNCE_MS = 120;
 const MAGIC_SYNC_POLL_MS = 500;
 const MAGIC_SYNC_RECONCILE_MS = 3_000;
@@ -928,6 +939,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     if (disposed) return;
     pendingDocs.add(documentId);
     pendingReasons.set(documentId, reason);
+    if (syncHeld) return; // 画板挂起：进 pending 集即可，推送等 setRuntimeSyncHeld(false) 统一补
     void publishDocStatus('queued', runtimeDocumentIdForSyncRequest(documentId), reason);
     if (timer !== null) window.clearTimeout(timer);
     timer = window.setTimeout(() => {
@@ -1055,14 +1067,21 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     window.addEventListener('pointercancel', onHostPenClear, { capture: true, passive: true });
   }
   if (pollMs > 0 && typeof window !== 'undefined') {
-    pollTimer = window.setInterval(() => { if (!penStrokeActive) void pullNow(); }, pollMs);
+    pollTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void pullNow(); }, pollMs);
   }
   if (reconcileMs > 0 && typeof window !== 'undefined') {
-    reconcileTimer = window.setInterval(() => { if (!penStrokeActive) void reconcileNow(); }, reconcileMs);
+    reconcileTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void reconcileNow(); }, reconcileMs);
   }
   if (outboxDrainMs > 0 && typeof window !== 'undefined') {
-    outboxDrainTimer = window.setInterval(() => { if (!penStrokeActive) void drainOutbox('outbox-retry'); }, outboxDrainMs);
+    outboxDrainTimer = window.setInterval(() => { if (!penStrokeActive && !syncHeld) void drainOutbox('outbox-retry'); }, outboxDrainMs);
   }
+  // 画板挂起解除：把挂起期攒的 pending 文档补推 + 排空 outbox + 拉一轮远端
+  const onSyncHeldRelease = (): void => {
+    void flush('held-release');
+    void drainOutbox('held-release-outbox-drain');
+    void pullNow('held-release');
+  };
+  syncHeldReleases.add(onSyncHeldRelease);
   const onVisibilityChange = (): void => {
     if (document.visibilityState === 'hidden') return;
     void drainOutbox('visible-outbox-drain');
@@ -1109,6 +1128,7 @@ export function installWebRuntimeSyncHost(options: WebRuntimeSyncHostOptions = {
     reconcileNow,
     dispose() {
       disposed = true;
+      syncHeldReleases.delete(onSyncHeldRelease);
       authStop();
       setRuntimeLedgerAppendHook(null);
       setAiTurnAppendHook(null);
