@@ -67,6 +67,7 @@ import {
 } from './google-oauth-state';
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
 import { backfillGoogleMeetSmartNotes, fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
+import { createZoomApiHandler } from './zoom-api-handler';
 import {
   currentMtlToken,
   mintMtlToken,
@@ -938,7 +939,7 @@ function sendGoogleHtml(res: ServerResponse, status: number, title: string, mess
 async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url || '/api/google', 'http://inkloop.local');
   const path = url.pathname;
-  if (path === '/api/google/meeting-summary') {
+  if (path === '/api/google/meeting-summary' || path === '/api/meetings/summary') {
     if (req.method !== 'POST') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'POST only' } });
       return;
@@ -954,7 +955,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     }
     return;
   }
-  if (path === '/api/google/mtl-token') {
+  if (path === '/api/google/mtl-token' || path === '/api/meeting-providers/mtl-token') {
     if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'DELETE') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET/POST/DELETE only' } });
       return;
@@ -978,7 +979,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     } : { token: null, base_url: null });
     return;
   }
-  if (path === '/api/google/meeting-live-state') {
+  if (path === '/api/google/meeting-live-state' || path === '/api/meeting-providers/live-state') {
     if (req.method !== 'GET') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
       return;
@@ -1141,6 +1142,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
 
   sendJson(res, 404, { error: { code: 'google_route_not_found', message: 'Google API route not found' } });
 }
+
+const handleZoomApi = createZoomApiHandler({
+  env: process.env,
+  requireDeviceSession,
+});
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {
   const configured = String(process.env.LARK_CLOUD_HUB_REDIRECT_URI || process.env.INKLOOP_LARK_REDIRECT_URI || process.env.LARK_REDIRECT_URI || '').trim();
   if (configured) return configured;
@@ -2645,6 +2651,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (url.startsWith('/api/inkloop/auth')) { await handleInkLoopAuth(req, res); return; }
   // Google Calendar OAuth + meeting sources；callback 由 Google 直连，其余子路由在 handler 内校验设备 session。
   if (url.startsWith('/api/google')) { await handleGoogleApi(req, res); return; }
+  // provider-neutral aliases 复用现有 Google handler；旧路由继续保留。
+  if (url.startsWith('/api/meetings/summary') || url.startsWith('/api/meeting-providers/')) { await handleGoogleApi(req, res); return; }
+  // Zoom S2S 状态 + type=2 排期快照；所有子路由在 handler 内校验设备 session。
+  if (url.startsWith('/api/zoom/')) { await handleZoomApi(req, res); return; }
   // MTL browser extension receiver uses a per-user secret path and includes GET /api/state.
   if (url.startsWith('/api/mtl/')) { await handleMtlReceiver(req, res); return; }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）

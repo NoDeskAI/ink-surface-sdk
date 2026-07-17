@@ -1,7 +1,12 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
 import { normalizeGoogleMeetTranscriptEntries } from '../vendor/meeting-timeline-sdk/adapters/transcript.mjs';
 import { normalizeAbsoluteMs } from '../vendor/meeting-timeline-sdk/time.mjs';
+import {
+  loadProviderArtifactState,
+  mergeSaveProviderArtifactJob,
+  providerArtifactNextPoll,
+  providerArtifactTerminalRecheckDue,
+  ProviderArtifactSingleFlight,
+} from './provider-artifact-poller';
 
 const GOOGLE_MEET_BASE = 'https://meet.googleapis.com/v2';
 const GOOGLE_DRIVE_BASE = 'https://www.googleapis.com/drive/v3';
@@ -156,23 +161,13 @@ function emptyState(): GoogleMeetRecordsFile {
 }
 
 function loadState(path: string): GoogleMeetRecordsFile {
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<GoogleMeetRecordsFile>;
+  return loadProviderArtifactState(path, emptyState, (value) => {
+    const parsed = value as Partial<GoogleMeetRecordsFile>;
     return {
       schema_version: 'inkloop.google_meet_records.v1',
       meetings: parsed.meetings && typeof parsed.meetings === 'object' ? parsed.meetings : {},
     };
-  } catch {
-    return emptyState();
-  }
-}
-
-function saveState(path: string, state: GoogleMeetRecordsFile): void {
-  mkdirSync(dirname(path), { recursive: true });
-  // tmp+rename 原子落盘：进程中途挂掉不会留半截 JSON（loadState 解析失败=整库清空）
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-  renameSync(tmp, path);
+  });
 }
 
 /** 写入点统一走这里：写时重新 load、只合并自己的 key、立即落盘。
@@ -180,9 +175,7 @@ function saveState(path: string, state: GoogleMeetRecordsFile): void {
  * 请求并发时后写的会用自己手里的旧快照把先写的更新整个冲掉（review P1-2）。Node 单线程下
  * 这段同步 load-merge-save 不可能被打断，天然免锁。 */
 function persistJob(path: string, key: string, job: GoogleMeetJobState): void {
-  const fresh = loadState(path);
-  fresh.meetings[key] = job;
-  saveState(path, fresh);
+  mergeSaveProviderArtifactJob({ path, key, job, load: loadState, meetings: (state) => state.meetings });
 }
 
 function absoluteMs(value: string | number | Date | undefined, field: string): number {
@@ -574,15 +567,7 @@ function pollAnchorMs(job: GoogleMeetJobState, chosen?: GoogleMeetRecord): numbe
 }
 
 function nextPoll(anchorMs: number, nowMs: number): { attempt: number; nextCheckAt?: string; exhausted: boolean } {
-  const elapsedMs = Math.max(0, nowMs - anchorMs);
-  const elapsedMinutes = elapsedMs / 60_000;
-  const attempt = GOOGLE_MEET_POLL_MINUTES.filter((minute) => elapsedMinutes >= minute).length;
-  const nextMinute = GOOGLE_MEET_POLL_MINUTES[attempt];
-  return {
-    attempt,
-    ...(nextMinute ? { nextCheckAt: new Date(anchorMs + nextMinute * 60_000).toISOString() } : {}),
-    exhausted: elapsedMinutes >= GOOGLE_MEET_POLL_MINUTES.at(-1)!,
-  };
+  return providerArtifactNextPoll(anchorMs, nowMs, GOOGLE_MEET_POLL_MINUTES);
 }
 
 async function fetchCandidates(
@@ -714,20 +699,17 @@ export async function backfillGoogleMeetSmartNotes(
       result.backfilled += 1;
       if (updated.smart_note?.text) result.completed += 1;
     })();
-    sweepJobsInFlight.set(lockKey, task.then(() => undefined, () => undefined));
     try {
-      await task;
+      await sweepJobsInFlight.run(lockKey, () => task);
     } catch (e) {
       result.errors.push(`${key}: ${String((e as Error)?.message || e)}`);
-    } finally {
-      sweepJobsInFlight.delete(lockKey);
     }
   }
   return result;
 }
 
-const jobsInFlight = new Map<string, Promise<GoogleMeetingTranscriptResult>>();
-const sweepJobsInFlight = new Map<string, Promise<void>>();
+const jobsInFlight = new ProviderArtifactSingleFlight<GoogleMeetingTranscriptResult>();
+const sweepJobsInFlight = new ProviderArtifactSingleFlight<void>();
 
 async function runCatchUp(
   token: string,
@@ -742,10 +724,9 @@ async function runCatchUp(
   const state = loadState(recordsRef.path);
   const key = meetingKey(meetingCode, scheduledAt);
   const current = state.meetings[key];
-  const currentUpdatedMs = Date.parse(current?.updated_at || '');
   const terminalRetryDue = !!current?.terminal
     && current.status !== 'ready'
-    && (!Number.isFinite(currentUpdatedMs) || nowMs - currentUpdatedMs >= 10 * 60_000);
+    && providerArtifactTerminalRecheckDue(current, nowMs, 10 * 60_000);
   const driveScopeAdded = !!current?.smart_note_scope_missing && (options.grantedScopes || []).includes(GOOGLE_DRIVE_READONLY_SCOPE);
   const artifactBackfillDue = googleMeetArtifactBackfillDue(current, nowMs);
   if ((current?.terminal && !terminalRetryDue && !driveScopeAdded && !artifactBackfillDue)
@@ -862,15 +843,8 @@ export function fetchGoogleMeetingTranscript(
   let scheduledKey = input.scheduledAt;
   try { scheduledKey = new Date(absoluteMs(input.scheduledAt, 'scheduled_at')).toISOString(); } catch { /* 非法输入交给 runCatchUp 抛同样的错 */ }
   const lockKey = `${recordsRef.path}|${input.meetingCode.trim()}|${scheduledKey}`;
-  const existing = jobsInFlight.get(lockKey);
-  if (existing) return existing;
   // sweep 正在回补同一场：等它 persist 完再跑，避免从旧 job 派生互相覆盖（review C7·sweep 锁已吞错不会 reject）
-  const sweepLock = sweepJobsInFlight.get(lockKey) ?? Promise.resolve();
-  const job = sweepLock
-    .then(() => runCatchUp(token, recordsRef, input, options))
-    .finally(() => jobsInFlight.delete(lockKey));
-  jobsInFlight.set(lockKey, job);
-  return job;
+  return jobsInFlight.run(lockKey, () => runCatchUp(token, recordsRef, input, options), sweepJobsInFlight.pending(lockKey));
 }
 
 export function googleMeetRecordsErrorPayload(error: unknown): { status: number; body: { error: { code: string; message: string } } } {
