@@ -12,8 +12,8 @@ import { addMark, type Mark } from '../capture/session';
 import type { PersistedMark } from '../core/store-format';
 import type { StrokeFeature, ScoredGesture } from '../capture/classify';
 
-/** 持久 mark → 内存 Mark（仅 pending session 重建用）。t 由 abs_timestamp 折回 performance.now 时间线（保关系 gap）。 */
-function persistedToMark(pm: PersistedMark, baseT: number, wall: number): Mark {
+/** 持久 mark → 内存 Mark（仅 pending session 重建用）。t 保持 epoch ms，旧条目回退收口时刻。 */
+export function persistedToMark(pm: PersistedMark): Mark {
   const points = pm.strokes.flatMap((s) => s.points);
   const event: AnnotationEvent = {
     event_id: pm.mark_id, trace_id: '', document_id: pm.document_id, page_id: pm.page_id,
@@ -28,7 +28,7 @@ function persistedToMark(pm: PersistedMark, baseT: number, wall: number): Mark {
     raw: { strokeCount: pm.strokes.length, templateScore: 0, templateType: pm.scored_type as EventType, scaleRatio: NaN, complexity: 0, ocrWorthy: false, tplSpan: 0 },
   };
   const scored: ScoredGesture = { type: pm.scored_type as EventType, score: pm.scored_score };
-  return { id: pm.mark_id, event, feature, scored, t: baseT - (wall - pm.abs_timestamp), hmp: pm.hmp, markedText: pm.marked_text };
+  return { id: pm.mark_id, event, feature, scored, t: pm.pen_down_at ?? pm.abs_timestamp, hmp: pm.hmp, markedText: pm.marked_text };
 }
 
 /** 从账本把一本书的内存态重建出来：笔迹(folded marks) + AI 旁注/对话 buffer + pending session(水位线后)。 */
@@ -74,8 +74,7 @@ export async function restoreLedgerState(docId: string): Promise<void> {
   const pending = await getPendingMarks(docId);
   if (!alive()) return;
   if (pending.length) {
-    const baseT = performance.now(), wall = Date.now();
-    for (const pm of pending) addMark(docId, persistedToMark(pm, baseT, wall));
+    for (const pm of pending) addMark(docId, persistedToMark(pm));
   }
 
   bus.emit('page:rendered'); // 补一次重绘：让 redrawInk/whisper 拿到恢复后的数据

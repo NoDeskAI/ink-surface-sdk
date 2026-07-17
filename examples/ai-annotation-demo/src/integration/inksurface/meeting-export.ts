@@ -34,6 +34,7 @@ import {
 import type { InkLoopAnnotation, InkLoopVisualBlock, InkLoopVisualModel } from 'ink-surface-sdk/surface-model';
 import { stampExportId, stableToken } from './export-ids';
 import { meetingPlatformOf, providerTranscriptCacheToken } from '../../mobile/meeting-platform';
+import { markTime } from '../../core/mark-time';
 
 const DOC_PROJECTION_SCHEMA_VERSION = 'inkloop.document_projection.v1' as const;
 const KO_EXPORT_SCHEMA_VERSION = 'inkloop.knowledge_export.v1' as const;
@@ -140,11 +141,12 @@ export async function buildMeetingL1Export(meetingId: string, opts: MeetingExpor
       break;
     }
   }
-  const marksRaw = (await getFoldedMarksByContext(`mtg_${meetingId}`)).filter((mk) => !mk.is_tombstone).sort((a, b) => a.abs_timestamp - b.abs_timestamp);
+  const marksRaw = (await getFoldedMarksByContext(`mtg_${meetingId}`)).filter((mk) => !mk.is_tombstone).sort((a, b) => markTime(a) - markTime(b));
   const marks = marksRaw.map((mk) => ({
     mark_id: mk.mark_id,
     entry_id: mk.entry_id,
     abs_timestamp: mk.abs_timestamp,
+    pen_down_at: mk.pen_down_at,
     feature_type: mk.feature_type,
     marked_text: mk.marked_text,
     page_index: mk.page_index,
@@ -165,7 +167,7 @@ export interface MeetingExportInput {
   meeting: PersistedMeeting;
   cues: ReturnType<typeof parseSrtTranscript>;
   marks: {
-    mark_id: string; entry_id?: string; abs_timestamp: number; feature_type?: string; marked_text?: string; page_index?: number;
+    mark_id: string; entry_id?: string; abs_timestamp: number; pen_down_at?: number; feature_type?: string; marked_text?: string; page_index?: number;
     entity_refs?: LedgerEntityRef[]; topic_refs?: LedgerEntityRef[]; // 存储原生拓扑：会中手写笔的实体声明（P4 采集入口写入·目前多数缺）
     // 笔迹 SVG 内嵌导出用：原样透传笔画点（不做块内坐标变换——会议块是合成竖排 bbox，没有真实页几何可换算）。
     strokes?: PersistedStroke[]; color?: string; coord_space?: string; capture_surface?: string; surface_bbox?: readonly number[]; surface_coord_space?: string;

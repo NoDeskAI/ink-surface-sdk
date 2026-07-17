@@ -18,8 +18,8 @@ import type { RawRef } from './bedrock';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
 export const DB_VERSION = 11;     // v10→v11：library_sync（Cloud Hub/本地 Library manifest 状态）。任何升级都自愈缺表。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
-export type MarkEntrySchemaVersion = '3' | '4' | '5';
-export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '5'; // v4→v5：reader_px 笔迹可选带 reader_layout_id（引用阅读页视觉行布局快照，导出复现文字背景）。additive·不 bump STORE_VERSION·旧条目缺字段即可。
+export type MarkEntrySchemaVersion = '3' | '4' | '5' | '6';
+export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '6'; // v5→v6：mark 可选带真实起笔墙钟 pen_down_at。additive·不 bump STORE_VERSION·旧条目回退 abs_timestamp。
 
 /** 一张图的解读：图本身可从 PDF 重渲，故只存 bbox + 文字解读。 */
 export interface PersistedImage {
@@ -174,7 +174,7 @@ export interface BaseEntry {
 
 /** 页账本条目 = 一次组装手势（marks store）。is_tombstone=true 表示擦除携同 mark_id。 */
 export interface PersistedMark extends BaseEntry {
-  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface 取证；v4=新增可选 entity_refs/topic_refs。新条目写 MARK_ENTRY_SCHEMA_VERSION。
+  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface；v4=entity refs；v5=reader layout；v6=pen_down_at。新条目写当前版本。
   mark_id: string;                  // = 代表 event 的 event_id，跨 reload 稳定引用
   strokes: PersistedStroke[];       // 构成笔（tool+points），redraw 保真（不存合并点）
   bbox: NormBBox;                   // union bbox
@@ -187,7 +187,8 @@ export interface PersistedMark extends BaseEntry {
   color: string;                    // 据 tool 派生的颜色（取证完整性；redraw 仍按 tool）
   pointer_type: string;             // pen / touch / mouse / unknown
   device_id: string;
-  abs_timestamp: number;            // 组装时 Date.now()（reload 折回 perf 时间线算关系）
+  abs_timestamp: number;            // 区域收口/落库时 Date.now()；不是落笔时刻。
+  pen_down_at?: number;             // 构成笔最早 pointerdown 的 epoch ms；旧条目缺时回退 abs_timestamp。
   context_id?: string;              // C2 时间脊：落笔时活跃 surface 实例 id（'__reader__' / 'mtg_<id>' / 日记…）；按会话取笔用，老条目缺=undefined
   feature_type: MarkFeatureType;    // markup / handwriting / drawing（路由/显示粗类型）
   feature_confidence: number;
@@ -338,7 +339,7 @@ export interface PersistedMeeting {
   title: string;
   scheduled_at: string;             // ISO 计划时间（日程聚合 + 状态派生用）
   status: MeetingStatus;
-  started_at?: string;              // ISO 真实「开始会议」墙钟（时间脊原点：会中每笔的相对时刻 = abs_timestamp − started_at；会后与飞书录音对轴的 t0）
+  started_at?: string;              // ISO 真实「开始会议」墙钟（时间脊原点：会中每笔的相对时刻 = markTime − started_at；会后与飞书录音对轴的 t0）
   ended_at?: string;                // ISO 真实「结束会议」墙钟
   material_doc_ids: string[];       // 可能有用的文件（指向 docs/pdf_blobs 的 document_id）
   material_links?: PersistedMeetingMaterialLink[]; // 链接型资料（妙记 docx 等·不强求可批注·见 PersistedMeetingMaterialLink）

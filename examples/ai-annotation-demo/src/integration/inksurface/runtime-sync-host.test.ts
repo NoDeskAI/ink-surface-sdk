@@ -7,7 +7,7 @@ import { installWebRuntimeSyncHost, outboundRuntimeMarksForCloudPush, runtimeAnn
 
 function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }): PersistedMark {
   return {
-    schema_version: '5',
+    schema_version: input.schema_version ?? '6',
     entry_id: `ent_${input.mark_id}`,
     document_id: input.document_id ?? 'doc_test',
     page_id: input.page_id ?? 'pg_test_0',
@@ -24,6 +24,7 @@ function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }):
     pointer_type: input.pointer_type ?? 'pen',
     device_id: input.device_id ?? 'device_test',
     abs_timestamp: 0,
+    pen_down_at: input.pen_down_at,
     feature_type: input.feature_type ?? 'drawing',
     feature_confidence: 1,
     kind: input.kind,
@@ -412,6 +413,7 @@ describe('runtimeAnnotationToMark', () => {
         tool: 'pen',
         origin: 'pen',
         bbox: [0.3, 0.2, 0.2, 0.01],
+        pen_down_at: 1_751_500_000_123,
       },
       visual_strokes: [
         {
@@ -433,6 +435,7 @@ describe('runtimeAnnotationToMark', () => {
       { x: 0.3, y: 0.2, t: 0, pressure: 0.5 },
       { x: 0.5, y: 0.21, t: 1, pressure: 0.5 },
     ]);
+    expect(mark?.pen_down_at).toBe(1_751_500_000_123);
   });
 });
 

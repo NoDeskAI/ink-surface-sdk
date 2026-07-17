@@ -38,7 +38,8 @@ import { notePanelSyncOk, notePanelSyncError } from './meeting-sync-status';
 import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
-import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, MEETING_PROVIDER_LEAD_OPTIONS, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingMarkPhase, MEETING_PROVIDER_LEAD_OPTIONS, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { markTime } from '../core/mark-time';
 import {
   createMeetingKeyLock,
   findMeetingForProviderSource,
@@ -250,7 +251,7 @@ let mv: { wsId?: string; mtgId?: string } = {};
 let readerCtx: SurfaceContext;
 // 会中
 let meetingCtx: SurfaceContext | null = null;
-let liveMtg: { id: string; title: string; chatId?: string; status: MeetingStatus; startedAt: number; frozenAt: number } | null = null;
+let liveMtg: { id: string; title: string; chatId?: string; status: MeetingStatus; startedAt: number; frozenAt: number; meeting: PersistedMeeting } | null = null;
 let clockTimer = 0;
 let prevGesture = true;
 let liveMarkCount = 0;
@@ -1722,7 +1723,7 @@ async function enterMeeting(mtgId: string, material?: { docId: string; name: str
   const reviewing = status === 'ended';
   const endedAtMs = reviewing && m.ended_at ? Date.parse(m.ended_at) : NaN;
   const endedMs = Number.isFinite(endedAtMs) ? endedAtMs : 0;
-  liveMtg = { id: mtgId, title: decodeMeetingTitle(m.title), chatId: ws?.feishu_chat_id, status, startedAt: startedMs, frozenAt: startedMs > 0 ? (endedMs || (reviewing ? startedMs : 0)) : 0 };
+  liveMtg = { id: mtgId, title: decodeMeetingTitle(m.title), chatId: ws?.feishu_chat_id, status, startedAt: startedMs, frozenAt: startedMs > 0 ? (endedMs || (reviewing ? startedMs : 0)) : 0, meeting: m };
   liveMarkCount = 0;
   bedrockUserOverride = false; // 新会议：清上一场的手动接管标记
   if (status === 'live') startMeetingBedrock(); // 只有飞书已判 live 才录基岩；会前工作台 / 已结束回看不录。
@@ -1862,7 +1863,7 @@ async function mountSide(): Promise<void> {
 async function refreshSpine(): Promise<void> {
   const mtg = liveMtg; // capture：await 期间可能退会/切会，迟到结果不能用新 liveMtg 解释（跨会污染/空指针）
   if (!mtg) return;
-  const marks = (await getFoldedMarksByContext('mtg_' + mtg.id)).sort((a, b) => (a.abs_timestamp || 0) - (b.abs_timestamp || 0));
+  const marks = (await getFoldedMarksByContext('mtg_' + mtg.id)).sort((a, b) => markTime(a) - markTime(b));
   if (liveMtg !== mtg) return;
   setLiveMarkCount(marks.length);
   // surface 源标签：白板 + 各资料文件名，让聚合后的脊能区分笔来自哪儿
@@ -1871,7 +1872,9 @@ async function refreshSpine(): Promise<void> {
   if (liveMtg !== mtg) return;
   const labelFor = (docId: string): string => (docId === boardId ? (liveNoteDoc?.filename || '会议手记') : nameOf.get(docId) || '资料'); // 脊上手记来源标签跟手记名（升格后不再叫"白板"）
   const blocks = marks.map((mk: PersistedMark) => {
-    const rel = mtg.startedAt > 0 ? clk(Math.max(0, (mk.abs_timestamp || 0) - mtg.startedAt)) : '会前'; // M1·会前（t0 未定）笔标「会前」；精确会前段对齐留 M6(recap)
+    const phase = meetingMarkPhase(mk, mtg.meeting);
+    const relClock = mtg.startedAt > 0 ? clk(Math.max(0, markTime(mk) - mtg.startedAt)) : '';
+    const rel = phase === 'pre' ? '会前' : phase === 'post' ? `会后${relClock ? ` · ${relClock}` : ''}` : relClock || '会中';
     const lines = (mk.marked_text || '').split('\n').filter(Boolean);
     const body = lines.length ? lines.map((l) => `<div class="hw"${/[一-龥]/.test(l) ? ' style="font-size:24px"' : ''}>${esc(l)}</div>`).join('') : '<div class="hw" style="color:var(--mut2);font-size:20px">（图形标注）</div>';
     return `<div class="mblk"><span class="tk"></span><div class="t">${rel}</div><div class="c"><div class="src">${esc(labelFor(mk.document_id))}</div>${body}</div></div>`;
@@ -1970,7 +1973,8 @@ export async function createSyntheticMeetingEventMark(kind: SyntheticMeetingEven
   const bbox = bboxForMeetingPoints(points);
   const markId = shortId('evt');
   const text = (opts.text || SYNTHETIC_MEETING_EVENT_TEXT[kind]).trim();
-  const stroke: Stroke = { tool: 'pen', points };
+  const absTimestamp = Date.now();
+  const stroke: Stroke = { tool: 'pen', points, penDownAt: absTimestamp };
   currentStrokes().push(stroke);
   strokeMarkIds.set(stroke, markId);
   redrawInk();
@@ -1986,7 +1990,8 @@ export async function createSyntheticMeetingEventMark(kind: SyntheticMeetingEven
     color: '#111111',
     pointer_type: 'synthetic',
     device_id: DEVICE_ID,
-    abs_timestamp: Date.now(),
+    abs_timestamp: absTimestamp,
+    pen_down_at: absTimestamp,
     context_id: `mtg_${meetingId}`,
     feature_type: kind === 'note' ? 'handwriting' : 'markup',
     feature_confidence: 1,

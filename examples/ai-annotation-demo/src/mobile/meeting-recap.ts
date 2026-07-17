@@ -19,6 +19,8 @@ import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, Feishu
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
 import { generateGoogleMeetingSummary, getGoogleMeetingTranscript } from '../integration/google-meet/client';
 import { meetingPlatformOf, meetingTranscriptSource, providerTranscriptCacheToken } from './meeting-platform';
+import { markTime } from '../core/mark-time';
+import { meetingMarkPhase } from './meeting-home-model';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
 
@@ -578,6 +580,7 @@ function rebuildRecapTimeline(state: RecapV2): void {
     marks: marks.map((mk) => ({
       mark_id: mk.mark_id,
       abs_timestamp: mk.abs_timestamp,
+      pen_down_at: mk.pen_down_at,
       feature_type: mk.feature_type,
       marked_text: mk.marked_text,
       page_index: mk.page_index,
@@ -762,7 +765,7 @@ const meetingT0 = (m: PersistedMeeting): number =>
 function activeInkMarks(marks: PersistedMark[]): PersistedMark[] {
   return marks
     .filter((mark) => !mark.is_tombstone && hasMeetingInk(mark))
-    .sort((a, b) => (a.abs_timestamp - b.abs_timestamp) || (a.seq - b.seq));
+    .sort((a, b) => (markTime(a) - markTime(b)) || (a.seq - b.seq));
 }
 
 async function directMeetingMarks(meetingId: string): Promise<PersistedMark[]> {
@@ -770,7 +773,7 @@ async function directMeetingMarks(meetingId: string): Promise<PersistedMark[]> {
   const byBoard = activeInkMarks(await getFoldedMarks('mtgboard_' + meetingId));
   const deduped = new Map<string, PersistedMark>();
   for (const mark of [...byContext, ...byBoard]) deduped.set(mark.mark_id, mark);
-  return [...deduped.values()].sort((a, b) => (a.abs_timestamp - b.abs_timestamp) || (a.seq - b.seq));
+  return [...deduped.values()].sort((a, b) => (markTime(a) - markTime(b)) || (a.seq - b.seq));
 }
 
 // 手记严格只属于本地单场 meeting_id（写入端 context_id='mtg_'+id / 'mtgboard_'+id）。
@@ -1878,7 +1881,7 @@ function refreshRecapOverviewBlocks(bodyEl: HTMLElement, selectors: string[]): v
 function meetingNotePages(state: RecapV2): MeetingInkPage[] {
   const marks = [...state.marksById.values()]
     .filter((mark) => !mark.is_tombstone && hasMeetingInk(mark))
-    .sort((a, b) => (a.page_index - b.page_index) || (a.seq - b.seq) || (a.abs_timestamp - b.abs_timestamp));
+    .sort((a, b) => (a.page_index - b.page_index) || (markTime(a) - markTime(b)) || (a.seq - b.seq));
   const boardId = `mtgboard_${state.markSourceMeeting?.meeting_id ?? state.meeting.meeting_id}`;
   const boardMarks = marks.filter((mark) => mark.document_id === boardId || mark.document_id.startsWith('mtgboard_'));
   const scopedMarks = boardMarks.length ? boardMarks : marks;
@@ -1906,7 +1909,7 @@ const INK_TIME_PLAUSIBLE_POST_MS = 30 * 60_000;
 interface InkPageTranscriptSelection {
   cues: TranscriptCue[];
   meta: string;
-  source: 'time' | 'page_order' | 'empty';
+  source: 'time' | 'page_order' | 'empty' | 'pre_meeting' | 'post_meeting';
 }
 
 function cueDurationMs(cues: TranscriptCue[]): number {
@@ -1941,7 +1944,8 @@ function cueIndexRange(cues: TranscriptCue[], selected: TranscriptCue[]): string
 
 export function selectInkPageTranscriptCues(input: {
   cues: TranscriptCue[];
-  marks: Array<{ abs_timestamp: number }>;
+  marks: Array<{ abs_timestamp: number; pen_down_at?: number }>;
+  meeting: PersistedMeeting;
   pageIndex: number;
   totalPages: number;
   t0AbsMs: number;
@@ -1950,12 +1954,20 @@ export function selectInkPageTranscriptCues(input: {
 }): InkPageTranscriptSelection {
   const limit = input.limit ?? DETAIL_CUES_PER_SCREEN;
   const cues = input.cues;
+  const phasedMarks = input.marks.map((mark) => ({ mark, phase: meetingMarkPhase(mark, input.meeting) }));
+  const inMeetingMarks = phasedMarks.filter((item) => item.phase === 'in').map((item) => item.mark);
+  if (input.marks.length && !inMeetingMarks.length) {
+    const post = phasedMarks.some((item) => item.phase === 'post');
+    return post
+      ? { cues: [], meta: '会后补充·不参与转写对齐', source: 'post_meeting' }
+      : { cues: [], meta: '会前准备·不参与转写对齐', source: 'pre_meeting' };
+  }
   if (!cues.length) return { cues: [], meta: '原始发言待同步', source: 'empty' };
 
   const duration = cueDurationMs(cues);
   const base = input.t0AbsMs + input.offsetMs;
-  const rels = input.marks
-    .map((mark) => mark.abs_timestamp - base)
+  const rels = inMeetingMarks
+    .map((mark) => markTime(mark) - base)
     .filter((value) => Number.isFinite(value))
     .sort((a, b) => a - b);
   const minRel = rels[0];
@@ -1990,6 +2002,9 @@ export function selectInkPageTranscriptCues(input: {
 }
 
 function renderDetailTranscriptScreen(selection: InkPageTranscriptSelection): string {
+  if (selection.source === 'pre_meeting' || selection.source === 'post_meeting') {
+    return `<div class="tl-combo-empty">${esc(selection.meta)}</div>`;
+  }
   if (!selection.cues.length) return '<div class="tl-combo-empty">这场会议还没有同步原始发言。</div>';
   return selection.cues.map((cue) => {
     const speaker = cue.speaker ? `<b>${esc(cue.speaker)}</b>` : '<b>未知说话人</b>';
@@ -2016,6 +2031,7 @@ function renderRecapDetail(bodyEl: HTMLElement): void {
   const transcript = selectInkPageTranscriptCues({
     cues: state.cues,
     marks: page.marks,
+    meeting: state.meeting,
     pageIndex: p,
     totalPages: total,
     t0AbsMs: meetingT0(state.meeting),
@@ -2041,7 +2057,7 @@ function renderRecapDetail(bodyEl: HTMLElement): void {
 
 /** 组装喂 AI 的结构化文本：转写（可能截断）+ 手写文字列表（各带近似时间）；**不喂** linked_cue 精确关系。
  *  返回是否截断 + 实际喂了几句，供 summary_source 记录 + UI 透明告知（防"看起来是全文总结"误导）。 */
-function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], marks: PersistedMark[]): { prompt: string; truncated: boolean; usedCueCount: number } {
+export function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], marks: PersistedMark[]): { prompt: string; truncated: boolean; usedCueCount: number } {
   const t0 = meetingT0(m);
   const off = finiteMs(m.align_offset_ms);
   const lines: string[] = [`会议标题：${m.title || '(未命名)'}`];
@@ -2051,11 +2067,26 @@ function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], marks: P
   lines.push(...capped.lines);
   lines.push('</转写>', '');
   lines.push('<手写标注 各为用户当时的强调·时间是近似会议相对时刻·非与某句转写的精确对应>');
-  if (marks.length) for (const mk of marks) {
-    const txt = (mk.marked_text || '').trim();
-    lines.push(txt ? `[${clk(mk.abs_timestamp - t0 - off)}] ${txt}` : `[${clk(mk.abs_timestamp - t0 - off)}] （一处${mk.feature_type === 'drawing' ? '图形/圈画' : '无法识别的手写'}·别推断其文字含义）`);
-  }
-  else lines.push('（本场没有手写标注）');
+  if (marks.length) {
+    const groups = { pre: [] as PersistedMark[], in: [] as PersistedMark[], post: [] as PersistedMark[] };
+    for (const mk of [...marks].sort((a, b) => markTime(a) - markTime(b))) groups[meetingMarkPhase(mk, m)].push(mk);
+    const content = (mk: PersistedMark): string => {
+      const txt = (mk.marked_text || '').trim();
+      return txt || `（一处${mk.feature_type === 'drawing' ? '图形/圈画' : '无法识别的手写'}·别推断其文字含义）`;
+    };
+    if (groups.pre.length) {
+      lines.push('会前准备（不参与转写时间对齐）：');
+      for (const mk of groups.pre) lines.push(`- ${content(mk)}`);
+    }
+    if (groups.in.length) {
+      lines.push('会中手记：');
+      for (const mk of groups.in) lines.push(`[${clk(markTime(mk) - t0 - off)}] ${content(mk)}`);
+    }
+    if (groups.post.length) {
+      lines.push('会后补充（不参与转写时间对齐）：');
+      for (const mk of groups.post) lines.push(`- ${content(mk)}`);
+    }
+  } else lines.push('（本场没有手写标注）');
   lines.push('</手写标注>', '', '请按系统要求产出会后思路总结。');
   return { prompt: lines.join('\n'), truncated: capped.truncated, usedCueCount: capped.usedCueCount };
 }
@@ -2077,7 +2108,7 @@ export async function summarizeMeeting(meetingId: string, onDelta: (full: string
   let loaded: LoadedTranscript | null;
   try { loaded = await loadTranscript(m); } catch (e) { await infoSheet({ title: '拉取转写失败', message: String((e as Error)?.message || e) }); return null; }
   if (!loaded || !loaded.cues.length) { await infoSheet({ title: '转写为空', message: '没有可用于总结的转写内容。' }); return null; }
-  const marks = (await getFoldedMarksByContext('mtg_' + m.meeting_id)).filter((mk) => !mk.is_tombstone).sort((a, b) => a.abs_timestamp - b.abs_timestamp);
+  const marks = (await getFoldedMarksByContext('mtg_' + m.meeting_id)).filter((mk) => !mk.is_tombstone).sort((a, b) => markTime(a) - markTime(b));
 
   const { prompt, truncated, usedCueCount } = buildSummaryPrompt(m, loaded.cues, marks);
   let full = '';

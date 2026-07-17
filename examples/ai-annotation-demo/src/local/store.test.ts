@@ -289,6 +289,7 @@ describe('mark ledger runtime hook', () => {
       seq: 2,
       is_tombstone: false,
       marked_text: 'local mark',
+      pen_down_at: 1_725_000_000_123,
     });
 
     await store.appendMarkEntry(remoteDraft, { notifyRuntime: false });
@@ -296,7 +297,11 @@ describe('mark ledger runtime hook', () => {
 
     await store.appendMarkEntry(localDraft);
     expect(hook).toHaveBeenCalledTimes(1);
-    expect(hook.mock.calls[0][0]).toMatchObject({ mark_id: 'evt_local' });
+    expect(hook.mock.calls[0][0]).toMatchObject({
+      mark_id: 'evt_local',
+      schema_version: '6',
+      pen_down_at: 1_725_000_000_123,
+    });
   });
 });
 

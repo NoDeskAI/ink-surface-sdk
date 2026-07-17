@@ -26,6 +26,7 @@ import type { RawRef } from '../core/bedrock';
 import type { PersistedMark, PersistedStroke } from '../core/store-format';
 import { shouldJoinContentPenStroke } from './mark-assembly';
 import { isLineLikePenMarkupBbox, markedTextForPenMarkupBboxFromBlocks } from './mark-text';
+import { earliestPenDownAt } from '../capture/stroke-time';
 
 // 区域组装（空间+时间连续）：同一小块区域里继续写的笔画并进一个 mark；附近无动作满 REGION_QUIET 才提交；
 // 笔落到远处=离开该区域 → 上一区域立刻收口。无书写时长上限——慢写整段保持静默、聚成一整团再识别（读得准、只回一条）。
@@ -253,6 +254,7 @@ function persistContentStroke(evt: AnnotationEvent, stroke: Stroke): void {
   const textTool = isHi || isUnderline;
   const markedText = textTool ? markedTextForTextTool(evt.geometry.bbox, stroke.tool) : '';
   const anchoredTextTool = textTool && !!markedText;
+  const absTimestamp = Date.now();
   enqueueContentMark({
     document_id: bookId, page_id: evt.page_id, page_index: typeof evt.page_index === 'number' ? evt.page_index : pageIdxOf(evt.page_id), mark_id: markId,
     strokes: [persistedStrokeOf(evt, stroke)],
@@ -262,7 +264,8 @@ function persistContentStroke(evt: AnnotationEvent, stroke: Stroke): void {
     ...(evt.reflow_ink_points?.length ? { surface_bbox: bboxOfSurface(evt.reflow_ink_points), surface_coord_space: 'reader_px' as const } : {}),
     ...(evt.reader_layout_id ? { reader_layout_id: evt.reader_layout_id } : {}),
     color: isHi ? 'rgba(212,207,202,0.85)' : '#1A1A1A',
-    pointer_type: evt.pointer_type, device_id: evt.device_id, abs_timestamp: Date.now(),
+    pointer_type: evt.pointer_type, device_id: evt.device_id, abs_timestamp: absTimestamp,
+    pen_down_at: stroke.penDownAt ?? absTimestamp,
     context_id: evt.context_id || getActiveContext().id,
     feature_type: anchoredTextTool ? 'markup' : 'drawing',
     feature_confidence: anchoredTextTool ? 1 : 0,
@@ -314,6 +317,7 @@ function flushContentPen(reason: FlushReason = 'manual'): void {
   const reflowAnchorRuns = [...new Set(events.flatMap((e) => e.anchor_runs ?? []))];
   const readerLayoutIds = [...new Set(events.map((e) => e.reader_layout_id).filter((id): id is string => !!id))];
   const raw_ref = mergeRawRefs(rawRefs);
+  const absTimestamp = Date.now();
   for (const s of strokes) strokeMarkIds.set(s, markId);
   const strokeCount = strokes.length;
   const entry: MarkEntryDraft = {
@@ -324,7 +328,8 @@ function flushContentPen(reason: FlushReason = 'manual'): void {
     capture_surface: first.capture_surface ?? (first.pointer_type === 'reader' ? 'reader' : 'page'),
     ...(surfacePoints.length ? { surface_bbox: bboxOfSurface(surfacePoints), surface_coord_space: 'reader_px' as const } : {}),
     ...(readerLayoutIds.length === 1 ? { reader_layout_id: readerLayoutIds[0] } : first.reader_layout_id ? { reader_layout_id: first.reader_layout_id } : {}),
-    pointer_type: first.pointer_type, device_id: first.device_id, abs_timestamp: Date.now(),
+    pointer_type: first.pointer_type, device_id: first.device_id, abs_timestamp: absTimestamp,
+    pen_down_at: earliestPenDownAt(strokes) ?? absTimestamp,
     context_id: first.context_id || getActiveContext().id,
     feature_type: strokeCount >= 2 ? 'handwriting' : 'drawing',
     feature_confidence: strokeCount >= 2 ? 0.85 : 0,
@@ -850,7 +855,7 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
   };
   const cap = await captureMark(repr, geom, markScored.score); // 识别定型 → cap.feature 是最终类型
   const feature = cap.feature;
-  const mark = makeMark(repr, feature, markScored, cap.hmp, cap.markedText);
+  const mark = makeMark(repr, feature, markScored, cap.hmp, cap.markedText, earliestPenDownAt(realStrokes));
   mark.trace = cap.trace; // 落笔当时这笔经手的组件阶段（识别/OCR兜底/取证）→ 提交时拼进整轮流水线
   mark.manner = computeManner(realStrokes, feature.type); // 运笔方式（Slice A）：随 mark 进叙事
   const isAiPen = realStrokes.some((s) => s.tool === 'aipen');
@@ -883,6 +888,7 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
   // 逐笔投影仍各认各笔的 stroke.anchor_runs（projectPersistedMark 的 refs=0 分支）；本字段供块高亮 / 缺锚 fallback / 导出。
   const reflowAnchorRuns = [...new Set(realEvents.flatMap((e) => e.anchor_runs ?? []))];
   const readerLayoutIds = [...new Set(realEvents.map((e) => e.reader_layout_id).filter((id): id is string => !!id))];
+  const absTimestamp = Date.now();
   const entry: MarkEntryDraft = {
     document_id: bookId, page_id: pid, page_index: typeof repr.page_index === 'number' ? repr.page_index : pageIdxOf(pid), mark_id: mark.id,
     strokes: keep.map((x) => persistedStrokeOf(x.e, x.st)), // 逐笔带各自的块锚 + surface-local 点（位置真相与取证真相分开）
@@ -892,7 +898,8 @@ async function resolveRegion(batch: AnnotationEvent[], strokes: Stroke[], flushI
     capture_surface: repr.capture_surface ?? (repr.pointer_type === 'reader' ? 'reader' : 'page'),
     ...(repr.reflow_ink_points?.length ? { surface_bbox: bboxOfSurface(repr.reflow_ink_points), surface_coord_space: 'reader_px' as const } : {}),
     ...(readerLayoutIds.length === 1 ? { reader_layout_id: readerLayoutIds[0] } : repr.reader_layout_id ? { reader_layout_id: repr.reader_layout_id } : {}),
-    pointer_type: repr.pointer_type, device_id: repr.device_id, abs_timestamp: Date.now(),
+    pointer_type: repr.pointer_type, device_id: repr.device_id, abs_timestamp: absTimestamp,
+    pen_down_at: mark.t,
     context_id: repr.context_id || getActiveContext().id,
     feature_type: feature.type, feature_confidence: feature.confidence,
     kind: cap.kind, kind_source: cap.kindSource,

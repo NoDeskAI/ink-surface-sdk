@@ -11,6 +11,7 @@ import { takeHqSocketStroke, type HqSocketPoint } from './m103-hqhw-socket';
 import { publishM103RawPenStroke, type M103RawPenSource } from './m103-raw-pen-adapter';
 import { isM103Device, isOnyxPaperDevice } from './m103-device';
 import { isLikelyStylusPointer, shouldPersistNativeStrokeFromDrain } from './input-policy';
+import { estimatePenDownAt } from './stroke-time';
 
 let cv: HTMLCanvasElement;
 let ctx: CanvasRenderingContext2D;
@@ -22,7 +23,7 @@ export interface StrokeCaptureContext {
   strokesByPage: Map<string, Stroke[]>;
 }
 
-let live: { tool: Tool; points: StrokePoint[]; t0: number; pointerType: string; skipLiveDraw: boolean; capture: StrokeCaptureContext } | null = null;
+let live: { tool: Tool; points: StrokePoint[]; t0: number; penDownAt: number; pointerType: string; skipLiveDraw: boolean; capture: StrokeCaptureContext } | null = null;
 let nav: { x0: number; y0: number; lastX: number; lastY: number; scrolled: boolean } | null = null;
 let erasingOsd = false; // OSD 武装时的橡皮手势：抬笔要清掉 OSD 那条虚线拖影（橡皮走 eraseAt 早退、不进 finish）
 /** 死区半径（CSS px）：逐 pointermove 丢掉与上一采样点相距 < 此值的 sub-px 抖动。
@@ -115,7 +116,7 @@ function drainNativePhysicalPenQueue(): void {
     if (!points.length) continue;
     publishNativePhysicalPenStroke(nativeStroke, cv.getBoundingClientRect(), capture.pageId);
     drawStroke(points, state.tool, capture.pageId);
-    const stroke: Stroke = { tool: state.tool, points };
+    const stroke: Stroke = { tool: state.tool, points, penDownAt: estimatePenDownAt(points) };
     const pageStrokes = capture.strokesByPage.get(capture.pageId) ?? [];
     pageStrokes.push(stroke);
     capture.strokesByPage.set(capture.pageId, pageStrokes);
@@ -334,6 +335,7 @@ export function initInk(
     live = {
       tool: state.tool,
       t0: performance.now(),
+      penDownAt: Date.now(),
       pointerType: isPhysicalPenContact(e) ? 'pen' : e.pointerType, // 落库用的身份别信可能被弄脏的 e.pointerType
       points: [{ x: p.x, y: p.y, t: 0, pressure: e.pressure || 0 }],
       skipLiveDraw,
@@ -429,7 +431,7 @@ export function initInk(
         publishNativePhysicalPenStroke(motion, cv.getBoundingClientRect(), st.capture.pageId ?? 'native_surface');
       }
     }
-    const stroke: Stroke = { tool: st.tool, points };
+    const stroke: Stroke = { tool: st.tool, points, penDownAt: st.penDownAt };
     const pageStrokes = st.capture.strokesByPage.get(st.capture.pageId) ?? [];
     pageStrokes.push(stroke);
     st.capture.strokesByPage.set(st.capture.pageId, pageStrokes);

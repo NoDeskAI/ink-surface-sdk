@@ -6,11 +6,12 @@
  *  - quiet  段＝你没写的时段（只有转写、无手写）；用一条简介带过。
  * 「你的手写就是会议的目录」——概览按段呈现、无聊段塌缩，精确逐句只在下钻详情时出现。
  *
- * ⚠️同 align.ts：这是「近似对照」非「精确对齐」。relMs = abs_timestamp − t0 − offset 偏后且 t0 近似，
+ * ⚠️同 align.ts：这是「近似对照」非「精确对齐」。relMs = markTime − t0 − offset，且 t0 仍可能近似，
  * 故段边界、手写落点都是「附近/同时段」语义，UI 不得呈现成「这笔＝这句」。
  */
 
 import type { TranscriptCue } from './align';
+import { markTime } from '../../core/mark-time';
 
 /** 段内手写（UI 右轴 + 详情用）。relMs＝相对会议时刻；可为负＝会前落笔（M6：不再 clamp ≥0）。 */
 export interface SegmentMark {
@@ -19,6 +20,7 @@ export interface SegmentMark {
   feature_type: string;   // handwriting / drawing / markup
   marked_text: string;    // 识别文字（可能空）
   page_index: number;
+  phase?: 'pre' | 'in' | 'post';
 }
 
 /** 一段（active 或 quiet）。cues 按 startMs 升序；active 段 marks 非空。 */
@@ -49,11 +51,11 @@ const CONTEXT_POST = 8_000;  // 段在末笔后裹 8s
 const MERGE_GAP = 5_000;     // 仅间隔 ≤5s 的两 active 才合并
 const SUMMARY_MAX = 28;
 
-/** 由 PersistedMark 列表算 SegmentMark：relMs = abs_timestamp − t0 − offset，按 relMs 升序。
+/** 由 PersistedMark 列表算 SegmentMark：relMs = markTime − t0 − offset，按 relMs 升序。
  *  负值＝落笔早于会议 t0（会前记录·M6 不再 clamp ≥0，UI 呈现在时间轴左侧）。
  *  调用方传已折叠、已去墓碑的 marks。t0AbsMs = 录音 t0 近似（panel start）；offsetMs = 人工/启发式微调。 */
 export function buildSegmentMarks(
-  marks: Array<{ mark_id: string; abs_timestamp: number; feature_type?: string; marked_text?: string; page_index?: number }>,
+  marks: Array<{ mark_id: string; abs_timestamp: number; pen_down_at?: number; feature_type?: string; marked_text?: string; page_index?: number; phase?: 'pre' | 'in' | 'post' }>,
   t0AbsMs: number,
   offsetMs: number,
 ): SegmentMark[] {
@@ -61,10 +63,11 @@ export function buildSegmentMarks(
   return marks
     .map((m) => ({
       mark_id: m.mark_id,
-      relMs: m.abs_timestamp - base,
+      relMs: markTime(m) - base,
       feature_type: m.feature_type || 'handwriting',
       marked_text: (m.marked_text || '').trim(),
       page_index: m.page_index ?? 0,
+      phase: m.phase,
     }))
     .sort((a, b) => a.relMs - b.relMs);
 }
