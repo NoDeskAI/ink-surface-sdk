@@ -6,7 +6,7 @@ import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import contract from './fixtures/mtl-protocol-contract.json';
 import { mintMtlToken } from './mtl-receiver-auth';
-import { handleMtlReceiver, type MtlReceiverEnv } from './mtl-receiver';
+import { handleMtlReceiver, listMtlMeetingWindows, type MtlReceiverEnv } from './mtl-receiver';
 
 // Payload outputs are pinned from meeting-timeline-sdk commit
 // fd13d52a67a915f4afb9a2a7383beedba623114a. Do not import a developer-local SDK here.
@@ -24,7 +24,8 @@ describe('MTL SDK protocol contract', () => {
       MTL_TOKEN_STORE: join(root, 'mtl-tokens.json'),
       MTL_EVENTS_ROOT: join(root, 'events'),
     };
-    const { token } = mintMtlToken({ tenant_id: 'tenant-contract', user_id: 'user-contract' }, env);
+    const identity = { tenant_id: 'tenant-contract', user_id: 'user-contract' };
+    const { token } = mintMtlToken(identity, env);
     const call = async (path: string, init: { method?: string; body?: unknown } = {}) => {
       const rawBody = init.body === undefined ? '' : JSON.stringify(init.body);
       const req = Readable.from(rawBody ? [Buffer.from(rawBody)] : []) as unknown as IncomingMessage;
@@ -50,7 +51,7 @@ describe('MTL SDK protocol contract', () => {
         body: JSON.parse(responseBody) as Record<string, unknown>,
       };
     };
-    return { call };
+    return { call, env, identity };
   }
 
   it('accepts pinned SDK payloads and preserves acceptance response checkpoints', async () => {
@@ -167,5 +168,56 @@ describe('MTL SDK protocol contract', () => {
         },
       },
     });
+  });
+
+  it('persists real Zoom start/end identity and returns platform-filtered windows', async () => {
+    const { call, env, identity } = await createHarness();
+    const { zoom_start: start, zoom_end: end, start: googleStart, end: googleEnd } = contract.payload_cases;
+
+    const started = await call('meeting-session/start', { method: 'POST', body: start.expected });
+    expect(started).toMatchObject({
+      handled: true,
+      status: 200,
+      body: {
+        ok: true,
+        meeting: {
+          platform: 'zoom',
+          meeting_id: start.expected.meeting_id,
+          external_meeting_id: start.expected.external_meeting_id,
+          meeting_url: 'https://acme.zoom.us/j/987654321',
+        },
+      },
+    });
+
+    const ended = await call('meeting-session/end', { method: 'POST', body: end.expected });
+    expect(ended).toMatchObject({
+      handled: true,
+      status: 200,
+      body: {
+        ok: true,
+        meeting: {
+          platform: 'zoom',
+          meeting_id: start.expected.meeting_id,
+          external_meeting_id: start.expected.external_meeting_id,
+          meeting_url: 'https://acme.zoom.us/j/987654321',
+          ended_at_ms: end.expected.end_time_ms,
+        },
+      },
+    });
+    await call('meeting-session/start', { method: 'POST', body: googleStart.expected });
+    await call('meeting-session/end', { method: 'POST', body: googleEnd.expected });
+
+    expect(listMtlMeetingWindows(identity, env, 'zoom')).toEqual([
+      expect.objectContaining({
+        platform: 'zoom',
+        meeting_id: '987654321',
+        external_meeting_id: 'zoom-session/uuid-42',
+        meeting_url: 'https://acme.zoom.us/j/987654321',
+      }),
+    ]);
+    expect(listMtlMeetingWindows(identity, env, 'google-meet')).toEqual([
+      expect.objectContaining({ platform: 'google_meet', meeting_id: 'abc-defg-hij' }),
+    ]);
+    expect(listMtlMeetingWindows(identity, env)).toHaveLength(2);
   });
 });

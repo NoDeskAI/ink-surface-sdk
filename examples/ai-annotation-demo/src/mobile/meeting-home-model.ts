@@ -3,6 +3,8 @@ import { meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
 
 export type MeetingHomeFilter = 'active' | 'history';
 
+export const MEETING_PROVIDER_LEAD_OPTIONS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'zoom', 'manual'];
+
 export interface MeetingHomeBuckets {
   active: PersistedMeeting[];
   history: PersistedMeeting[];

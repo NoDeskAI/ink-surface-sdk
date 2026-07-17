@@ -19,6 +19,7 @@ export interface MtlReceiverEnv extends MtlReceiverAuthEnv, GoogleOAuthEnv {
 export interface MtlLiveMeetingWindow {
   platform: string;
   meeting_id: string;
+  external_meeting_id?: string;
   meeting_code?: string;
   meeting_url?: string;
   title?: string;
@@ -111,8 +112,12 @@ function writeLiveStateFile(identity: MtlReceiverIdentity, env: MtlReceiverEnv, 
 export function listMtlMeetingWindows(
   identity: MtlReceiverIdentity,
   env: MtlReceiverEnv = process.env,
+  platform?: string,
 ): MtlLiveMeetingWindow[] {
-  return readLiveStateFile(identity, env).windows.map((window) => ({ ...window }));
+  const normalizedPlatform = normalizeMtlPlatform(clean(platform, 64));
+  return readLiveStateFile(identity, env).windows
+    .filter((window) => !normalizedPlatform || window.platform === normalizedPlatform)
+    .map((window) => ({ ...window }));
 }
 
 export function normalizeGoogleMeetCode(value: unknown): string | undefined {
@@ -196,6 +201,7 @@ function appendAudit(
   mkdirSync(dirname(path), { recursive: true });
   const platform = normalizeMtlPlatform(clean(payload.platform, 64));
   const meetingId = clean(payload.meeting_id, 256);
+  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const detectorSource = clean(payload.detector_source || payload.source, 256);
   const observerSurface = clean(payload.observer_surface, 128);
   const action = clean(payload.action, 128);
@@ -208,6 +214,7 @@ function appendAudit(
     received_at_ms: nowMs,
     ...(platform ? { platform } : {}),
     ...(meetingId ? { meeting_id: meetingId } : {}),
+    ...(externalMeetingId ? { external_meeting_id: externalMeetingId } : {}),
     ...(meetingCodeFromMtlPayload(payload) ? { meeting_code: meetingCodeFromMtlPayload(payload) } : {}),
     ...(canonicalUrl(payload.meeting_url) ? { meeting_url: canonicalUrl(payload.meeting_url) } : {}),
     ...(Number.isFinite(Number(payload.start_time_ms)) ? { start_time_ms: Number(payload.start_time_ms) } : {}),
@@ -314,12 +321,14 @@ function startMeeting(
   }
 
   const meetingUrl = canonicalUrl(payload.meeting_url);
+  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const title = clean(payload.title, 512);
   const detectorSource = clean(payload.detector_source, 256);
   const observerSurface = clean(payload.observer_surface, 128);
   const window: MtlLiveMeetingWindow = {
     platform,
     meeting_id: meetingId,
+    ...(externalMeetingId ? { external_meeting_id: externalMeetingId } : {}),
     ...(meetingCodeFromMtlPayload({ ...payload, platform, meeting_id: meetingId })
       ? { meeting_code: meetingCodeFromMtlPayload({ ...payload, platform, meeting_id: meetingId }) }
       : {}),

@@ -38,7 +38,7 @@ import { notePanelSyncOk, notePanelSyncError } from './meeting-sync-status';
 import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
-import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, MEETING_PROVIDER_LEAD_OPTIONS, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
 import {
   createMeetingKeyLock,
   findMeetingForProviderSource,
@@ -55,6 +55,8 @@ import {
   startGoogleDeviceOAuth,
 } from '../integration/google-meet/client';
 import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-meeting-sync';
+import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomStatus } from '../integration/zoom/client';
+import { syncZoomMeetingLiveState, syncZoomMeetingSources } from './zoom-meeting-sync';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -304,7 +306,6 @@ const MEETING_PROVIDER_HINTS: Record<MeetingPlatform, string> = {
   manual: '手写记录 · 无需连接',
 };
 const MEETING_PROVIDERS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'zoom', 'microsoft_teams', 'manual'];
-const MEETING_PROVIDER_LEAD_OPTIONS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'manual'];
 function normalizeMeetingProvider(value: unknown): MeetingPlatform {
   return MEETING_PROVIDERS.includes(value as MeetingPlatform) ? value as MeetingPlatform : 'lark';
 }
@@ -655,6 +656,25 @@ function rememberGoogleCalendarConnection(connected: boolean): void {
   } catch { /* storage unavailable: keep the in-memory connection state */ }
 }
 let googleConnectedCache = googleCalendarConnectionHint();
+const ZOOM_CONNECTED_KEY = 'inkloop.zoomConnected';
+function zoomConnectionHint(): boolean {
+  try { return localStorage.getItem(ZOOM_CONNECTED_KEY) === '1'; }
+  catch { return false; }
+}
+function rememberZoomConnection(connected: boolean): void {
+  try {
+    if (connected) localStorage.setItem(ZOOM_CONNECTED_KEY, '1');
+    else localStorage.removeItem(ZOOM_CONNECTED_KEY);
+  } catch { /* storage unavailable: keep the in-memory connection state */ }
+}
+let zoomConnectedCache = zoomConnectionHint();
+let zoomConfiguredCache = zoomConnectedCache;
+
+function updateZoomConnection(status: { connected: boolean; configured: boolean }): void {
+  zoomConnectedCache = status.connected;
+  zoomConfiguredCache = status.configured;
+  rememberZoomConnection(status.connected);
+}
 
 function feishuIdentityConnected(): boolean {
   const session = getSession();
@@ -678,6 +698,9 @@ function providerStatusHtml(provider: MeetingPlatform): string {
         ? '<button class="mp-status is-connected" type="button" id="mp-google-identity"><span class="d"></span>已连接</button>'
         : '<span class="mp-status">未连接</span>';
     case 'zoom':
+      return zoomConnectedCache
+        ? '<button class="mp-status is-connected" type="button" id="mp-zoom-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
     case 'microsoft_teams':
       return '<span class="mp-status">暂未接入</span>';
   }
@@ -708,6 +731,15 @@ async function chooseMeetingProvider(provider: MeetingPlatform): Promise<void> {
       }
       break;
     case 'zoom':
+      {
+        const status = await fetchZoomStatus().catch(() => null);
+        if (status) updateZoomConnection(status);
+      }
+      if (!zoomConfiguredCache) {
+        await infoSheet({ title: 'Zoom', message: 'Zoom 由服务器统一接入，请在 Cloud Hub 配置 S2S 凭据。' });
+        return;
+      }
+      break;
     case 'microsoft_teams':
     case 'manual':
       break;
@@ -716,15 +748,17 @@ async function chooseMeetingProvider(provider: MeetingPlatform): Promise<void> {
 }
 
 async function refreshMeetingProviderLeadConnections(): Promise<void> {
-  const [identity, googleStatus] = await Promise.all([
+  const [identity, googleStatus, zoomStatus] = await Promise.all([
     feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null),
     googleCalendarConnectionHint() ? getGoogleOAuthStatus().catch(() => null) : Promise.resolve(null),
+    fetchZoomStatus().catch(() => null),
   ]);
   if (identity) fsIdentityCache = identity;
   if (googleStatus) {
     googleConnectedCache = googleStatus.connected;
     rememberGoogleCalendarConnection(googleStatus.connected);
   }
+  if (zoomStatus) updateZoomConnection(zoomStatus);
   if (meetingProviderLeadVisible && document.body.dataset.mode === 'meet' && document.body.dataset.mtg === 'home') {
     renderMeetingProviderLead(false);
   }
@@ -765,6 +799,10 @@ function renderMeetingProviderLead(refresh = true): void {
     event.stopPropagation();
     void openGoogleCalendarConnection();
   });
+  root.querySelector('#mp-zoom-identity')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void infoSheet({ title: 'Zoom', message: 'Zoom 由服务器统一接入，当前已连接。' });
+  });
   root.querySelector<HTMLElement>('.mp-option.is-default')?.focus({ preventScroll: true });
   if (refresh) void refreshMeetingProviderLeadConnections();
 }
@@ -794,6 +832,22 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
   const liveState = await getMeetingLiveState();
   if (!liveState.connected) return;
   await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
+}
+
+async function syncZoomMeetings(): Promise<void> {
+  const status = await fetchZoomStatus();
+  updateZoomConnection(status);
+  if (!status.connected) return;
+  const response = await fetchZoomMeetingSources();
+  await syncZoomMeetingSources(response.sources || [], {
+    listAllMeetings,
+    upsertScheduleWorkspace,
+    createMeeting,
+    updateMeeting,
+  });
+  const liveState = await fetchZoomMeetingLiveState();
+  if (!liveState.connected) return;
+  await syncZoomMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
 }
 
 // ════ 重复卡自愈：历史竞态给同一场飞书会建过两张卡（锁上线前的存量+万一的漏网）。════
@@ -856,6 +910,7 @@ async function syncHomeData(): Promise<void> {
   fsConnectedCache = fsConnectedCache || meetingSources.connected;
   if (!fsCalendarIssue && meetingSources.issue) fsCalendarIssue = meetingSources.issue;
   await syncGoogleCalendarMeetings().catch(() => {});
+  await syncZoomMeetings().catch(() => {});
   await healDuplicateLarkMeetings().catch(() => {}); // 重复卡自愈（存量清理+锁的漏网兜底）·幂等
 }
 
@@ -873,6 +928,7 @@ function homeSig(workspaces: PersistedWorkspace[], meetings: PersistedMeeting[])
     fsIdentityCache?.oauth?.connected ? 'connected' : 'disconnected',
     fsIdentityCache?.session?.feishu_open_id || '',
     googleConnectedCache ? 'google-connected' : 'google-disconnected',
+    zoomConnectedCache ? 'zoom-connected' : 'zoom-disconnected',
   ].join(':');
   return `${identity}@${clock}#${ws}#${mtg}`;
 }

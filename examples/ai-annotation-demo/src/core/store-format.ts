@@ -354,6 +354,8 @@ export interface PersistedMeeting {
   google_smart_note_scope_missing?: boolean; // 旧 OAuth token 缺 drive.readonly，提示用户重授权
   google_recordings?: Array<{ export_uri: string; state: string }>; // Meet 录像 Drive 引用；只存可打开链接
   meeting_url?: string;                // 平台通用入会链接；飞书与 Google Meet 均可使用
+  topic?: string;                      // provider 原始会议主题；卡片标题可由它派生但仍保留原值
+  duration?: number;                   // provider 计划时长（分钟）；当前 Zoom List Meetings 使用
   // ── WS2-C 飞书妙记对照（optional·零迁移；近似对照非精确对齐·见 integration/panel-feishu）──
   feishu_meeting_id?: string;       // 关联的飞书 VC 会议 id
   feishu_meeting_no?: string;       // 9 位会议号

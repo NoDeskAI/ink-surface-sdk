@@ -989,10 +989,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     res.setHeader('cache-control', 'no-store');
     const identity = mtlReceiverIdentity(session);
     const configured = !!currentMtlToken(identity);
+    const platform = url.searchParams.get('platform') || undefined;
     sendJson(res, 200, {
       connected: configured,
       source: 'mtl_receiver',
-      windows: configured ? listMtlMeetingWindows(identity) : [],
+      windows: configured ? listMtlMeetingWindows(identity, process.env, platform) : [],
     });
     return;
   }

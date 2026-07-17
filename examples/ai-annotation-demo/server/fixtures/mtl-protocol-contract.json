@@ -162,6 +162,62 @@
         "meeting_app_record": { "phase": "ended", "captured_at_ms": 1784087700000 }
       }
     },
+    "zoom_start": {
+      "builder": "buildMeetingStartPayload",
+      "input": {
+        "platform": "zoom",
+        "meetingId": "987654321",
+        "externalMeetingId": "zoom-session/uuid-42",
+        "meetingUrl": "https://acme.zoom.us/j/987654321?pwd=join-secret",
+        "topic": "Zoom protocol review",
+        "timezone": "Asia/Shanghai",
+        "startedAt": "2026-07-15T05:00:00.000Z",
+        "detectorSource": "meeting_app_extension",
+        "observerSurface": "browser_extension",
+        "runId": "zoom:987654321",
+        "meetingAppRecord": { "phase": "active", "captured_at_ms": 1784091600000 }
+      },
+      "defaults": {
+        "platform": "lark",
+        "timezone": "UTC",
+        "detectorSource": "fixture-default"
+      },
+      "expected": {
+        "platform": "zoom",
+        "meeting_id": "987654321",
+        "external_meeting_id": "zoom-session/uuid-42",
+        "meeting_url": "https://acme.zoom.us/j/987654321?pwd=join-secret",
+        "title": "Zoom protocol review",
+        "timezone": "Asia/Shanghai",
+        "start_time_ms": 1784091600000,
+        "detector_source": "meeting_app_extension",
+        "observer_surface": "browser_extension",
+        "run_id": "zoom:987654321",
+        "meeting_app_record": { "phase": "active", "captured_at_ms": 1784091600000 }
+      }
+    },
+    "zoom_end": {
+      "builder": "buildMeetingEndPayload",
+      "input": {
+        "meetingId": "987654321",
+        "endedAt": "2026-07-15T05:55:00.000Z",
+        "timeMs": 3300000,
+        "detectorSource": "meeting_app_extension_leave",
+        "observerSurface": "browser_extension",
+        "runId": "zoom:987654321",
+        "meetingAppRecord": { "phase": "ended", "captured_at_ms": 1784094900000 }
+      },
+      "defaults": { "detectorSource": "fixture-default" },
+      "expected": {
+        "meeting_id": "987654321",
+        "end_time_ms": 1784094900000,
+        "time_ms": 3300000,
+        "detector_source": "meeting_app_extension_leave",
+        "observer_surface": "browser_extension",
+        "run_id": "zoom:987654321",
+        "meeting_app_record": { "phase": "ended", "captured_at_ms": 1784094900000 }
+      }
+    },
     "annotation": {
       "builder": "buildTimelineMark",
       "input": {
