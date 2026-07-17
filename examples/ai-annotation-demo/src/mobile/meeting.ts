@@ -17,7 +17,7 @@ import { setRuntimeSyncHeld } from '../integration/inksurface/runtime-sync-host'
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
-  createMeeting, getMeeting, updateMeeting, deleteMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
+  createMeeting, getMeeting, mutateMeeting, updateMeeting, deleteMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
   createDiaryDoc, renameDiary, setActiveDoc, setLastReadPage, getDoc, upsertPanelWorkspace, upsertScheduleWorkspace,
   appendMarkEntry,
 } from '../local/store';
@@ -836,11 +836,12 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
     upsertScheduleWorkspace,
     createMeeting,
     updateMeeting,
+    mutateMeeting,
   });
   if (!response.mtl_token_configured) return;
   const liveState = await getMeetingLiveState();
   if (!liveState.connected) return;
-  await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
+  await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, mutateMeeting });
 }
 
 async function syncZoomMeetings(): Promise<void> {
@@ -853,10 +854,11 @@ async function syncZoomMeetings(): Promise<void> {
     upsertScheduleWorkspace,
     createMeeting,
     updateMeeting,
+    mutateMeeting,
   });
   const liveState = await fetchZoomMeetingLiveState();
   if (!liveState.connected) return;
-  await syncZoomMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
+  await syncZoomMeetingLiveState(liveState.windows || [], { listAllMeetings, mutateMeeting });
 }
 
 // ════ 重复卡自愈：历史竞态给同一场飞书会建过两张卡（锁上线前的存量+万一的漏网）。════
@@ -1264,14 +1266,54 @@ async function refreshMeetNavBadge(): Promise<void> {
   if (tabBadge) tabBadge.hidden = !on;
 }
 
+/** live 画板只拉 MTL 小响应；日程列表、文件和 provider 详情仍留给 home 同步。 */
+async function syncActiveMeetingProviderLiveState(previousStatus: MeetingStatus | undefined): Promise<void> {
+  const active = liveMtg;
+  if (!active) return;
+  const platform = meetingPlatformOf(active.meeting);
+  if (platform === 'google_meet' || googleCalendarConnectionHint()) {
+    const state = await getMeetingLiveState().catch(() => null);
+    if (state?.connected) await syncGoogleMeetingLiveState(state.windows || [], { listAllMeetings, mutateMeeting }).catch(() => {});
+  }
+  if (platform === 'zoom' || zoomConfiguredCache) {
+    const state = await fetchZoomMeetingLiveState().catch(() => null);
+    if (state?.connected) await syncZoomMeetingLiveState(state.windows || [], { listAllMeetings, mutateMeeting }).catch(() => {});
+  }
+  const fresh = await getMeeting(active.id);
+  if (!fresh || liveMtg !== active) return;
+  active.meeting = fresh;
+  active.status = fresh.status;
+  const startMs = Number.isFinite(fresh.vc_meeting_start_t0)
+    ? (fresh.vc_meeting_start_t0 as number)
+    : Date.parse(fresh.started_at || '');
+  if (Number.isFinite(startMs) && startMs > 0) active.startedAt = startMs;
+  if (fresh.status === 'ended') {
+    const endedMs = Date.parse(fresh.ended_at || '');
+    active.frozenAt = Number.isFinite(endedMs) && endedMs > 0 ? endedMs : meetingNowMs();
+    stopMeetingBedrock();
+    if (previousStatus !== 'ended') void triggerMeetingBoardOcr(fresh.meeting_id);
+  } else if (fresh.status === 'live') {
+    active.frozenAt = 0;
+    startMeetingBedrock();
+  }
+  startClock();
+  void refreshSpine();
+}
+
 /** 一拍：同步 panel/日历（实时归类）→ 窗口内已归真群的会议抓群文件（节流）→ 数据变了才重渲首页（守翻页·不打断 ws/detail/live）。
  *  不在「会议」面时也要轻量收 panel started/ended 事件才能点亮 nav 徽标（M7·「第一时间通知」不能只在会议面里生效），
  *  但只做这一件事——不拉日历/不抓群文件/不重渲 home（不抢资源·不打断阅读/dev 当前活动）。 */
 async function meetingPollTick(): Promise<void> {
   if (document.hidden) return;
   if (document.body.dataset.mode !== 'meet') { await syncPanelMeetingsObserved().catch(() => {}); void refreshMeetNavBadge(); return; }
-  // 会中(记录工作台)也要消费 panel started/ended 事件(M1·status 飞书驱动)，但只轻量同步、不抓群文件/不重渲 home（保 P0 不抢资源/不打断画板）。
-  if (document.body.dataset.mtg === 'live') { await syncPanelMeetingsObserved().catch(() => {}); void refreshMeetNavBadge(); return; }
+  // 会中记录工作台消费 panel + 各 provider MTL 小窗口，热更状态条；不拉日程/文件、不重渲画板。
+  if (document.body.dataset.mtg === 'live') {
+    const previousStatus = liveMtg?.status;
+    await syncPanelMeetingsObserved().catch(() => {});
+    await syncActiveMeetingProviderLiveState(previousStatus);
+    void refreshMeetNavBadge();
+    return;
+  }
   try { await syncHomeData(); } catch { return; }
   for (const m of await listAllMeetings()) { // 文件捕获窗口：窗口内 + 已归真飞书群（会前1h只对已知群生效）
     const ws = m.workspace_id ? await getWorkspace(m.workspace_id) : null;
@@ -1772,6 +1814,9 @@ async function enterMeeting(mtgId: string, material?: { docId: string; name: str
 
 function teardownLive(): void {
   if (!liveMtg) return;
+  const meetingId = liveMtg.id;
+  const leavingMeetingNote = document.body.classList.contains('mtg-note-open');
+  if (leavingMeetingNote) void triggerMeetingBoardOcr(meetingId);
   liveMtg = null;
   liveNoteDoc = null;
   stopClock();

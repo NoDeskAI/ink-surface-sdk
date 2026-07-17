@@ -62,6 +62,14 @@ function dependencies(initial: PersistedMeeting[]) {
     meetings[index] = { ...meetings[index], ...patch, updated_at: new Date(NOW).toISOString() };
     return meetings[index];
   });
+  const mutateMeeting = vi.fn(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
+    const index = meetings.findIndex((item) => item.meeting_id === id);
+    if (index < 0) return null;
+    const patch = mutator(meetings[index]);
+    if (!patch) return null;
+    meetings[index] = { ...meetings[index], ...patch, updated_at: new Date(NOW).toISOString() };
+    return meetings[index];
+  });
   let seq = 0;
   const createMeeting = vi.fn(async (workspaceId: string, input: { title: string; scheduled_at: string; status?: PersistedMeeting['status'] }) => {
     const created = meeting(`created-${++seq}`, { workspace_id: workspaceId, ...input, status: input.status || 'upcoming' });
@@ -75,10 +83,12 @@ function dependencies(initial: PersistedMeeting[]) {
       upsertScheduleWorkspace: async () => schedule,
       createMeeting,
       updateMeeting,
+      mutateMeeting,
       nowMs: NOW,
     },
     createMeeting,
     updateMeeting,
+    mutateMeeting,
   };
 }
 
@@ -193,6 +203,25 @@ describe('Google meeting source persistence', () => {
       status: 'live',
       started_at: '2026-07-14T07:10:00.000Z',
     });
+  });
+
+  it('does not replace an actual provider end with the Calendar end', async () => {
+    const actualEnd = '2026-07-14T07:42:00.000Z';
+    const state = dependencies([meeting('google-actual-end', {
+      platform: 'google_meet',
+      provider_calendar_event_id: 'actual-end',
+      scheduled_at: '2026-07-14T06:00:00.000Z',
+      status: 'ended',
+      ended_at: actualEnd,
+      t0_source: 'provider_event',
+    })]);
+
+    await syncGoogleMeetingSources([source('actual-end', {
+      scheduled_at: '2026-07-14T06:00:00.000Z',
+      scheduled_end_at: '2026-07-14T07:00:00.000Z',
+    })], state.deps);
+
+    expect(state.meetings[0].ended_at).toBe(actualEnd);
   });
 
   it('clears stale instance artifacts but preserves Calendar identity when an ended occurrence is rescheduled', async () => {

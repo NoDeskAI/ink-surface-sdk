@@ -106,8 +106,8 @@ describe('meeting home model', () => {
   it('classifies mark phases from actual start with scheduled fallback and inclusive grace boundaries', () => {
     const scheduled = Date.parse('2026-07-09T08:00:00.000Z');
     const scheduledOnly = meeting('scheduled-only', 'live', new Date(scheduled).toISOString());
-    expect(meetingMarkPhase({ abs_timestamp: scheduled - 10 * 60_000 }, scheduledOnly, scheduled)).toBe('in');
-    expect(meetingMarkPhase({ abs_timestamp: scheduled - 10 * 60_000 - 1 }, scheduledOnly, scheduled)).toBe('pre');
+    expect(meetingMarkPhase({ abs_timestamp: scheduled - 60_000 }, scheduledOnly, scheduled)).toBe('in');
+    expect(meetingMarkPhase({ abs_timestamp: scheduled - 60_001 }, scheduledOnly, scheduled)).toBe('pre');
 
     const actual = { ...scheduledOnly, started_at: new Date(scheduled + 30 * 60_000).toISOString() };
     expect(meetingMarkPhase({ abs_timestamp: scheduled }, actual, scheduled + 30 * 60_000)).toBe('pre');

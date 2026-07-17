@@ -42,6 +42,9 @@ function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }):
     device_id: input.device_id ?? 'device_bridge',
     abs_timestamp: 0,
     pen_down_at: input.pen_down_at,
+    ocr_at: input.ocr_at,
+    ocr_fingerprint: input.ocr_fingerprint,
+    ocr_empty: input.ocr_empty,
     feature_type: input.feature_type ?? 'drawing',
     feature_confidence: 1,
     kind: input.kind,
@@ -78,7 +81,14 @@ describe('runtime sync bridge', () => {
   it('bridges mark ledger entries to IndexedDB runtime snapshot and outbox exactly once', async () => {
     const store = new IndexedDbOfflineRuntimeStore({ dbName: `bridge-${Date.now()}-${Math.random()}`, factory: indexedDB });
     const watermarks = createMemoryRuntimeBridgeWatermarks();
-    const marks = [mark({ mark_id: 'mark_1', seq: 1, pen_down_at: 1_751_500_000_123 })];
+    const marks = [mark({
+      mark_id: 'mark_1',
+      seq: 1,
+      pen_down_at: 1_751_500_000_123,
+      ocr_at: 1_751_500_100_000,
+      ocr_fingerprint: 'bo1_sync',
+      ocr_empty: false,
+    })];
 
     const first = await bridgeRuntimeLedgerToStore({
       documentId: 'doc_bridge',
@@ -108,7 +118,17 @@ describe('runtime sync bridge', () => {
     expect(bridgedAnnotations?.[0]).toMatchObject({ ko_id: 'ko_mark_1' });
     expect((await store.listPendingEvents('doc_bridge')).map((event) => event.operation)).toEqual(['runtime.bootstrap', 'annotation.add']);
     const add = (await store.listPendingEvents('doc_bridge')).find((event) => event.operation === 'annotation.add');
-    expect((add?.payload.annotation as { inkloop_mark?: Record<string, unknown> })?.inkloop_mark?.pen_down_at).toBe(1_751_500_000_123);
+    expect((add?.payload.annotation as { inkloop_mark?: Record<string, unknown> })?.inkloop_mark).toMatchObject({
+      pen_down_at: 1_751_500_000_123,
+      ocr_at: 1_751_500_100_000,
+      ocr_fingerprint: 'bo1_sync',
+      ocr_empty: false,
+    });
+    expect(add?.payload).toMatchObject({
+      ocr_at: 1_751_500_100_000,
+      ocr_fingerprint: 'bo1_sync',
+      ocr_empty: false,
+    });
     await store.close();
   });
 

@@ -3,7 +3,7 @@ import type { NormBBox } from '../core/contracts';
 import { postJson } from '../core/api';
 import { devEmit } from '../core/dev-telemetry';
 import type { PersistedMark } from '../core/store-format';
-import { appendMarkRevision, getFoldedMarks } from '../local/store';
+import { appendMarkRevisionIfCurrent, getFoldedMarks } from '../local/store';
 import { normalizeBoardOcrBbox, rasterizeNormalizedPageJpeg, type RasterStroke } from './rasterize';
 
 const PLACEHOLDER = /^手写\s+\d+\s*笔$/;
@@ -190,9 +190,9 @@ export async function recognizeBoardDocument(documentId: string): Promise<BoardO
     rasterize: defaultRasterize,
     request: (payload) => postJson('/api/ink/board-ocr', payload, { auth: true }),
     writeRevision: async (mark, patch, expectedFingerprint) => {
-      const latest = (await getFoldedMarks(documentId)).find((candidate) => candidate.mark_id === mark.mark_id);
-      if (!latest || boardOcrFingerprint(latest) !== expectedFingerprint || !shouldRecognizeBoardMark(latest)) return false;
-      const revision = await appendMarkRevision(latest, patch);
+      if (boardOcrFingerprint(mark) !== expectedFingerprint) return false;
+      const revision = await appendMarkRevisionIfCurrent(documentId, mark.mark_id, { seq: mark.seq }, patch);
+      if (!revision) return false;
       bus.emit('mark:recorded', revision);
       return true;
     },
@@ -209,18 +209,18 @@ export async function recognizeBoardDocument(documentId: string): Promise<BoardO
 
 export function createBoardOcrTrigger(
   run: (documentId: string) => Promise<BoardOcrRunResult>,
-  now: () => number = () => Date.now(),
-  cooldownMs = BOARD_OCR_TRIGGER_COOLDOWN_MS,
+  _now: () => number = () => Date.now(),
+  _cooldownMs = BOARD_OCR_TRIGGER_COOLDOWN_MS,
 ): (documentId: string) => Promise<BoardOcrRunResult> {
-  const recent = new Map<string, { at: number; promise: Promise<BoardOcrRunResult> }>();
+  const pending = new Map<string, Promise<BoardOcrRunResult>>();
   return (documentId: string) => {
-    const at = now();
-    const prior = recent.get(documentId);
-    if (prior && at - prior.at < cooldownMs) return prior.promise;
-    const promise = run(documentId).catch(() => ({
-      document_id: documentId, marks: 0, ok: 0, empty: 0, ms: 0, failed: true,
-    }));
-    recent.set(documentId, { at, promise });
+    const prior = pending.get(documentId);
+    if (prior) return prior;
+    let promise: Promise<BoardOcrRunResult>;
+    promise = run(documentId)
+      .catch(() => ({ document_id: documentId, marks: 0, ok: 0, empty: 0, ms: 0, failed: true }))
+      .finally(() => { if (pending.get(documentId) === promise) pending.delete(documentId); });
+    pending.set(documentId, promise);
     return promise;
   };
 }

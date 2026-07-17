@@ -62,6 +62,14 @@ function dependencies(initial: PersistedMeeting[]) {
     meetings[index] = { ...meetings[index], ...patch, updated_at: new Date(NOW).toISOString() };
     return meetings[index];
   });
+  const mutateMeeting = vi.fn(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
+    const index = meetings.findIndex((item) => item.meeting_id === id);
+    if (index < 0) return null;
+    const patch = mutator(meetings[index]);
+    if (!patch) return null;
+    meetings[index] = { ...meetings[index], ...patch, updated_at: new Date(NOW).toISOString() };
+    return meetings[index];
+  });
   let seq = 0;
   const createMeeting = vi.fn(async (workspaceId: string, input: { title: string; scheduled_at: string; status?: PersistedMeeting['status'] }) => {
     const created = meeting(`created-${++seq}`, { workspace_id: workspaceId, ...input, status: input.status || 'upcoming' });
@@ -75,11 +83,13 @@ function dependencies(initial: PersistedMeeting[]) {
       upsertScheduleWorkspace,
       createMeeting,
       updateMeeting,
+      mutateMeeting,
       nowMs: NOW,
     },
     upsertScheduleWorkspace,
     createMeeting,
     updateMeeting,
+    mutateMeeting,
   };
 }
 
@@ -182,6 +192,25 @@ describe('Zoom meeting source persistence', () => {
     expect(state.meetings[0].provider_meeting_id).toBeUndefined();
     expect(state.meetings[0].provider_transcript_ref).toBeUndefined();
     expect(state.meetings[0].t0_source).toBeUndefined();
+  });
+
+  it('does not replace an actual provider end with the scheduled end', async () => {
+    const actualEnd = '2026-07-17T07:42:00.000Z';
+    const state = dependencies([meeting('zoom-actual-end', {
+      platform: 'zoom',
+      provider_space_name: '987654321',
+      scheduled_at: '2026-07-17T06:00:00.000Z',
+      status: 'ended',
+      ended_at: actualEnd,
+      t0_source: 'provider_event',
+    })]);
+
+    await syncZoomMeetingSources([source('987654321', {
+      scheduled_at: '2026-07-17T06:00:00.000Z',
+      duration_minutes: 60,
+    })], state.deps);
+
+    expect(state.meetings[0].ended_at).toBe(actualEnd);
   });
 });
 
@@ -288,5 +317,21 @@ describe('Zoom MTL live window merge', () => {
       align_state: 'event',
     });
     expect(state.meetings[0].ended_at).toBeUndefined();
+  });
+
+  it('decides detector writes from the transactional meeting value, not the stale matching snapshot', async () => {
+    const actualEnd = '2026-07-18T01:50:00.000Z';
+    const current = meeting('zoom-cas-anchor', {
+      platform: 'zoom',
+      provider_space_name: '987654321',
+      ended_at: actualEnd,
+      t0_source: 'provider_event',
+    });
+    const state = dependencies([current]);
+    state.deps.listAllMeetings = async () => [{ ...current, ended_at: undefined, t0_source: 'local_detector' }];
+
+    await syncZoomMeetingLiveState([liveWindow({ ended_at_ms: Date.parse('2026-07-18T01:55:00.000Z') })], state.deps);
+
+    expect(state.meetings[0].ended_at).toBe(actualEnd);
   });
 });

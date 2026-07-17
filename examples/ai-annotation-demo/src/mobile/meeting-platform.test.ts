@@ -60,6 +60,8 @@ describe('providerTranscriptCacheToken', () => {
     expect(providerTranscriptCacheToken('lark', '7659677460199738340')).toBe('feishu_note_docx:7659677460199738340');
     expect(providerTranscriptCacheToken('google_meet', 'local-google-1')).toBe('google_meet:local-google-1');
     expect(providerTranscriptCacheToken('zoom', 'local-zoom-1')).toBe('zoom:local-zoom-1');
+    expect(providerTranscriptCacheToken('zoom', 'local-zoom-1', '20260718T010000Z')).toBe('zoom:local-zoom-1:20260718T010000Z');
+    expect(providerTranscriptCacheToken('google_meet', 'local-google-1', 'ignored')).toBe('google_meet:local-google-1');
     expect(providerTranscriptCacheToken('microsoft_teams', 'local-teams-1')).toBe('microsoft_teams:local-teams-1');
   });
 });

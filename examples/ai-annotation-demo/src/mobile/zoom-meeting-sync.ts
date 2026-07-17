@@ -7,6 +7,7 @@ export interface ZoomMeetingSyncDependencies {
   upsertScheduleWorkspace: () => Promise<PersistedWorkspace>;
   createMeeting: (workspaceId: string, input: { title: string; scheduled_at: string; status?: MeetingStatus }) => Promise<PersistedMeeting>;
   updateMeeting: (id: string, patch: Partial<PersistedMeeting>) => Promise<PersistedMeeting | null>;
+  mutateMeeting: (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => Promise<PersistedMeeting | null>;
   nowMs?: number;
 }
 
@@ -65,7 +66,9 @@ export function zoomMeetingPatch(
         align_state: 'estimated',
       }
       : {}),
-    ...(status === 'ended' && Number.isFinite(endMs) ? { ended_at: new Date(endMs).toISOString() } : {}),
+    ...(status === 'ended' && Number.isFinite(endMs) && !(existing && hasStrongerZoomAnchor(existing) && existing.ended_at)
+      ? { ended_at: new Date(endMs).toISOString() }
+      : {}),
     ...(rescheduled
       ? {
         started_at: undefined,
@@ -73,6 +76,7 @@ export function zoomMeetingPatch(
         provider_meeting_id: undefined,
         provider_transcript_ref: undefined,
         provider_transcript_status: undefined,
+        provider_transcript_reason: undefined,
         vc_meeting_start_t0: undefined,
         t0_source: undefined,
         align_offset_ms: undefined,
@@ -200,7 +204,7 @@ function hasStrongerZoomAnchor(meeting: PersistedMeeting): boolean {
 /** MTL detector 窗口只允许更新已有 Zoom 日程卡，绝不新建卡（未匹配即忽略）。 */
 export async function syncZoomMeetingLiveState(
   windows: ZoomMeetingLiveWindow[],
-  dependencies: Pick<ZoomMeetingSyncDependencies, 'listAllMeetings' | 'updateMeeting'>,
+  dependencies: Pick<ZoomMeetingSyncDependencies, 'listAllMeetings' | 'mutateMeeting'>,
 ): Promise<ZoomMeetingLiveSyncResult> {
   const result: ZoomMeetingLiveSyncResult = { matched: 0, updated: 0 };
   if (!windows.length) return result;
@@ -211,28 +215,26 @@ export async function syncZoomMeetingLiveState(
     const existing = findMeetingForZoomWindow(meetings, window);
     if (!existing) continue;
     result.matched += 1;
-    const strongerAnchor = hasStrongerZoomAnchor(existing);
-    const patch: Partial<PersistedMeeting> = window.ended_at_ms
-      ? {
-        status: 'ended',
-        ended_at: strongerAnchor && existing.ended_at
-          ? existing.ended_at
-          : new Date(window.ended_at_ms).toISOString(),
-      }
-      : {
-        status: 'live',
-        ended_at: undefined,
-        ...(!strongerAnchor ? {
-          started_at: new Date(window.started_at_ms).toISOString(),
-          vc_meeting_start_t0: window.started_at_ms,
-          t0_source: 'local_detector' as const,
-          align_state: 'estimated' as const,
-        } : {}),
-      };
-    await dependencies.updateMeeting(existing.meeting_id, patch);
-    meetings = meetings.map((meeting) => meeting.meeting_id === existing.meeting_id
-      ? { ...meeting, ...patch }
-      : meeting);
+    const updated = await dependencies.mutateMeeting(existing.meeting_id, (current) => {
+      const strongerAnchor = hasStrongerZoomAnchor(current);
+      return window.ended_at_ms
+        ? {
+          status: 'ended',
+          ...(!(strongerAnchor && current.ended_at) ? { ended_at: new Date(window.ended_at_ms).toISOString() } : {}),
+        }
+        : {
+          status: 'live',
+          ended_at: undefined,
+          ...(!strongerAnchor ? {
+            started_at: new Date(window.started_at_ms).toISOString(),
+            vc_meeting_start_t0: window.started_at_ms,
+            t0_source: 'local_detector' as const,
+            align_state: 'estimated' as const,
+          } : {}),
+        };
+    });
+    if (!updated) continue;
+    meetings = meetings.map((meeting) => meeting.meeting_id === updated.meeting_id ? updated : meeting);
     result.updated += 1;
   }
   return result;

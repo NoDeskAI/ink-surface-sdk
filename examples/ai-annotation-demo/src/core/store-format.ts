@@ -354,6 +354,7 @@ export interface PersistedMeeting {
   provider_space_name?: string;        // 平台逻辑会议容器 ID；Google space.name，Teams onlineMeeting.id，Zoom meeting id
   provider_transcript_ref?: string;    // 平台转写工件 ID；Google transcript.name，Teams callTranscript.id
   provider_transcript_status?: 'ready' | 'pending' | 'not_generated' | 'no_record';
+  provider_transcript_reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
   google_smart_note?: { text: string; export_uri?: string; fetched_at: string }; // Gemini 官方智能纪要纯文本（Drive export）
   google_smart_note_scope_missing?: boolean; // 旧 OAuth token 缺 drive.readonly，提示用户重授权
   google_recordings?: Array<{ export_uri: string; state: string }>; // Meet 录像 Drive 引用；只存可打开链接

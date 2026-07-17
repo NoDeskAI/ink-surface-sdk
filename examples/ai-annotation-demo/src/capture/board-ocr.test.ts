@@ -97,15 +97,19 @@ describe('board OCR writeback', () => {
 });
 
 describe('board OCR trigger idempotency', () => {
-  it('deduplicates the same document for 30 seconds', async () => {
-    let now = 1_000;
-    const run = vi.fn(async (documentId: string) => ({ document_id: documentId, marks: 1, ok: 1, empty: 0, ms: 10 }));
-    const trigger = createBoardOcrTrigger(run, () => now);
-    await Promise.all([trigger('doc_1'), trigger('doc_1')]);
-    now += 29_999;
-    await trigger('doc_1');
+  it('deduplicates only while a scan is pending and allows an immediate rescan after completion', async () => {
+    const markResult = (documentId: string) => ({ document_id: documentId, marks: 1, ok: 1, empty: 0, ms: 10 });
+    let finish!: (value: { document_id: string; marks: number; ok: number; empty: number; ms: number }) => void;
+    let callCount = 0;
+    const run = vi.fn((documentId: string) => callCount++ === 0
+      ? new Promise<ReturnType<typeof markResult>>((resolve) => { finish = resolve; })
+      : Promise.resolve(markResult(documentId)));
+    const trigger = createBoardOcrTrigger(run);
+    const first = trigger('doc_1');
+    const duplicate = trigger('doc_1');
     expect(run).toHaveBeenCalledTimes(1);
-    now += 2;
+    finish(markResult('doc_1'));
+    await Promise.all([first, duplicate]);
     await trigger('doc_1');
     expect(run).toHaveBeenCalledTimes(2);
   });

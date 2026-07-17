@@ -37,9 +37,18 @@ export function meetingTranscriptSource(meeting: Partial<PersistedMeeting>): Mee
   return MEETING_TRANSCRIPT_SOURCES[meetingPlatformOf(meeting)];
 }
 
-/** 飞书妙记 token 仍直接作为主缓存键；此函数命名其 note/docx 兜底缓存及其它平台缓存。 */
-export function providerTranscriptCacheToken(platform: MeetingPlatform, localMeetingId: string): string {
-  return `${TRANSCRIPT_CACHE_PREFIXES[platform]}:${localMeetingId}`;
+/** ISO 日程时间压成稳定、可读且不含分隔冒号的 occurrence token。 */
+export function providerOccurrenceToken(value: string | undefined): string {
+  const raw = value?.trim() || '';
+  const ms = Date.parse(raw);
+  if (Number.isFinite(ms)) return new Date(ms).toISOString().replace(/[-:.]/g, '').replace(/000Z$/, 'Z');
+  return raw.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/** 飞书妙记 token 仍直接作为主缓存键；只有 Zoom 按 occurrence 隔离改期前后的缓存。 */
+export function providerTranscriptCacheToken(platform: MeetingPlatform, localMeetingId: string, occurrenceToken?: string): string {
+  const base = `${TRANSCRIPT_CACHE_PREFIXES[platform]}:${localMeetingId}`;
+  return platform === 'zoom' && occurrenceToken ? `${base}:${occurrenceToken}` : base;
 }
 
 export function providerMeetingLockKey(platform: MeetingPlatform, id: string): string {

@@ -19,6 +19,7 @@ export function filterMeetingsByPlatform(meetings: PersistedMeeting[], platform:
 const LIVE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_STALE_MEETING_DURATION_MS = 60 * 60 * 1000;
 export const MEETING_MARK_GRACE_MS = 10 * 60 * 1000;
+export const MEETING_MARK_PRE_GRACE_MS = 60 * 1000;
 export type MeetingMarkPhase = 'pre' | 'in' | 'post';
 
 export function normalizeMeetingHomeFilter(value: unknown): MeetingHomeFilter {
@@ -62,7 +63,7 @@ export function meetingMarkPhase(
 ): MeetingMarkPhase {
   const at = markTime(mark);
   const startedAt = parseMs(meeting.started_at) || parseMs(meeting.scheduled_at);
-  if (startedAt > 0 && at < startedAt - MEETING_MARK_GRACE_MS) return 'pre';
+  if (startedAt > 0 && at < startedAt - MEETING_MARK_PRE_GRACE_MS) return 'pre';
   const endedAt = parseMs(meeting.ended_at) || parseMs(effectiveMeetingEndIso(meeting, nowMs));
   if (endedAt > 0 && at > endedAt + MEETING_MARK_GRACE_MS) return 'post';
   return 'in';

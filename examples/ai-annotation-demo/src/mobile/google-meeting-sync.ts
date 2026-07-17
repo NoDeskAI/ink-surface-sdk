@@ -7,6 +7,7 @@ export interface GoogleMeetingSyncDependencies {
   upsertScheduleWorkspace: () => Promise<PersistedWorkspace>;
   createMeeting: (workspaceId: string, input: { title: string; scheduled_at: string; status?: MeetingStatus }) => Promise<PersistedMeeting>;
   updateMeeting: (id: string, patch: Partial<PersistedMeeting>) => Promise<PersistedMeeting | null>;
+  mutateMeeting: (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => Promise<PersistedMeeting | null>;
   nowMs?: number;
 }
 
@@ -57,7 +58,9 @@ export function googleMeetingPatch(
     ...(status === 'live' && !existing?.started_at
       ? { started_at: source.scheduled_at, vc_meeting_start_t0: Date.parse(source.scheduled_at), t0_source: 'calendar', align_state: 'estimated' }
       : {}),
-    ...(status === 'ended' && endedAt ? { ended_at: endedAt } : {}),
+    ...(status === 'ended' && endedAt && !(existing && hasStrongerGoogleAnchor(existing) && existing.ended_at)
+      ? { ended_at: endedAt }
+      : {}),
     ...(rescheduled
       ? {
         started_at: undefined,
@@ -66,6 +69,7 @@ export function googleMeetingPatch(
         provider_space_name: undefined,
         provider_transcript_ref: undefined,
         provider_transcript_status: undefined,
+        provider_transcript_reason: undefined,
         google_smart_note: undefined,
         google_smart_note_scope_missing: undefined,
         google_recordings: undefined,
@@ -132,7 +136,7 @@ function hasStrongerGoogleAnchor(meeting: PersistedMeeting): boolean {
  * server-side diagnostics and never manufacture or overwrite an unrelated local meeting. */
 export async function syncGoogleMeetingLiveState(
   windows: GoogleMeetingLiveWindow[],
-  dependencies: Pick<GoogleMeetingSyncDependencies, 'listAllMeetings' | 'updateMeeting'>,
+  dependencies: Pick<GoogleMeetingSyncDependencies, 'listAllMeetings' | 'mutateMeeting'>,
 ): Promise<GoogleMeetingLiveSyncResult> {
   const result: GoogleMeetingLiveSyncResult = { matched: 0, updated: 0 };
   if (!windows.length) return result;
@@ -147,28 +151,26 @@ export async function syncGoogleMeetingLiveState(
     });
     if (!existing) continue;
     result.matched += 1;
-    const strongerAnchor = hasStrongerGoogleAnchor(existing);
-    const patch: Partial<PersistedMeeting> = window.ended_at_ms
-      ? {
-        status: 'ended',
-        ended_at: strongerAnchor && existing.ended_at
-          ? existing.ended_at
-          : new Date(window.ended_at_ms).toISOString(),
-      }
-      : {
-        status: 'live',
-        ended_at: undefined,
-        ...(!strongerAnchor ? {
-          started_at: new Date(window.started_at_ms).toISOString(),
-          vc_meeting_start_t0: window.started_at_ms,
-          t0_source: 'local_detector' as const,
-          align_state: 'estimated' as const,
-        } : {}),
-      };
-    await dependencies.updateMeeting(existing.meeting_id, patch);
-    meetings = meetings.map((meeting) => meeting.meeting_id === existing.meeting_id
-      ? { ...meeting, ...patch }
-      : meeting);
+    const updated = await dependencies.mutateMeeting(existing.meeting_id, (current) => {
+      const strongerAnchor = hasStrongerGoogleAnchor(current);
+      return window.ended_at_ms
+        ? {
+          status: 'ended',
+          ...(!(strongerAnchor && current.ended_at) ? { ended_at: new Date(window.ended_at_ms).toISOString() } : {}),
+        }
+        : {
+          status: 'live',
+          ended_at: undefined,
+          ...(!strongerAnchor ? {
+            started_at: new Date(window.started_at_ms).toISOString(),
+            vc_meeting_start_t0: window.started_at_ms,
+            t0_source: 'local_detector' as const,
+            align_state: 'estimated' as const,
+          } : {}),
+        };
+    });
+    if (!updated) continue;
+    meetings = meetings.map((meeting) => meeting.meeting_id === updated.meeting_id ? updated : meeting);
     result.updated += 1;
   }
   return result;

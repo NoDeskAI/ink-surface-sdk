@@ -77,7 +77,7 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
       platform: 'zoom',
       meeting_id: 'local-zoom-meeting',
       feishu_minute_token: 'must-not-leak',
-    }))).toEqual(['zoom:local-zoom-meeting']);
+    }))).toEqual(['zoom:local-zoom-meeting:20231114T221320Z']);
     expect(meetingTranscriptCacheTokens(meeting({
       platform: 'microsoft_teams',
       meeting_id: 'local-teams-meeting',
@@ -183,6 +183,15 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     expect(out.diagnostics.transcriptMissing).toBe(true);
     expect(out.knowledgeExport.objects.filter((k) => k.kind === 'annotation')).toHaveLength(3);
   });
+
+  it('does not export an OCR placeholder as literal user text', async () => {
+    const out = await assembleMeetingL1Export(input({
+      marks: [{ ...mkInk('ocr-empty', 15), marked_text: '手写 4 笔', ocr_empty: true }],
+    }), OPTS);
+    const annotation = out.knowledgeExport.objects.find((item) => item.kind === 'annotation');
+    expect(annotation?.body_md).toContain('无法识别的手写·别推断其文字含义');
+    expect(annotation?.body_md).not.toContain('手写 4 笔');
+  });
 });
 
 describe('assembleMeetingL1Export（存储原生拓扑：KO-KO 关系层 same_context，零 LLM）', () => {
@@ -216,7 +225,12 @@ describe('assembleMeetingL1Export（存储原生拓扑：KO-KO 关系层 same_co
 
 describe('assembleMeetingL1Export（笔迹 SVG 内嵌导出：visualModel）', () => {
   it('带 strokes 的手写 mark → visualModel 里对应 ko_id 挂上 visual_strokes', async () => {
-    const out = await assembleMeetingL1Export(input({ marks: [mkInk('a', 15)] }), OPTS);
+    const out = await assembleMeetingL1Export(input({ marks: [mkInk('a', 15, {
+      pen_down_at: T0 + 15_000,
+      ocr_at: T0 + 20_000,
+      ocr_fingerprint: 'bo1_export',
+      ocr_empty: false,
+    })] }), OPTS);
     const annKo = out.knowledgeExport.objects.find((k) => k.kind === 'annotation')!;
     const annotations = out.visualModel.blocks.flatMap((b) => b.annotations);
     const mine = annotations.find((a) => a.ko_id === annKo.ko_id);
@@ -224,6 +238,12 @@ describe('assembleMeetingL1Export（笔迹 SVG 内嵌导出：visualModel）', (
     expect(mine!.visual_strokes).toHaveLength(1);
     expect(mine!.visual_strokes![0].points).toHaveLength(2);
     expect(mine!.render_mode).toBe('stroke_only');
+    expect((mine as typeof mine & { inkloop_mark?: Record<string, unknown> })?.inkloop_mark).toMatchObject({
+      pen_down_at: T0 + 15_000,
+      ocr_at: T0 + 20_000,
+      ocr_fingerprint: 'bo1_export',
+      ocr_empty: false,
+    });
   });
 
   it('surface_points 存在时同时填 surface_strokes', async () => {

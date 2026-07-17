@@ -110,6 +110,10 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function runtimeBbox(value: unknown): [number, number, number, number] | null {
   if (!Array.isArray(value) || value.length !== 4) return null;
   const nums = value.map((part) => Number(part));
@@ -313,6 +317,9 @@ export function runtimeAnnotationToMark(docId: string, block: RuntimeSurfaceBloc
     device_id: stringValue(meta.source_device_id) || 'runtime-sync',
     abs_timestamp: Date.parse(createdAt) || Date.now(),
     pen_down_at: finiteNumber(meta.pen_down_at) ?? undefined,
+    ocr_at: finiteNumber(meta.ocr_at) ?? undefined,
+    ocr_fingerprint: stringValue(meta.ocr_fingerprint) || undefined,
+    ocr_empty: booleanValue(meta.ocr_empty),
     feature_type: featureType,
     feature_confidence: 1,
     kind: stringValue(meta.kind) || annotation.kind || featureType,
@@ -329,6 +336,13 @@ export function runtimeAnnotationToMark(docId: string, block: RuntimeSurfaceBloc
 
 export function shouldAdoptRemoteMarkRevision(local: PersistedMark | undefined, remote: PersistedMark | null): local is PersistedMark {
   if (!local || !remote || local.is_tombstone || remote.is_tombstone) return false;
+  if (remote.pen_down_at != null && remote.pen_down_at !== local.pen_down_at) return true;
+  const remoteHasOcrProvenance = remote.ocr_at != null || remote.ocr_fingerprint != null || remote.ocr_empty != null;
+  if (remoteHasOcrProvenance && (
+    remote.ocr_at !== local.ocr_at
+    || remote.ocr_fingerprint !== local.ocr_fingerprint
+    || remote.ocr_empty !== local.ocr_empty
+  )) return true;
   const remoteText = (remote.marked_text || '').trim();
   if (remoteText && remoteText !== (local.marked_text || '').trim()) return true;
   if (!markHasDrawablePageNormStrokes(local) && markHasDrawablePageNormStrokes(remote)) return true;
@@ -349,6 +363,9 @@ async function appendRemoteMarkRevision(local: PersistedMark, remote: PersistedM
     surface_coord_space: remote.surface_coord_space ?? local.surface_coord_space,
     reader_layout_id: remote.reader_layout_id ?? local.reader_layout_id,
     pen_down_at: remote.pen_down_at ?? local.pen_down_at,
+    ocr_at: remote.ocr_at ?? local.ocr_at,
+    ocr_fingerprint: remote.ocr_fingerprint ?? local.ocr_fingerprint,
+    ocr_empty: remote.ocr_empty ?? local.ocr_empty,
     tool: remote.tool || local.tool,
     color: remote.color || local.color,
     bbox: remote.bbox,

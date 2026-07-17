@@ -7,7 +7,7 @@
  */
 import { esc } from '../core/escape';
 import { confirmSheet, infoSheet, pickOneSheet } from './sheet';
-import { getMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute } from '../local/store';
+import { getMeeting, mutateMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute } from '../local/store';
 import { apiUrl, authFetch, getJson, postJson, postNdjson } from '../core/api';
 import { settings } from '../app/state';
 import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, resolveMeetingInstance, bindPanelMinute, getPanelMeetingSummary, generatePanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
@@ -19,9 +19,10 @@ import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, Feishu
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
 import { getGoogleMeetingTranscript } from '../integration/google-meet/client';
 import { fetchZoomMeetingTranscript, type ZoomTimestampQuality } from '../integration/zoom/client';
-import { meetingPlatformOf, meetingTranscriptSource, providerTranscriptCacheToken } from './meeting-platform';
+import { meetingPlatformOf, meetingTranscriptSource, providerOccurrenceToken, providerTranscriptCacheToken } from './meeting-platform';
 import { markTime } from '../core/mark-time';
 import { meetingMarkPhase } from './meeting-home-model';
+import { isUnrecognizedHandwritingText } from '../app/mark-text';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
 type ProviderMeetingSummaryResponse = { summary: PanelMeetingSummaryRecord['summary']; model: string };
@@ -75,9 +76,9 @@ export function renderRecapCard(m: PersistedMeeting): string {
     const status = m.provider_transcript_status === 'ready'
       ? '转写已同步'
       : m.provider_transcript_status === 'not_generated'
-        ? '转写未生成（可能未开启云录制）'
+        ? zoomTerminalTranscriptMessage(m, false)
         : m.provider_transcript_status === 'no_record'
-          ? '未找到实际召开的场次'
+          ? zoomTerminalTranscriptMessage(m, false)
           : '等待会后转写';
     return `<section class="msec" id="recap-sec"><div class="msec-h"><span class="mt">会后记录</span><span class="mb">${status}</span></div>`
       + `<div class="matcard" id="recap-open"><span class="ic">${SVG_DOC}</span><div><div class="nm">Zoom 会后转写</div>`
@@ -273,9 +274,10 @@ function transcriptSourceKey(m: PersistedMeeting): string {
     case 'lark':
       return m.feishu_minute_token || (m.feishu_meeting_id ? providerTranscriptCacheToken('lark', m.feishu_meeting_id) : '');
     case 'google_meet':
-    case 'zoom':
     case 'microsoft_teams':
       return providerTranscriptCacheToken(platform, m.meeting_id);
+    case 'zoom':
+      return providerTranscriptCacheToken(platform, m.meeting_id, providerOccurrenceToken(m.scheduled_at));
     case 'manual':
       return '';
   }
@@ -425,41 +427,63 @@ export async function loadGoogleTranscript(m: PersistedMeeting): Promise<LoadedT
   }
 }
 
-function hasStrongerZoomAnchor(m: PersistedMeeting): boolean {
-  return m.t0_source === 'provider_event' || m.t0_source === 'recording_event';
+function sameZoomOccurrence(left: Pick<PersistedMeeting, 'scheduled_at'>, rightToken: string): boolean {
+  return providerOccurrenceToken(left.scheduled_at) === rightToken;
 }
 
 /** Zoom 会后转写：本机缓存先行兜底，在线结果只按实际场次字段做条件写回。 */
 export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
   if (meetingTranscriptSource(m) !== 'zoom_transcript' || !m.provider_space_name || !m.scheduled_at) return null;
-  const cacheToken = providerTranscriptCacheToken('zoom', m.meeting_id);
+  const occurrenceToken = providerOccurrenceToken(m.scheduled_at);
+  const cacheToken = providerTranscriptCacheToken('zoom', m.meeting_id, occurrenceToken);
   const cached = await getCachedMinute(cacheToken);
   try {
     const result = await fetchZoomMeetingTranscript(m.provider_space_name, m.scheduled_at);
-    const patch: Partial<PersistedMeeting> = {};
-    if (m.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
-    if (result.instance_uuid && result.instance_uuid !== m.provider_meeting_id) patch.provider_meeting_id = result.instance_uuid;
-    if (result.transcript?.name && result.transcript.name !== m.provider_transcript_ref) patch.provider_transcript_ref = result.transcript.name;
-
-    const strongerAnchor = hasStrongerZoomAnchor(m);
     const t0Ms = feishuEpochMs(result.t0 || result.record?.start_time);
     const startMs = feishuEpochMs(result.started_at || result.record?.start_time);
     const endMs = feishuEpochMs(result.ended_at || result.record?.end_time);
-    if (t0Ms > 0 && (!strongerAnchor || !m.vc_meeting_start_t0)) {
-      if (m.vc_meeting_start_t0 !== t0Ms) patch.vc_meeting_start_t0 = t0Ms;
-      if (!strongerAnchor && m.t0_source !== 'provider_event') patch.t0_source = 'provider_event';
-      if (!strongerAnchor && m.align_state !== 'manual' && m.align_state !== 'event') patch.align_state = 'event';
-    }
-    if (startMs > 0 && (!strongerAnchor || !m.started_at) && Date.parse(m.started_at || '') !== startMs) {
-      patch.started_at = new Date(startMs).toISOString();
-    }
-    if (endMs > 0 && (!strongerAnchor || !m.ended_at) && Date.parse(m.ended_at || '') !== endMs) {
-      patch.ended_at = new Date(endMs).toISOString();
-    }
-    if (Object.keys(patch).length) {
-      await updateMeeting(m.meeting_id, patch);
-      Object.assign(m, patch);
-    }
+    let occurrenceCurrent = false;
+    let appliedPatch: Partial<PersistedMeeting> = {};
+    const saved = await mutateMeeting(m.meeting_id, (current) => {
+      if (!sameZoomOccurrence(current, occurrenceToken)) return null;
+      occurrenceCurrent = true;
+      const patch: Partial<PersistedMeeting> = {};
+      if (current.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
+      if (current.provider_transcript_reason !== result.reason) patch.provider_transcript_reason = result.reason;
+
+      const instanceChanged = !!result.instance_uuid && result.instance_uuid !== current.provider_meeting_id;
+      const protectAnchor = current.align_state === 'manual'
+        || current.t0_source === 'recording_event'
+        || (current.t0_source === 'provider_event' && result.instance_uuid === current.provider_meeting_id);
+      if (instanceChanged) {
+        patch.provider_meeting_id = result.instance_uuid;
+        patch.provider_transcript_ref = result.transcript?.name || undefined;
+        if (!protectAnchor) {
+          patch.vc_meeting_start_t0 = t0Ms > 0 ? t0Ms : undefined;
+          patch.started_at = startMs > 0 ? new Date(startMs).toISOString() : undefined;
+          patch.ended_at = endMs > 0 ? new Date(endMs).toISOString() : undefined;
+          patch.t0_source = t0Ms > 0 ? 'provider_event' : undefined;
+          patch.align_state = t0Ms > 0 ? 'event' : undefined;
+        }
+      } else {
+        if (result.transcript?.name && result.transcript.name !== current.provider_transcript_ref) patch.provider_transcript_ref = result.transcript.name;
+        if (t0Ms > 0 && (!protectAnchor || !current.vc_meeting_start_t0)) {
+          if (current.vc_meeting_start_t0 !== t0Ms) patch.vc_meeting_start_t0 = t0Ms;
+          if (!protectAnchor && current.t0_source !== 'provider_event') patch.t0_source = 'provider_event';
+          if (!protectAnchor && current.align_state !== 'event') patch.align_state = 'event';
+        }
+        if (startMs > 0 && (!protectAnchor || !current.started_at) && Date.parse(current.started_at || '') !== startMs) {
+          patch.started_at = new Date(startMs).toISOString();
+        }
+        if (endMs > 0 && (!protectAnchor || !current.ended_at) && Date.parse(current.ended_at || '') !== endMs) {
+          patch.ended_at = new Date(endMs).toISOString();
+        }
+      }
+      appliedPatch = patch;
+      return Object.keys(patch).length ? patch : null;
+    });
+    if (!occurrenceCurrent) return null;
+    Object.assign(m, saved ?? appliedPatch);
 
     const timestampQuality = result.timestamp_quality || result.transcript?.timestamp_quality;
     const readySrt = result.transcript?.srt?.trim() || result.srt?.trim() || '';
@@ -493,6 +517,8 @@ export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTra
       ...(timestampQuality ? { timestampQuality } : {}),
     };
   } catch (error) {
+    const current = await getMeeting(m.meeting_id);
+    if (!current || !sameZoomOccurrence(current, occurrenceToken)) return null;
     if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: cacheToken };
     throw error;
   }
@@ -502,9 +528,13 @@ async function loadCachedTranscript(m: PersistedMeeting): Promise<LoadedTranscri
   const platform = meetingPlatformOf(m);
   switch (platform) {
     case 'google_meet':
-    case 'zoom':
     case 'microsoft_teams': {
       const token = providerTranscriptCacheToken(platform, m.meeting_id);
+      const cached = await getCachedMinute(token);
+      return cached?.srt ? { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: token } : null;
+    }
+    case 'zoom': {
+      const token = providerTranscriptCacheToken(platform, m.meeting_id, providerOccurrenceToken(m.scheduled_at));
       const cached = await getCachedMinute(token);
       return cached?.srt ? { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: token } : null;
     }
@@ -580,13 +610,27 @@ export function recapTranscriptMissingMessage(meeting: Partial<PersistedMeeting>
       }
       return 'Google 转写尚未生成；当前没有可展示的原始发言。';
     case 'zoom':
-      if (meeting.provider_transcript_status === 'no_record') return '未找到实际召开的场次。';
-      if (meeting.provider_transcript_status === 'not_generated') return '转写未生成（可能未开启云录制）。';
+      if (meeting.provider_transcript_status === 'no_record' || meeting.provider_transcript_status === 'not_generated') {
+        return zoomTerminalTranscriptMessage(meeting, true);
+      }
       return '正在等待 Zoom 会后转写生成。';
     case 'microsoft_teams':
     case 'manual':
       return '该来源暂不支持转写拉取。';
   }
+}
+
+function zoomTerminalTranscriptMessage(meeting: Partial<PersistedMeeting>, sentence: boolean): string {
+  const message = meeting.provider_transcript_reason === 'instance_not_found'
+    ? '未找到实际召开的场次'
+    : meeting.provider_transcript_reason === 'recording_missing'
+      ? '该场次未开启云录制，没有转写'
+      : meeting.provider_transcript_reason === 'transcript_not_generated'
+        ? '转写尚未生成或未开启'
+        : meeting.provider_transcript_status === 'no_record'
+          ? '未找到实际召开的场次'
+          : '转写未生成（可能未开启云录制）';
+  return sentence ? `${message}。` : message;
 }
 
 export function recapTranscriptRetryLabel(meeting: Partial<PersistedMeeting>): string | null {
@@ -1522,10 +1566,12 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
   if (!cues.length) return null;
   const platform = meetingPlatformOf(m);
   if (platform !== 'google_meet' && platform !== 'zoom') return null;
-  const inFlightKey = `${platform}:${m.meeting_id}`;
+  const occurrenceToken = platform === 'zoom' ? providerOccurrenceToken(m.scheduled_at) : '';
+  const transcriptToken = providerTranscriptCacheToken(platform, m.meeting_id, occurrenceToken);
+  const inFlightKey = transcriptToken;
   const running = providerPanelSummaryInFlight.get(inFlightKey);
   if (running) return running;
-  const task = (async (): Promise<PanelMeetingSummaryRecord> => {
+  const task = (async (): Promise<PanelMeetingSummaryRecord | null> => {
     const capped = cappedTranscriptLines(cues);
     const response = await postJson<ProviderMeetingSummaryResponse>('/api/meetings/summary', {
       title: m.title || '(未命名会议)',
@@ -1534,18 +1580,29 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
       model: settings.inferModel,
     }, { auth: true });
     const summary: PanelMeetingSummaryRecord = {
-      minute_token: providerTranscriptCacheToken(platform, m.meeting_id),
+      minute_token: transcriptToken,
       meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.provider_space_name || m.meeting_id,
       topic: m.title,
       generated_at: Date.now(),
       model: response.model,
       summary: response.summary,
     };
-    await updateMeeting(m.meeting_id, {
+    const patch: Partial<PersistedMeeting> = {
       panel_summary: summary,
       panel_summary_fetched_at: new Date().toISOString(),
       panel_summary_status: 'ready',
-    });
+    };
+    if (platform === 'zoom') {
+      let occurrenceCurrent = false;
+      await mutateMeeting(m.meeting_id, (current) => {
+        if (!sameZoomOccurrence(current, occurrenceToken)) return null;
+        occurrenceCurrent = true;
+        return patch;
+      });
+      if (!occurrenceCurrent) return null;
+    } else {
+      await updateMeeting(m.meeting_id, patch);
+    }
     return summary;
   })();
   providerPanelSummaryInFlight.set(inFlightKey, task);
@@ -1916,8 +1973,10 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     ? `共 ${inkCount} 处手写/圈画${markSource}，点击按屏查看原始发言和整页手写。`
     : '本场没有手写记录；如果会后补写，会自动归到这里。';
   const exportState = meeting.exported_at ? `已导出 ${fmtExportedAt(meeting.exported_at)}` : '未导出';
-  const alignmentLabel = zoom && meeting.align_state === 'event'
-    ? zoomTranscriptAlignmentLabel(recapState.providerTimestampQuality)
+  const alignmentLabel = zoom && meeting.provider_transcript_status !== 'ready'
+    ? '转写未就绪'
+    : zoom && meeting.align_state === 'event'
+      ? zoomTranscriptAlignmentLabel(recapState.providerTimestampQuality)
     : google && meeting.align_state === 'event'
     ? '场次真实时间对齐'
     : !lark && meeting.align_state === 'event'
@@ -2211,6 +2270,7 @@ export function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], m
     for (const mk of [...marks].sort((a, b) => markTime(a) - markTime(b))) groups[meetingMarkPhase(mk, m)].push(mk);
     const content = (mk: PersistedMark): string => {
       const txt = (mk.marked_text || '').trim();
+      if (isUnrecognizedHandwritingText(mk)) return '（一处无法识别的手写·别推断其文字含义）';
       return txt || `（一处${mk.feature_type === 'drawing' ? '图形/圈画' : '无法识别的手写'}·别推断其文字含义）`;
     };
     if (groups.pre.length) {
@@ -2277,10 +2337,22 @@ export async function summarizeMeeting(meetingId: string, onDelta: (full: string
   if (!summary) return null;
   // 截断时给 summary 顶一行透明告知（防"看起来是全文总结"误导·UI 直接可见）
   if (truncated) summary = `〔注：本总结基于前 ${usedCueCount}/${loaded.cues.length} 句转写 + 全部手写生成，后半场转写过长未参与〕\n\n${summary}`;
-  await updateMeeting(m.meeting_id, {
+  const patch: Partial<PersistedMeeting> = {
     summary,
     summary_generated_at: new Date().toISOString(),
     summary_source: { transcript_cache_token: loaded.sourceToken, align_offset_ms: m.align_offset_ms ?? 0, mark_count: marks.length, cue_count: loaded.cues.length, transcript_truncated: truncated, used_cue_count: usedCueCount },
-  });
+  };
+  if (meetingPlatformOf(m) === 'zoom') {
+    const occurrenceToken = providerOccurrenceToken(m.scheduled_at);
+    let occurrenceCurrent = false;
+    await mutateMeeting(m.meeting_id, (current) => {
+      if (!sameZoomOccurrence(current, occurrenceToken)) return null;
+      occurrenceCurrent = true;
+      return patch;
+    });
+    if (!occurrenceCurrent) return null;
+  } else {
+    await updateMeeting(m.meeting_id, patch);
+  }
   return summary;
 }

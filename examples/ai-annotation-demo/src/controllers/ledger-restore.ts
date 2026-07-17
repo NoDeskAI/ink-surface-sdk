@@ -11,6 +11,7 @@ import { getFoldedMarks, getBookAiTurns, getPendingMarks } from '../local/store'
 import { addMark, type Mark } from '../capture/session';
 import type { PersistedMark } from '../core/store-format';
 import type { StrokeFeature, ScoredGesture } from '../capture/classify';
+import { isEpochMs, markTime } from '../core/mark-time';
 
 /** 持久 mark → 内存 Mark（仅 pending session 重建用）。t 保持 epoch ms，旧条目回退收口时刻。 */
 export function persistedToMark(pm: PersistedMark): Mark {
@@ -28,7 +29,9 @@ export function persistedToMark(pm: PersistedMark): Mark {
     raw: { strokeCount: pm.strokes.length, templateScore: 0, templateType: pm.scored_type as EventType, scaleRatio: NaN, complexity: 0, ocrWorthy: false, tplSpan: 0 },
   };
   const scored: ScoredGesture = { type: pm.scored_type as EventType, score: pm.scored_score };
-  return { id: pm.mark_id, event, feature, scored, t: pm.pen_down_at ?? pm.abs_timestamp, hmp: pm.hmp, markedText: pm.marked_text };
+  const capturedAt = markTime(pm);
+  const createdAt = Date.parse(pm.created_at);
+  return { id: pm.mark_id, event, feature, scored, t: capturedAt || (isEpochMs(createdAt) ? createdAt : Date.now()), hmp: pm.hmp, markedText: pm.marked_text };
 }
 
 /** 从账本把一本书的内存态重建出来：笔迹(folded marks) + AI 旁注/对话 buffer + pending session(水位线后)。 */

@@ -47,7 +47,10 @@ describe('restoreLedgerState 竞态守卫（P0-5）', () => {
 
 describe('persisted mark time restore', () => {
   it('restores Mark.t from pen_down_at and falls back for v5 data', () => {
-    expect(persistedToMark(persistedMark({ abs_timestamp: 9_000, pen_down_at: 1_000 })).t).toBe(1_000);
-    expect(persistedToMark(persistedMark({ abs_timestamp: 9_000 })).t).toBe(9_000);
+    const penDown = 1_751_500_000_123;
+    const fallback = 1_751_500_009_000;
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback, pen_down_at: penDown })).t).toBe(penDown);
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback })).t).toBe(fallback);
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback, pen_down_at: 1_751_500_000 })).t).toBe(fallback);
   });
 });

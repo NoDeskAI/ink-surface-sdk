@@ -40,7 +40,7 @@ function summaryMark(t0: number, relMs: number, text: string, feature: Persisted
 
 describe('meeting recap detail transcript selection', () => {
   it('uses the ink page time window when meeting ink timestamps are plausible', () => {
-    const t0 = 1_000_000;
+    const t0 = Date.parse('2026-07-09T08:00:00.000Z');
     const cues = Array.from({ length: 20 }, (_, i) => cue(i + 1, i * 10));
 
     const selected = selectInkPageTranscriptCues({
@@ -60,7 +60,7 @@ describe('meeting recap detail transcript selection', () => {
   });
 
   it('returns a terminal pre-meeting state instead of faking transcript alignment by page order', () => {
-    const t0 = 1_000_000;
+    const t0 = Date.parse('2026-07-09T08:00:00.000Z');
     const cues = Array.from({ length: 12 }, (_, i) => cue(i + 1, i * 10));
 
     const selected = selectInkPageTranscriptCues({
@@ -78,7 +78,7 @@ describe('meeting recap detail transcript selection', () => {
   });
 
   it('returns a terminal post-meeting state for a page containing only late additions', () => {
-    const t0 = 1_000_000;
+    const t0 = Date.parse('2026-07-09T08:00:00.000Z');
     const selected = selectInkPageTranscriptCues({
       cues: [cue(1, 0)],
       marks: [{ abs_timestamp: t0 + 16 * 60_000 }],
@@ -93,7 +93,7 @@ describe('meeting recap detail transcript selection', () => {
   });
 
   it('uses only in-meeting pen-down times when a page mixes preparation and live notes', () => {
-    const t0 = 1_000_000;
+    const t0 = Date.parse('2026-07-09T08:00:00.000Z');
     const cues = Array.from({ length: 20 }, (_, i) => cue(i + 1, i * 10));
     const selected = selectInkPageTranscriptCues({
       cues,
@@ -146,5 +146,15 @@ describe('meeting recap detail transcript selection', () => {
         "usedCueCount": 1,
       }
     `);
+  });
+
+  it('treats OCR-empty placeholders as unrecognized handwriting in the summary prompt', () => {
+    const t0 = Date.parse('2026-07-09T08:00:00.000Z');
+    const result = buildSummaryPrompt(meeting(t0), [cue(1, 5)], [
+      { ...summaryMark(t0, 30_000, '手写 6 笔'), ocr_empty: true },
+    ]);
+
+    expect(result.prompt).toContain('无法识别的手写·别推断其文字含义');
+    expect(result.prompt).not.toContain('手写 6 笔');
   });
 });

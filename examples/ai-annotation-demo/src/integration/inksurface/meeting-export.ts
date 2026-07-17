@@ -33,8 +33,9 @@ import {
 } from 'ink-surface-sdk/knowledge-schema';
 import type { InkLoopAnnotation, InkLoopVisualBlock, InkLoopVisualModel } from 'ink-surface-sdk/surface-model';
 import { stampExportId, stableToken } from './export-ids';
-import { meetingPlatformOf, providerTranscriptCacheToken } from '../../mobile/meeting-platform';
+import { meetingPlatformOf, providerOccurrenceToken, providerTranscriptCacheToken } from '../../mobile/meeting-platform';
 import { markTime } from '../../core/mark-time';
+import { isUnrecognizedHandwritingText } from '../../app/mark-text';
 
 const DOC_PROJECTION_SCHEMA_VERSION = 'inkloop.document_projection.v1' as const;
 const KO_EXPORT_SCHEMA_VERSION = 'inkloop.knowledge_export.v1' as const;
@@ -73,9 +74,10 @@ export function meetingTranscriptCacheTokens(meeting: PersistedMeeting): string[
         meeting.feishu_meeting_id ? providerTranscriptCacheToken('lark', meeting.feishu_meeting_id) : undefined,
       ].filter((token, index, tokens): token is string => !!token && tokens.indexOf(token) === index);
     case 'google_meet':
-    case 'zoom':
     case 'microsoft_teams':
       return [providerTranscriptCacheToken(platform, meeting.meeting_id)];
+    case 'zoom':
+      return [providerTranscriptCacheToken(platform, meeting.meeting_id, providerOccurrenceToken(meeting.scheduled_at))];
     case 'manual':
       return [];
   }
@@ -87,7 +89,10 @@ const meetingT0 = (m: PersistedMeeting): number =>
 // M6 语义已进导出链路（⑤·会前手写 relMs 为负）：别再 clamp≥0 把会前笔误标成 0:00，同 meeting-recap.ts 的 clk（codex 抓）。
 const clk = (ms: number): string => { const s = Math.round(Math.abs(ms) / 1000); const neg = ms < 0 && s > 0; return `${neg ? '-' : ''}${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 const rng = (a: number, b: number): string => `${clk(a)}–${clk(b)}`;
-const inkBody = (text: string, feat: string): string => text.trim() || (feat === 'drawing' ? INK_PLACEHOLDER_DRAWING : INK_PLACEHOLDER_HANDWRITING);
+const inkBody = (mark: { marked_text?: string; feature_type?: string; ocr_empty?: boolean }): string => {
+  if (isUnrecognizedHandwritingText(mark)) return '（无法识别的手写·别推断其文字含义）';
+  return mark.marked_text?.trim() || (mark.feature_type === 'drawing' ? INK_PLACEHOLDER_DRAWING : INK_PLACEHOLDER_HANDWRITING);
+};
 type StructuredMeetingKind = Extract<KnowledgeKind, 'meeting_action' | 'meeting_decision' | 'meeting_risk' | 'qa'>;
 
 function structuredMeetingMark(text: string | undefined): { kind: StructuredMeetingKind; body: string; title: string } | null {
@@ -147,6 +152,9 @@ export async function buildMeetingL1Export(meetingId: string, opts: MeetingExpor
     entry_id: mk.entry_id,
     abs_timestamp: mk.abs_timestamp,
     pen_down_at: mk.pen_down_at,
+    ocr_at: mk.ocr_at,
+    ocr_fingerprint: mk.ocr_fingerprint,
+    ocr_empty: mk.ocr_empty,
     feature_type: mk.feature_type,
     marked_text: mk.marked_text,
     page_index: mk.page_index,
@@ -168,6 +176,7 @@ export interface MeetingExportInput {
   cues: ReturnType<typeof parseSrtTranscript>;
   marks: {
     mark_id: string; entry_id?: string; abs_timestamp: number; pen_down_at?: number; feature_type?: string; marked_text?: string; page_index?: number;
+    ocr_at?: number; ocr_fingerprint?: string; ocr_empty?: boolean;
     entity_refs?: LedgerEntityRef[]; topic_refs?: LedgerEntityRef[]; // 存储原生拓扑：会中手写笔的实体声明（P4 采集入口写入·目前多数缺）
     // 笔迹 SVG 内嵌导出用：原样透传笔画点（不做块内坐标变换——会议块是合成竖排 bbox，没有真实页几何可换算）。
     strokes?: PersistedStroke[]; color?: string; coord_space?: string; capture_surface?: string; surface_bbox?: readonly number[]; surface_coord_space?: string;
@@ -267,6 +276,14 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
   const refsByMarkId = new Map(input.marks.map((m) => [m.mark_id, { entity_refs: m.entity_refs, topic_refs: m.topic_refs, entryId: m.entry_id ?? m.mark_id }] as const));
   // 同上：strokes 也在 buildSegmentMarks 窄化时丢了，按 mark_id 回查原始笔画（笔迹 SVG 内嵌导出用）。
   const inkByMarkId = new Map(input.marks.map((m) => [m.mark_id, { strokes: m.strokes, color: m.color }] as const));
+  const markMetaById = new Map(input.marks.map((m) => [m.mark_id, {
+    marked_text: m.marked_text,
+    feature_type: m.feature_type,
+    pen_down_at: m.pen_down_at,
+    ocr_at: m.ocr_at,
+    ocr_fingerprint: m.ocr_fingerprint,
+    ocr_empty: m.ocr_empty,
+  }] as const));
 
   let annotationKoCount = 0;
   const entityFacts: EntityMembershipFact[] = [];
@@ -277,8 +294,16 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
     const si = segOfMark.get(mk.mark_id);
     const headId = si != null ? segHeadingId[si] : undefined;
     const anchorBlock = headId ? blockById.get(headId) : undefined;
-    const structured = structuredMeetingMark(mk.marked_text);
-    const body = structured?.body ?? `${inkBody(mk.marked_text, mk.feature_type)}　（约 ${clk(mk.relMs)} 处手写）`;
+    const markMeta = markMetaById.get(mk.mark_id) ?? {
+      marked_text: mk.marked_text,
+      feature_type: mk.feature_type,
+      pen_down_at: undefined,
+      ocr_at: undefined,
+      ocr_fingerprint: undefined,
+      ocr_empty: undefined,
+    };
+    const structured = isUnrecognizedHandwritingText(markMeta) ? null : structuredMeetingMark(mk.marked_text);
+    const body = structured?.body ?? `${inkBody(markMeta)}　（约 ${clk(mk.relMs)} 处手写）`;
     const ko = await finalize({
       stableKey: `mtg|${meetingId}|mark|${mk.mark_id}|${structured?.kind ?? 'annotation'}`,
       kind: structured?.kind ?? 'annotation',
@@ -305,7 +330,21 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
     if (ink?.strokes?.length) {
       const targetBlockId = anchorBlock?.block_id ?? blocks[0]?.block_id;
       if (targetBlockId) {
-        const annotation: InkLoopAnnotation = { ko_id: ko.ko_id, kind: ko.kind, title: ko.title, status: ko.status, render_mode: 'stroke_only', ...markInkStrokes(ink.strokes, ink.color ?? '#1A1A1A') };
+        const annotation: InkLoopAnnotation & { inkloop_mark: Record<string, unknown> } = {
+          ko_id: ko.ko_id,
+          kind: ko.kind,
+          title: ko.title,
+          status: ko.status,
+          render_mode: 'stroke_only',
+          inkloop_mark: {
+            mark_id: mk.mark_id,
+            pen_down_at: markMeta.pen_down_at,
+            ocr_at: markMeta.ocr_at,
+            ocr_fingerprint: markMeta.ocr_fingerprint,
+            ocr_empty: markMeta.ocr_empty,
+          },
+          ...markInkStrokes(ink.strokes, ink.color ?? '#1A1A1A'),
+        };
         (annotationsByBlock.get(targetBlockId) ?? annotationsByBlock.set(targetBlockId, []).get(targetBlockId)!).push(annotation);
       }
     }

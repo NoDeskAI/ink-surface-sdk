@@ -73,6 +73,7 @@ export interface ZoomTranscriptLine {
 
 export interface ZoomMeetingTranscriptResponse {
   status: ZoomTranscriptStatus;
+  reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: {
     name: string;

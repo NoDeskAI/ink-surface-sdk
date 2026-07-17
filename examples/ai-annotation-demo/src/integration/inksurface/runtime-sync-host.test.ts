@@ -25,6 +25,9 @@ function mark(input: Partial<PersistedMark> & { mark_id: string; seq: number }):
     device_id: input.device_id ?? 'device_test',
     abs_timestamp: 0,
     pen_down_at: input.pen_down_at,
+    ocr_at: input.ocr_at,
+    ocr_fingerprint: input.ocr_fingerprint,
+    ocr_empty: input.ocr_empty,
     feature_type: input.feature_type ?? 'drawing',
     feature_confidence: 1,
     kind: input.kind,
@@ -414,6 +417,9 @@ describe('runtimeAnnotationToMark', () => {
         origin: 'pen',
         bbox: [0.3, 0.2, 0.2, 0.01],
         pen_down_at: 1_751_500_000_123,
+        ocr_at: 1_751_500_100_000,
+        ocr_fingerprint: 'bo1_remote',
+        ocr_empty: false,
       },
       visual_strokes: [
         {
@@ -436,6 +442,7 @@ describe('runtimeAnnotationToMark', () => {
       { x: 0.5, y: 0.21, t: 1, pressure: 0.5 },
     ]);
     expect(mark?.pen_down_at).toBe(1_751_500_000_123);
+    expect(mark).toMatchObject({ ocr_at: 1_751_500_100_000, ocr_fingerprint: 'bo1_remote', ocr_empty: false });
   });
 });
 
@@ -462,6 +469,22 @@ describe('shouldAdoptRemoteMarkRevision', () => {
 
     expect(shouldAdoptRemoteMarkRevision(local, remote)).toBe(true);
     expect(shouldAdoptRemoteMarkRevision(remote, remote)).toBe(false);
+  });
+
+  it('adopts metadata-only pen time and OCR provenance revisions', () => {
+    const local = mark({ mark_id: 'mark_meta', seq: 1, pen_down_at: 1_751_500_000_000 });
+    const remoteTime = mark({ mark_id: 'mark_meta', seq: 2, pen_down_at: 1_751_500_000_123 });
+    const remoteOcr = mark({
+      mark_id: 'mark_meta',
+      seq: 3,
+      pen_down_at: local.pen_down_at,
+      ocr_at: 1_751_500_100_000,
+      ocr_fingerprint: 'bo1_remote',
+      ocr_empty: true,
+    });
+
+    expect(shouldAdoptRemoteMarkRevision(local, remoteTime)).toBe(true);
+    expect(shouldAdoptRemoteMarkRevision(local, remoteOcr)).toBe(true);
   });
 });
 
