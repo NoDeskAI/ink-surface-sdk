@@ -49,6 +49,47 @@ export interface ZoomMeetingLiveStateResponse {
   windows: ZoomMeetingLiveWindow[];
 }
 
+export type ZoomTranscriptStatus = 'ready' | 'pending' | 'not_generated' | 'no_record';
+export type ZoomTimestampQuality = 'derived_no_pause' | 'approximate_pause_unknown';
+
+export interface ZoomTranscriptParticipant {
+  join_time?: string;
+  leave_time?: string;
+  display_name: string;
+  identity_quality: 'signed_in' | 'external_email' | 'anonymous';
+}
+
+export interface ZoomTranscriptLine {
+  start_time: string;
+  end_time: string;
+  speaker: {
+    display_name?: string;
+    stable_id: null;
+    attribution_quality: 'display_label';
+  };
+  text: string;
+  recording_file_id: string;
+}
+
+export interface ZoomMeetingTranscriptResponse {
+  status: ZoomTranscriptStatus;
+  record?: { name: string; start_time?: string; end_time?: string };
+  transcript?: {
+    name: string;
+    lines: ZoomTranscriptLine[];
+    srt: string;
+    timestamp_quality: ZoomTimestampQuality;
+  };
+  participants: ZoomTranscriptParticipant[];
+  instance_uuid?: string;
+  t0?: string;
+  started_at?: string;
+  ended_at?: string;
+  srt?: string;
+  timestamp_quality?: ZoomTimestampQuality;
+  next_check_at?: string;
+}
+
 export function fetchZoomStatus(opts?: { signal?: AbortSignal }): Promise<ZoomStatusResponse> {
   return getJson<ZoomStatusResponse>(`${BASE}/status`, { ...opts, auth: true });
 }
@@ -59,4 +100,13 @@ export function fetchZoomMeetingSources(opts?: { signal?: AbortSignal }): Promis
 
 export function fetchZoomMeetingLiveState(opts?: { signal?: AbortSignal }): Promise<ZoomMeetingLiveStateResponse> {
   return getJson<ZoomMeetingLiveStateResponse>('/api/meeting-providers/live-state?platform=zoom', { ...opts, auth: true });
+}
+
+export function fetchZoomMeetingTranscript(
+  spaceName: string,
+  scheduledAt: string,
+  opts?: { signal?: AbortSignal },
+): Promise<ZoomMeetingTranscriptResponse> {
+  const query = new URLSearchParams({ space_name: spaceName, scheduled_at: scheduledAt });
+  return getJson<ZoomMeetingTranscriptResponse>(`${BASE}/meeting-transcript?${query.toString()}`, { ...opts, auth: true });
 }

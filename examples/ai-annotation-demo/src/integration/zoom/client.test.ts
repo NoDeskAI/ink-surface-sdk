@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../../core/api';
-import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomStatus } from './client';
+import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomMeetingTranscript, fetchZoomStatus } from './client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -37,6 +37,21 @@ describe('Zoom device client', () => {
       if (url.endsWith('/api/meeting-providers/live-state?platform=zoom')) {
         return new Response(JSON.stringify({ connected: true, source: 'mtl_receiver', windows: [] }), { status: 200 });
       }
+      if (url.includes('/api/zoom/meeting-transcript?')) {
+        const parsed = new URL(url, 'http://inkloop.local');
+        expect(parsed.searchParams.get('space_name')).toBe('987654321');
+        expect(parsed.searchParams.get('scheduled_at')).toBe('2026-07-18T01:00:00.000Z');
+        return new Response(JSON.stringify({
+          status: 'ready',
+          participants: [],
+          instance_uuid: '/zoom-instance-1',
+          t0: '2026-07-18T01:02:00.000Z',
+          started_at: '2026-07-18T01:02:00.000Z',
+          ended_at: '2026-07-18T01:47:00.000Z',
+          srt: '1\n00:00:01,000 --> 00:00:02,000\nAda: Ready',
+          timestamp_quality: 'derived_no_pause',
+        }), { status: 200 });
+      }
       throw new Error(`unexpected URL ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -47,7 +62,12 @@ describe('Zoom device client', () => {
       sources: [expect.objectContaining({ meeting_id: '987654321' })],
     });
     await expect(fetchZoomMeetingLiveState()).resolves.toEqual({ connected: true, source: 'mtl_receiver', windows: [] });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(fetchZoomMeetingTranscript('987654321', '2026-07-18T01:00:00.000Z')).resolves.toMatchObject({
+      status: 'ready',
+      instance_uuid: '/zoom-instance-1',
+      timestamp_quality: 'derived_no_pause',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it('preserves core/api structured error semantics', async () => {
@@ -55,7 +75,7 @@ describe('Zoom device client', () => {
       error: { code: 'zoom_s2s_not_configured', message: 'Zoom S2S is not configured' },
     }), { status: 401, headers: { 'content-type': 'application/json' } })));
 
-    await expect(fetchZoomMeetingSources()).rejects.toEqual(expect.objectContaining({
+    await expect(fetchZoomMeetingTranscript('987654321', '2026-07-18T01:00:00.000Z')).rejects.toEqual(expect.objectContaining({
       name: 'ApiError',
       status: 401,
       code: 'zoom_s2s_not_configured',

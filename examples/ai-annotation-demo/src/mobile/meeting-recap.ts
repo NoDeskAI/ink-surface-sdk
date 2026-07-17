@@ -8,7 +8,7 @@
 import { esc } from '../core/escape';
 import { confirmSheet, infoSheet, pickOneSheet } from './sheet';
 import { getMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute } from '../local/store';
-import { apiUrl, authFetch, getJson, postNdjson } from '../core/api';
+import { apiUrl, authFetch, getJson, postJson, postNdjson } from '../core/api';
 import { settings } from '../app/state';
 import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, resolveMeetingInstance, bindPanelMinute, getPanelMeetingSummary, generatePanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
 import { parseSrtTranscript, type TranscriptCue } from '../integration/panel-feishu/align';
@@ -17,12 +17,14 @@ import { buildEpaperMeetingTimeline, type EpaperMeetingTimeline } from '../integ
 import { publishEntityToVault } from '../integration/inksurface/vault-publish-device';
 import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, FeishuNoteSummaryRecord } from '../core/store-format';
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
-import { generateGoogleMeetingSummary, getGoogleMeetingTranscript } from '../integration/google-meet/client';
+import { getGoogleMeetingTranscript } from '../integration/google-meet/client';
+import { fetchZoomMeetingTranscript, type ZoomTimestampQuality } from '../integration/zoom/client';
 import { meetingPlatformOf, meetingTranscriptSource, providerTranscriptCacheToken } from './meeting-platform';
 import { markTime } from '../core/mark-time';
 import { meetingMarkPhase } from './meeting-home-model';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
+type ProviderMeetingSummaryResponse = { summary: PanelMeetingSummaryRecord['summary']; model: string };
 
 const ALIGN_LABEL: Record<NonNullable<PersistedMeeting['align_state']>, string> = {
   uncalibrated: '未校准',
@@ -67,6 +69,18 @@ export function renderRecapCard(m: PersistedMeeting): string {
           : '等待会后转写';
     return `<section class="msec" id="recap-sec"><div class="msec-h"><span class="mt">会后记录</span><span class="mb">${status}</span></div>`
       + `<div class="matcard" id="recap-open"><span class="ic">${SVG_DOC}</span><div><div class="nm">Google Meet 转写</div>`
+      + `<div class="mt">点开读取会后转写和手写档案</div></div></div></section>`;
+  }
+  if (platform === 'zoom') {
+    const status = m.provider_transcript_status === 'ready'
+      ? '转写已同步'
+      : m.provider_transcript_status === 'not_generated'
+        ? '转写未生成（可能未开启云录制）'
+        : m.provider_transcript_status === 'no_record'
+          ? '未找到实际召开的场次'
+          : '等待会后转写';
+    return `<section class="msec" id="recap-sec"><div class="msec-h"><span class="mt">会后记录</span><span class="mb">${status}</span></div>`
+      + `<div class="matcard" id="recap-open"><span class="ic">${SVG_DOC}</span><div><div class="nm">Zoom 会后转写</div>`
       + `<div class="mt">点开读取会后转写和手写档案</div></div></div></section>`;
   }
   if (platform !== 'lark') {
@@ -227,9 +241,10 @@ interface RecapV2 {
   noteLoad: RecapBlockLoadState;
   marksLoad: RecapBlockLoadState;
   panelSummaryError?: string;
+  providerTimestampQuality?: ZoomTimestampQuality;
 }
 let recapState: RecapV2 | null = null;
-const googlePanelSummaryInFlight = new Map<string, Promise<PanelMeetingSummaryRecord | null>>();
+const providerPanelSummaryInFlight = new Map<string, Promise<PanelMeetingSummaryRecord | null>>();
 // 防异步串会：打开 A 后快速返回/打开 B，A 的晚到结果（转写/AI 摘要）不能覆盖 B 的视图/状态。
 let recapLoadSeq = 0;
 export function resetRecapView(): void { recapLoadSeq++; recapState = null; delete document.body.dataset.recapView; updateExportButton(); updateRecapNav(); }
@@ -250,7 +265,7 @@ export function recapHandleBack(): boolean {
   return false;
 }
 
-type LoadedTranscript = { srt: string; cues: TranscriptCue[]; sourceToken: string };
+type LoadedTranscript = { srt: string; cues: TranscriptCue[]; sourceToken: string; timestampQuality?: ZoomTimestampQuality };
 
 function transcriptSourceKey(m: PersistedMeeting): string {
   const platform = meetingPlatformOf(m);
@@ -410,6 +425,79 @@ export async function loadGoogleTranscript(m: PersistedMeeting): Promise<LoadedT
   }
 }
 
+function hasStrongerZoomAnchor(m: PersistedMeeting): boolean {
+  return m.t0_source === 'provider_event' || m.t0_source === 'recording_event';
+}
+
+/** Zoom 会后转写：本机缓存先行兜底，在线结果只按实际场次字段做条件写回。 */
+export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
+  if (meetingTranscriptSource(m) !== 'zoom_transcript' || !m.provider_space_name || !m.scheduled_at) return null;
+  const cacheToken = providerTranscriptCacheToken('zoom', m.meeting_id);
+  const cached = await getCachedMinute(cacheToken);
+  try {
+    const result = await fetchZoomMeetingTranscript(m.provider_space_name, m.scheduled_at);
+    const patch: Partial<PersistedMeeting> = {};
+    if (m.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
+    if (result.instance_uuid && result.instance_uuid !== m.provider_meeting_id) patch.provider_meeting_id = result.instance_uuid;
+    if (result.transcript?.name && result.transcript.name !== m.provider_transcript_ref) patch.provider_transcript_ref = result.transcript.name;
+
+    const strongerAnchor = hasStrongerZoomAnchor(m);
+    const t0Ms = feishuEpochMs(result.t0 || result.record?.start_time);
+    const startMs = feishuEpochMs(result.started_at || result.record?.start_time);
+    const endMs = feishuEpochMs(result.ended_at || result.record?.end_time);
+    if (t0Ms > 0 && (!strongerAnchor || !m.vc_meeting_start_t0)) {
+      if (m.vc_meeting_start_t0 !== t0Ms) patch.vc_meeting_start_t0 = t0Ms;
+      if (!strongerAnchor && m.t0_source !== 'provider_event') patch.t0_source = 'provider_event';
+      if (!strongerAnchor && m.align_state !== 'manual' && m.align_state !== 'event') patch.align_state = 'event';
+    }
+    if (startMs > 0 && (!strongerAnchor || !m.started_at) && Date.parse(m.started_at || '') !== startMs) {
+      patch.started_at = new Date(startMs).toISOString();
+    }
+    if (endMs > 0 && (!strongerAnchor || !m.ended_at) && Date.parse(m.ended_at || '') !== endMs) {
+      patch.ended_at = new Date(endMs).toISOString();
+    }
+    if (Object.keys(patch).length) {
+      await updateMeeting(m.meeting_id, patch);
+      Object.assign(m, patch);
+    }
+
+    const timestampQuality = result.timestamp_quality || result.transcript?.timestamp_quality;
+    const readySrt = result.transcript?.srt?.trim() || result.srt?.trim() || '';
+    if (result.status === 'ready' && readySrt) {
+      await putCachedMinute({
+        minute_token: cacheToken,
+        meeting_id: m.meeting_id,
+        srt: readySrt,
+        ...(startMs > 0 && endMs > startMs ? { duration_ms: endMs - startMs } : {}),
+        fetched_at: new Date().toISOString(),
+      });
+      return {
+        srt: readySrt,
+        cues: parseSrtTranscript(readySrt),
+        sourceToken: cacheToken,
+        ...(timestampQuality ? { timestampQuality } : {}),
+      };
+    }
+    if (cached?.srt) {
+      return {
+        srt: cached.srt,
+        cues: parseSrtTranscript(cached.srt),
+        sourceToken: cacheToken,
+        ...(timestampQuality ? { timestampQuality } : {}),
+      };
+    }
+    return {
+      srt: '',
+      cues: [],
+      sourceToken: cacheToken,
+      ...(timestampQuality ? { timestampQuality } : {}),
+    };
+  } catch (error) {
+    if (cached?.srt) return { srt: cached.srt, cues: parseSrtTranscript(cached.srt), sourceToken: cacheToken };
+    throw error;
+  }
+}
+
 async function loadCachedTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
   const platform = meetingPlatformOf(m);
   switch (platform) {
@@ -442,6 +530,8 @@ async function loadTranscript(m: PersistedMeeting): Promise<LoadedTranscript | n
   switch (platform) {
     case 'google_meet':
       return loadGoogleTranscript(m);
+    case 'zoom':
+      return loadZoomTranscript(m);
     case 'lark': {
       let minuteError: unknown = null;
       if (m.feishu_minute_token) {
@@ -457,7 +547,6 @@ async function loadTranscript(m: PersistedMeeting): Promise<LoadedTranscript | n
       if (minuteError) throw minuteError;
       return null;
     }
-    case 'zoom':
     case 'microsoft_teams':
     case 'manual':
       return loadCachedTranscript(m);
@@ -491,9 +580,35 @@ export function recapTranscriptMissingMessage(meeting: Partial<PersistedMeeting>
       }
       return 'Google 转写尚未生成；当前没有可展示的原始发言。';
     case 'zoom':
+      if (meeting.provider_transcript_status === 'no_record') return '未找到实际召开的场次。';
+      if (meeting.provider_transcript_status === 'not_generated') return '转写未生成（可能未开启云录制）。';
+      return '正在等待 Zoom 会后转写生成。';
     case 'microsoft_teams':
     case 'manual':
       return '该来源暂不支持转写拉取。';
+  }
+}
+
+export function recapTranscriptRetryLabel(meeting: Partial<PersistedMeeting>): string | null {
+  if (meeting.provider_transcript_status !== 'pending') return null;
+  return meetingPlatformOf(meeting) === 'zoom' ? '重试' : '重新检查';
+}
+
+export function recapTranscriptSpeakerLabel(meeting: Partial<PersistedMeeting>, speaker?: string): string {
+  return speaker || (meetingPlatformOf(meeting) === 'zoom' ? '未知说话人' : '');
+}
+
+export function recapTranscriptPageDescription(meeting: Partial<PersistedMeeting>): string {
+  switch (meetingPlatformOf(meeting)) {
+    case 'google_meet':
+      return '这里展示 Google Meet逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。';
+    case 'lark':
+      return '这里展示飞书会后记录里的逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。';
+    case 'zoom':
+      return '这里展示 Zoom 会后录制的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。';
+    case 'microsoft_teams':
+    case 'manual':
+      return '这里展示该来源已缓存的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。';
   }
 }
 
@@ -538,6 +653,7 @@ function hasRemoteTranscriptSource(m: PersistedMeeting): boolean {
     case 'google_meet':
       return !!(m.calendar_meeting_no && m.scheduled_at);
     case 'zoom':
+      return !!(m.provider_space_name && m.scheduled_at);
     case 'microsoft_teams':
     case 'manual':
       return false;
@@ -681,6 +797,7 @@ async function refreshTranscriptAfterInitialRender(seq: number, bodyEl: HTMLElem
       if (!recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
       recapState.meeting = freshMeeting;
       recapState.cues = loaded?.cues ?? [];
+      if (loaded?.timestampQuality) recapState.providerTimestampQuality = loaded.timestampQuality;
       recapState.transcriptLoad = recapState.cues.length
         ? { status: 'ready', message: '原始发言已同步。' }
         : { status: 'missing', message: recapTranscriptMissingMessage(freshMeeting) };
@@ -693,7 +810,11 @@ async function refreshTranscriptAfterInitialRender(seq: number, bodyEl: HTMLElem
         updateProviderNoteState(recapState);
         refreshRecapOverviewBlocks(bodyEl, ['#rc-feishu-block']);
         if (recapState.view === 'feishu') renderRecap(bodyEl);
-        if (recapState.cues.length && !recapState.panelSummary) void loadGooglePanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
+        if (recapState.cues.length && !recapState.panelSummary) void loadProviderPanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
+      } else if (platform === 'zoom') {
+        updateProviderNoteState(recapState);
+        refreshRecapOverviewBlocks(bodyEl, ['#rc-feishu-block']);
+        if (recapState.cues.length && !recapState.panelSummary) void loadProviderPanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
       } else if (platform === 'lark') {
         if (loaded?.sourceToken === freshMeeting.feishu_minute_token && freshMeeting.feishu_meeting_id) {
           try {
@@ -1221,7 +1342,9 @@ function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
     ? 'Google Meet 逐句转写'
     : platform === 'lark'
       ? '飞书逐句转写'
-      : '来源逐句转写';
+      : platform === 'zoom'
+        ? 'Zoom 会后逐句转写'
+        : '来源逐句转写';
   if (!cues.length) {
     // 加载中允许进入（卡片不再封死）：这里给拉取中提示，拉完 refreshTranscriptAfterInitialRender 会重渲本页
     const load = recapState.transcriptLoad;
@@ -1229,7 +1352,9 @@ function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
       ? load.status === 'loading'
         ? (load.message || '正在拉取原始发言…')
         : '原始发言还没有同步到本机；稍后重新进入本页会自动重试。'
-      : '该来源暂不支持转写拉取。';
+      : platform === 'zoom'
+        ? (load.message || '正在等待 Zoom 会后转写生成。')
+        : '该来源暂不支持转写拉取。';
     bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>原始发言</b><span class="mdl">${sourceLabel}</span></div><div class="empty">${esc(hint)}</div></div>`;
     return;
   }
@@ -1239,16 +1364,13 @@ function renderRecapTranscriptPage(bodyEl: HTMLElement): void {
   const slice = cues.slice(p * TX_PAGE, (p + 1) * TX_PAGE);
   const speakerCount = new Set(cues.map((cue) => cue.speaker || '').filter(Boolean)).size;
   const rows = slice.map((cue) => {
-    const speaker = cue.speaker ? `<span class="rc-tr-speaker">${esc(cue.speaker)}</span>` : '';
+    const speakerLabel = recapTranscriptSpeakerLabel({ platform }, cue.speaker);
+    const speaker = speakerLabel ? `<span class="rc-tr-speaker">${esc(speakerLabel)}</span>` : '';
     return `<div class="rc-tr-row"><span class="rc-tr-time">${clk(cue.startMs)}</span><span class="rc-tr-text">${speaker}${esc(cue.text)}</span></div>`;
   }).join('');
   bodyEl.innerHTML = `<div class="rc-transcript">`
     + `<div class="rc-msum-h"><b>原始发言</b><span class="mdl">${cues.length} 句 · ${speakerCount || '未知'} 人</span></div>`
-    + `<div class="rc-note">${platform === 'google_meet'
-      ? '这里展示 Google Meet逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。'
-      : platform === 'lark'
-        ? '这里展示飞书会后记录里的逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。'
-        : '这里展示该来源已缓存的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。'}</div>`
+    + `<div class="rc-note">${recapTranscriptPageDescription(recapState.meeting)}</div>`
     + `<div class="rc-tr-list">${rows}</div>`
     + pagerHtml('tx', p, total)
     + `</div>`;
@@ -1394,23 +1516,26 @@ function cappedTranscriptLines(cues: TranscriptCue[]): CappedTranscript {
   return { lines, truncated, usedCueCount };
 }
 
-/** Google 路线的纯数据生成入口：已有结果直接复用，同一会议并发请求共享一个 in-flight Promise。 */
-export async function ensureGooglePanelSummary(m: PersistedMeeting, cues: TranscriptCue[]): Promise<PanelMeetingSummaryRecord | null> {
+/** Provider 路线的纯数据生成入口：已有结果直接复用，同一会议并发请求共享一个 in-flight Promise。 */
+export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: TranscriptCue[]): Promise<PanelMeetingSummaryRecord | null> {
   if (m.panel_summary) return m.panel_summary;
   if (!cues.length) return null;
-  const running = googlePanelSummaryInFlight.get(m.meeting_id);
+  const platform = meetingPlatformOf(m);
+  if (platform !== 'google_meet' && platform !== 'zoom') return null;
+  const inFlightKey = `${platform}:${m.meeting_id}`;
+  const running = providerPanelSummaryInFlight.get(inFlightKey);
   if (running) return running;
   const task = (async (): Promise<PanelMeetingSummaryRecord> => {
     const capped = cappedTranscriptLines(cues);
-    const response = await generateGoogleMeetingSummary({
+    const response = await postJson<ProviderMeetingSummaryResponse>('/api/meetings/summary', {
       title: m.title || '(未命名会议)',
       transcript: capped.lines.join('\n'),
-      ...(m.google_smart_note?.text ? { smart_note: m.google_smart_note.text } : {}),
+      ...(platform === 'google_meet' && m.google_smart_note?.text ? { smart_note: m.google_smart_note.text } : {}),
       model: settings.inferModel,
-    });
+    }, { auth: true });
     const summary: PanelMeetingSummaryRecord = {
-      minute_token: providerTranscriptCacheToken('google_meet', m.meeting_id),
-      meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.meeting_id,
+      minute_token: providerTranscriptCacheToken(platform, m.meeting_id),
+      meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.provider_space_name || m.meeting_id,
       topic: m.title,
       generated_at: Date.now(),
       model: response.model,
@@ -1423,22 +1548,27 @@ export async function ensureGooglePanelSummary(m: PersistedMeeting, cues: Transc
     });
     return summary;
   })();
-  googlePanelSummaryInFlight.set(m.meeting_id, task);
+  providerPanelSummaryInFlight.set(inFlightKey, task);
   try {
     return await task;
   } finally {
-    if (googlePanelSummaryInFlight.get(m.meeting_id) === task) googlePanelSummaryInFlight.delete(m.meeting_id);
+    if (providerPanelSummaryInFlight.get(inFlightKey) === task) providerPanelSummaryInFlight.delete(inFlightKey);
   }
 }
 
-async function loadGooglePanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMeeting, cues: TranscriptCue[]): Promise<void> {
+/** 兼容现有 Google 调用与外部测试；实现统一走 provider-neutral 端点。 */
+export function ensureGooglePanelSummary(m: PersistedMeeting, cues: TranscriptCue[]): Promise<PanelMeetingSummaryRecord | null> {
+  return ensureProviderPanelSummary(m, cues);
+}
+
+async function loadProviderPanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMeeting, cues: TranscriptCue[]): Promise<void> {
   if (m.panel_summary || !cues.length) return;
   if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) {
     recapState.panelSummaryStatus = 'generating';
     renderRecap(bodyEl);
   }
   try {
-    const summary = await ensureGooglePanelSummary(m, cues);
+    const summary = await ensureProviderPanelSummary(m, cues);
     if (!summary || !recapAlive(seq, bodyEl) || recapState?.meeting.meeting_id !== m.meeting_id) return;
     recapState.panelSummary = summary;
     recapState.meeting = { ...recapState.meeting, panel_summary: summary, panel_summary_status: 'ready' };
@@ -1562,7 +1692,7 @@ function panelSummaryHtml(): string {
       + blk('结论', s.conclusions) + ai + blk('风险', s.risks) + blk('待决', s.open_questions) + blk('后续', s.next_steps));
   }
   const platform = meetingPlatformOf(recapState.meeting);
-  if (platform === 'zoom' || platform === 'microsoft_teams' || platform === 'manual') {
+  if (platform === 'microsoft_teams' || platform === 'manual') {
     return box('该来源暂不支持远端总结生成。');
   }
   if (status === 'transcript_not_ready') return box('用于生成总结的转写还在生成中（飞书会后文字记录或妙记还在生成）。就绪后会自动生成 InkLoop 总结，也可以稍后手动重试。<button class="hbtn rc-psum-retry" id="ps-gen">重试</button>');
@@ -1579,16 +1709,16 @@ function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
   bodyEl.querySelector('#ps-login')?.addEventListener('click', () => {
     void promptFeishuRelogin(recapState?.panelSummaryError || '当前飞书身份不可用。');
   });
-  bodyEl.querySelector('#ps-gen')?.addEventListener('click', () => { // 生成总结（Google 走 hub；飞书走 panel）
+  bodyEl.querySelector('#ps-gen')?.addEventListener('click', () => { // 生成总结（Google/Zoom 走 hub；飞书走 panel）
     if (!recapState) return;
     switch (meetingPlatformOf(recapState.meeting)) {
       case 'google_meet':
-        void loadGooglePanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
+      case 'zoom':
+        void loadProviderPanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
         break;
       case 'lark':
         void generatePanelSummary(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
         break;
-      case 'zoom':
       case 'microsoft_teams':
       case 'manual':
         break;
@@ -1598,14 +1728,14 @@ function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
     if (!recapState) return;
     switch (meetingPlatformOf(recapState.meeting)) {
       case 'google_meet':
-        void loadGooglePanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
+      case 'zoom':
+        void loadProviderPanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
         break;
       case 'lark':
         recapState.panelSummaryStatus = 'loading';
         renderRecap(bodyEl);
         void loadPanelSummary(recapLoadSeq, bodyEl, recapState.meeting);
         break;
-      case 'zoom':
       case 'microsoft_teams':
       case 'manual':
         break;
@@ -1653,7 +1783,7 @@ function panelSummaryLabel(): string {
   if (recapState.panelSummary) return '已生成';
   if (buildLocalPanelSummaryPreview()) return '本地预览';
   const platform = meetingPlatformOf(recapState.meeting);
-  if (platform === 'zoom' || platform === 'microsoft_teams' || platform === 'manual') return '暂不支持';
+  if (platform === 'microsoft_teams' || platform === 'manual') return '暂不支持';
   if (recapState.panelSummaryStatus === 'generating') return '生成中';
   if (recapState.panelSummaryStatus === 'auth_required') return '需重新登录';
   if (recapState.panelSummaryStatus === 'failed') return '待重试';
@@ -1729,6 +1859,12 @@ export function renderGoogleRecordingsHtml(meeting: Pick<PersistedMeeting, 'goog
     + `</div>`;
 }
 
+export function zoomTranscriptAlignmentLabel(timestampQuality?: ZoomTimestampQuality): string {
+  return timestampQuality === 'approximate_pause_unknown'
+    ? '时间为近似（录制中断未校准）'
+    : 'Zoom 场次时间对齐';
+}
+
 /** 概览：会后第一屏。只放核心状态和入口；长转写进入「原始发言」详情页。 */
 function renderRecapOverview(bodyEl: HTMLElement): void {
   if (!recapState) return;
@@ -1736,6 +1872,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
   const platform = meetingPlatformOf(meeting);
   const google = platform === 'google_meet';
   const lark = platform === 'lark';
+  const zoom = platform === 'zoom';
   const title = (lark || google ? meeting.feishu_topic : '') || meeting.title || '会议';
   const speakerCount = new Set(cues.map((cue) => cue.speaker || '').filter(Boolean)).size;
   const inkPages = meetingNotePages(recapState);
@@ -1748,7 +1885,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
   const conclusions = overviewConclusionItems();
   const conclusionHtml = conclusions.length
     ? conclusions.map((item) => `<span class="rc-over-li">${esc(item)}</span>`).join('')
-    : `<span class="rc-over-empty">${google
+    : `<span class="rc-over-empty">${google || zoom
       ? '原始发言同步后，这里会出现会议要点。'
       : lark
         ? '飞书原始发言或智能纪要同步后，这里会出现会议要点。'
@@ -1762,8 +1899,8 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
       ? [{ command: 'retry-transcript', label: '重试', primary: true }]
       : !hasRemoteTranscriptSource(meeting) && lark
         ? [{ command: 'associate', label: '关联飞书会议', primary: true }]
-        : meeting.provider_transcript_status === 'pending'
-          ? [{ command: 'retry-transcript', label: '重新检查' }]
+        : recapTranscriptRetryLabel(meeting)
+          ? [{ command: 'retry-transcript', label: recapTranscriptRetryLabel(meeting)! }]
           : undefined;
   const note = recapState.noteLoad;
   const noteActions: OverviewCardAction[] | undefined = note.status === 'auth_required' && lark
@@ -1779,12 +1916,14 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     ? `共 ${inkCount} 处手写/圈画${markSource}，点击按屏查看原始发言和整页手写。`
     : '本场没有手写记录；如果会后补写，会自动归到这里。';
   const exportState = meeting.exported_at ? `已导出 ${fmtExportedAt(meeting.exported_at)}` : '未导出';
-  const alignmentLabel = google && meeting.align_state === 'event'
+  const alignmentLabel = zoom && meeting.align_state === 'event'
+    ? zoomTranscriptAlignmentLabel(recapState.providerTimestampQuality)
+    : google && meeting.align_state === 'event'
     ? '场次真实时间对齐'
     : !lark && meeting.align_state === 'event'
       ? '平台事件时间对齐'
       : meeting.align_state ? ALIGN_LABEL[meeting.align_state] : '约对齐';
-  const panelBody = !lark && !google
+  const panelBody = !lark && !google && !zoom
     ? '该来源暂不支持远端总结生成。'
     : recapState.panelSummary
       ? '查看结构化结论、行动项、风险和后续，也可以从顶栏导出知识库。'

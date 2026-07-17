@@ -67,7 +67,7 @@ describe('meeting recap Google transcript branch', () => {
       platform: 'lark',
       feishu_meeting_id: 'om_1',
     })).toContain('未检测到妙记');
-    expect(recapTranscriptMissingMessage({ platform: 'zoom' })).toBe('该来源暂不支持转写拉取。');
+    expect(recapTranscriptMissingMessage({ platform: 'zoom' })).toBe('正在等待 Zoom 会后转写生成。');
     expect(recapTranscriptMissingMessage({ platform: 'microsoft_teams' })).toBe('该来源暂不支持转写拉取。');
     expect(renderRecapCard(googleMeeting({ platform: 'zoom' }))).not.toContain('飞书');
     expect(renderRecapCard(googleMeeting({ platform: 'microsoft_teams' }))).not.toContain('飞书');
@@ -128,7 +128,7 @@ describe('meeting recap Google transcript branch', () => {
     }), cues);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/google/meeting-summary');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/meetings/summary');
     const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
     expect(request.transcript).toContain('[0:01]Ada：确认先发布会议恢复能力');
     expect(request.transcript).toContain('转写在此截断');
