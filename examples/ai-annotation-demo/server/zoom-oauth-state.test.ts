@@ -22,6 +22,7 @@ function tokenResponse(token: string, expiresIn = 3600): Response {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   resetZoomS2SStateForTests();
   vi.restoreAllMocks();
 });
@@ -57,6 +58,19 @@ describe('zoom S2S OAuth state', () => {
     await expect(Promise.all([first, second])).resolves.toEqual(['shared-token', 'shared-token']);
   });
 
+  it('hard-times out token exchange after ten seconds and clears the failed single-flight', async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(() => new Promise<Response>(() => {}));
+    const first = getZoomS2SAccessToken(env, { fetchImpl: fetchImpl as typeof fetch, nowMs: NOW_MS });
+    const timedOut = expect(first).rejects.toMatchObject({ code: 'zoom_s2s_token_timeout', status: 504 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await timedOut;
+
+    fetchImpl.mockResolvedValueOnce(tokenResponse('recovered-token'));
+    await expect(getZoomS2SAccessToken(env, { fetchImpl: fetchImpl as typeof fetch, nowMs: NOW_MS })).resolves.toBe('recovered-token');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it('forces one refresh on API 401 and never retries a second 401', async () => {
     const fetchImpl = vi.fn(async (input: string | URL, _init?: RequestInit) => {
       const url = new URL(String(input));
@@ -76,6 +90,39 @@ describe('zoom S2S OAuth state', () => {
     expect(apiCalls).toHaveLength(2);
     expect(new Headers(apiCalls[0][1]?.headers).get('authorization')).toBe('Bearer token-1');
     expect(new Headers(apiCalls[1][1]?.headers).get('authorization')).toBe('Bearer token-2');
+  });
+
+  it('uses manual redirects and strips Bearer after a redirect leaves Zoom domains', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return tokenResponse('redirect-token');
+      if (url.hostname === 'api.zoom.us') {
+        expect(init?.redirect).toBe('manual');
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer redirect-token');
+        return new Response(null, { status: 302, headers: { location: 'https://cdn.example.test/result?access_token=must-not-leak' } });
+      }
+      if (url.hostname === 'cdn.example.test') {
+        expect(url.searchParams.get('access_token')).toBeNull();
+        expect(init?.redirect).toBe('manual');
+        expect(new Headers(init?.headers).get('authorization')).toBeNull();
+        return new Response('downloaded', { status: 200 });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const response = await zoomS2SFetch('https://api.zoom.us/v2/redirect', {}, env, {
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: NOW_MS,
+    });
+    expect(await response.text()).toBe('downloaded');
+  });
+
+  it('rejects an untrusted first hop before token exchange or credentialed fetch', async () => {
+    const fetchImpl = vi.fn();
+    await expect(zoomS2SFetch('https://evil.example.test/steal', {}, env, {
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: NOW_MS,
+    })).rejects.toMatchObject({ code: 'zoom_credential_url_untrusted' });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('reports and rejects an explicitly unconfigured environment without making a request', async () => {

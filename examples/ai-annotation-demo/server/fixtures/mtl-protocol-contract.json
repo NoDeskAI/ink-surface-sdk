@@ -1,5 +1,10 @@
 {
   "schema_version": 1,
+  "epoch_ms_contract": {
+    "minimum": 946684800000,
+    "future_tolerance_ms": 300000,
+    "reject_epoch_seconds": true
+  },
   "source": {
     "commit": "fd13d52a67a915f4afb9a2a7383beedba623114a",
     "payload_builders": "packages/meeting-timeline-sdk/index.mjs",

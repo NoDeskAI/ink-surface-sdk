@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchZoomMeetingSources, type ZoomMeetingSyncEnv } from './zoom-meeting-sync';
+import { fetchZoomMeetingSources, zoomMeetingIdFromUrl, type ZoomMeetingSyncEnv } from './zoom-meeting-sync';
 import { resetZoomS2SStateForTests } from './zoom-oauth-state';
 
 const NOW_MS = Date.parse('2026-07-17T00:00:00.000Z');
@@ -38,6 +38,13 @@ afterEach(() => {
 });
 
 describe('zoom meeting sync', () => {
+  it('derives numeric meeting ids only from trusted Zoom /j/ URLs', () => {
+    expect(zoomMeetingIdFromUrl('https://acme.zoom.us/j/987654321?pwd=secret')).toBe('987654321');
+    expect(zoomMeetingIdFromUrl('https://zoom.us/j/123/')).toBe('123');
+    expect(zoomMeetingIdFromUrl('https://evil.example/j/987654321')).toBe('');
+    expect(zoomMeetingIdFromUrl('https://zoom.us/wc/987654321/join')).toBe('');
+  });
+
   it('filters type=2, follows list pagination, gets details, and never stores start_url', async () => {
     const path = statePath();
     const fetchImpl = vi.fn(async (input: string | URL) => {
@@ -159,7 +166,7 @@ describe('zoom meeting sync', () => {
       if (url.hostname === 'zoom.us') return token();
       if (url.pathname.endsWith('/meetings')) {
         listAttempts += 1;
-        if (listAttempts === 1) return json({ code: 429 }, 429, { 'retry-after': '2' });
+        if (listAttempts === 1) return json({ code: 429 }, 429, { 'retry-after': '120' });
         return json({ meetings: [] });
       }
       throw new Error(`unexpected request ${url}`);
@@ -173,7 +180,48 @@ describe('zoom meeting sync', () => {
     });
     expect(listAttempts).toBe(2);
     expect(sleepImpl).toHaveBeenCalledTimes(1);
-    expect(sleepImpl).toHaveBeenCalledWith(2_000);
+    expect(sleepImpl).toHaveBeenCalledWith(30_000);
+  });
+
+  it('rejects a repeated meeting next_page_token instead of looping forever', async () => {
+    const path = statePath();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname.endsWith('/meetings')) return json({ meetings: [], next_page_token: 'same-token' });
+      throw new Error(`unexpected request ${url}`);
+    });
+    await expect(fetchZoomMeetingSources(env, { path }, {
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: NOW_MS,
+      minIntervalMs: 0,
+    })).rejects.toMatchObject({ code: 'zoom_pagination_token_loop' });
+    expect(fetchImpl.mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith('/meetings'))).toHaveLength(2);
+  });
+
+  it('aborts a Retry-After sleep when the request signal is cancelled', async () => {
+    const path = statePath();
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      return json({ code: 429 }, 429, { 'retry-after': '30' });
+    });
+    let sleepStarted!: () => void;
+    const started = new Promise<void>((resolve) => { sleepStarted = resolve; });
+    const pending = fetchZoomMeetingSources(env, { path }, {
+      fetchImpl: fetchImpl as typeof fetch,
+      sleepImpl: () => {
+        sleepStarted();
+        return new Promise<void>(() => {});
+      },
+      nowMs: NOW_MS,
+      minIntervalMs: 0,
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort(new Error('client-aborted'));
+    await expect(pending).rejects.toThrow('client-aborted');
   });
 
   it('discovers only licensed active hosts and caps automatic expansion at ten', async () => {

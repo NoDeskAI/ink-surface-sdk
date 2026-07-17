@@ -6,6 +6,8 @@ import { createHash } from 'node:crypto';
 
 const ZOOM_TOKEN_ENDPOINT = 'https://zoom.us/oauth/token';
 const EARLY_REFRESH_MS = 5 * 60_000;
+const TOKEN_EXCHANGE_TIMEOUT_MS = 10_000;
+const MAX_REDIRECTS = 5;
 
 export interface ZoomS2SEnv {
   ZOOM_S2S_ACCOUNT_ID?: string;
@@ -79,6 +81,85 @@ function cacheUsable(cached: CachedZoomToken | undefined, nowMs: number): cached
   return !!cached?.accessToken && nowMs + EARLY_REFRESH_MS < cached.expiresAtMs;
 }
 
+function credentialUrl(value: string | URL): URL {
+  let url: URL;
+  try {
+    url = new URL(String(value));
+  } catch {
+    throw new ZoomOAuthError('zoom_credential_url_invalid', 502, 'Zoom credential URL is invalid');
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:' || (hostname !== 'zoom.us' && !hostname.endsWith('.zoom.us'))) {
+    throw new ZoomOAuthError('zoom_credential_url_untrusted', 502, 'Zoom credentials may only be sent to trusted HTTPS Zoom hosts');
+  }
+  return url;
+}
+
+function redirectLocation(response: Response, current: URL): URL | undefined {
+  if (![301, 302, 303, 307, 308].includes(response.status)) return undefined;
+  const location = clean(response.headers.get('location'));
+  if (!location) throw new ZoomOAuthError('zoom_redirect_location_missing', 502, 'Zoom redirect response is missing Location');
+  let next: URL;
+  try {
+    next = new URL(location, current);
+  } catch {
+    throw new ZoomOAuthError('zoom_redirect_location_invalid', 502, 'Zoom redirect Location is invalid');
+  }
+  if (next.protocol !== 'https:') {
+    throw new ZoomOAuthError('zoom_redirect_url_untrusted', 502, 'Zoom redirects must use HTTPS');
+  }
+  return next;
+}
+
+function trustedZoomHost(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase();
+  return hostname === 'zoom.us' || hostname.endsWith('.zoom.us');
+}
+
+async function fetchWithValidatedRedirects(
+  input: string | URL,
+  init: RequestInit,
+  fetchImpl: typeof fetch,
+  authorization?: string,
+): Promise<Response> {
+  let current = credentialUrl(input);
+  let maySendAuthorization = true;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    const headers = new Headers(init.headers);
+    if (authorization && maySendAuthorization) headers.set('authorization', authorization);
+    else headers.delete('authorization');
+    const response = await fetchImpl(current, { ...init, headers, redirect: 'manual' });
+    const next = redirectLocation(response, current);
+    if (!next) return response;
+    if (redirectCount === MAX_REDIRECTS) {
+      throw new ZoomOAuthError('zoom_redirect_limit_exceeded', 502, 'Zoom redirect limit exceeded');
+    }
+    const nextIsTrusted = trustedZoomHost(next);
+    maySendAuthorization = maySendAuthorization && nextIsTrusted;
+    if (!nextIsTrusted) next.searchParams.delete('access_token');
+    current = next;
+  }
+  throw new ZoomOAuthError('zoom_redirect_limit_exceeded', 502, 'Zoom redirect limit exceeded');
+}
+
+async function fetchTokenWithTimeout(fetchImpl: typeof fetch, url: URL, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutError = new ZoomOAuthError('zoom_s2s_token_timeout', 504, 'Zoom token exchange timed out');
+  const timer = setTimeout(() => controller.abort(timeoutError), TOKEN_EXCHANGE_TIMEOUT_MS);
+  timer.unref?.();
+  const aborted = new Promise<never>((_resolve, reject) => {
+    controller.signal.addEventListener('abort', () => reject(controller.signal.reason || timeoutError), { once: true });
+  });
+  try {
+    return await Promise.race([
+      fetchImpl(url, { ...init, signal: controller.signal, redirect: 'manual' }),
+      aborted,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function readJson(response: Response): Promise<Record<string, unknown>> {
   try {
     return await response.json() as Record<string, unknown>;
@@ -111,7 +192,7 @@ export function getZoomS2SAccessToken(
     const url = new URL(ZOOM_TOKEN_ENDPOINT);
     url.searchParams.set('grant_type', 'account_credentials');
     url.searchParams.set('account_id', config.accountId);
-    const response = await (options.fetchImpl || fetch)(url, {
+    const response = await fetchTokenWithTimeout(options.fetchImpl || fetch, url, {
       method: 'POST',
       headers: {
         authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`, 'utf8').toString('base64')}`,
@@ -154,12 +235,11 @@ export async function zoomS2SFetch(
   env: ZoomS2SEnv = process.env,
   options: Pick<ZoomS2SOptions, 'fetchImpl' | 'nowMs'> = {},
 ): Promise<Response> {
+  credentialUrl(input);
   const config = requireZoomS2SConfig(env);
   const fetchImpl = options.fetchImpl || fetch;
   const request = async (token: string): Promise<Response> => {
-    const headers = new Headers(init.headers);
-    headers.set('authorization', `Bearer ${token}`);
-    return fetchImpl(input, { ...init, headers });
+    return fetchWithValidatedRedirects(input, init, fetchImpl, `Bearer ${token}`);
   };
   const firstToken = await getZoomS2SAccessToken(env, options);
   const first = await request(firstToken);
@@ -168,6 +248,15 @@ export async function zoomS2SFetch(
   if (cached?.accessToken === firstToken) tokenCache.delete(config.fingerprint);
   const refreshed = await getZoomS2SAccessToken(env, { ...options, forceRefresh: true });
   return request(refreshed);
+}
+
+/** Download-token URLs use the same trusted first hop and manual redirect policy, without adding S2S Bearer. */
+export function zoomDownloadTokenFetch(
+  input: string | URL,
+  init: RequestInit = {},
+  options: Pick<ZoomS2SOptions, 'fetchImpl'> = {},
+): Promise<Response> {
+  return fetchWithValidatedRedirects(input, init, options.fetchImpl || fetch);
 }
 
 /** 默认只做静态/缓存检查；probe=true 时实际换取一次 token 来验证 credentials。 */

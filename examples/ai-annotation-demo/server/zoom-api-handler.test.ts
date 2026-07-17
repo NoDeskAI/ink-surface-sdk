@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -114,12 +115,13 @@ describe('zoom API routes', () => {
   it('serves the meeting transcript response contract behind the device session gate', async () => {
     const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-transcript-route-'));
     roots.push(root);
-    const fetchImpl = vi.fn(async (input: string | URL) => {
+    const fetchImpl = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       if (url.hostname === 'zoom.us') {
         return new Response(JSON.stringify({ access_token: 'token', expires_in: 3600 }), { status: 200 });
       }
       if (url.pathname === '/v2/past_meetings/123456789/instances') {
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
         return new Response(JSON.stringify({ meetings: [{ uuid: 'route-session' }] }), { status: 200 });
       }
       if (url.pathname === '/v2/past_meetings/route-session') {
@@ -197,5 +199,85 @@ describe('zoom API routes', () => {
         },
       }
     `);
+  });
+
+  it('keeps no_record status compatible while exposing instance_not_found reason', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-reason-route-'));
+    roots.push(root);
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') {
+        return new Response(JSON.stringify({ access_token: 'token', expires_in: 3600 }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/987654321/instances') {
+        return new Response(JSON.stringify({ meetings: [] }), { status: 200 });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const handler = createZoomApiHandler({
+      env: {
+        ZOOM_S2S_ACCOUNT_ID: 'account',
+        ZOOM_S2S_CLIENT_ID: 'client',
+        ZOOM_S2S_CLIENT_SECRET: 'secret',
+        ZOOM_MEETING_TRANSCRIPT_PROBE: '0',
+      },
+      recordsRef: { path: join(root, 'records.json') },
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: () => Date.parse('2026-07-17T12:10:00Z'),
+      requireDeviceSession: async () => ({ active: true }),
+    });
+    const result = await invoke(handler, '/api/zoom/meeting-transcript?space_name=987654321&scheduled_at=2026-07-17T10%3A00%3A00Z');
+    expect(result).toMatchObject({
+      status: 200,
+      body: { status: 'no_record', reason: 'instance_not_found', participants: [] },
+    });
+  });
+
+  it('propagates request abort into the meeting-sources fetch chain', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-abort-route-'));
+    roots.push(root);
+    let apiSignal: AbortSignal | undefined;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const fetchImpl = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') {
+        return new Response(JSON.stringify({ access_token: 'token', expires_in: 3600 }), { status: 200 });
+      }
+      apiSignal = init?.signal || undefined;
+      markStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        apiSignal?.addEventListener('abort', () => reject(apiSignal?.reason), { once: true });
+      });
+    });
+    const handler = createZoomApiHandler({
+      env: {
+        ZOOM_S2S_ACCOUNT_ID: 'account',
+        ZOOM_S2S_CLIENT_ID: 'client',
+        ZOOM_S2S_CLIENT_SECRET: 'secret',
+        ZOOM_HOST_USER_IDS: 'host',
+      },
+      syncRef: { path: join(root, 'sync.json') },
+      fetchImpl: fetchImpl as typeof fetch,
+      minSyncIntervalMs: 0,
+      requireDeviceSession: async () => ({ active: true }),
+    });
+    const request = Object.assign(new EventEmitter(), {
+      method: 'GET',
+      url: '/api/zoom/meeting-sources',
+      headers: { authorization: 'Bearer device-session' },
+      aborted: false,
+    }) as unknown as IncomingMessage;
+    const response = {
+      statusCode: 200,
+      setHeader() {},
+      end() {},
+    } as unknown as ServerResponse;
+    const pending = handler(request, response);
+    await started;
+    request.emit('aborted');
+    await pending;
+    expect(apiSignal?.aborted).toBe(true);
+    expect(response.statusCode).toBe(500);
   });
 });

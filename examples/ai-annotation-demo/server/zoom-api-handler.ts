@@ -20,6 +20,8 @@ import {
 } from './zoom-meeting-records';
 import { zoomS2SConfigured, zoomS2SStatus } from './zoom-oauth-state';
 
+const ZOOM_REQUEST_TIMEOUT_MS = 30_000;
+
 export interface ZoomApiHandlerOptions {
   env?: ZoomMeetingRecordsEnv;
   syncRef?: ZoomMeetingSyncRef;
@@ -36,6 +38,24 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json');
   res.end(JSON.stringify(body));
+}
+
+function requestAbortScope(req: IncomingMessage): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const abortRequest = () => controller.abort(new DOMException('Request aborted', 'AbortError'));
+  if (req.aborted) abortRequest();
+  req.once?.('aborted', abortRequest);
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('Zoom request timed out', 'TimeoutError'));
+  }, ZOOM_REQUEST_TIMEOUT_MS);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      req.off?.('aborted', abortRequest);
+    },
+  };
 }
 
 export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
@@ -86,6 +106,7 @@ export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
         });
         return true;
       }
+      const requestScope = requestAbortScope(req);
       try {
         const source = readZoomMeetingSources(syncRef)
           .filter((item) => item.meeting_id === meetingId)
@@ -105,26 +126,33 @@ export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
           fetchImpl: options.fetchImpl,
           sleepImpl: options.sleepImpl,
           nowMs,
+          signal: requestScope.signal,
         });
         sendJson(res, 200, result);
       } catch (error) {
         const failure = zoomMeetingRecordsErrorPayload(error);
         sendJson(res, failure.status, failure.body);
+      } finally {
+        requestScope.dispose();
       }
       return true;
     }
 
+    const requestScope = requestAbortScope(req);
     try {
       const result = await fetchZoomMeetingSources(env, syncRef, {
         fetchImpl: options.fetchImpl,
         sleepImpl: options.sleepImpl,
         nowMs,
         minIntervalMs: options.minSyncIntervalMs,
+        signal: requestScope.signal,
       });
       sendJson(res, 200, { configured: true, connected: true, ...result });
     } catch (error) {
       const failure = zoomMeetingSyncErrorPayload(error);
       sendJson(res, failure.status, { configured: true, connected: false, sources: [], ...failure.body });
+    } finally {
+      requestScope.dispose();
     }
     return true;
   };

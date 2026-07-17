@@ -50,7 +50,7 @@ afterEach(() => {
 });
 
 describe('zoom meeting records', () => {
-  it('absolutely prefers a transcript-bearing instance, then uses MTL overlap and schedule distance', () => {
+  it('prefers attendance and schedule windows before using transcript availability as the last tie-break', () => {
     const scheduledAt = '2026-07-17T10:00:00.000Z';
     const transcriptSession = {
       uuid: 'session-with-transcript',
@@ -70,7 +70,7 @@ describe('zoom meeting records', () => {
     ], scheduledAt, '2026-07-17T10:30:00.000Z', [{
       startMs: Date.parse('2026-07-17T10:02:00.000Z'),
       endMs: Date.parse('2026-07-17T10:20:00.000Z'),
-    }])?.uuid).toBe('session-with-transcript');
+    }])?.uuid).toBe('session-attended');
     expect(chooseZoomMeetingCandidate([
       attendedSession,
       { ...transcriptSession, recordings: [] },
@@ -78,9 +78,30 @@ describe('zoom meeting records', () => {
       startMs: Date.parse('2026-07-17T10:02:00.000Z'),
       endMs: Date.parse('2026-07-17T10:20:00.000Z'),
     }])?.uuid).toBe('session-attended');
+    expect(chooseZoomMeetingCandidate([
+      { ...attendedSession, uuid: 'same-window-without-transcript' },
+      { ...attendedSession, uuid: 'same-window-with-transcript', recordings: [{ id: 'tx', file_type: 'TRANSCRIPT' }] },
+    ], scheduledAt, '2026-07-17T10:30:00.000Z')?.uuid).toBe('same-window-with-transcript');
   });
 
-  it('stores both discovered instances and chooses the transcript-bearing session through the full fetch chain', async () => {
+  it('chooses this week in-window occurrence over last week transcript for the same recurring meeting id', () => {
+    expect(chooseZoomMeetingCandidate([
+      {
+        uuid: 'last-week-with-transcript',
+        start_time: '2026-07-10T10:00:00.000Z',
+        end_time: '2026-07-10T10:30:00.000Z',
+        recordings: [{ id: 'old-tx', file_type: 'TRANSCRIPT' }],
+      },
+      {
+        uuid: 'this-week-without-transcript',
+        start_time: '2026-07-17T10:01:00.000Z',
+        end_time: '2026-07-17T10:30:00.000Z',
+        recordings: [],
+      },
+    ], '2026-07-17T10:00:00.000Z', '2026-07-17T10:30:00.000Z')?.uuid).toBe('this-week-without-transcript');
+  });
+
+  it('stores both discovered instances and chooses the scheduled session through the full fetch chain', async () => {
     const { records } = statePaths();
     const fetchImpl = vi.fn(async (input: string | URL) => {
       const url = new URL(String(input));
@@ -103,6 +124,7 @@ describe('zoom meeting records', () => {
           recording_end: '2026-07-17T09:40:05Z', download_url: 'https://download.zoom.us/main.vtt',
         }] });
       }
+      if (url.pathname === '/v2/past_meetings/near-rejoin/participants') return json({ participants: [] });
       if (url.pathname === '/v2/past_meetings/main-session/participants') return json({ participants: [] });
       if (url.pathname === '/main.vtt') return vtt('00:00:00.000 --> 00:00:05.000\nAda: main');
       throw new Error(`unexpected ${url}`);
@@ -110,15 +132,61 @@ describe('zoom meeting records', () => {
     const result = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
       meetingId: '111', scheduledAt: '2026-07-17T10:00:00Z',
     }, {
-      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:11:00Z'),
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:12:00Z'),
     });
-    expect(result).toMatchObject({ status: 'ready', instance_uuid: 'main-session' });
+    expect(result).toMatchObject({ status: 'not_generated', reason: 'transcript_not_generated', instance_uuid: 'near-rejoin' });
     const job = Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as {
       candidates: Array<{ uuid: string }>;
       chosen_instance_uuid: string;
+      selection_input_hash: string;
     };
     expect(job.candidates.map((candidate) => candidate.uuid).sort()).toEqual(['main-session', 'near-rejoin']);
-    expect(job.chosen_instance_uuid).toBe('main-session');
+    expect(job.chosen_instance_uuid).toBe('near-rejoin');
+    expect(job.selection_input_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('rediscovers and reselects a ready job when the attendance selection hash changes', async () => {
+    const { records } = statePaths();
+    let instancesCalls = 0;
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/112/instances') {
+        instancesCalls += 1;
+        return json({ meetings: [{ uuid: 'first-instance' }, { uuid: 'second-instance' }] });
+      }
+      if (url.pathname === '/v2/past_meetings/first-instance') return json({ start_time: '2026-07-17T10:00:00Z', duration: 20 });
+      if (url.pathname === '/v2/past_meetings/second-instance') return json({ start_time: '2026-07-17T10:20:00Z', duration: 20 });
+      if (url.pathname === '/v2/meetings/first-instance/recordings') return json({ recording_files: [{
+        id: 'first-tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        recording_end: '2026-07-17T10:00:05Z', download_url: 'https://download.zoom.us/first.vtt',
+      }] });
+      if (url.pathname === '/v2/meetings/second-instance/recordings') return json({ recording_files: [] });
+      if (url.pathname === '/v2/past_meetings/first-instance/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/past_meetings/second-instance/participants') return json({ participants: [] });
+      if (url.pathname === '/first.vtt') return vtt('00:00:00.000 --> 00:00:05.000\nAda: first');
+      throw new Error(`unexpected ${url}`);
+    });
+    const input = {
+      meetingId: '112',
+      scheduledAt: '2026-07-17T10:00:00Z',
+      scheduledEndAt: '2026-07-17T11:00:00Z',
+    };
+    const first = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      ...input,
+      attendance: [{ startMs: Date.parse('2026-07-17T10:01:00Z'), endMs: Date.parse('2026-07-17T10:10:00Z') }],
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T11:00:00Z') });
+    const firstHash = (Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as { selection_input_hash: string }).selection_input_hash;
+    expect(first).toMatchObject({ status: 'ready', instance_uuid: 'first-instance' });
+
+    const second = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      ...input,
+      attendance: [{ startMs: Date.parse('2026-07-17T10:21:00Z'), endMs: Date.parse('2026-07-17T10:30:00Z') }],
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T11:00:01Z') });
+    const secondHash = (Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as { selection_input_hash: string }).selection_input_hash;
+    expect(second).toMatchObject({ status: 'no_record', reason: 'recording_missing', instance_uuid: 'second-instance' });
+    expect(instancesCalls).toBe(2);
+    expect(secondHash).not.toBe(firstHash);
   });
 
   it('double-encodes every UUID path when an instance UUID starts with slash', async () => {
@@ -145,7 +213,7 @@ describe('zoom meeting records', () => {
       fetchImpl: fetchImpl as typeof fetch,
       nowMs: Date.parse('2026-07-17T10:10:00Z'),
     });
-    expect(result).toMatchObject({ status: 'no_record', instance_uuid: uuid });
+    expect(result).toMatchObject({ status: 'no_record', reason: 'recording_missing', instance_uuid: uuid });
     expect(visited).toEqual(expect.arrayContaining([
       '/v2/past_meetings/%252Fabc%252F%252Fdef',
       '/v2/meetings/%252Fabc%252F%252Fdef/recordings',
@@ -266,7 +334,7 @@ describe('zoom meeting records', () => {
       if (url.hostname === 'zoom.us') return token();
       if (url.pathname === '/v2/past_meetings/400/instances') {
         attempts += 1;
-        return attempts === 1 ? json({ code: 429 }, 429, { 'retry-after': '2' }) : json({ meetings: [] });
+        return attempts === 1 ? json({ code: 429 }, 429, { 'retry-after': '120' }) : json({ meetings: [] });
       }
       throw new Error(`unexpected ${url}`);
     });
@@ -279,7 +347,30 @@ describe('zoom meeting records', () => {
       nowMs: Date.parse('2026-07-17T10:01:00Z'),
     });
     expect(attempts).toBe(2);
-    expect(sleepImpl).toHaveBeenCalledWith(2_000);
+    expect(sleepImpl).toHaveBeenCalledWith(30_000);
+  });
+
+  it('rejects a repeated participant next_page_token instead of looping forever', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/401/instances') return json({ meetings: [{ uuid: 'looping' }] });
+      if (url.pathname === '/v2/past_meetings/looping') return json({ start_time: '2026-07-17T10:00:00Z', duration: 10 });
+      if (url.pathname === '/v2/meetings/looping/recordings') return json({ recording_files: [{
+        id: 'tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        download_url: 'https://download.zoom.us/loop.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/looping/participants') return json({ participants: [], next_page_token: 'same-token' });
+      if (url.pathname === '/loop.vtt') return vtt('00:00:00.000 --> 00:00:01.000\nAda: loop');
+      throw new Error(`unexpected ${url}`);
+    });
+    await expect(fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '401', scheduledAt: '2026-07-17T10:00:00Z',
+    }, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:11:00Z'),
+    })).rejects.toMatchObject({ code: 'zoom_pagination_token_loop' });
+    expect(fetchImpl.mock.calls.filter(([input]) => apiPath(input).endsWith('/participants'))).toHaveLength(2);
   });
 
   it('advances the Meeting transcript probe from NOT_READY to ready without making it the main source', async () => {
@@ -354,7 +445,7 @@ describe('zoom meeting records', () => {
     const first = await fetchZoomMeetingTranscript(baseEnv, { path: records }, input, {
       fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:00:00Z'),
     });
-    expect(first).toMatchObject({ status: 'no_record' });
+    expect(first).toMatchObject({ status: 'no_record', reason: 'instance_not_found' });
     expect(first.next_check_at).toBeUndefined();
 
     available = true;
@@ -389,7 +480,7 @@ describe('zoom meeting records', () => {
     const first = await fetchZoomMeetingTranscript(baseEnv, { path: records }, input, {
       fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:10:00Z'),
     });
-    expect(first.status).toBe('not_generated');
+    expect(first).toMatchObject({ status: 'not_generated', reason: 'transcript_not_generated' });
     transcriptAvailable = true;
     const flipped = await fetchZoomMeetingTranscript(baseEnv, { path: records }, input, {
       fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:20:00Z'),
@@ -418,6 +509,33 @@ describe('zoom meeting records', () => {
       fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:11:00Z'),
     });
     expect(result.timestamp_quality).toBe('approximate_pause_unknown');
+  });
+
+  it.each([
+    ['empty VTT', '', 'text/vtt'],
+    ['HTML body', '<!doctype html><html><body>login</body></html>', 'text/html'],
+  ])('keeps %s out of ready state', async (_label, body, contentType) => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/710/instances') return json({ meetings: [{ uuid: 'invalid-vtt' }] });
+      if (url.pathname === '/v2/past_meetings/invalid-vtt') return json({ start_time: '2026-07-17T10:00:00Z', duration: 10 });
+      if (url.pathname === '/v2/meetings/invalid-vtt/recordings') return json({ recording_files: [{
+        id: 'tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        download_url: 'https://download.zoom.us/invalid.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/invalid-vtt/participants') return json({ participants: [] });
+      if (url.pathname === '/invalid.vtt') return new Response(body, { status: 200, headers: { 'content-type': contentType } });
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '710', scheduledAt: '2026-07-17T10:00:00Z',
+    }, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:10:00Z'),
+    });
+    expect(result).toMatchObject({ status: 'not_generated', reason: 'transcript_not_generated' });
+    expect(result.srt).toBeUndefined();
   });
 
   it('keeps a classic transcript ready when the new-route probe fails', async () => {
@@ -485,6 +603,36 @@ describe('zoom meeting records', () => {
     expect(oauthDownloadSeen).toBe(true);
     expect(fallbackSeen).toBe(true);
     expect(readFileSync(records, 'utf8')).not.toContain('short-lived-download-secret');
+  });
+
+  it('never sends credentials to an untrusted transcript download_url', async () => {
+    const { records } = statePaths();
+    const evilCalls: Array<RequestInit | undefined> = [];
+    const fetchImpl = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.hostname === 'evil.example') {
+        evilCalls.push(init);
+        return vtt('00:00:00.000 --> 00:00:01.000\nStolen: secret');
+      }
+      if (url.pathname === '/v2/past_meetings/851/instances') return json({ meetings: [{ uuid: 'malicious' }] });
+      if (url.pathname === '/v2/past_meetings/malicious') return json({ start_time: '2026-07-17T10:00:00Z', duration: 1 });
+      if (url.pathname === '/v2/meetings/malicious/recordings') return json({
+        download_access_token: 'must-not-leak',
+        recording_files: [{
+          id: 'tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+          download_url: 'https://evil.example/steal.vtt',
+        }],
+      });
+      if (url.pathname === '/v2/past_meetings/malicious/participants') return json({ participants: [] });
+      throw new Error(`unexpected ${url}`);
+    });
+    await expect(fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '851', scheduledAt: '2026-07-17T10:00:00Z',
+    }, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:02:00Z'),
+    })).rejects.toMatchObject({ code: 'zoom_credential_url_untrusted' });
+    expect(evilCalls).toEqual([]);
   });
 
   it('backfills only Zoom sync entries whose scheduled window has ended', async () => {

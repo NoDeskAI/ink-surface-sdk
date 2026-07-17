@@ -431,15 +431,16 @@ export async function runReadingNotePostprocess(payload: any): Promise<{ title: 
   };
 }
 
-/** Google Meet 会后转写 → panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
+/** Provider 会后转写 -> panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
 export async function runMeetingPanelSummary(payload: any): Promise<{ summary: MeetingPanelSummary; model: string }> {
   const title = String(payload?.title || '').trim().slice(0, 300) || '(未命名会议)';
+  const platform = String(payload?.platform || 'google_meet').trim().slice(0, 64) || 'google_meet';
   const transcript = String(payload?.transcript || '').trim();
   const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
   if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
   const model = String(payload?.model || cfg().model);
-  const user = JSON.stringify({ meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
+  const user = JSON.stringify({ platform, meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
   const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');

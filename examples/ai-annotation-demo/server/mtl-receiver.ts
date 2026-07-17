@@ -6,11 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { googleCalendarSyncPath, googleMeetRecordsPath, resolveAnyUserGoogleToken, type GoogleOAuthEnv } from './google-oauth-state';
 import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload, type GoogleMeetAttendanceWindow } from './google-meet-records';
 import { resolveMtlToken, type MtlReceiverAuthEnv, type MtlReceiverIdentity } from './mtl-receiver-auth';
+import { zoomMeetingIdFromUrl } from './zoom-meeting-sync';
 
 const DEFAULT_MTL_EVENTS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../.inkloop/mtl-events');
 const MAX_LIVE_WINDOWS = 20;
 const MAX_BATCH_SIZE = 200;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MIN_EPOCH_MS = Date.UTC(2000, 0, 1);
+const EPOCH_FUTURE_TOLERANCE_MS = 5 * 60_000;
 
 export interface MtlReceiverEnv extends MtlReceiverAuthEnv, GoogleOAuthEnv {
   MTL_EVENTS_ROOT?: string;
@@ -61,6 +64,27 @@ function clean(value: unknown, maxLength = 512): string {
 
 function recordOf(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+export function isEpochMs(value: unknown, nowMs = Date.now()): boolean {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp)
+    && timestamp >= MIN_EPOCH_MS
+    && timestamp <= nowMs + EPOCH_FUTURE_TOLERANCE_MS;
+}
+
+function validateEpochTimeFields(value: unknown, nowMs: number): void {
+  if (Array.isArray(value)) {
+    for (const item of value) validateEpochTimeFields(item, nowMs);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  for (const [field, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (field.endsWith('_time_ms') && !isEpochMs(nested, nowMs)) {
+      throw Object.assign(new Error(`mtl_${field}_invalid`), { status: 400, field });
+    }
+    validateEpochTimeFields(nested, nowMs);
+  }
 }
 
 function safePathPart(value: string, fallback: string): string {
@@ -279,9 +303,9 @@ function requiredText(payload: Record<string, unknown>, field: string): string {
   return value;
 }
 
-function requiredTime(payload: Record<string, unknown>, field: string): number {
+function requiredTime(payload: Record<string, unknown>, field: string, nowMs: number): number {
   const value = Number(payload[field]);
-  if (!Number.isFinite(value) || value <= 0) {
+  if (!isEpochMs(value, nowMs)) {
     throw Object.assign(new Error(`mtl_${field}_invalid`), { status: 400, field });
   }
   return Math.round(value);
@@ -295,7 +319,7 @@ function startMeeting(
 ): { deduplicated: boolean; meeting: MtlLiveMeetingWindow } {
   const platform = normalizeMtlPlatform(requiredText(payload, 'platform'));
   const meetingId = requiredText(payload, 'meeting_id');
-  const startedAtMs = requiredTime(payload, 'start_time_ms');
+  const startedAtMs = requiredTime(payload, 'start_time_ms', nowMs);
   const state = readLiveStateFile(identity, env);
   const active = state.windows.find((window) => window.ended_at_ms === undefined);
   if (active) {
@@ -355,7 +379,7 @@ function endMeeting(
   const platform = payload.platform === undefined
     ? undefined
     : normalizeMtlPlatform(requiredText(payload, 'platform'));
-  const endedAtMs = requiredTime(payload, 'end_time_ms');
+  const endedAtMs = requiredTime(payload, 'end_time_ms', nowMs);
   const state = readLiveStateFile(identity, env);
   const activeIndex = state.windows.findIndex((window) => window.ended_at_ms === undefined);
   const active = activeIndex >= 0 ? state.windows[activeIndex] : undefined;
@@ -457,6 +481,19 @@ export function mtlAttendanceWindows(
   });
 }
 
+export function mtlZoomAttendanceWindows(
+  identity: MtlReceiverIdentity,
+  meetingId: string,
+  env: MtlReceiverEnv = process.env,
+  nowMs = Date.now(),
+): GoogleMeetAttendanceWindow[] {
+  return listMtlMeetingWindows(identity, env, 'zoom').flatMap((window) => {
+    const ids = [window.meeting_id, window.external_meeting_id, zoomMeetingIdFromUrl(window.meeting_url)];
+    if (!ids.includes(meetingId)) return [];
+    return [{ startMs: window.started_at_ms, endMs: window.ended_at_ms || nowMs }];
+  });
+}
+
 export async function runMtlGoogleTranscriptCatchUp(
   identity: MtlReceiverIdentity,
   window: MtlLiveMeetingWindow,
@@ -533,6 +570,7 @@ export async function handleMtlReceiver(
   const nowMs = options.now?.() ?? Date.now();
   try {
     const payload = await readJsonBody(req);
+    validateEpochTimeFields(payload, nowMs);
     if (path === '/api/meeting-session/start') {
       const result = startMeeting(identity, env, payload, nowMs);
       sendJson(res, 200, {

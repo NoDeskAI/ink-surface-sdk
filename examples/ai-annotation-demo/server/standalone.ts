@@ -79,7 +79,7 @@ import {
   revokeMtlToken,
   type MtlReceiverIdentity,
 } from './mtl-receiver-auth';
-import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from './mtl-receiver';
+import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows, mtlZoomAttendanceWindows } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import { exportLarkDocxToPdf } from './lark-docx-export';
 import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
@@ -1153,10 +1153,7 @@ const handleZoomApi = createZoomApiHandler({
   requireDeviceSession,
   resolveAttendanceWindows: (rawSession, meetingId, nowMs) => {
     const session = rawSession as InkLoopSessionContext;
-    return listMtlMeetingWindows(mtlReceiverIdentity(session), process.env, 'zoom').flatMap((window) => {
-      if (window.meeting_id !== meetingId && window.external_meeting_id !== meetingId) return [];
-      return [{ startMs: window.started_at_ms, endMs: window.ended_at_ms || nowMs }];
-    });
+    return mtlZoomAttendanceWindows(mtlReceiverIdentity(session), meetingId, process.env, nowMs);
   },
 });
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {

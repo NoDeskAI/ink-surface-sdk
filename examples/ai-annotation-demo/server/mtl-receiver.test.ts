@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mintMtlToken, type MtlReceiverIdentity } from './mtl-receiver-auth';
 import {
   handleMtlReceiver,
+  isEpochMs,
   listMtlMeetingWindows,
   mtlEventsAuditPath,
+  mtlZoomAttendanceWindows,
   type MtlLiveMeetingWindow,
   type MtlReceiverEnv,
 } from './mtl-receiver';
@@ -178,6 +180,48 @@ describe('MTL receiver', () => {
     expect(audit).not.toContain('DO_NOT_STORE_FULL_DOM');
     expect(audit).not.toContain('PRIVATE_SPEAKER_LABEL');
     expect(audit).not.toContain('snapshot');
+  });
+
+  it('matches a Zoom attendance window whose numeric id exists only in meeting_url', async () => {
+    const { env, identity, token, call } = await fixture();
+    const startedAt = Date.parse('2026-07-15T03:00:00.000Z');
+    const response = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: {
+        platform: 'zoom',
+        meeting_id: 'detector-window-alias',
+        meeting_url: 'https://acme.zoom.us/j/987654321?pwd=secret',
+        start_time_ms: startedAt,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(mtlZoomAttendanceWindows(
+      identity,
+      '987654321',
+      env,
+      Date.parse('2026-07-15T04:00:00.000Z'),
+    )).toEqual([{ startMs: startedAt, endMs: Date.parse('2026-07-15T04:00:00.000Z') }]);
+  });
+
+  it('rejects second-scale and implausibly future *_time_ms values', async () => {
+    const { token, call } = await fixture();
+    const nowMs = Date.parse('2026-07-15T04:00:00.000Z');
+    expect(isEpochMs(nowMs, nowMs)).toBe(true);
+    expect(isEpochMs(Math.floor(nowMs / 1000), nowMs)).toBe(false);
+
+    const seconds = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: { platform: 'zoom', meeting_id: '123', start_time_ms: Math.floor(nowMs / 1000) },
+    });
+    expect(seconds.status).toBe(400);
+    expect(seconds.json()).toMatchObject({ error: { code: 'mtl_start_time_ms_invalid' } });
+
+    const future = await call(`${token}/api/meeting-platform/runtime-events`, {
+      method: 'POST',
+      body: { detector: { observed_time_ms: nowMs + 5 * 60_000 + 1 } },
+    });
+    expect(future.status).toBe(400);
+    expect(future.json()).toMatchObject({ error: { code: 'mtl_observed_time_ms_invalid' } });
   });
 
   it('rejects an end event whose normalized platform does not match the active meeting', async () => {

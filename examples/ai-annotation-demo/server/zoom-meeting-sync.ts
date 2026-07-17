@@ -21,6 +21,8 @@ const DEFAULT_ZOOM_SYNC_PATH = resolve(dirname(fileURLToPath(import.meta.url)), 
 const DEFAULT_MIN_SYNC_INTERVAL_MS = 60_000;
 const MAX_ATTEMPTS = 3;
 const MAX_DISCOVERED_HOSTS = 10;
+const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_PAGES = 100;
 
 export interface ZoomMeetingSyncEnv extends ZoomS2SEnv {
   ZOOM_HOST_USER_IDS?: string;
@@ -73,6 +75,14 @@ export interface ZoomMeetingSyncOptions {
   nowMs?: number;
   minIntervalMs?: number;
   force?: boolean;
+  signal?: AbortSignal;
+}
+
+interface ZoomRequestOptions {
+  fetchImpl: typeof fetch;
+  sleepImpl: (delayMs: number) => Promise<void>;
+  nowMs: number;
+  signal?: AbortSignal;
 }
 
 export interface ZoomMeetingSourcesResult {
@@ -103,6 +113,19 @@ function clean(value: unknown): string {
 
 function cleanId(value: unknown): string {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
+
+export function zoomMeetingIdFromUrl(value: string | undefined): string {
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'zoom.us' && !hostname.endsWith('.zoom.us')) return '';
+    const meetingId = url.pathname.match(/^\/j\/(\d+)(?:\/|$)/)?.[1] || '';
+    return /^\d+$/.test(meetingId) ? meetingId : '';
+  } catch {
+    return '';
+  }
 }
 
 function emptyState(): ZoomSyncFile {
@@ -193,10 +216,28 @@ async function defaultSleep(delayMs: number): Promise<void> {
 function retryAfterMs(response: Response, nowMs: number, fallbackMs: number): number {
   const raw = clean(response.headers.get('retry-after'));
   const seconds = Number(raw);
-  if (raw && Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  if (raw && Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_RETRY_AFTER_MS, seconds * 1000);
   const dateMs = Date.parse(raw);
-  if (raw && Number.isFinite(dateMs)) return Math.max(0, dateMs - nowMs);
+  if (raw && Number.isFinite(dateMs)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, dateMs - nowMs));
   return fallbackMs;
+}
+
+async function abortableSleep(delayMs: number, options: ZoomRequestOptions): Promise<void> {
+  if (!options.signal) return options.sleepImpl(delayMs);
+  if (options.signal.aborted) throw options.signal.reason;
+  const signal = options.signal;
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      options.sleepImpl(delayMs),
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
 }
 
 async function readJson(response: Response): Promise<Record<string, unknown>> {
@@ -210,16 +251,16 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
 async function fetchZoomJson(
   url: string,
   env: ZoomMeetingSyncEnv,
-  options: Required<Pick<ZoomMeetingSyncOptions, 'fetchImpl' | 'sleepImpl' | 'nowMs'>>,
+  options: ZoomRequestOptions,
 ): Promise<Record<string, unknown>> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    const response = await zoomS2SFetch(url, {}, env, { fetchImpl: options.fetchImpl, nowMs: options.nowMs });
+    const response = await zoomS2SFetch(url, { signal: options.signal }, env, { fetchImpl: options.fetchImpl, nowMs: options.nowMs });
     if (response.ok) return readJson(response);
     if ((response.status === 429 || response.status >= 500) && attempt < MAX_ATTEMPTS) {
       const fallbackMs = 250 * (2 ** (attempt - 1));
-      await options.sleepImpl(response.status === 429
+      await abortableSleep(response.status === 429
         ? retryAfterMs(response, options.nowMs, fallbackMs)
-        : fallbackMs);
+        : fallbackMs, options);
       continue;
     }
     throw new ZoomMeetingSyncError(
@@ -237,13 +278,14 @@ function explicitHostIds(env: ZoomMeetingSyncEnv): string[] {
 
 async function discoverHostIds(
   env: ZoomMeetingSyncEnv,
-  options: Required<Pick<ZoomMeetingSyncOptions, 'fetchImpl' | 'sleepImpl' | 'nowMs'>>,
+  options: ZoomRequestOptions,
 ): Promise<string[]> {
   const explicit = explicitHostIds(env);
   if (explicit.length) return explicit;
   const hosts: string[] = [];
   let nextPageToken = '';
-  do {
+  const seenTokens = new Set<string>();
+  for (let pageCount = 0; pageCount < MAX_PAGES; pageCount += 1) {
     const page = await fetchZoomJson(zoomUrl('users', {
       status: 'active',
       page_size: '30',
@@ -255,28 +297,37 @@ async function discoverHostIds(
       if (id && Number(user.type) >= 2 && !hosts.includes(id)) hosts.push(id);
       if (hosts.length >= MAX_DISCOVERED_HOSTS) return hosts;
     }
-    nextPageToken = clean(page.next_page_token);
-  } while (nextPageToken);
-  return hosts;
+    const token = clean(page.next_page_token);
+    if (!token) return hosts;
+    if (seenTokens.has(token)) throw new ZoomMeetingSyncError('zoom_pagination_token_loop', 502, 'Zoom user pagination token repeated');
+    seenTokens.add(token);
+    nextPageToken = token;
+  }
+  throw new ZoomMeetingSyncError('zoom_pagination_limit_exceeded', 502, 'Zoom user pagination limit exceeded');
 }
 
 async function listHostMeetings(
   hostUserId: string,
   env: ZoomMeetingSyncEnv,
-  options: Required<Pick<ZoomMeetingSyncOptions, 'fetchImpl' | 'sleepImpl' | 'nowMs'>>,
+  options: ZoomRequestOptions,
 ): Promise<ZoomMeeting[]> {
   const meetings: ZoomMeeting[] = [];
   let nextPageToken = '';
-  do {
+  const seenTokens = new Set<string>();
+  for (let pageCount = 0; pageCount < MAX_PAGES; pageCount += 1) {
     const page = await fetchZoomJson(zoomUrl(`users/${zoomUuidPathSegment(hostUserId)}/meetings`, {
       type: 'scheduled',
       page_size: '30',
       ...(nextPageToken ? { next_page_token: nextPageToken } : {}),
     }), env, options);
     if (Array.isArray(page.meetings)) meetings.push(...page.meetings as ZoomMeeting[]);
-    nextPageToken = clean(page.next_page_token);
-  } while (nextPageToken);
-  return meetings;
+    const token = clean(page.next_page_token);
+    if (!token) return meetings;
+    if (seenTokens.has(token)) throw new ZoomMeetingSyncError('zoom_pagination_token_loop', 502, 'Zoom meeting pagination token repeated');
+    seenTokens.add(token);
+    nextPageToken = token;
+  }
+  throw new ZoomMeetingSyncError('zoom_pagination_limit_exceeded', 502, 'Zoom meeting pagination limit exceeded');
 }
 
 function normalizeMeeting(detail: ZoomMeeting, listed: ZoomMeeting, hostUserId: string): ZoomMeetingSource | null {
@@ -316,6 +367,7 @@ async function runSync(
     fetchImpl: options.fetchImpl || fetch,
     sleepImpl: options.sleepImpl || defaultSleep,
     nowMs,
+    signal: options.signal,
   };
   const currentSources = new Map(current.meetings.map((source) => [sourceKey(source), source]));
   const nextSources = new Map<string, ZoomMeetingSource>();

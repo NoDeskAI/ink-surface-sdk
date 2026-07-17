@@ -3,6 +3,7 @@
  * 拉取参会区间和经典云录制 VTT，并以实际会议开始时间为 t0 产出 SRT。终态会定期重查，允许晚到
  * UUID/TRANSCRIPT 翻转；Meeting transcript 新路线只做可关闭的对比探测，不替代经典产物。
  */
+import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -19,7 +20,7 @@ import {
   type ZoomMeetingSyncEnv,
   type ZoomMeetingSyncRef,
 } from './zoom-meeting-sync';
-import { zoomOAuthErrorPayload, zoomS2SFetch } from './zoom-oauth-state';
+import { zoomDownloadTokenFetch, zoomOAuthErrorPayload, zoomS2SFetch } from './zoom-oauth-state';
 import { zoomUuidPathSegment } from './zoom-uuid';
 
 const ZOOM_API_BASE = 'https://api.zoom.us/v2';
@@ -29,6 +30,8 @@ const TERMINAL_RECHECK_MS = 10 * 60_000;
 const DEFAULT_SCHEDULED_DURATION_MS = 60 * 60_000;
 const TIMESTAMP_MISMATCH_MIN_MS = 30_000;
 const TIMESTAMP_MISMATCH_RATIO = 0.2;
+const MAX_RETRY_AFTER_MS = 30_000;
+const MAX_PAGES = 100;
 
 export const ZOOM_MEETING_POLL_MINUTES = [1, 2, 5, 10, 20, 30, 60, 120] as const;
 
@@ -102,6 +105,7 @@ export interface ZoomMeetingJobState {
   meeting_id: string;
   scheduled_at: string;
   scheduled_end_at?: string;
+  selection_input_hash: string;
   candidates: ZoomMeetingInstanceCandidate[];
   chosen_instance_uuid?: string;
   participants?: ZoomParticipantInterval[];
@@ -132,6 +136,7 @@ export interface ZoomMeetingRecordsOptions {
 
 export interface ZoomMeetingTranscriptResult {
   status: 'pending' | 'ready' | 'not_generated' | 'no_record';
+  reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: {
     name: string;
@@ -256,10 +261,31 @@ async function defaultSleep(delayMs: number): Promise<void> {
 function retryAfterMs(response: Response, nowMs: number, fallbackMs: number): number {
   const raw = clean(response.headers.get('retry-after'));
   const seconds = Number(raw);
-  if (raw && Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  if (raw && Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_RETRY_AFTER_MS, seconds * 1000);
   const dateMs = Date.parse(raw);
-  if (raw && Number.isFinite(dateMs)) return Math.max(0, dateMs - nowMs);
+  if (raw && Number.isFinite(dateMs)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, dateMs - nowMs));
   return fallbackMs;
+}
+
+async function abortableSleep(
+  delayMs: number,
+  sleepImpl: (delayMs: number) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!signal) return sleepImpl(delayMs);
+  if (signal.aborted) throw signal.reason;
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      sleepImpl(delayMs),
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
 }
 
 function retryable(status: number): boolean {
@@ -279,9 +305,9 @@ async function fetchZoomResponse(
     }, env, { fetchImpl: options.fetchImpl, nowMs: options.nowMs });
     if (response.ok || !retryable(response.status) || attempt === MAX_ATTEMPTS) return response;
     const fallbackMs = 250 * (2 ** (attempt - 1));
-    await options.sleepImpl(response.status === 429
+    await abortableSleep(response.status === 429
       ? retryAfterMs(response, options.nowMs, fallbackMs)
-      : fallbackMs);
+      : fallbackMs, options.sleepImpl, options.signal);
   }
   throw new ZoomMeetingRecordsError('zoom_meeting_retry_exhausted', 502);
 }
@@ -360,27 +386,42 @@ function validWindows(windows: ZoomMeetingAttendanceWindow[]): ZoomMeetingAttend
   ));
 }
 
-/** 转写存在是最高优先级；其后按 MTL、排期窗口重叠和计划开始距离排序，绝不假设 instances 只有一项。 */
+function normalizedScheduledWindow(scheduledAt: string, scheduledEndAt?: string): ZoomMeetingAttendanceWindow {
+  const startMs = Date.parse(requiredIso(scheduledAt, 'scheduled_at'));
+  const parsedEndMs = Date.parse(scheduledEndAt || '');
+  return {
+    startMs,
+    endMs: Number.isFinite(parsedEndMs) && parsedEndMs >= startMs
+      ? parsedEndMs
+      : startMs + DEFAULT_SCHEDULED_DURATION_MS,
+  };
+}
+
+function selectionInputHash(
+  scheduledAt: string,
+  scheduledEndAt: string | undefined,
+  attendance: ZoomMeetingAttendanceWindow[] = [],
+): string {
+  const schedule = normalizedScheduledWindow(scheduledAt, scheduledEndAt);
+  const windows = validWindows(attendance)
+    .map((window) => ({ startMs: window.startMs, endMs: window.endMs }))
+    .sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs);
+  return createHash('sha256').update(JSON.stringify({ schedule, attendance: windows })).digest('hex');
+}
+
+/** MTL/排期命中优先；转写只在窗口、时长和计划距离都相同时打破平局。 */
 export function chooseZoomMeetingCandidate(
   candidates: ZoomMeetingInstanceCandidate[],
   scheduledAt: string,
   scheduledEndAt?: string,
   attendance: ZoomMeetingAttendanceWindow[] = [],
 ): ZoomMeetingInstanceCandidate | undefined {
-  const scheduledStartMs = Date.parse(requiredIso(scheduledAt, 'scheduled_at'));
-  const parsedScheduledEnd = Date.parse(scheduledEndAt || '');
-  const scheduledWindow = {
-    startMs: scheduledStartMs,
-    endMs: Number.isFinite(parsedScheduledEnd) && parsedScheduledEnd >= scheduledStartMs
-      ? parsedScheduledEnd
-      : scheduledStartMs + DEFAULT_SCHEDULED_DURATION_MS,
-  };
+  const scheduledWindow = normalizedScheduledWindow(scheduledAt, scheduledEndAt);
+  const scheduledStartMs = scheduledWindow.startMs;
   const attendanceWindows = validWindows(attendance);
   return [...candidates]
     .filter((candidate) => !!candidate.uuid && !!candidateStartMs(candidate))
     .sort((left, right) => {
-      const transcriptDelta = Number(transcriptFiles(right).length > 0) - Number(transcriptFiles(left).length > 0);
-      if (transcriptDelta) return transcriptDelta;
       const leftAttendance = attendanceWindows.reduce((sum, window) => sum + overlapMs(left, window), 0);
       const rightAttendance = attendanceWindows.reduce((sum, window) => sum + overlapMs(right, window), 0);
       const attendanceOverlapDelta = Number(rightAttendance > 0) - Number(leftAttendance > 0);
@@ -390,7 +431,9 @@ export function chooseZoomMeetingCandidate(
       if (rightAttendance !== leftAttendance) return rightAttendance - leftAttendance;
       const leftDistance = Math.abs(candidateStartMs(left) - scheduledStartMs);
       const rightDistance = Math.abs(candidateStartMs(right) - scheduledStartMs);
-      return leftDistance - rightDistance || left.uuid.localeCompare(right.uuid);
+      if (leftDistance !== rightDistance) return leftDistance - rightDistance;
+      const transcriptDelta = Number(transcriptFiles(right).length > 0) - Number(transcriptFiles(left).length > 0);
+      return transcriptDelta || left.uuid.localeCompare(right.uuid);
     })[0];
 }
 
@@ -494,7 +537,8 @@ async function fetchParticipants(
 ): Promise<ZoomParticipantInterval[]> {
   const participants: ZoomParticipantInterval[] = [];
   let nextPageToken = '';
-  do {
+  const seenTokens = new Set<string>();
+  for (let pageCount = 0; pageCount < MAX_PAGES; pageCount += 1) {
     const body = await requireZoomJson(zoomUrl(
       `past_meetings/${zoomUuidPathSegment(uuid)}/participants`,
       { page_size: '300', ...(nextPageToken ? { next_page_token: nextPageToken } : {}) },
@@ -502,9 +546,15 @@ async function fetchParticipants(
     if (Array.isArray(body.participants)) {
       participants.push(...body.participants.map(normalizeParticipant).filter((item): item is ZoomParticipantInterval => !!item));
     }
-    nextPageToken = clean(body.next_page_token);
-  } while (nextPageToken);
-  return participants;
+    const token = clean(body.next_page_token);
+    if (!token) return participants;
+    if (seenTokens.has(token)) {
+      throw new ZoomMeetingRecordsError('zoom_pagination_token_loop', 502, 'Zoom participant pagination token repeated');
+    }
+    seenTokens.add(token);
+    nextPageToken = token;
+  }
+  throw new ZoomMeetingRecordsError('zoom_pagination_limit_exceeded', 502, 'Zoom participant pagination limit exceeded');
 }
 
 function vttOffsetMs(value: string): number | undefined {
@@ -566,12 +616,12 @@ export function parseZoomVtt(vtt: string): ParsedVttCue[] {
 
 async function fetchDirectWithRetry(url: string, options: RequestOptions): Promise<Response> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    const response = await options.fetchImpl(url, { signal: options.signal });
+    const response = await zoomDownloadTokenFetch(url, { signal: options.signal }, { fetchImpl: options.fetchImpl });
     if (response.ok || !retryable(response.status) || attempt === MAX_ATTEMPTS) return response;
     const fallbackMs = 250 * (2 ** (attempt - 1));
-    await options.sleepImpl(response.status === 429
+    await abortableSleep(response.status === 429
       ? retryAfterMs(response, options.nowMs, fallbackMs)
-      : fallbackMs);
+      : fallbackMs, options.sleepImpl, options.signal);
   }
   throw new ZoomMeetingRecordsError('zoom_download_retry_exhausted', 502);
 }
@@ -581,7 +631,7 @@ async function downloadZoomText(
   env: ZoomMeetingRecordsEnv,
   options: RequestOptions,
   downloadAccessToken?: string,
-): Promise<string> {
+): Promise<{ body: string; contentType: string }> {
   let response = await fetchZoomResponse(downloadUrl, env, options);
   if (!response.ok && (response.status === 401 || response.status === 403) && downloadAccessToken) {
     const fallbackUrl = new URL(downloadUrl);
@@ -591,7 +641,15 @@ async function downloadZoomText(
   if (!response.ok) {
     throw new ZoomMeetingRecordsError('zoom_transcript_download_failed', 502, `Zoom transcript download failed (HTTP ${response.status})`);
   }
-  return response.text();
+  return { body: await response.text(), contentType: clean(response.headers.get('content-type')).toLowerCase() };
+}
+
+function validZoomVttBody(body: string, contentType: string): boolean {
+  const trimmed = body.trim();
+  if (!trimmed) return false;
+  if (contentType.includes('text/html') || /^\s*<(?:!doctype\s+html|html)(?:\s|>)/i.test(trimmed)) return false;
+  return contentType.includes('text/vtt')
+    || /(?:^|\n)\s*(?:\d+:)?\d{2}:\d{2}[.,]\d{3}\s+-->\s+(?:\d+:)?\d{2}:\d{2}[.,]\d{3}(?:\s|$)/m.test(body);
 }
 
 async function downloadClassicTranscripts(
@@ -601,8 +659,10 @@ async function downloadClassicTranscripts(
 ): Promise<{ files: ParsedTranscriptFile[]; complete: boolean }> {
   const files = transcriptFiles(candidate.stored);
   const downloadable = files.filter((file) => file.download_url && file.recording_start);
-  const parsed = await Promise.all(downloadable.map(async (file): Promise<ParsedTranscriptFile> => {
-    const cues = parseZoomVtt(await downloadZoomText(file.download_url || '', env, options, candidate.downloadAccessToken));
+  const outcomes = await Promise.all(downloadable.map(async (file): Promise<ParsedTranscriptFile | null> => {
+    const downloaded = await downloadZoomText(file.download_url || '', env, options, candidate.downloadAccessToken);
+    if (!validZoomVttBody(downloaded.body, downloaded.contentType)) return null;
+    const cues = parseZoomVtt(downloaded.body);
     const recordingStartMs = Date.parse(file.recording_start || '');
     const lines = cues.map((cue): ZoomTranscriptLine => ({
       start_time: new Date(recordingStartMs + cue.startOffsetMs).toISOString(),
@@ -613,7 +673,9 @@ async function downloadClassicTranscripts(
     }));
     return { file, cues, lines };
   }));
-  return { files: parsed, complete: files.length > 0 && parsed.length === files.length };
+  const parsed = outcomes.filter((file): file is ParsedTranscriptFile => !!file);
+  const cueCount = parsed.reduce((sum, file) => sum + file.cues.length, 0);
+  return { files: parsed, complete: files.length > 0 && parsed.length === files.length && cueCount > 0 };
 }
 
 export function zoomTimestampQuality(files: ParsedTranscriptFile[]): ZoomTimestampQuality {
@@ -682,7 +744,13 @@ async function probeMeetingTranscript(
     }
     const download = await fetchZoomResponse(clean(body.download_url), env, options);
     if (!download.ok) return { state: { status: 'error', checked_at: checkedAt }, cues: [] };
-    const cues = parseZoomVtt(await download.text());
+    const downloadBody = await download.text();
+    const contentType = clean(download.headers.get('content-type')).toLowerCase();
+    if (!validZoomVttBody(downloadBody, contentType)) {
+      return { state: { status: 'not_ready', checked_at: checkedAt }, cues: [] };
+    }
+    const cues = parseZoomVtt(downloadBody);
+    if (!cues.length) return { state: { status: 'not_ready', checked_at: checkedAt }, cues: [] };
     return {
       state: {
         status: 'ready',
@@ -693,6 +761,7 @@ async function probeMeetingTranscript(
       cues,
     };
   } catch {
+    if (options.signal?.aborted) throw options.signal.reason;
     return { state: { status: 'error', checked_at: checkedAt }, cues: [] };
   }
 }
@@ -731,6 +800,11 @@ function responseFromJob(job: ZoomMeetingJobState): ZoomMeetingTranscriptResult 
   const chosen = candidateByUuid(job);
   const result: ZoomMeetingTranscriptResult = {
     status: job.status,
+    ...(job.status === 'no_record'
+      ? { reason: chosen ? 'recording_missing' as const : 'instance_not_found' as const }
+      : job.status === 'not_generated'
+        ? { reason: 'transcript_not_generated' as const }
+        : {}),
     participants: job.participants || [],
     ...(chosen ? {
       record: {
@@ -814,13 +888,15 @@ async function runCatchUp(
   const nowMs = rawOptions.nowMs ?? Date.now();
   const key = meetingKey(meetingId, scheduledAt);
   const current = loadState(recordsRef.path).meetings[key];
+  const inputHash = selectionInputHash(scheduledAt, scheduledEndAt, input.attendance);
+  const selectionInputsChanged = !!current && current.selection_input_hash !== inputHash;
   const enabledProbe = probeEnabled(env);
   const terminalRetryDue = !!current?.terminal
     && current.status !== 'ready'
     && providerArtifactTerminalRecheckDue(current, nowMs, TERMINAL_RECHECK_MS);
   const shouldRefreshProbe = probeRecheckDue(current, nowMs, enabledProbe);
-  if ((current?.terminal && !terminalRetryDue && !shouldRefreshProbe)
-    || (current?.next_check_at && nowMs < Date.parse(current.next_check_at))) {
+  if (!selectionInputsChanged && ((current?.terminal && !terminalRetryDue && !shouldRefreshProbe)
+    || (current?.next_check_at && nowMs < Date.parse(current.next_check_at)))) {
     return responseFromJob(current);
   }
 
@@ -831,7 +907,7 @@ async function runCatchUp(
     signal: rawOptions.signal,
     logger: rawOptions.logger || ((event, details) => console.info(`[zoom-meeting-records] ${event}`, JSON.stringify(details))),
   };
-  if (shouldRefreshProbe && current) return refreshReadyProbe(current, env, recordsRef, key, options);
+  if (shouldRefreshProbe && current && !selectionInputsChanged) return refreshReadyProbe(current, env, recordsRef, key, options);
 
   const discovered = await discoverCandidates(meetingId, env, options);
   const candidates = discovered.map((candidate) => candidate.stored);
@@ -846,6 +922,7 @@ async function runCatchUp(
     meeting_id: meetingId,
     scheduled_at: scheduledAt,
     ...(scheduledEndAt ? { scheduled_end_at: scheduledEndAt } : {}),
+    selection_input_hash: inputHash,
     candidates,
     ...(chosenStored ? { chosen_instance_uuid: chosenStored.uuid } : {}),
     status: chosenStored?.recordings.length ? 'pending' : 'no_record',

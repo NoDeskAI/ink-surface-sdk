@@ -6,7 +6,7 @@ import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import contract from './fixtures/mtl-protocol-contract.json';
 import { mintMtlToken } from './mtl-receiver-auth';
-import { handleMtlReceiver, listMtlMeetingWindows, type MtlReceiverEnv } from './mtl-receiver';
+import { handleMtlReceiver, isEpochMs, listMtlMeetingWindows, type MtlReceiverEnv } from './mtl-receiver';
 
 // Payload outputs are pinned from meeting-timeline-sdk commit
 // fd13d52a67a915f4afb9a2a7383beedba623114a. Do not import a developer-local SDK here.
@@ -42,7 +42,7 @@ describe('MTL SDK protocol contract', () => {
       } as unknown as ServerResponse;
       const handled = await handleMtlReceiver(req, res, {
         env,
-        now: () => Date.parse('2026-07-15T04:00:00.000Z'),
+        now: () => Date.parse('2026-07-15T06:00:00.000Z'),
         onMeetingEnded: () => {},
       });
       return {
@@ -167,6 +167,26 @@ describe('MTL SDK protocol contract', () => {
           ended_at_ms: end.expected.end_time_ms,
         },
       },
+    });
+  });
+
+  it('rejects protocol timestamps encoded as epoch seconds', async () => {
+    const { call } = await createHarness();
+    const nowMs = Date.parse('2026-07-15T06:00:00.000Z');
+    expect(isEpochMs(contract.epoch_ms_contract.minimum, nowMs)).toBe(true);
+    expect(isEpochMs(nowMs + contract.epoch_ms_contract.future_tolerance_ms, nowMs)).toBe(true);
+    expect(isEpochMs(nowMs + contract.epoch_ms_contract.future_tolerance_ms + 1, nowMs)).toBe(false);
+    const invalid = await call('meeting-session/start', {
+      method: 'POST',
+      body: {
+        ...contract.payload_cases.start.expected,
+        start_time_ms: Math.floor(contract.payload_cases.start.expected.start_time_ms / 1000),
+      },
+    });
+    expect(invalid).toMatchObject({
+      handled: true,
+      status: 400,
+      body: { error: { code: 'mtl_start_time_ms_invalid' } },
     });
   });
 
