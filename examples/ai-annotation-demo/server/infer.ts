@@ -267,6 +267,7 @@ type ImgIn = { role?: string; data: string };
 const ROLE_LABEL: Record<string, string> = {
   ink: '【笔迹图·用户手写已从原文单独抽出、铺白底，识别手写就看这张】',
   composite: '【合成图·墨迹叠在原文上，判断画在哪、圈/划住了什么就看这张】',
+  board: '【完整白板页·白底笔迹，区域坐标在后续 JSON 中给出】',
   // page(原文层)已弃用——原文以整页文字 page_text 为准，不再单独发图
 };
 
@@ -593,6 +594,27 @@ export async function runOcrVlm(payload: any): Promise<{ text: string }> {
   }
   const text = await gateway(system, user, isPage ? 700 : 500, image, payload?.model); // 局部 OCR 随 inferModel 走（kimi/gemini A/B）
   return { text: text.trim() };
+}
+
+/**
+ * 整页白板 OCR：一页只调一次 VLM，整页供上下文，regions 保留 mark 级时间锚。
+ * 返回原始模型文本，码块/多余文字的防御解析统一留给 server/board-ocr.ts。
+ */
+export async function runBoardOcrVlm(payload: any): Promise<string> {
+  const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  if (!image || !regions.length) return '{}';
+  const langHint = typeof payload?.lang_hint === 'string' && payload.lang_hint.trim()
+    ? `\n语言提示：${payload.lang_hint.trim().slice(0, 64)}`
+    : '';
+  const user = `按下列区域转写手写，bbox=[x,y,w,h]且已归一化到 0–1：\n${JSON.stringify(regions)}${langHint}`;
+  return gateway(
+    SYSTEM_PROMPTS.board_ocr,
+    user,
+    Math.min(2400, Math.max(600, regions.length * 100)),
+    [{ role: 'board', data: `data:image/jpeg;base64,${image}` }],
+    payload?.model,
+  );
 }
 
 /**

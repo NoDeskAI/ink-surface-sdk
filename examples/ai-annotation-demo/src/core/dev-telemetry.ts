@@ -28,7 +28,8 @@ export type DevEventKind =
   | 'relviz'     // 关系图可视化（dev 叠层）调试
   | 'bedrock'    // 基岩录制（Tier 1 影子）：起段(profile/锚) + 每次 flush 的采样块摘要(帧数/seq区间/首末帧)
   | 'reflow'     // 重排锚定：draw=落笔每笔命中的重排块(id/runs/屏幕中心·看多笔是否跨段)；reproj=mark 的 live 落点 vs 重投影落点 + 认到的块（live==restored 即逐笔块锚恒等·不漂；查漂移/塌缩用）
-  | 'meeting';   // 会议 panel 同步：sync 起止/成败/事件数、live_unread 提醒 toast 展示/点击/消失（低频·诊断"同步没跑"vs"提醒UI太弱"用）
+  | 'meeting'    // 会议 panel 同步：sync 起止/成败/事件数、live_unread 提醒 toast 展示/点击/消失（低频·诊断"同步没跑"vs"提醒UI太弱"用）
+  | 'board_ocr'; // 会后/离板整页 OCR：只记 document/计数/耗时，不记识别文本
 
 import { settings } from '../app/state';
 

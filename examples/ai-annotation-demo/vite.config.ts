@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite';
 import type { Plugin } from 'vite';
-import { runReflow, runReflowAi, reflowAiStream, chatStream, runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReflowVlm } from './server/infer';
+import { runReflow, runReflowAi, reflowAiStream, chatStream, runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReflowVlm } from './server/infer';
+import { handleBoardOcrHttp } from './server/board-ocr';
 import { debugEvent, debugSnapshot } from './server/debug.mjs';
 import { runOcrLayout } from './server/ocr-layout-dev.mjs'; // dev-only：扫描页带坐标 OCR（mac_runner），不进生产代理
 import { runInterpretHwr } from './server/hwr-dev.mjs';     // dev-only：英文手写识别（OpenVINO 徐方案模型），不进生产代理
@@ -250,6 +251,18 @@ function inferenceProxy(env: Record<string, string>): Plugin {
             }
           });
         });
+      server.middlewares.use('/api/ink/board-ocr', (req, res) => {
+        void (async () => {
+          const session = await requireDeviceSessionDev(req, res);
+          if (!session) return;
+          await handleBoardOcrHttp(req, res, runBoardOcrVlm);
+        })().catch((error) => {
+          if (res.writableEnded) return;
+          res.statusCode = 502;
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify({ error: String((error as Error)?.message || error) }));
+        });
+      });
       // dev-only 调试通道：客户端镜像 inspect → JSONL + 内存环；GET 快照供外部读。
       post('/api/__debug/event', async (b) => debugEvent(b));
       // dev-only：WS3 对接产物落盘——浏览器(IDB 真数据)产 InkSurface artifacts → 写进协作方 .inkloop-smoke-runs/（其 .gitignore 已忽略）供其 validator/demo 读。relName 限相对路径防穿越。

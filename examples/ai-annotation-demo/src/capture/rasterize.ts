@@ -1,10 +1,46 @@
-import type { StrokePoint } from '../core/contracts';
+import type { NormBBox, StrokePoint } from '../core/contracts';
 import type { Tool } from '../app/state';
 import { styleFor } from './stroke-style';
 
 export interface RasterStroke {
   tool: Tool;
   points: StrokePoint[];
+}
+
+export interface NormalizedPageRasterPlan {
+  sourceWidth: number;
+  sourceHeight: number;
+  width: number;
+  height: number;
+  scale: number;
+}
+
+export function normalizedPageRasterPlan(width: number, height: number, maxLongEdge = 1600): NormalizedPageRasterPlan {
+  const sourceWidth = Number.isFinite(width) && width > 0 ? width : 1000;
+  const sourceHeight = Number.isFinite(height) && height > 0 ? height : 1320;
+  const scale = maxLongEdge / Math.max(sourceWidth, sourceHeight);
+  return {
+    sourceWidth,
+    sourceHeight,
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+    scale,
+  };
+}
+
+/** 给 VLM 的簇区域夹回页内，并给单线/单点退化 bbox 一个可见的最小面积。 */
+export function normalizeBoardOcrBbox(bbox: NormBBox, pad = 0.003): NormBBox {
+  const rawX0 = Number.isFinite(bbox[0]) ? bbox[0] : 0;
+  const rawY0 = Number.isFinite(bbox[1]) ? bbox[1] : 0;
+  const rawX1 = rawX0 + (Number.isFinite(bbox[2]) ? Math.max(0, bbox[2]) : 0);
+  const rawY1 = rawY0 + (Number.isFinite(bbox[3]) ? Math.max(0, bbox[3]) : 0);
+  let x0 = Math.max(0, Math.min(1, rawX0 - pad));
+  let y0 = Math.max(0, Math.min(1, rawY0 - pad));
+  let x1 = Math.max(0, Math.min(1, rawX1 + pad));
+  let y1 = Math.max(0, Math.min(1, rawY1 + pad));
+  if (x1 - x0 < 0.001) { const center = (x0 + x1) / 2; x0 = Math.max(0, Math.min(0.999, center - 0.0005)); x1 = x0 + 0.001; }
+  if (y1 - y0 < 0.001) { const center = (y0 + y1) / 2; y0 = Math.max(0, Math.min(0.999, center - 0.0005)); y1 = y0 + 0.001; }
+  return [x0, y0, x1 - x0, y1 - y0];
 }
 
 function applyStyle(ctx: CanvasRenderingContext2D, tool: Tool, pressure: number): ReturnType<typeof styleFor> {
@@ -68,6 +104,39 @@ export function rasterizeStrokes(strokes: RasterStroke[], pad = 18, max = 900): 
     ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
     for (const st of strokes) drawStroke(ctx, st);
     return cv.toDataURL('image/png');
+  } catch {
+    return undefined;
+  }
+}
+
+/** 将 page_norm 笔迹栅格化成完整白板页 JPEG。 */
+export function rasterizeNormalizedPageJpeg(
+  strokes: RasterStroke[],
+  pageWidth: number,
+  pageHeight: number,
+  maxLongEdge = 1600,
+  quality = 0.8,
+): string | undefined {
+  const plan = normalizedPageRasterPlan(pageWidth, pageHeight, maxLongEdge);
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = plan.width;
+    canvas.height = plan.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, plan.width, plan.height);
+    ctx.setTransform(plan.scale, 0, 0, plan.scale, 0, 0);
+    for (const stroke of strokes) {
+      drawStroke(ctx, {
+        tool: stroke.tool,
+        points: stroke.points.map((point) => ({ ...point, x: point.x * plan.sourceWidth, y: point.y * plan.sourceHeight })),
+      });
+    }
+    const image = canvas.toDataURL('image/jpeg', quality);
+    const rawLength = image.slice(image.indexOf(',') + 1).length;
+    const estimatedBytes = Math.floor(rawLength * 3 / 4);
+    return estimatedBytes <= 1_450_000 ? image : undefined;
   } catch {
     return undefined;
   }

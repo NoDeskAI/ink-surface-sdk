@@ -22,8 +22,9 @@ import { homedir } from 'node:os';
 import { assertNonEmptyVaultRelease, guardPanelVaultReqUrl, panelVaultGuardPayload, resolvePanelVaultGuardUser } from './panel-vault-guard';
 import {
   runReflow, runReflowAi, reflowAiStream, chatStream,
-  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
+  runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
 } from './infer';
+import { handleBoardOcrHttp } from './board-ocr';
 import { runOcrLayout } from './ocr-layout-dev.mjs';
 import { createRuntimeSyncDevHandler } from './runtime-sync-dev';
 import { JsonlRuntimeSyncEventStore } from './runtime-sync-store';
@@ -2675,6 +2676,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // P0 安全止血：feishu-service / convert-service GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/feishu-svc')) { await handleFeishuService(req, res); return; }
   if (url.startsWith('/api/convert')) { await handleConvertService(req, res); return; }
+  // 白板 OCR 含整页手记图：必须先过设备 session 门，且绕开通用 25MB 推理 body 上限。
+  if (url === '/api/ink/board-ocr') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    await handleBoardOcrHttp(req, res, runBoardOcrVlm);
+    return;
+  }
   if (req.method !== 'POST') { res.statusCode = 405; res.end('POST only'); return; }
 
   try {

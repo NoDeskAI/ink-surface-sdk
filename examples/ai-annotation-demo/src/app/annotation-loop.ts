@@ -164,6 +164,12 @@ async function waitContentMarks(): Promise<void> {
   try { await contentMarkWrites; } catch { /* appendMarkEntry best-effort */ }
 }
 
+/** 离开白板前收口最后一簇普通笔，并等它真正进账本；不改组装判定与 AI session。 */
+export async function flushBoardOcrMarks(): Promise<void> {
+  flushRegion('manual');
+  await waitContentMarks();
+}
+
 function expandedTextHitBbox(bbox: NormBBox, tool: Stroke['tool']): NormBBox {
   const padX = tool === 'underline' ? 0.012 : 0.006;
   const padTop = tool === 'underline' ? 0.035 : 0.012;

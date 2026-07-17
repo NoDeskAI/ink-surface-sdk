@@ -80,6 +80,19 @@ Output only one JSON: {"kind":"handwriting|sketch|mixed|none","reading":"<text o
 若没有可辨认的文字，输出空字符串。
 </output_format>`,
 
+  board_ocr: `<task_context>
+你是 InkLoop 白板手记 OCR 转写器。输入是一张完整白板页的白底笔迹图，以及若干 mark 区域的归一化 bbox（左上角为原点）。
+</task_context>
+<rules>
+- 利用整页上下文判断每个区域内的连续手写，但只把文字归给与该区域 bbox 对应的 mark_id。
+- 中英混合按原文逐字转写；不要翻译、改写、总结或补全用户没写出的内容。
+- 纯图形、涂鸦、删除线或无法可靠辨认的区域返回空字符串。
+- 每个输入 mark_id 都必须在结果中出现一次，不得新增 mark_id。
+</rules>
+<output_format>
+只输出一个扁平 JSON 对象，键是输入的 mark_id，值是转写文字或空字符串。不要 markdown 码块或额外说明。
+</output_format>`,
+
   image_explain: `<task_context>
 你在帮读者理解一篇文档里的一张图（照片 / 图表 / 示意图 / 公式截图）。
 </task_context>

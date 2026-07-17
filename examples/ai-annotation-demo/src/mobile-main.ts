@@ -12,7 +12,8 @@ import { initAnchorLayer } from './surface/anchor-layer';
 import { buildRecords, initInsightPanel } from './surface/insight-panel';
 import { initReader, readerFlip, readerArmBackward, readerVInfo, readerSetVPage, readerFocusMark, readerFocusOverlay, readerDocumentPageInfo, readerPageCountForSource } from './surface/reader';
 import { initDevOverlay } from './dev/dev-overlay';
-import { wireAnnotationLoop, flushRegion } from './app/annotation-loop';
+import { wireAnnotationLoop, flushBoardOcrMarks, flushRegion } from './app/annotation-loop';
+import { triggerBoardOcr } from './capture/board-ocr';
 import { setTool, getActiveContext, state, settings, saveSettings, bus, currentStrokes, strokeMarkIds, type Stroke, type Tool } from './app/state';
 import type { NormBBox, ScreenOverlay, StrokePoint } from './core/contracts';
 import { DEVICE_ID, pageIdFor, shortId } from './core/ids';
@@ -763,8 +764,15 @@ function showWritable(read: 'new' | 'book' = 'new'): void {
   document.body.classList.add('writable'); // 模块切视图时自己点亮工具格子（不依赖 inline updateWritable）
 }
 
+function triggerDiaryBoardOcrOnLeave(): void {
+  const documentId = state.surfaceType === 'whiteboard' && state.documentId?.startsWith('diary') ? state.documentId : null;
+  if (!documentId) return;
+  void flushBoardOcrMarks().then(() => triggerBoardOcr(documentId));
+}
+
 /** 点「新日记」=先建并落库一份新日记文件，再渲染空白可写页。 */
 async function newDiary(): Promise<void> {
+  triggerDiaryBoardOcrOnLeave();
   const d = new Date();
   const title = `${d.getMonth() + 1}.${d.getDate()} 日记`;
   const id = shortId('diary');
@@ -781,6 +789,7 @@ async function newDiary(): Promise<void> {
 
 /** 重开一篇已存日记（从日记列表点开）。 */
 function openDiary(doc: PersistedDoc): void {
+  if (state.documentId !== doc.document_id) triggerDiaryBoardOcrOnLeave();
   const title = doc.filename || '未命名';
   showWritable('new'); // 必须先让写区可见——隐藏时 stage-wrap.clientWidth=0，纸会被算成 0 宽
   titleEl.contentEditable = 'true';
@@ -2188,6 +2197,10 @@ bus.on('mark:resolved', (p) => {
 
 // 点「新日记」即新建（即便已在新日记页也另起一份）。
 el('read-sub').querySelector<HTMLElement>('[data-read="new"]')?.addEventListener('click', () => void newDiary());
+// 导航切走即视为离开日记画板；监听注册在 shell 之后，但判定只读尚未被新 surface 覆盖的 state.documentId。
+document.querySelectorAll<HTMLElement>('.nav [data-mode], #read-sub [data-read]').forEach((button) => {
+  button.addEventListener('click', triggerDiaryBoardOcrOnLeave);
+});
 if (document.body.dataset.read === 'new') void newDiary();
 
 // ════ 翻页（多页日记） ════
@@ -2509,6 +2522,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pagehide', () => {
   flushBookReadingProgress();
   disarmM103HqHwAreaNow();
+  triggerDiaryBoardOcrOnLeave();
 });
 window.addEventListener('beforeunload', () => {
   disarmM103HqHwAreaNow();

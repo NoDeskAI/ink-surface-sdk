@@ -718,6 +718,27 @@ export function appendMarkEntry(
   });
 }
 
+/**
+ * 给可见 mark 追加一条折叠 revision。保留 canonical id/原始语义时间，不就地改账本。
+ * 调用方应传最新折叠条目；长耗时任务在调用前需重读，避免覆盖擦除/远端修订。
+ */
+export async function appendMarkRevision(
+  base: PersistedMark,
+  patch: Partial<Omit<PersistedMark, 'entry_id' | 'seq' | 'created_at' | 'schema_version' | 'document_id' | 'mark_id'>>,
+  options: { notifyRuntime?: boolean } = {},
+): Promise<Omit<PersistedMark, 'entry_id' | 'seq' | 'created_at'>> {
+  const { entry_id: _entryId, seq: _seq, created_at, schema_version: _schemaVersion, ...rest } = base;
+  const revision = {
+    ...rest,
+    ...patch,
+    document_id: base.document_id,
+    mark_id: base.mark_id,
+    source_created_at: base.source_created_at ?? created_at,
+  };
+  await appendMarkEntry(revision, options);
+  return revision;
+}
+
 /** 基岩：写一段录制头（每段一次）。 */
 export function appendInkSegment(seg: PersistedInkSegment): Promise<void> {
   return appendEntry(INK_SEGMENTS, seg);

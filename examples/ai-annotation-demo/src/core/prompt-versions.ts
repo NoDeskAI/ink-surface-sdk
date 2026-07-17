@@ -9,6 +9,7 @@ export const PROMPT_VERSIONS = {
   ink_classifier: 'v3',     // /api/interpret 笔迹「手写 vs 画」分类 + 转写 + 草图描述
   context_classifier: 'v3', // /api/classify-context respond/fold
   ocr: 'v3',                // /api/ocr-vlm 转写
+  board_ocr: 'v1',          // /api/ink/board-ocr 整页白板按 mark bbox 转写
   image_explain: 'v3',      // /api/explain-image 图解读
   reflow_refine: 'v3',      // /api/reflow 逐块精修
   reflow_structure: 'v3',   // /api/reflow-ai[-stream] 结构重建

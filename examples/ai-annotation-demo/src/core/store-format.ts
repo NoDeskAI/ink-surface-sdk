@@ -19,7 +19,7 @@ import type { RawRef } from './bedrock';
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
 export const DB_VERSION = 11;     // v10→v11：library_sync（Cloud Hub/本地 Library manifest 状态）。任何升级都自愈缺表。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
 export type MarkEntrySchemaVersion = '3' | '4' | '5' | '6';
-export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '6'; // v5→v6：mark 可选带真实起笔墙钟 pen_down_at。additive·不 bump STORE_VERSION·旧条目回退 abs_timestamp。
+export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '6'; // v6 持续允许 additive 可选字段：pen_down_at + 白板 OCR 标记；不 bump STORE_VERSION。
 
 /** 一张图的解读：图本身可从 PDF 重渲，故只存 bbox + 文字解读。 */
 export interface PersistedImage {
@@ -174,7 +174,7 @@ export interface BaseEntry {
 
 /** 页账本条目 = 一次组装手势（marks store）。is_tombstone=true 表示擦除携同 mark_id。 */
 export interface PersistedMark extends BaseEntry {
-  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface；v4=entity refs；v5=reader layout；v6=pen_down_at。新条目写当前版本。
+  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface；v4=entity refs；v5=reader layout；v6=可选 pen_down_at/OCR 标记。新条目写当前版本。
   mark_id: string;                  // = 代表 event 的 event_id，跨 reload 稳定引用
   strokes: PersistedStroke[];       // 构成笔（tool+points），redraw 保真（不存合并点）
   bbox: NormBBox;                   // union bbox
@@ -199,6 +199,9 @@ export interface PersistedMark extends BaseEntry {
   hmp: HMP | null;                 // 取证（落库前剥掉 crop_ref/vector_ref，存料不存图）
   marked_text: string;             // 落笔当时解析好的"所标内容"
   ai_eligible?: boolean;           // 笔触划分（Phase P）：是否进 AI 管线。false=普通笔/荧光纯内容（不识别/不答问/不进 pending session）；true/缺=AI 笔触或旧自动判意（reload 仍可综合）。getPendingMarks 据此排除内容笔
+  ocr_at?: number;                 // 白板整页 OCR 最近一次成功返回（含空结果）的 epoch ms。v6 additive，不升格式版本。
+  ocr_fingerprint?: string;        // 当次 OCR 对应的笔迹内容指纹；内容未变时不重复请求。
+  ocr_empty?: boolean;             // 模型对该指纹返空；保留原占位文本，并阻止空结果重试风暴。
   origin?: 'pen' | 'ai_pen' | 'highlighter' | 'underline' | 'auto'; // 来源：普通笔 / AI 笔 / 荧光 / 下划线 / 自动判意模式。诊断+将来策略用；缺=旧条目
   raw_ref?: RawRef;                // → 基岩录像的对应段+seq 区间（仅 features/settings.bedrock 开时有；老条目缺=undefined）
   reflow_anchor_runs?: string[];   // 位置真相锚：重排面落笔时所在重排块的 source run ids → 重投影时认它定段（恒等·不靠坐标猜）。仅重排落笔有；原版落笔/老条目缺=undefined（退 nearestBlockByBbox 近似）
