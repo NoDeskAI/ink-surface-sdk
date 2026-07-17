@@ -335,6 +335,13 @@ export interface PersistedMeetingMaterialLink {
   error?: string;                  // 上一次尝试失败的原因（导出 PDF 403/超时等）
 }
 
+export interface PersistedMeetingProviderParticipant {
+  name: string;
+  joined_at: string;
+  left_at: string;
+  identity: 'signed_in' | 'external_email' | 'anonymous';
+}
+
 /** 一场会议：属某 workspace，引用资料（已导入书的 document_id），会后留手写档案 + 思路总结。 */
 export interface PersistedMeeting {
   meeting_id: string;               // 'mtg_'+shortId
@@ -355,6 +362,7 @@ export interface PersistedMeeting {
   provider_transcript_ref?: string;    // 平台转写工件 ID；Google transcript.name，Teams callTranscript.id
   provider_transcript_status?: 'ready' | 'pending' | 'not_generated' | 'no_record';
   provider_transcript_reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
+  provider_participants?: PersistedMeetingProviderParticipant[]; // 平台参会区间；optional additive，旧记录零迁移
   google_smart_note?: { text: string; export_uri?: string; fetched_at: string }; // Gemini 官方智能纪要纯文本（Drive export）
   google_smart_note_scope_missing?: boolean; // 旧 OAuth token 缺 drive.readonly，提示用户重授权
   google_recordings?: Array<{ export_uri: string; state: string }>; // Meet 录像 Drive 引用；只存可打开链接

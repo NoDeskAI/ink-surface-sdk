@@ -36,6 +36,7 @@ import { stampExportId, stableToken } from './export-ids';
 import { meetingPlatformOf, providerOccurrenceToken, providerTranscriptCacheToken } from '../../mobile/meeting-platform';
 import { markTime } from '../../core/mark-time';
 import { isUnrecognizedHandwritingText } from '../../app/mark-text';
+import { aggregateProviderParticipants, providerParticipantLines } from '../../features/meeting/provider-participants';
 
 const DOC_PROJECTION_SCHEMA_VERSION = 'inkloop.document_projection.v1' as const;
 const KO_EXPORT_SCHEMA_VERSION = 'inkloop.knowledge_export.v1' as const;
@@ -210,20 +211,28 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
   });
   const segMarks = timeline.segmentMarks;
   const segments = timeline.segments;
-  if (!segments.length) warnings.push('本场既无转写也无手写——仅可能含总结');
+  const participantGroups = aggregateProviderParticipants(m.provider_participants);
+  if (!segments.length && !participantGroups.length) warnings.push('本场既无转写也无手写——仅可能含总结');
 
   // ③ 文档投影块：段 → heading + 各 cue para。同步收集「段 idx → heading 块 id」。
   const pageId = pageIdFor(documentId, 0);
-  const rawBlocks: { block: BlockShell; segIndex: number; isHeading: boolean }[] = [];
+  const rawBlocks: { block: BlockShell; segIndex?: number; isSegmentHeading: boolean }[] = [];
   const digestOf = (s: RecapSegment): string => (s.heuristicSummary || '（这段）').trim();
+
+  if (participantGroups.length) {
+    rawBlocks.push({ isSegmentHeading: false, block: blockShell('heading', `参会（${participantGroups.length} 人）`, pageId, 2) });
+    for (const line of providerParticipantLines(m.provider_participants)) {
+      rawBlocks.push({ isSegmentHeading: false, block: blockShell('paragraph', line, pageId) });
+    }
+  }
 
   for (let si = 0; si < segments.length; si++) {
     const s = segments[si];
     const headTxt = `${digestOf(s)}　〔${rng(s.startMs, s.endMs)}〕`;
-    rawBlocks.push({ segIndex: si, isHeading: true, block: blockShell('heading', headTxt, pageId, 2) });
+    rawBlocks.push({ segIndex: si, isSegmentHeading: true, block: blockShell('heading', headTxt, pageId, 2) });
     for (const c of s.cues) {
       const txt = `${c.speaker ? c.speaker + '：' : ''}${c.text}`;
-      rawBlocks.push({ segIndex: si, isHeading: false, block: blockShell('paragraph', txt, pageId, undefined) });
+      rawBlocks.push({ segIndex: si, isSegmentHeading: false, block: blockShell('paragraph', txt, pageId, undefined) });
     }
   }
 
@@ -233,7 +242,7 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
   let offset = 0;
   const blocks: ProjectionBlock[] = [];
   for (let i = 0; i < rawBlocks.length; i++) {
-    const { block, segIndex, isHeading } = rawBlocks[i];
+    const { block, segIndex, isSegmentHeading } = rawBlocks[i];
     const bbox = bandBBox(i, N);
     const block_id = `blk_${String(i + 1).padStart(3, '0')}_${await stableToken(`${documentId}|${i}|${block.text_md}`)}`;
     const text_md = block.text_md;
@@ -244,7 +253,7 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
       knowledge_object_ids: [],
     };
     blocks.push(full);
-    if (isHeading) segHeadingId[segIndex] = block_id;
+    if (isSegmentHeading && segIndex != null) segHeadingId[segIndex] = block_id;
     offset += text_md.length + 1;
   }
 

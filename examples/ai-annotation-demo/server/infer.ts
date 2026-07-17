@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { SYSTEM_PROMPTS, type PromptRole } from './prompts';
+import { buildMeetingPanelSummaryPrompts, SYSTEM_PROMPTS, type MeetingPanelSummaryHandwritingSections, type PromptRole } from './prompts';
 
 /**
  * 推理网关代理（Node 侧，仅 dev server 内运行）。
@@ -440,11 +440,46 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
   if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
   const model = String(payload?.model || cfg().model);
-  const user = JSON.stringify({ platform, meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
-  const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
+  const handwritingSections = normalizeMeetingPanelHandwritingSections(payload?.handwriting_sections);
+  const prompt = buildMeetingPanelSummaryPrompts({
+    platform,
+    meeting_title: title,
+    transcript,
+    ...(smartNote ? { smart_note: smartNote } : {}),
+    ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
+  });
+  const raw = await gateway(prompt.system, prompt.user, 1800, undefined, model);
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
+}
+
+function normalizeMeetingPanelHandwritingSections(value: unknown): MeetingPanelSummaryHandwritingSections | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  let remaining = 8_000;
+  const take = (raw: unknown, max = 500): string => {
+    if (remaining <= 0 || typeof raw !== 'string') return '';
+    const text = raw.trim().slice(0, Math.min(max, remaining));
+    remaining -= text.length;
+    return text;
+  };
+  const textList = (raw: unknown): string[] => Array.isArray(raw)
+    ? raw.slice(0, 80).map((item) => take(item)).filter(Boolean)
+    : [];
+  const preMeeting = textList(source.pre_meeting);
+  const inMeeting = Array.isArray(source.in_meeting)
+    ? source.in_meeting.slice(0, 80).flatMap((raw) => {
+      if (!raw || typeof raw !== 'object') return [];
+      const item = raw as Record<string, unknown>;
+      const relativeTime = take(item.relative_time, 24);
+      const text = take(item.text);
+      return text ? [{ relative_time: relativeTime, text }] : [];
+    })
+    : [];
+  const postMeeting = textList(source.post_meeting);
+  if (!preMeeting.length && !inMeeting.length && !postMeeting.length) return undefined;
+  return { pre_meeting: preMeeting, in_meeting: inMeeting, post_meeting: postMeeting };
 }
 
 

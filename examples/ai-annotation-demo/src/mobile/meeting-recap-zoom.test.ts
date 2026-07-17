@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   mutateMeeting: vi.fn(),
   updateMeeting: vi.fn(),
   fetchZoomMeetingTranscript: vi.fn(),
+  getFoldedMarksByContext: vi.fn(),
+  triggerBoardOcr: vi.fn(),
   meetings: new Map<string, PersistedMeeting>(),
   appliedPatches: [] as Array<Partial<PersistedMeeting>>,
 }));
@@ -19,6 +21,12 @@ vi.mock('../local/store', async (importOriginal) => ({
   getMeeting: mocks.getMeeting,
   mutateMeeting: mocks.mutateMeeting,
   updateMeeting: mocks.updateMeeting,
+  getFoldedMarksByContext: mocks.getFoldedMarksByContext,
+}));
+
+vi.mock('../capture/board-ocr', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../capture/board-ocr')>(),
+  triggerBoardOcr: mocks.triggerBoardOcr,
 }));
 
 vi.mock('../integration/zoom/client', async (importOriginal) => ({
@@ -35,6 +43,7 @@ import {
   recapTranscriptRetryLabel,
   recapTranscriptSpeakerLabel,
   renderRecapCard,
+  renderProviderParticipantsOverview,
   zoomTranscriptAlignmentLabel,
 } from './meeting-recap';
 
@@ -66,6 +75,8 @@ describe('meeting recap Zoom transcript branch', () => {
     mocks.getCachedMinute.mockResolvedValue(null);
     mocks.putCachedMinute.mockResolvedValue(undefined);
     mocks.updateMeeting.mockResolvedValue(null);
+    mocks.getFoldedMarksByContext.mockResolvedValue([]);
+    mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-zoom-1', marks: 0, ok: 0, empty: 0, ms: 0 });
     mocks.getMeeting.mockImplementation(async (id: string) => mocks.meetings.get(id) ?? null);
     mocks.mutateMeeting.mockImplementation(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
       const current = mocks.meetings.get(id);
@@ -102,7 +113,10 @@ describe('meeting recap Zoom transcript branch', () => {
   it('caches ready SRT and writes the complete actual-session anchor without undefined fields', async () => {
     mocks.fetchZoomMeetingTranscript.mockResolvedValue({
       status: 'ready',
-      participants: [{ display_name: 'Ada', identity_quality: 'signed_in' }],
+      participants: [{
+        display_name: 'Ada', identity_quality: 'signed_in',
+        join_time: '2026-07-18T01:02:00.000Z', leave_time: '2026-07-18T01:47:00.000Z',
+      }],
       instance_uuid: '/zoom-instance-1',
       t0: '2026-07-18T01:02:00.000Z',
       started_at: '2026-07-18T01:02:00.000Z',
@@ -141,7 +155,17 @@ describe('meeting recap Zoom transcript branch', () => {
       align_state: 'event',
       started_at: '2026-07-18T01:02:00.000Z',
       ended_at: '2026-07-18T01:47:00.000Z',
+      provider_participants: [{
+        name: 'Ada', identity: 'signed_in',
+        joined_at: '2026-07-18T01:02:00.000Z', left_at: '2026-07-18T01:47:00.000Z',
+      }],
     });
+    expect(mocks.appliedPatches[0]).toEqual(expect.objectContaining({
+      provider_participants: [{
+        name: 'Ada', identity: 'signed_in',
+        joined_at: '2026-07-18T01:02:00.000Z', left_at: '2026-07-18T01:47:00.000Z',
+      }],
+    }));
     const applied = mocks.appliedPatches[0] as Record<string, unknown>;
     expect(Object.values(applied)).not.toContain(undefined);
     expect(mocks.putCachedMinute).toHaveBeenCalledWith(expect.objectContaining({
@@ -149,6 +173,21 @@ describe('meeting recap Zoom transcript branch', () => {
       meeting_id: 'local-zoom-1',
       duration_ms: 45 * 60_000,
     }));
+  });
+
+  it('renders a lightweight participant section without replacing the transcript speaker count', () => {
+    const meeting = zoomMeeting({
+      provider_participants: [
+        { name: 'Ada', joined_at: '2026-07-18T09:00:00', left_at: '2026-07-18T09:20:00', identity: 'signed_in' },
+        { name: 'Ada', joined_at: '2026-07-18T09:30:00', left_at: '2026-07-18T09:45:00', identity: 'signed_in' },
+        { name: '外部同事', joined_at: '2026-07-18T09:05:00', left_at: '2026-07-18T09:15:00', identity: 'external_email' },
+      ],
+    });
+
+    expect(renderProviderParticipantsOverview(meeting)).toMatchInlineSnapshot(`
+      "<section class=\"rc-over-participants\" id=\"rc-participants\"><div class=\"rc-sec-title\"><b>参会（2 人）</b></div><div class=\"rc-participant-list\"><span class=\"rc-participant-li\">Ada · 共 35 分钟 · 2 段：09:00–09:20、09:30–09:45</span><span class=\"rc-participant-li\">外部同事（访客） · 共 10 分钟 · 09:05–09:15</span></div></section>"
+    `);
+    expect(renderProviderParticipantsOverview(zoomMeeting())).toBe('');
   });
 
   it.each(['provider_event', 'recording_event'] as const)('does not regress an existing %s stronger anchor', async (t0Source) => {
@@ -227,7 +266,10 @@ describe('meeting recap Zoom transcript branch', () => {
       meeting.scheduled_at = '2026-07-19T01:00:00.000Z';
       return {
         status: 'ready',
-        participants: [],
+        participants: [{
+          display_name: 'Stale participant', identity_quality: 'signed_in',
+          join_time: '2026-07-18T01:00:00.000Z', leave_time: '2026-07-18T01:30:00.000Z',
+        }],
         instance_uuid: '/stale-instance',
         transcript: {
           name: 'stale-transcript',
@@ -323,6 +365,8 @@ describe('meeting recap Zoom transcript branch', () => {
     const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
     expect(request.transcript).toContain('[0:01]Ada：确认发布 Zoom 会后恢复。');
     expect(request.smart_note).toBeUndefined();
+    expect(request.handwriting_sections).toBeUndefined();
+    expect(request.platform).toBe('zoom');
     expect(summary).toMatchObject({
       minute_token: ZOOM_CACHE_TOKEN,
       meeting_id: '/zoom-instance-1',

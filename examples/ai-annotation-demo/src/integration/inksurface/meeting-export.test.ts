@@ -85,6 +85,43 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     }))).toEqual(['microsoft_teams:local-teams-meeting']);
   });
 
+  it('会议 markdown 投影在有参会数据时增加聚合区间，无数据时不增加', async () => {
+    const withParticipants = await assembleMeetingL1Export(input({
+      meeting: meeting({
+        platform: 'zoom',
+        provider_participants: [
+          { name: 'Ada', joined_at: '2026-07-18T09:00:00', left_at: '2026-07-18T09:20:00', identity: 'signed_in' },
+          { name: 'Ada', joined_at: '2026-07-18T09:30:00', left_at: '2026-07-18T09:45:00', identity: 'signed_in' },
+          { name: '外部同事', joined_at: '2026-07-18T09:05:00', left_at: '2026-07-18T09:15:00', identity: 'anonymous' },
+        ],
+      }),
+    }), OPTS);
+    const participantBlocks = withParticipants.documentProjections.document_projections[0].blocks.slice(0, 3)
+      .map(({ kind, heading_level, text_md }) => ({ kind, heading_level, text_md }));
+
+    expect(participantBlocks).toMatchInlineSnapshot(`
+      [
+        {
+          "heading_level": 2,
+          "kind": "heading",
+          "text_md": "参会（2 人）",
+        },
+        {
+          "heading_level": undefined,
+          "kind": "paragraph",
+          "text_md": "Ada · 共 35 分钟 · 2 段：09:00–09:20、09:30–09:45",
+        },
+        {
+          "heading_level": undefined,
+          "kind": "paragraph",
+          "text_md": "外部同事（访客） · 共 10 分钟 · 09:05–09:15",
+        },
+      ]
+    `);
+    const withoutParticipants = await assembleMeetingL1Export(input(), OPTS);
+    expect(withoutParticipants.documentProjections.document_projections[0].blocks.some((block) => block.text_md.startsWith('参会（'))).toBe(false);
+  });
+
   it('手写零丢失：每笔 → 一条 annotation KO', async () => {
     const out = await assembleMeetingL1Export(input(), OPTS);
     const anns = out.knowledgeExport.objects.filter((k) => k.kind === 'annotation');

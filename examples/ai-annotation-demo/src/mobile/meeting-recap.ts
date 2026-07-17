@@ -18,11 +18,13 @@ import { publishEntityToVault } from '../integration/inksurface/vault-publish-de
 import type { PersistedMeeting, PersistedMark, PanelMeetingSummaryRecord, FeishuNoteSummaryRecord } from '../core/store-format';
 import { hasMeetingInk, renderMeetingInkPageSvg, type MeetingInkPage } from './meeting-ink-preview';
 import { getGoogleMeetingTranscript } from '../integration/google-meet/client';
-import { fetchZoomMeetingTranscript, type ZoomTimestampQuality } from '../integration/zoom/client';
+import { fetchZoomMeetingTranscript, type ZoomTimestampQuality, type ZoomTranscriptParticipant } from '../integration/zoom/client';
 import { meetingPlatformOf, meetingTranscriptSource, providerOccurrenceToken, providerTranscriptCacheToken } from './meeting-platform';
 import { markTime } from '../core/mark-time';
 import { meetingMarkPhase } from './meeting-home-model';
-import { isUnrecognizedHandwritingText } from '../app/mark-text';
+import { triggerBoardOcr } from '../capture/board-ocr';
+import { buildMeetingHandwritingSections, hasMeetingHandwritingSections, meetingHandwritingSectionLines } from '../features/meeting/meeting-summary-handwriting';
+import { aggregateProviderParticipants, providerParticipantLines } from '../features/meeting/provider-participants';
 
 const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
 type ProviderMeetingSummaryResponse = { summary: PanelMeetingSummaryRecord['summary']; model: string };
@@ -431,6 +433,20 @@ function sameZoomOccurrence(left: Pick<PersistedMeeting, 'scheduled_at'>, rightT
   return providerOccurrenceToken(left.scheduled_at) === rightToken;
 }
 
+function persistedZoomParticipants(participants: ZoomTranscriptParticipant[]): NonNullable<PersistedMeeting['provider_participants']> {
+  return participants.flatMap((participant) => {
+    const name = participant.display_name?.trim();
+    const joinedAt = participant.join_time?.trim();
+    const leftAt = participant.leave_time?.trim();
+    const joinedMs = Date.parse(joinedAt || '');
+    const leftMs = Date.parse(leftAt || '');
+    if (!name || !joinedAt || !leftAt || !Number.isFinite(joinedMs) || !Number.isFinite(leftMs) || leftMs < joinedMs) return [];
+    return [{ name, joined_at: joinedAt, left_at: leftAt, identity: participant.identity_quality }];
+  }).sort((left, right) => Date.parse(left.joined_at) - Date.parse(right.joined_at)
+    || left.name.localeCompare(right.name, 'zh-CN')
+    || left.identity.localeCompare(right.identity));
+}
+
 /** Zoom 会后转写：本机缓存先行兜底，在线结果只按实际场次字段做条件写回。 */
 export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTranscript | null> {
   if (meetingTranscriptSource(m) !== 'zoom_transcript' || !m.provider_space_name || !m.scheduled_at) return null;
@@ -450,6 +466,13 @@ export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTra
       const patch: Partial<PersistedMeeting> = {};
       if (current.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
       if (current.provider_transcript_reason !== result.reason) patch.provider_transcript_reason = result.reason;
+      if (result.status === 'ready') {
+        const participants = persistedZoomParticipants(result.participants || []);
+        if ((participants.length || current.provider_participants?.length)
+          && JSON.stringify(participants) !== JSON.stringify(current.provider_participants || [])) {
+          patch.provider_participants = participants;
+        }
+      }
 
       const instanceChanged = !!result.instance_uuid && result.instance_uuid !== current.provider_meeting_id;
       const protectAnchor = current.align_state === 'manual'
@@ -846,7 +869,7 @@ async function refreshTranscriptAfterInitialRender(seq: number, bodyEl: HTMLElem
         ? { status: 'ready', message: '原始发言已同步。' }
         : { status: 'missing', message: recapTranscriptMissingMessage(freshMeeting) };
       rebuildRecapTimeline(recapState);
-      refreshRecapOverviewBlocks(bodyEl, ['#rc-over-hero', '#rc-over-focus', '#rc-transcript-block']);
+      refreshRecapOverviewBlocks(bodyEl, ['#rc-over-hero', '#rc-participants', '#rc-over-focus', '#rc-transcript-block']);
       if (recapState.view === 'transcript') renderRecap(bodyEl);
 
       const platform = meetingPlatformOf(freshMeeting);
@@ -1560,6 +1583,22 @@ function cappedTranscriptLines(cues: TranscriptCue[]): CappedTranscript {
   return { lines, truncated, usedCueCount };
 }
 
+const PROVIDER_SUMMARY_OCR_TIMEOUT_MS = 10_000;
+
+async function awaitProviderSummaryBoardOcr(meetingId: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      triggerBoardOcr(`mtgboard_${meetingId}`).then(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, PROVIDER_SUMMARY_OCR_TIMEOUT_MS); }),
+    ]);
+  } catch {
+    // OCR 失败不阻断总结；后续继续使用账本里当前已有文字。
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** Provider 路线的纯数据生成入口：已有结果直接复用，同一会议并发请求共享一个 in-flight Promise。 */
 export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: TranscriptCue[]): Promise<PanelMeetingSummaryRecord | null> {
   if (m.panel_summary) return m.panel_summary;
@@ -1572,11 +1611,18 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
   const running = providerPanelSummaryInFlight.get(inFlightKey);
   if (running) return running;
   const task = (async (): Promise<PanelMeetingSummaryRecord | null> => {
+    await awaitProviderSummaryBoardOcr(m.meeting_id);
+    const marks = await getFoldedMarksByContext(`mtg_${m.meeting_id}`)
+      .then((items) => items.filter((mark) => !mark.is_tombstone))
+      .catch(() => [] as PersistedMark[]);
+    const handwritingSections = buildMeetingHandwritingSections(m, marks, meetingT0(m), finiteMs(m.align_offset_ms));
     const capped = cappedTranscriptLines(cues);
     const response = await postJson<ProviderMeetingSummaryResponse>('/api/meetings/summary', {
+      platform,
       title: m.title || '(未命名会议)',
       transcript: capped.lines.join('\n'),
       ...(platform === 'google_meet' && m.google_smart_note?.text ? { smart_note: m.google_smart_note.text } : {}),
+      ...(hasMeetingHandwritingSections(handwritingSections) ? { handwriting_sections: handwritingSections } : {}),
       model: settings.inferModel,
     }, { auth: true });
     const summary: PanelMeetingSummaryRecord = {
@@ -1922,6 +1968,16 @@ export function zoomTranscriptAlignmentLabel(timestampQuality?: ZoomTimestampQua
     : 'Zoom 场次时间对齐';
 }
 
+export function renderProviderParticipantsOverview(
+  meeting: Pick<PersistedMeeting, 'provider_participants'>,
+): string {
+  const participants = aggregateProviderParticipants(meeting.provider_participants);
+  if (!participants.length) return '';
+  const lines = providerParticipantLines(meeting.provider_participants)
+    .map((line) => `<span class="rc-participant-li">${esc(line)}</span>`).join('');
+  return `<section class="rc-over-participants" id="rc-participants"><div class="rc-sec-title"><b>参会（${participants.length} 人）</b></div><div class="rc-participant-list">${lines}</div></section>`;
+}
+
 /** 概览：会后第一屏。只放核心状态和入口；长转写进入「原始发言」详情页。 */
 function renderRecapOverview(bodyEl: HTMLElement): void {
   if (!recapState) return;
@@ -2001,6 +2057,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     + `<div class="rc-metrics"><span><b>${cues.length || '-'}</b>句</span><span><b>${speakerCount || '-'}</b>人</span><span><b>${inkCount}</b>手写</span></div>`
     + (google ? renderGoogleRecordingsHtml(meeting) : '')
     + `</section>`
+    + renderProviderParticipantsOverview(meeting)
     + `<section class="rc-over-focus" id="rc-over-focus"><div class="rc-sec-title"><b>会议要点</b><span>${esc(panelSummaryLabel())}</span></div><div class="rc-over-list">${conclusionHtml}</div></section>`
     + `<section class="rc-entry-grid">`
     + overviewCardHtml({ action: 'transcript', title: '原始发言', meta: rawMeta, body: rawBody, disabled: !cues.length && !transcriptActions && transcript.status !== 'loading', actions: transcriptActions })
@@ -2073,6 +2130,8 @@ function refreshRecapOverviewBlocks(bodyEl: HTMLElement, selectors: string[]): v
     const replacement = draft.querySelector(selector);
     // 内容没变就不动 DOM：少一次节点替换=少一次丢点按窗口+少一次电纸屏闪刷
     if (current && replacement && current.outerHTML !== replacement.outerHTML) current.replaceWith(replacement);
+    else if (selector === '#rc-participants' && current && !replacement) current.remove();
+    else if (selector === '#rc-participants' && !current && replacement) bodyEl.querySelector('#rc-over-focus')?.before(replacement);
   }
 }
 
@@ -2265,27 +2324,9 @@ export function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], m
   lines.push(...capped.lines);
   lines.push('</转写>', '');
   lines.push('<手写标注 各为用户当时的强调·时间是近似会议相对时刻·非与某句转写的精确对应>');
-  if (marks.length) {
-    const groups = { pre: [] as PersistedMark[], in: [] as PersistedMark[], post: [] as PersistedMark[] };
-    for (const mk of [...marks].sort((a, b) => markTime(a) - markTime(b))) groups[meetingMarkPhase(mk, m)].push(mk);
-    const content = (mk: PersistedMark): string => {
-      const txt = (mk.marked_text || '').trim();
-      if (isUnrecognizedHandwritingText(mk)) return '（一处无法识别的手写·别推断其文字含义）';
-      return txt || `（一处${mk.feature_type === 'drawing' ? '图形/圈画' : '无法识别的手写'}·别推断其文字含义）`;
-    };
-    if (groups.pre.length) {
-      lines.push('会前准备（不参与转写时间对齐）：');
-      for (const mk of groups.pre) lines.push(`- ${content(mk)}`);
-    }
-    if (groups.in.length) {
-      lines.push('会中手记：');
-      for (const mk of groups.in) lines.push(`[${clk(markTime(mk) - t0 - off)}] ${content(mk)}`);
-    }
-    if (groups.post.length) {
-      lines.push('会后补充（不参与转写时间对齐）：');
-      for (const mk of groups.post) lines.push(`- ${content(mk)}`);
-    }
-  } else lines.push('（本场没有手写标注）');
+  const handwritingSections = buildMeetingHandwritingSections(m, marks, t0, off);
+  const handwritingLines = meetingHandwritingSectionLines(handwritingSections);
+  lines.push(...(handwritingLines.length ? handwritingLines : ['（本场没有手写标注）']));
   lines.push('</手写标注>', '', '请按系统要求产出会后思路总结。');
   return { prompt: lines.join('\n'), truncated: capped.truncated, usedCueCount: capped.usedCueCount };
 }
