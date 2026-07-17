@@ -68,6 +68,9 @@ import {
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
 import { backfillGoogleMeetSmartNotes, fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
 import { createZoomApiHandler } from './zoom-api-handler';
+import { backfillZoomMeetingTranscripts, zoomMeetingRecordsPath } from './zoom-meeting-records';
+import { zoomMeetingSyncPath } from './zoom-meeting-sync';
+import { zoomS2SConfigured } from './zoom-oauth-state';
 import {
   currentMtlToken,
   mintMtlToken,
@@ -1147,6 +1150,13 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
 const handleZoomApi = createZoomApiHandler({
   env: process.env,
   requireDeviceSession,
+  resolveAttendanceWindows: (rawSession, meetingId, nowMs) => {
+    const session = rawSession as InkLoopSessionContext;
+    return listMtlMeetingWindows(mtlReceiverIdentity(session), process.env, 'zoom').flatMap((window) => {
+      if (window.meeting_id !== meetingId && window.external_meeting_id !== meetingId) return [];
+      return [{ startMs: window.started_at_ms, endMs: window.ended_at_ms || nowMs }];
+    });
+  },
 });
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {
   const configured = String(process.env.LARK_CLOUD_HUB_REDIRECT_URI || process.env.INKLOOP_LARK_REDIRECT_URI || process.env.LARK_REDIRECT_URI || '').trim();
@@ -2803,6 +2813,33 @@ async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
   }
 }
 
+// Zoom 会后 instances/participants/transcript 不应依赖设备打开 recap；账号级快照由 hub 周期推进。
+const ZOOM_RECORDS_BACKFILL_MS = Math.max(0, Number(process.env.INKLOOP_ZOOM_RECORDS_BACKFILL_MS ?? 120_000));
+const ZOOM_RECORDS_BACKFILL_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_ZOOM_RECORDS_BACKFILL_TIMEOUT_MS, 60_000);
+const zoomRecordsGate = createDeadlineSingleFlight({
+  timeoutMs: ZOOM_RECORDS_BACKFILL_TIMEOUT_MS,
+  label: 'Zoom meeting records backfill',
+});
+async function runZoomRecordsBackfill(reason: string): Promise<void> {
+  if (!zoomS2SConfigured(process.env)) return;
+  try {
+    await zoomRecordsGate.run(async (signal) => {
+      const fetchImpl: typeof fetch = (input, init) => fetch(input, { ...init, signal });
+      const result = await backfillZoomMeetingTranscripts(
+        process.env,
+        { path: zoomMeetingRecordsPath(process.env) },
+        { path: zoomMeetingSyncPath(process.env) },
+        { fetchImpl, signal },
+      );
+      if (result.scanned > 0 || result.errors.length > 0) {
+        console.log(`[inkloop proxy] provider_zoom_records_backfill provider_reason=${reason} provider_scanned=${result.scanned} provider_advanced=${result.advanced} provider_completed=${result.completed}${result.errors.length ? ` provider_errors=${result.errors.join('; ')}` : ''}`);
+      }
+    });
+  } catch (e) {
+    console.warn(`[inkloop proxy] provider_zoom_records_backfill_failed provider_reason=${reason} provider_error=${String((e as Error)?.message || e)}`);
+  }
+}
+
 const PORT = Number(process.env.PORT || 3000);
 server.listen(PORT, () => {
   console.log(`[inkloop proxy] :${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
@@ -2816,6 +2853,10 @@ server.listen(PORT, () => {
   if (GOOGLE_SMART_NOTE_BACKFILL_MS > 0) {
     setInterval(() => { void runGoogleSmartNoteBackfill('interval'); }, GOOGLE_SMART_NOTE_BACKFILL_MS).unref();
     setTimeout(() => { void runGoogleSmartNoteBackfill('boot'); }, 20_000).unref();
+  }
+  if (ZOOM_RECORDS_BACKFILL_MS > 0) {
+    setInterval(() => { void runZoomRecordsBackfill('interval'); }, ZOOM_RECORDS_BACKFILL_MS).unref();
+    setTimeout(() => { void runZoomRecordsBackfill('boot'); }, 25_000).unref();
   }
 });
 

@@ -351,6 +351,13 @@ export function zoomMeetingSyncPath(env: ZoomMeetingSyncEnv = process.env): stri
   return resolve(clean(env.ZOOM_SYNC_STATE_PATH) || DEFAULT_ZOOM_SYNC_PATH);
 }
 
+/** 供会后回补只读消费最近一次排期快照；不触发网络同步，也不暴露内部缺损对象。 */
+export function readZoomMeetingSources(
+  ref: ZoomMeetingSyncRef = { path: zoomMeetingSyncPath() },
+): ZoomMeetingSource[] {
+  return resultFromState(loadState(ref.path), true).sources;
+}
+
 export function fetchZoomMeetingSources(
   env: ZoomMeetingSyncEnv = process.env,
   ref: ZoomMeetingSyncRef = { path: zoomMeetingSyncPath(env) },

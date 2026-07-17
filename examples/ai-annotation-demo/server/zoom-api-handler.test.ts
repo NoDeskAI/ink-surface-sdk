@@ -110,4 +110,92 @@ describe('zoom API routes', () => {
     expect(cached).toMatchObject({ status: 200, body: { connected: true, throttled: true, sources: [] } });
     expect(fetchImpl).toHaveBeenCalledTimes(callsAfterFirst);
   });
+
+  it('serves the meeting transcript response contract behind the device session gate', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-transcript-route-'));
+    roots.push(root);
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') {
+        return new Response(JSON.stringify({ access_token: 'token', expires_in: 3600 }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/123456789/instances') {
+        return new Response(JSON.stringify({ meetings: [{ uuid: 'route-session' }] }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/route-session') {
+        return new Response(JSON.stringify({ start_time: '2026-07-17T10:00:00Z', duration: 5 }), { status: 200 });
+      }
+      if (url.pathname === '/v2/meetings/route-session/recordings') {
+        return new Response(JSON.stringify({ recording_files: [{
+          id: 'tx',
+          file_type: 'TRANSCRIPT',
+          recording_start: '2026-07-17T10:00:00Z',
+          recording_end: '2026-07-17T10:00:05Z',
+          download_url: 'https://download.zoom.us/route.vtt',
+        }] }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/route-session/participants') {
+        return new Response(JSON.stringify({ participants: [] }), { status: 200 });
+      }
+      if (url.pathname === '/route.vtt') {
+        return new Response('WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nAda: route contract', { status: 200 });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const handler = createZoomApiHandler({
+      env: {
+        ZOOM_S2S_ACCOUNT_ID: 'account',
+        ZOOM_S2S_CLIENT_ID: 'client',
+        ZOOM_S2S_CLIENT_SECRET: 'secret',
+        ZOOM_MEETING_TRANSCRIPT_PROBE: '0',
+      },
+      syncRef: { path: join(root, 'sync.json') },
+      recordsRef: { path: join(root, 'records.json') },
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: () => Date.parse('2026-07-17T10:05:00Z'),
+      requireDeviceSession: async () => ({ active: true }),
+    });
+
+    const result = await invoke(handler, '/api/zoom/meeting-transcript?space_name=123456789&scheduled_at=2026-07-17T10%3A00%3A00Z');
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchInlineSnapshot(`
+      {
+        "ended_at": "2026-07-17T10:05:00.000Z",
+        "instance_uuid": "route-session",
+        "participants": [],
+        "record": {
+          "end_time": "2026-07-17T10:05:00.000Z",
+          "name": "route-session",
+          "start_time": "2026-07-17T10:00:00.000Z",
+        },
+        "srt": "1
+      00:00:00,000 --> 00:00:05,000
+      Ada: route contract",
+        "started_at": "2026-07-17T10:00:00.000Z",
+        "status": "ready",
+        "t0": "2026-07-17T10:00:00.000Z",
+        "timestamp_quality": "derived_no_pause",
+        "transcript": {
+          "lines": [
+            {
+              "end_time": "2026-07-17T10:00:05.000Z",
+              "recording_file_id": "tx",
+              "speaker": {
+                "attribution_quality": "display_label",
+                "display_name": "Ada",
+                "stable_id": null,
+              },
+              "start_time": "2026-07-17T10:00:00.000Z",
+              "text": "route contract",
+            },
+          ],
+          "name": "past_meetings/route-session/transcripts",
+          "srt": "1
+      00:00:00,000 --> 00:00:05,000
+      Ada: route contract",
+          "timestamp_quality": "derived_no_pause",
+        },
+      }
+    `);
+  });
 });
