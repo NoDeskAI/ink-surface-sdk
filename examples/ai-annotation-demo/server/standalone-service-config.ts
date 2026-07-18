@@ -3,6 +3,12 @@ export interface StandaloneServiceEnv {
   PANEL_FEISHU_BASE?: string;
 }
 
+export const MEETING_SUMMARY_MAX_BODY_BYTES = 192 * 1024;
+
+export function meetingSummaryPayloadTooLargeError(): Error & { status: number } {
+  return Object.assign(new Error('meeting_summary_payload_too_large'), { status: 413 });
+}
+
 export function resolvePanelAuthBase(env: StandaloneServiceEnv): string {
   return String(env.PANEL_AUTH_BASE || '').trim().replace(/\/+$/, '');
 }

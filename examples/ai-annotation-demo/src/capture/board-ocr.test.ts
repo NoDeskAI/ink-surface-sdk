@@ -94,6 +94,46 @@ describe('board OCR writeback', () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls.map(([payload]) => payload.regions.map((region) => region.mark_id))).toEqual([['page_0'], ['page_1']]);
   });
+
+  it('响应漏掉的 mark 保持待识别，并在下一轮重新发送', async () => {
+    const first = mark({ mark_id: 'answered' });
+    const missing = mark({ mark_id: 'omitted' });
+    let current = [first, missing];
+    const requests: string[][] = [];
+    const request = vi.fn(async (payload: { regions: Array<{ mark_id: string }> }) => {
+      requests.push(payload.regions.map((region) => region.mark_id));
+      const texts: Record<string, string> = requests.length === 1
+        ? { answered: '已识别' }
+        : { omitted: '第二轮识别' };
+      return { texts };
+    });
+    const run = async (): Promise<void> => {
+      await recognizeBoardMarks({
+        documentId: 'diary_1',
+        marks: current,
+        pages: [{ page_id: first.page_id, page_index: 0, width: 1000, height: 1320 }],
+      }, {
+        rasterize: () => 'jpeg-base64', request,
+        writeRevision: async (input, patch) => {
+          current = current.map((item) => item.mark_id === input.mark_id ? { ...item, ...patch } : item);
+          return true;
+        },
+        now: () => 100,
+        emit: () => {},
+      });
+    };
+
+    await run();
+    const stillPending = current.find((item) => item.mark_id === 'omitted')!;
+    expect(stillPending.marked_text).toBe('手写 2 笔');
+    expect(stillPending.ocr_fingerprint).toBeUndefined();
+    expect(stillPending.ocr_at).toBeUndefined();
+    expect(stillPending.ocr_empty).toBeUndefined();
+
+    await run();
+    expect(requests).toEqual([['answered', 'omitted'], ['omitted']]);
+    expect(current.find((item) => item.mark_id === 'omitted')).toMatchObject({ marked_text: '第二轮识别', ocr_empty: false });
+  });
 });
 
 describe('board OCR trigger idempotency', () => {
@@ -108,8 +148,10 @@ describe('board OCR trigger idempotency', () => {
     const first = trigger('doc_1');
     const duplicate = trigger('doc_1');
     expect(run).toHaveBeenCalledTimes(1);
+    expect(trigger.isInFlight('doc_1')).toBe(true);
     finish(markResult('doc_1'));
     await Promise.all([first, duplicate]);
+    expect(trigger.isInFlight('doc_1')).toBe(false);
     await trigger('doc_1');
     expect(run).toHaveBeenCalledTimes(2);
   });

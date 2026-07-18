@@ -130,6 +130,24 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     expect(out.diagnostics.markCount).toBe(3);
   });
 
+  it('三段手写 KO 只给会中标注转写时钟', async () => {
+    const out = await assembleMeetingL1Export(input({
+      marks: [
+        mk('pre', -120, '会前记录'),
+        mk('in', 30, '会中记录'),
+        mk('post', 800, '会后记录'),
+      ],
+    }), OPTS);
+
+    expect(out.knowledgeExport.objects.filter((item) => item.kind === 'annotation').map((item) => item.body_md)).toMatchInlineSnapshot(`
+      [
+        "会前记录　（会前准备手写）",
+        "会中记录　（约 0:30 处手写）",
+        "会后记录　（会后补充手写）",
+      ]
+    `);
+  });
+
   it('会议输出候选 -> 一条 summary KO', async () => {
     const out = await assembleMeetingL1Export(input(), OPTS);
     const sum = out.knowledgeExport.objects.filter((k) => k.kind === 'summary');

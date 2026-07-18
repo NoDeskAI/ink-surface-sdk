@@ -37,6 +37,7 @@ import { meetingPlatformOf, providerOccurrenceToken, providerTranscriptCacheToke
 import { markTime } from '../../core/mark-time';
 import { isUnrecognizedHandwritingText } from '../../app/mark-text';
 import { aggregateProviderParticipants, providerParticipantLines } from '../../features/meeting/provider-participants';
+import { meetingMarkPhase } from '../../mobile/meeting-home-model';
 
 const DOC_PROJECTION_SCHEMA_VERSION = 'inkloop.document_projection.v1' as const;
 const KO_EXPORT_SCHEMA_VERSION = 'inkloop.knowledge_export.v1' as const;
@@ -293,6 +294,7 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
     ocr_fingerprint: m.ocr_fingerprint,
     ocr_empty: m.ocr_empty,
   }] as const));
+  const markPhaseById = new Map(input.marks.map((mark) => [mark.mark_id, meetingMarkPhase(mark, m)] as const));
 
   let annotationKoCount = 0;
   const entityFacts: EntityMembershipFact[] = [];
@@ -312,7 +314,12 @@ export async function assembleMeetingL1Export(input: MeetingExportInput, opts: M
       ocr_empty: undefined,
     };
     const structured = isUnrecognizedHandwritingText(markMeta) ? null : structuredMeetingMark(mk.marked_text);
-    const body = structured?.body ?? `${inkBody(markMeta)}　（约 ${clk(mk.relMs)} 处手写）`;
+    const phaseLabel = markPhaseById.get(mk.mark_id) === 'pre'
+      ? '（会前准备手写）'
+      : markPhaseById.get(mk.mark_id) === 'post'
+        ? '（会后补充手写）'
+        : `（约 ${clk(mk.relMs)} 处手写）`;
+    const body = structured?.body ?? `${inkBody(markMeta)}　${phaseLabel}`;
     const ko = await finalize({
       stableKey: `mtg|${meetingId}|mark|${mk.mark_id}|${structured?.kind ?? 'annotation'}`,
       kind: structured?.kind ?? 'annotation',

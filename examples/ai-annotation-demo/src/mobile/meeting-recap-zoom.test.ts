@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   fetchZoomMeetingTranscript: vi.fn(),
   getFoldedMarksByContext: vi.fn(),
   triggerBoardOcr: vi.fn(),
+  isBoardOcrInFlight: vi.fn(),
   meetings: new Map<string, PersistedMeeting>(),
   appliedPatches: [] as Array<Partial<PersistedMeeting>>,
 }));
@@ -27,6 +28,7 @@ vi.mock('../local/store', async (importOriginal) => ({
 vi.mock('../capture/board-ocr', async (importOriginal) => ({
   ...await importOriginal<typeof import('../capture/board-ocr')>(),
   triggerBoardOcr: mocks.triggerBoardOcr,
+  isBoardOcrInFlight: mocks.isBoardOcrInFlight,
 }));
 
 vi.mock('../integration/zoom/client', async (importOriginal) => ({
@@ -38,6 +40,7 @@ import {
   ensureProviderPanelSummary,
   loadZoomTranscript,
   meetingSummaryTranscriptCacheToken,
+  requestProviderPanelSummary,
   recapTranscriptMissingMessage,
   recapTranscriptPageDescription,
   recapTranscriptRetryLabel,
@@ -77,6 +80,7 @@ describe('meeting recap Zoom transcript branch', () => {
     mocks.updateMeeting.mockResolvedValue(null);
     mocks.getFoldedMarksByContext.mockResolvedValue([]);
     mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-zoom-1', marks: 0, ok: 0, empty: 0, ms: 0 });
+    mocks.isBoardOcrInFlight.mockReturnValue(false);
     mocks.getMeeting.mockImplementation(async (id: string) => mocks.meetings.get(id) ?? null);
     mocks.mutateMeeting.mockImplementation(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
       const current = mocks.meetings.get(id);
@@ -312,6 +316,40 @@ describe('meeting recap Zoom transcript branch', () => {
 
     expect(recapTranscriptMissingMessage(meeting)).toBe(`${message}。`);
     expect(renderRecapCard(meeting)).toContain(message);
+  });
+
+  it('转写未生成时仍落库名单并渲染参会区', async () => {
+    mocks.fetchZoomMeetingTranscript.mockResolvedValue({
+      status: 'not_generated',
+      reason: 'transcript_not_generated',
+      participants: [{
+        display_name: 'Ada', identity_quality: 'signed_in',
+        join_time: '2026-07-18T01:02:00.000Z', leave_time: '2026-07-18T01:42:00.000Z',
+      }],
+    });
+    const meeting = zoomMeeting();
+
+    await loadZoomTranscript(meeting);
+
+    expect(meeting.provider_participants).toHaveLength(1);
+    expect(renderProviderParticipantsOverview(meeting)).toContain('Ada · 共 40 分钟');
+  });
+
+  it('旧场总结请求失败前已改期时不污染新场', async () => {
+    const meeting = zoomMeeting();
+    mocks.getFoldedMarksByContext.mockResolvedValue([]);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => {
+      meeting.scheduled_at = '2026-07-19T01:00:00.000Z';
+      throw new Error('总结请求失败');
+    }));
+
+    const result = await requestProviderPanelSummary(meeting, [{
+      index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '旧场内容', rawText: '旧场内容',
+    }]);
+
+    expect(result).toMatchObject({ summary: null, failurePersisted: false, occurrenceToken: '20260718T010000Z' });
+    expect(mocks.appliedPatches).toEqual([]);
+    expect(meeting.panel_summary_status).toBeUndefined();
   });
 
   it('models pending retry, alignment quality, speaker fallback, and the Zoom recap card copy', () => {

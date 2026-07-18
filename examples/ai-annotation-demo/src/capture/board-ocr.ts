@@ -50,6 +50,11 @@ export interface BoardOcrEngineDeps {
   emit(result: BoardOcrRunResult): void;
 }
 
+export interface BoardOcrTrigger {
+  (documentId: string): Promise<BoardOcrRunResult>;
+  isInFlight(documentId: string): boolean;
+}
+
 function fnv1a(value: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
@@ -142,8 +147,10 @@ export async function recognizeBoardMarks(input: BoardOcrInput, deps: BoardOcrEn
       break; // 网络/5xx 静默放弃本轮；未写指纹的页下次触发重试。
     }
     for (const mark of pagePending) {
+      if (!Object.prototype.hasOwnProperty.call(response.texts ?? {}, mark.mark_id)) continue;
+      if (typeof response.texts[mark.mark_id] !== 'string') continue;
       const fingerprint = boardOcrFingerprint(mark);
-      const text = typeof response.texts?.[mark.mark_id] === 'string' ? response.texts[mark.mark_id].trim() : '';
+      const text = response.texts[mark.mark_id].trim();
       const wrote = await deps.writeRevision(mark, {
         marked_text: text || mark.marked_text,
         ai_eligible: false,
@@ -211,9 +218,9 @@ export function createBoardOcrTrigger(
   run: (documentId: string) => Promise<BoardOcrRunResult>,
   _now: () => number = () => Date.now(),
   _cooldownMs = BOARD_OCR_TRIGGER_COOLDOWN_MS,
-): (documentId: string) => Promise<BoardOcrRunResult> {
+): BoardOcrTrigger {
   const pending = new Map<string, Promise<BoardOcrRunResult>>();
-  return (documentId: string) => {
+  const trigger = ((documentId: string) => {
     const prior = pending.get(documentId);
     if (prior) return prior;
     let promise: Promise<BoardOcrRunResult>;
@@ -222,7 +229,13 @@ export function createBoardOcrTrigger(
       .finally(() => { if (pending.get(documentId) === promise) pending.delete(documentId); });
     pending.set(documentId, promise);
     return promise;
-  };
+  }) as BoardOcrTrigger;
+  trigger.isInFlight = (documentId: string): boolean => pending.has(documentId);
+  return trigger;
 }
 
 export const triggerBoardOcr = createBoardOcrTrigger(recognizeBoardDocument);
+
+export function isBoardOcrInFlight(documentId: string): boolean {
+  return triggerBoardOcr.isInFlight(documentId);
+}

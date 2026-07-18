@@ -138,15 +138,15 @@ export function parseBoardOcrModelOutput(raw: string, markIds: readonly string[]
       const value = JSON.parse(candidate) as unknown;
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         const object = value as Record<string, unknown>;
-        const score = markIds.reduce((count, markId) => count + (Object.hasOwn(object, markId) ? 1 : 0), 0);
+        const score = markIds.reduce((count, markId) => count + (typeof object[markId] === 'string' ? 1 : 0), 0);
         if (score > bestScore) { parsed = object; bestScore = score; }
       }
     } catch { /* 继续尝试下一个完整 JSON 对象 */ }
   }
-  if (!parsed) throw new BoardOcrHttpError(502, 'invalid_model_response');
-  return Object.fromEntries(markIds.map((markId) => {
+  if (!parsed || bestScore <= 0) throw new BoardOcrHttpError(502, 'invalid_model_response');
+  return Object.fromEntries(markIds.flatMap((markId) => {
     const value = parsed?.[markId];
-    return [markId, typeof value === 'string' ? value.trim().slice(0, 2_000) : ''];
+    return typeof value === 'string' ? [[markId, value.trim().slice(0, 2_000)]] : [];
   }));
 }
 

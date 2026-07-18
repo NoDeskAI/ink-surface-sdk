@@ -163,6 +163,10 @@ describe('Zoom meeting source persistence', () => {
       ended_at: '2026-07-17T07:50:00.000Z',
       provider_meeting_id: 'zoom-uuid-p2',
       provider_transcript_ref: 'transcript-p2',
+      provider_participants: [{
+        name: '旧场成员', identity: 'signed_in',
+        joined_at: '2026-07-17T07:10:00.000Z', left_at: '2026-07-17T07:50:00.000Z',
+      }],
       vc_meeting_start_t0: Date.parse('2026-07-17T07:10:00.000Z'),
       t0_source: 'provider_event',
       align_state: 'event',
@@ -191,7 +195,39 @@ describe('Zoom meeting source persistence', () => {
     expect(state.meetings[0].ended_at).toBeUndefined();
     expect(state.meetings[0].provider_meeting_id).toBeUndefined();
     expect(state.meetings[0].provider_transcript_ref).toBeUndefined();
+    expect(state.meetings[0].provider_participants).toBeUndefined();
     expect(state.meetings[0].t0_source).toBeUndefined();
+  });
+
+  it('按事务内当前值计算并保留并发写入的转写锚点', async () => {
+    const current = meeting('zoom-concurrent', {
+      platform: 'zoom',
+      provider_space_name: '987654321',
+      started_at: '2026-07-17T07:02:00.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-17T07:02:00.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
+    const state = dependencies([current]);
+    state.deps.listAllMeetings = async () => [{
+      ...current,
+      started_at: undefined,
+      vc_meeting_start_t0: undefined,
+      t0_source: undefined,
+      align_state: undefined,
+    }];
+
+    await syncZoomMeetingSources([source('987654321', {
+      scheduled_at: '2026-07-17T07:00:00.000Z',
+      duration_minutes: 120,
+    })], state.deps);
+
+    expect(state.meetings[0]).toMatchObject({
+      started_at: '2026-07-17T07:02:00.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-17T07:02:00.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
   });
 
   it('does not replace an actual provider end with the scheduled end', async () => {

@@ -83,7 +83,12 @@ import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows, mtlZoom
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import { exportLarkDocxToPdf } from './lark-docx-export';
 import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
-import { resolvePanelAuthBase, rewriteLegacyConvertSource } from './standalone-service-config';
+import {
+  MEETING_SUMMARY_MAX_BODY_BYTES,
+  meetingSummaryPayloadTooLargeError,
+  resolvePanelAuthBase,
+  rewriteLegacyConvertSource,
+} from './standalone-service-config';
 import {
   larkRealtimeMeetingSources,
   larkRealtimeMeetingStoreStatus,
@@ -951,7 +956,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     const session = await requireDeviceSession(req, res);
     if (!session) return;
     try {
-      const payload = JSON.parse(await readBody(req, 64 * 1024));
+      const payload = JSON.parse(await readBody(
+        req,
+        MEETING_SUMMARY_MAX_BODY_BYTES,
+        meetingSummaryPayloadTooLargeError,
+      ));
       sendJson(res, 200, await runMeetingPanelSummary(payload));
     } catch (error) {
       const status = Number((error as { status?: number })?.status) || 502;
@@ -1889,12 +1898,12 @@ async function handleConvertService(req: IncomingMessage, res: ServerResponse): 
 const AB_LOG = process.env.AB_LOG || resolve(ROOT, '.ab-intent.jsonl');
 
 const MAX_BODY = 25 * 1024 * 1024; // 25MB：页面图 / ink PNG dataURL
-function readBody(req: IncomingMessage, maxBody = MAX_BODY): Promise<string> {
+function readBody(req: IncomingMessage, maxBody = MAX_BODY, bodyTooLarge = () => new Error('body too large')): Promise<string> {
   return new Promise((res, rej) => {
     const chunks: Buffer[] = []; let size = 0;
     req.on('data', (c: Buffer) => {
       size += c.length;
-      if (size > maxBody) { rej(new Error('body too large')); req.destroy(); return; }
+      if (size > maxBody) { rej(bodyTooLarge()); req.destroy(); return; }
       chunks.push(c);
     });
     // 先 Buffer.concat 再一次性 decode：逐 chunk toString() 会在多字节 UTF-8（中文）跨 chunk 边界处插入替换字符，

@@ -237,6 +237,10 @@ describe('Google meeting source persistence', () => {
       provider_space_name: 'spaces/old-space',
       provider_transcript_ref: 'conferenceRecords/old-record/transcripts/old-transcript',
       provider_transcript_status: 'ready',
+      provider_participants: [{
+        name: '旧场成员', identity: 'signed_in',
+        joined_at: '2026-07-13T01:00:00.000Z', left_at: '2026-07-13T02:00:00.000Z',
+      }],
       google_smart_note: { text: 'Old Gemini notes', fetched_at: '2026-07-13T02:05:00.000Z' },
       google_smart_note_scope_missing: true,
       google_recordings: [{ export_uri: 'https://drive.google.com/file/d/old-recording/view', state: 'FILE_GENERATED' }],
@@ -276,29 +280,42 @@ describe('Google meeting source persistence', () => {
       meeting_url: 'https://meet.google.com/abc-defg-hij',
       scheduled_at: '2026-07-15T01:00:00.000Z',
     });
-    expect(state.updateMeeting).toHaveBeenCalledWith('google-rescheduled', expect.objectContaining({
+    expect(state.mutateMeeting).toHaveBeenCalledOnce();
+    expect(state.meetings[0].provider_participants).toBeUndefined();
+    expect(state.meetings[0].provider_meeting_id).toBeUndefined();
+    expect(state.meetings[0].google_smart_note).toBeUndefined();
+    expect(state.meetings[0].panel_summary).toBeUndefined();
+  });
+
+  it('按事务内当前值计算并保留并发写入的转写锚点', async () => {
+    const current = meeting('google-concurrent', {
+      platform: 'google_meet',
+      provider_calendar_event_id: 'concurrent',
+      started_at: '2026-07-14T07:02:00.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-14T07:02:00.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
+    const state = dependencies([current]);
+    state.deps.listAllMeetings = async () => [{
+      ...current,
       started_at: undefined,
-      ended_at: undefined,
-      provider_meeting_id: undefined,
-      provider_space_name: undefined,
-      provider_transcript_ref: undefined,
-      provider_transcript_status: undefined,
-      google_smart_note: undefined,
-      google_smart_note_scope_missing: undefined,
-      google_recordings: undefined,
       vc_meeting_start_t0: undefined,
       t0_source: undefined,
-      align_offset_ms: undefined,
       align_state: undefined,
-      summary: undefined,
-      summary_generated_at: undefined,
-      summary_source: undefined,
-      panel_summary: undefined,
-      panel_summary_fetched_at: undefined,
-      panel_summary_status: undefined,
-      panel_summary_unread: undefined,
-      exported_at: undefined,
-    }));
+    }];
+
+    await syncGoogleMeetingSources([source('concurrent', {
+      scheduled_at: '2026-07-14T07:00:00.000Z',
+      scheduled_end_at: '2026-07-14T09:00:00.000Z',
+    })], state.deps);
+
+    expect(state.meetings[0]).toMatchObject({
+      started_at: '2026-07-14T07:02:00.000Z',
+      vc_meeting_start_t0: Date.parse('2026-07-14T07:02:00.000Z'),
+      t0_source: 'provider_event',
+      align_state: 'event',
+    });
   });
 
   it('merges detector start/end windows into the matching Google Calendar card', async () => {

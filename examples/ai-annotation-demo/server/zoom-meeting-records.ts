@@ -28,6 +28,7 @@ const DEFAULT_ZOOM_RECORDS_PATH = resolve(dirname(fileURLToPath(import.meta.url)
 const MAX_ATTEMPTS = 3;
 const TERMINAL_RECHECK_MS = 10 * 60_000;
 const DEFAULT_SCHEDULED_DURATION_MS = 60 * 60_000;
+const CANDIDATE_WINDOW_TOLERANCE_MS = 4 * 60 * 60_000;
 const TIMESTAMP_MISMATCH_MIN_MS = 30_000;
 const TIMESTAMP_MISMATCH_RATIO = 0.2;
 const MAX_RETRY_AFTER_MS = 30_000;
@@ -144,7 +145,7 @@ export interface ZoomMeetingTranscriptResult {
     srt: string;
     timestamp_quality: ZoomTimestampQuality;
   };
-  participants: ZoomParticipantInterval[];
+  participants?: ZoomParticipantInterval[];
   instance_uuid?: string;
   t0?: string;
   started_at?: string;
@@ -185,6 +186,7 @@ interface ParsedTranscriptFile {
   file: ZoomRecordingFile;
   cues: ParsedVttCue[];
   lines: ZoomTranscriptLine[];
+  used_instance_start: boolean;
 }
 
 interface ProbeOutcome {
@@ -374,6 +376,13 @@ function overlapMs(candidate: ZoomMeetingInstanceCandidate, window: ZoomMeetingA
   return Math.max(0, Math.min(candidateEndMs(candidate), window.endMs) - Math.max(candidateStartMs(candidate), window.startMs));
 }
 
+function startDistanceFromWindowMs(candidate: ZoomMeetingInstanceCandidate, window: ZoomMeetingAttendanceWindow): number {
+  const startMs = candidateStartMs(candidate);
+  if (startMs < window.startMs) return window.startMs - startMs;
+  if (startMs > window.endMs) return startMs - window.endMs;
+  return 0;
+}
+
 function transcriptFiles(candidate: ZoomMeetingInstanceCandidate): ZoomRecordingFile[] {
   return candidate.recordings.filter((file) => file.file_type === 'TRANSCRIPT');
 }
@@ -409,7 +418,10 @@ function selectionInputHash(
   return createHash('sha256').update(JSON.stringify({ schedule, attendance: windows })).digest('hex');
 }
 
-/** MTL/排期命中优先；转写只在窗口、时长和计划距离都相同时打破平局。 */
+/**
+ * 只在参会/排期附近的实际实例中选场。四小时容差覆盖提前开会、拖堂和排期偏差，
+ * 同时能排除复用数字 meeting id 时相隔数天的历史实例。
+ */
 export function chooseZoomMeetingCandidate(
   candidates: ZoomMeetingInstanceCandidate[],
   scheduledAt: string,
@@ -421,14 +433,22 @@ export function chooseZoomMeetingCandidate(
   const attendanceWindows = validWindows(attendance);
   return [...candidates]
     .filter((candidate) => !!candidate.uuid && !!candidateStartMs(candidate))
+    .filter((candidate) => (
+      attendanceWindows.some((window) => overlapMs(candidate, window) > 0)
+      || overlapMs(candidate, scheduledWindow) > 0
+      || startDistanceFromWindowMs(candidate, scheduledWindow) <= CANDIDATE_WINDOW_TOLERANCE_MS
+    ))
     .sort((left, right) => {
       const leftAttendance = attendanceWindows.reduce((sum, window) => sum + overlapMs(left, window), 0);
       const rightAttendance = attendanceWindows.reduce((sum, window) => sum + overlapMs(right, window), 0);
       const attendanceOverlapDelta = Number(rightAttendance > 0) - Number(leftAttendance > 0);
       if (attendanceOverlapDelta) return attendanceOverlapDelta;
+      if (rightAttendance !== leftAttendance) return rightAttendance - leftAttendance;
       const scheduledOverlapDelta = Number(overlapMs(right, scheduledWindow) > 0) - Number(overlapMs(left, scheduledWindow) > 0);
       if (scheduledOverlapDelta) return scheduledOverlapDelta;
-      if (rightAttendance !== leftAttendance) return rightAttendance - leftAttendance;
+      const leftScheduled = overlapMs(left, scheduledWindow);
+      const rightScheduled = overlapMs(right, scheduledWindow);
+      if (rightScheduled !== leftScheduled) return rightScheduled - leftScheduled;
       const leftDistance = Math.abs(candidateStartMs(left) - scheduledStartMs);
       const rightDistance = Math.abs(candidateStartMs(right) - scheduledStartMs);
       if (leftDistance !== rightDistance) return leftDistance - rightDistance;
@@ -611,7 +631,10 @@ export function parseZoomVtt(vtt: string): ParsedVttCue[] {
       text: attributed.text,
     });
   }
-  return cues;
+  return cues.sort((left, right) => (
+    left.startOffsetMs - right.startOffsetMs
+    || left.endOffsetMs - right.endOffsetMs
+  ));
 }
 
 async function fetchDirectWithRetry(url: string, options: RequestOptions): Promise<Response> {
@@ -658,12 +681,14 @@ async function downloadClassicTranscripts(
   options: RequestOptions,
 ): Promise<{ files: ParsedTranscriptFile[]; complete: boolean }> {
   const files = transcriptFiles(candidate.stored);
-  const downloadable = files.filter((file) => file.download_url && file.recording_start);
+  const downloadable = files.filter((file) => file.download_url && (file.recording_start || candidate.stored.start_time));
   const outcomes = await Promise.all(downloadable.map(async (file): Promise<ParsedTranscriptFile | null> => {
     const downloaded = await downloadZoomText(file.download_url || '', env, options, candidate.downloadAccessToken);
     if (!validZoomVttBody(downloaded.body, downloaded.contentType)) return null;
     const cues = parseZoomVtt(downloaded.body);
-    const recordingStartMs = Date.parse(file.recording_start || '');
+    const usedInstanceStart = !file.recording_start;
+    const recordingStartMs = Date.parse(file.recording_start || candidate.stored.start_time || '');
+    if (!Number.isFinite(recordingStartMs)) return null;
     const lines = cues.map((cue): ZoomTranscriptLine => ({
       start_time: new Date(recordingStartMs + cue.startOffsetMs).toISOString(),
       end_time: new Date(recordingStartMs + cue.endOffsetMs).toISOString(),
@@ -671,7 +696,7 @@ async function downloadClassicTranscripts(
       text: cue.text,
       recording_file_id: file.id,
     }));
-    return { file, cues, lines };
+    return { file, cues, lines, used_instance_start: usedInstanceStart };
   }));
   const parsed = outcomes.filter((file): file is ParsedTranscriptFile => !!file);
   const cueCount = parsed.reduce((sum, file) => sum + file.cues.length, 0);
@@ -679,7 +704,7 @@ async function downloadClassicTranscripts(
 }
 
 export function zoomTimestampQuality(files: ParsedTranscriptFile[]): ZoomTimestampQuality {
-  if (files.length > 1) return 'approximate_pause_unknown';
+  if (files.length > 1 || files.some((file) => file.used_instance_start)) return 'approximate_pause_unknown';
   const only = files[0];
   if (!only?.file.recording_start || !only.file.recording_end || !only.cues.length) return 'derived_no_pause';
   const recordingDuration = Date.parse(only.file.recording_end) - Date.parse(only.file.recording_start);
@@ -805,7 +830,7 @@ function responseFromJob(job: ZoomMeetingJobState): ZoomMeetingTranscriptResult 
       : job.status === 'not_generated'
         ? { reason: 'transcript_not_generated' as const }
         : {}),
-    participants: job.participants || [],
+    ...(job.participants ? { participants: job.participants } : {}),
     ...(chosen ? {
       record: {
         name: chosen.uuid,
@@ -892,7 +917,6 @@ async function runCatchUp(
   const selectionInputsChanged = !!current && current.selection_input_hash !== inputHash;
   const enabledProbe = probeEnabled(env);
   const terminalRetryDue = !!current?.terminal
-    && current.status !== 'ready'
     && providerArtifactTerminalRecheckDue(current, nowMs, TERMINAL_RECHECK_MS);
   const shouldRefreshProbe = probeRecheckDue(current, nowMs, enabledProbe);
   if (!selectionInputsChanged && ((current?.terminal && !terminalRetryDue && !shouldRefreshProbe)
@@ -907,12 +931,22 @@ async function runCatchUp(
     signal: rawOptions.signal,
     logger: rawOptions.logger || ((event, details) => console.info(`[zoom-meeting-records] ${event}`, JSON.stringify(details))),
   };
-  if (shouldRefreshProbe && current && !selectionInputsChanged) return refreshReadyProbe(current, env, recordsRef, key, options);
+  if (shouldRefreshProbe && !terminalRetryDue && current && !selectionInputsChanged) {
+    return refreshReadyProbe(current, env, recordsRef, key, options);
+  }
 
   const discovered = await discoverCandidates(meetingId, env, options);
   const candidates = discovered.map((candidate) => candidate.stored);
   const chosenStored = chooseZoomMeetingCandidate(candidates, scheduledAt, scheduledEndAt, input.attendance);
   const chosen = chosenStored ? discovered.find((candidate) => candidate.stored.uuid === chosenStored.uuid) : undefined;
+  if (current?.status === 'ready'
+    && terminalRetryDue
+    && !selectionInputsChanged
+    && (!chosenStored || chosenStored.uuid === current.chosen_instance_uuid)) {
+    const rechecked = { ...current, updated_at: new Date(nowMs).toISOString() };
+    persistJob(recordsRef.path, key, rechecked);
+    return responseFromJob(rechecked);
+  }
   const poll = providerArtifactNextPoll(
     pollAnchorMs(current, chosenStored, scheduledAt, scheduledEndAt),
     nowMs,
@@ -936,9 +970,10 @@ async function runCatchUp(
     const probePromise = enabledProbe
       ? probeMeetingTranscript(chosenStored.uuid, env, options)
       : Promise.resolve<ProbeOutcome | undefined>(undefined);
-    const [participants, classic] = await Promise.all([
+    const [participants, classic, probe] = await Promise.all([
       fetchParticipants(chosenStored.uuid, env, options),
       downloadClassicTranscripts(chosen, env, options),
+      probePromise,
     ]);
     updated.participants = participants;
     const lines = sortedLines(classic.files);
@@ -947,11 +982,8 @@ async function runCatchUp(
       updated.transcript_lines = lines;
       updated.timestamp_quality = zoomTimestampQuality(classic.files);
     }
-    if (enabledProbe) {
-      // classic 下载与 probe 并行；probe 的失败/NOT_READY 只落自身状态，不改变主链结果。
-      const probe = await probePromise;
-      if (probe) updated.probe = finalizeProbe(probe, lines, chosenStored.start_time, options);
-    }
+    // classic 下载与 probe 并行；probe 的失败/NOT_READY 只落自身状态，不改变主链结果。
+    if (probe) updated.probe = finalizeProbe(probe, lines, chosenStored.start_time, options);
     if (classic.complete) {
       updated.status = 'ready';
       updated.terminal = true;
@@ -973,7 +1005,7 @@ export function zoomMeetingRecordsPath(env: ZoomMeetingRecordsEnv = process.env)
   return resolve(clean(env.ZOOM_RECORDS_STATE_PATH) || DEFAULT_ZOOM_RECORDS_PATH);
 }
 
-export function fetchZoomMeetingTranscript(
+export async function fetchZoomMeetingTranscript(
   env: ZoomMeetingRecordsEnv = process.env,
   recordsRef: ZoomMeetingRecordsRef = { path: zoomMeetingRecordsPath(env) },
   input: {
@@ -987,7 +1019,17 @@ export function fetchZoomMeetingTranscript(
   let scheduledKey = input.scheduledAt;
   try { scheduledKey = requiredIso(input.scheduledAt, 'scheduled_at'); } catch { /* runCatchUp 返回一致的稳定错误 */ }
   const lockKey = `${recordsRef.path}|${cleanId(input.meetingId)}|${scheduledKey}`;
-  return jobsInFlight.run(lockKey, () => runCatchUp(env, recordsRef, input, options));
+  let inputHash: string | undefined;
+  try { inputHash = selectionInputHash(input.scheduledAt, input.scheduledEndAt, input.attendance); } catch { /* 输入错误交给 runCatchUp 统一返回 */ }
+
+  while (true) {
+    const pending = jobsInFlight.pending(lockKey);
+    if (!pending) return jobsInFlight.run(lockKey, () => runCatchUp(env, recordsRef, input, options));
+    await pending.catch(() => undefined);
+    if (!inputHash) continue;
+    const persisted = loadState(recordsRef.path).meetings[meetingKey(cleanId(input.meetingId), scheduledKey)];
+    if (persisted?.selection_input_hash === inputHash) return responseFromJob(persisted);
+  }
 }
 
 function sourceScheduledEnd(source: ZoomMeetingSource): string {

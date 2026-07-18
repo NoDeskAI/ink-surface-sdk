@@ -22,7 +22,7 @@ import { fetchZoomMeetingTranscript, type ZoomTimestampQuality, type ZoomTranscr
 import { meetingPlatformOf, meetingTranscriptSource, providerOccurrenceToken, providerTranscriptCacheToken } from './meeting-platform';
 import { markTime } from '../core/mark-time';
 import { meetingMarkPhase } from './meeting-home-model';
-import { triggerBoardOcr } from '../capture/board-ocr';
+import { isBoardOcrInFlight, triggerBoardOcr } from '../capture/board-ocr';
 import { buildMeetingHandwritingSections, hasMeetingHandwritingSections, meetingHandwritingSectionLines } from '../features/meeting/meeting-summary-handwriting';
 import { aggregateProviderParticipants, providerParticipantLines } from '../features/meeting/provider-participants';
 
@@ -466,12 +466,9 @@ export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTra
       const patch: Partial<PersistedMeeting> = {};
       if (current.provider_transcript_status !== result.status) patch.provider_transcript_status = result.status;
       if (current.provider_transcript_reason !== result.reason) patch.provider_transcript_reason = result.reason;
-      if (result.status === 'ready') {
-        const participants = persistedZoomParticipants(result.participants || []);
-        if ((participants.length || current.provider_participants?.length)
-          && JSON.stringify(participants) !== JSON.stringify(current.provider_participants || [])) {
-          patch.provider_participants = participants;
-        }
+      const participants = persistedZoomParticipants(result.participants || []);
+      if (participants.length && JSON.stringify(participants) !== JSON.stringify(current.provider_participants || [])) {
+        patch.provider_participants = participants;
       }
 
       const instanceChanged = !!result.instance_uuid && result.instance_uuid !== current.provider_meeting_id;
@@ -1585,18 +1582,64 @@ function cappedTranscriptLines(cues: TranscriptCue[]): CappedTranscript {
 
 const PROVIDER_SUMMARY_OCR_TIMEOUT_MS = 10_000;
 
-async function awaitProviderSummaryBoardOcr(meetingId: string): Promise<void> {
+async function awaitProviderSummaryBoardOcr(meetingId: string): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
-      triggerBoardOcr(`mtgboard_${meetingId}`).then(() => undefined),
-      new Promise<void>((resolve) => { timer = setTimeout(resolve, PROVIDER_SUMMARY_OCR_TIMEOUT_MS); }),
+    const outcome = await Promise.race([
+      triggerBoardOcr(`mtgboard_${meetingId}`).then(() => 'finished' as const, () => 'finished' as const),
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), PROVIDER_SUMMARY_OCR_TIMEOUT_MS); }),
     ]);
+    return outcome === 'timeout';
   } catch {
-    // OCR 失败不阻断总结；后续继续使用账本里当前已有文字。
+    return false; // OCR 已经失败且不再 in-flight，不阻断总结。
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+function hasPendingProviderSummaryBoardOcr(marks: PersistedMark[]): boolean {
+  return marks.some((mark) => !mark.is_tombstone
+    && (mark.feature_type === 'handwriting' || mark.feature_type === 'drawing')
+    && !mark.ocr_fingerprint
+    && (mark.strokes ?? []).some((stroke) => stroke.points.length > 0));
+}
+
+type ProviderSummaryPlatform = 'google_meet' | 'zoom';
+
+function sameGoogleOccurrence(left: Pick<PersistedMeeting, 'scheduled_at'>, rightToken: string): boolean {
+  return providerOccurrenceToken(left.scheduled_at) === rightToken;
+}
+
+function sameProviderSummaryOccurrence(
+  current: PersistedMeeting,
+  platform: ProviderSummaryPlatform,
+  occurrenceToken: string,
+): boolean {
+  if (meetingPlatformOf(current) !== platform) return false;
+  return platform === 'zoom'
+    ? sameZoomOccurrence(current, occurrenceToken)
+    : sameGoogleOccurrence(current, occurrenceToken);
+}
+
+async function persistProviderPanelSummaryFailure(
+  meetingId: string,
+  platform: ProviderSummaryPlatform,
+  occurrenceToken: string,
+): Promise<boolean> {
+  let occurrenceCurrent = false;
+  await mutateMeeting(meetingId, (current) => {
+    if (!sameProviderSummaryOccurrence(current, platform, occurrenceToken)) return null;
+    occurrenceCurrent = true;
+    return { panel_summary_status: 'failed' };
+  });
+  return occurrenceCurrent;
+}
+
+interface ProviderPanelSummaryRequestResult {
+  summary: PanelMeetingSummaryRecord | null;
+  failurePersisted: boolean;
+  platform: ProviderSummaryPlatform;
+  occurrenceToken: string;
 }
 
 /** Provider 路线的纯数据生成入口：已有结果直接复用，同一会议并发请求共享一个 in-flight Promise。 */
@@ -1605,16 +1648,17 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
   if (!cues.length) return null;
   const platform = meetingPlatformOf(m);
   if (platform !== 'google_meet' && platform !== 'zoom') return null;
-  const occurrenceToken = platform === 'zoom' ? providerOccurrenceToken(m.scheduled_at) : '';
+  const occurrenceToken = providerOccurrenceToken(m.scheduled_at);
   const transcriptToken = providerTranscriptCacheToken(platform, m.meeting_id, occurrenceToken);
-  const inFlightKey = transcriptToken;
+  const inFlightKey = `${transcriptToken}:${occurrenceToken}`;
   const running = providerPanelSummaryInFlight.get(inFlightKey);
   if (running) return running;
   const task = (async (): Promise<PanelMeetingSummaryRecord | null> => {
-    await awaitProviderSummaryBoardOcr(m.meeting_id);
+    const boardDocumentId = `mtgboard_${m.meeting_id}`;
+    const ocrTimedOut = await awaitProviderSummaryBoardOcr(m.meeting_id);
     const marks = await getFoldedMarksByContext(`mtg_${m.meeting_id}`)
-      .then((items) => items.filter((mark) => !mark.is_tombstone))
-      .catch(() => [] as PersistedMark[]);
+      .then((items) => items.filter((mark) => !mark.is_tombstone));
+    if (ocrTimedOut && isBoardOcrInFlight(boardDocumentId) && hasPendingProviderSummaryBoardOcr(marks)) return null;
     const handwritingSections = buildMeetingHandwritingSections(m, marks, meetingT0(m), finiteMs(m.align_offset_ms));
     const capped = cappedTranscriptLines(cues);
     const response = await postJson<ProviderMeetingSummaryResponse>('/api/meetings/summary', {
@@ -1664,21 +1708,51 @@ export function ensureGooglePanelSummary(m: PersistedMeeting, cues: TranscriptCu
   return ensureProviderPanelSummary(m, cues);
 }
 
+export async function requestProviderPanelSummary(
+  m: PersistedMeeting,
+  cues: TranscriptCue[],
+): Promise<ProviderPanelSummaryRequestResult | null> {
+  const platform = meetingPlatformOf(m);
+  if (platform !== 'google_meet' && platform !== 'zoom') return null;
+  const occurrenceToken = providerOccurrenceToken(m.scheduled_at);
+  try {
+    return {
+      summary: await ensureProviderPanelSummary(m, cues),
+      failurePersisted: false,
+      platform,
+      occurrenceToken,
+    };
+  } catch {
+    return {
+      summary: null,
+      failurePersisted: await persistProviderPanelSummaryFailure(m.meeting_id, platform, occurrenceToken).catch(() => false),
+      platform,
+      occurrenceToken,
+    };
+  }
+}
+
 async function loadProviderPanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMeeting, cues: TranscriptCue[]): Promise<void> {
   if (m.panel_summary || !cues.length) return;
   if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) {
     recapState.panelSummaryStatus = 'generating';
     renderRecap(bodyEl);
   }
-  try {
-    const summary = await ensureProviderPanelSummary(m, cues);
-    if (!summary || !recapAlive(seq, bodyEl) || recapState?.meeting.meeting_id !== m.meeting_id) return;
-    recapState.panelSummary = summary;
-    recapState.meeting = { ...recapState.meeting, panel_summary: summary, panel_summary_status: 'ready' };
+  const result = await requestProviderPanelSummary(m, cues);
+  if (!result) return;
+  if (result.summary) {
+    if (!recapAlive(seq, bodyEl) || recapState?.meeting.meeting_id !== m.meeting_id) return;
+    recapState.panelSummary = result.summary;
+    recapState.meeting = { ...recapState.meeting, panel_summary: result.summary, panel_summary_status: 'ready' };
     recapState.panelSummaryStatus = 'ready';
-  } catch {
-    await updateMeeting(m.meeting_id, { panel_summary_status: 'failed' }).catch(() => null);
-    if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) recapState.panelSummaryStatus = 'failed';
+  } else if (result.failurePersisted) {
+    if (recapAlive(seq, bodyEl)
+      && recapState?.meeting.meeting_id === m.meeting_id
+      && sameProviderSummaryOccurrence(recapState.meeting, result.platform, result.occurrenceToken)) {
+      recapState.panelSummaryStatus = 'failed';
+    }
+  } else {
+    return;
   }
   if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
 }

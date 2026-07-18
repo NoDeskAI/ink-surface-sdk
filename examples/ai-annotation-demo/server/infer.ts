@@ -454,32 +454,103 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
   return { summary, model };
 }
 
-function normalizeMeetingPanelHandwritingSections(value: unknown): MeetingPanelSummaryHandwritingSections | undefined {
+type HandwritingSectionKey = 'pre_meeting' | 'in_meeting' | 'post_meeting';
+type PreparedHandwritingItem = { text: string; relative_time?: string; truncated: boolean };
+
+const HANDWRITING_TOTAL_CHARS = 8_000;
+const HANDWRITING_TOTAL_ITEMS = 80;
+const HANDWRITING_SECTION_ORDER = [1, 1, 1, 0, 2] as const;
+
+function fairHandwritingAllocation(
+  demands: readonly number[],
+  total: number,
+  reserved: readonly number[],
+): number[] {
+  const allocation = demands.map((demand, index) => Math.min(demand, reserved[index] || 0));
+  let remaining = Math.max(0, total - allocation.reduce((sum, value) => sum + value, 0));
+  while (remaining > 0) {
+    let progressed = false;
+    for (const index of HANDWRITING_SECTION_ORDER) {
+      if (remaining <= 0) break;
+      if ((allocation[index] || 0) >= (demands[index] || 0)) continue;
+      allocation[index] += 1;
+      remaining -= 1;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  return allocation;
+}
+
+function preparedTextItem(raw: unknown): PreparedHandwritingItem | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const original = raw.trim();
+  if (!original) return undefined;
+  return { text: original.slice(0, 500), truncated: original.length > 500 };
+}
+
+export function normalizeMeetingPanelHandwritingSections(value: unknown): MeetingPanelSummaryHandwritingSections | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const source = value as Record<string, unknown>;
-  let remaining = 8_000;
-  const take = (raw: unknown, max = 500): string => {
-    if (remaining <= 0 || typeof raw !== 'string') return '';
-    const text = raw.trim().slice(0, Math.min(max, remaining));
-    remaining -= text.length;
-    return text;
-  };
-  const textList = (raw: unknown): string[] => Array.isArray(raw)
-    ? raw.slice(0, 80).map((item) => take(item)).filter(Boolean)
+  const textItems = (raw: unknown): PreparedHandwritingItem[] => Array.isArray(raw)
+    ? raw.flatMap((item) => preparedTextItem(item) || [])
     : [];
-  const preMeeting = textList(source.pre_meeting);
-  const inMeeting = Array.isArray(source.in_meeting)
-    ? source.in_meeting.slice(0, 80).flatMap((raw) => {
-      if (!raw || typeof raw !== 'object') return [];
-      const item = raw as Record<string, unknown>;
-      const relativeTime = take(item.relative_time, 24);
-      const text = take(item.text);
-      return text ? [{ relative_time: relativeTime, text }] : [];
-    })
-    : [];
-  const postMeeting = textList(source.post_meeting);
+  const preItems = textItems(source.pre_meeting);
+  const inItems = Array.isArray(source.in_meeting) ? source.in_meeting.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const item = raw as Record<string, unknown>;
+    const prepared = preparedTextItem(item.text);
+    if (!prepared) return [];
+    const originalRelativeTime = typeof item.relative_time === 'string' ? item.relative_time.trim() : '';
+    return [{
+      ...prepared,
+      relative_time: originalRelativeTime.slice(0, 24),
+      truncated: prepared.truncated || originalRelativeTime.length > 24,
+    }];
+  }) : [];
+  const postItems = textItems(source.post_meeting);
+  const allItems = [preItems, inItems, postItems];
+  if (!allItems.some((items) => items.length)) return undefined;
+
+  const itemAllocation = fairHandwritingAllocation(
+    allItems.map((items) => items.length),
+    HANDWRITING_TOTAL_ITEMS,
+    [16, 48, 16],
+  );
+  const selectedItems = allItems.map((items, index) => items.slice(0, itemAllocation[index]));
+  const charAllocation = fairHandwritingAllocation(
+    selectedItems.map((items) => items.reduce((sum, item) => sum + item.text.length, 0)),
+    HANDWRITING_TOTAL_CHARS,
+    [1_600, 4_800, 1_600],
+  );
+  const omitted: Partial<Record<HandwritingSectionKey, number>> = {};
+  const sectionKeys: HandwritingSectionKey[] = ['pre_meeting', 'in_meeting', 'post_meeting'];
+  const emitted = selectedItems.map((items, sectionIndex) => {
+    let remaining = charAllocation[sectionIndex] || 0;
+    let omittedCount = allItems[sectionIndex].length - items.length;
+    const output = items.flatMap((item) => {
+      if (remaining <= 0) {
+        omittedCount += 1;
+        return [];
+      }
+      const text = item.text.slice(0, remaining);
+      remaining -= text.length;
+      if (item.truncated || text.length < item.text.length) omittedCount += 1;
+      return text ? [{ ...item, text }] : [];
+    });
+    if (omittedCount > 0) omitted[sectionKeys[sectionIndex]] = omittedCount;
+    return output;
+  });
+  const preMeeting = emitted[0].map((item) => item.text);
+  const inMeeting = emitted[1].map((item) => ({ relative_time: item.relative_time || '', text: item.text }));
+  const postMeeting = emitted[2].map((item) => item.text);
   if (!preMeeting.length && !inMeeting.length && !postMeeting.length) return undefined;
-  return { pre_meeting: preMeeting, in_meeting: inMeeting, post_meeting: postMeeting };
+  return {
+    pre_meeting: preMeeting,
+    in_meeting: inMeeting,
+    post_meeting: postMeeting,
+    ...(Object.keys(omitted).length ? { omitted_count: omitted } : {}),
+  };
 }
 
 

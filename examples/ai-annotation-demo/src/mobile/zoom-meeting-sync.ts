@@ -77,6 +77,7 @@ export function zoomMeetingPatch(
         provider_transcript_ref: undefined,
         provider_transcript_status: undefined,
         provider_transcript_reason: undefined,
+        provider_participants: undefined,
         vc_meeting_start_t0: undefined,
         t0_source: undefined,
         align_offset_ms: undefined,
@@ -118,15 +119,15 @@ export async function syncZoomMeetingSources(
       scheduledAt: source.scheduled_at,
     });
     if (source.missing_since) continue;
-    const patch = zoomMeetingPatch(source, nowMs, existing);
     if (existing) {
-      await dependencies.updateMeeting(existing.meeting_id, patch);
+      const updated = await dependencies.mutateMeeting(existing.meeting_id, (current) => zoomMeetingPatch(source, nowMs, current));
       meetings = meetings.map((meeting) => meeting.meeting_id === existing.meeting_id
-        ? { ...meeting, ...patch, updated_at: new Date(nowMs).toISOString() } as PersistedMeeting
+        ? updated ?? meeting
         : meeting);
       result.updated += 1;
       continue;
     }
+    const patch = zoomMeetingPatch(source, nowMs);
     workspace ||= await dependencies.upsertScheduleWorkspace();
     const created = await dependencies.createMeeting(workspace.workspace_id, {
       title: source.topic || 'Zoom',

@@ -70,6 +70,7 @@ export function googleMeetingPatch(
         provider_transcript_ref: undefined,
         provider_transcript_status: undefined,
         provider_transcript_reason: undefined,
+        provider_participants: undefined,
         google_smart_note: undefined,
         google_smart_note_scope_missing: undefined,
         google_recordings: undefined,
@@ -106,16 +107,16 @@ export async function syncGoogleMeetingSources(
       calendarEventId: source.calendar_event_id,
     });
     if (source.status === 'cancelled' && !existing) continue;
-    const patch = googleMeetingPatch(source, nowMs, existing);
     if (existing) {
-      await dependencies.updateMeeting(existing.meeting_id, patch);
+      const updated = await dependencies.mutateMeeting(existing.meeting_id, (current) => googleMeetingPatch(source, nowMs, current));
       meetings = meetings.map((meeting) => meeting.meeting_id === existing.meeting_id
-        ? { ...meeting, ...patch, updated_at: new Date(nowMs).toISOString() } as PersistedMeeting
+        ? updated ?? meeting
         : meeting);
       result.updated += 1;
       if (source.status === 'cancelled') result.cancelled += 1;
       continue;
     }
+    const patch = googleMeetingPatch(source, nowMs);
     const created = await dependencies.createMeeting(workspace.workspace_id, {
       title: source.title || 'Google Meet',
       scheduled_at: source.scheduled_at,

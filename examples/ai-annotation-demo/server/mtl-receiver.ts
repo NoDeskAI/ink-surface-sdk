@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -130,7 +130,14 @@ function writeLiveStateFile(identity: MtlReceiverIdentity, env: MtlReceiverEnv, 
   mkdirSync(dirname(path), { recursive: true });
   state.windows.sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
   state.windows = state.windows.slice(0, MAX_LIVE_WINDOWS);
-  writeFileSync(path, JSON.stringify(state, null, 2), 'utf8');
+  const temporaryPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch { /* 写入失败时清理尚存的临时文件 */ }
+    throw error;
+  }
 }
 
 export function listMtlMeetingWindows(
@@ -311,6 +318,24 @@ function requiredTime(payload: Record<string, unknown>, field: string, nowMs: nu
   return Math.round(value);
 }
 
+function reconcileRepeatedStartExternalId(
+  identity: MtlReceiverIdentity,
+  env: MtlReceiverEnv,
+  state: MtlLiveStateFile,
+  window: MtlLiveMeetingWindow,
+  externalMeetingId: string,
+  nowMs: number,
+): void {
+  if (!externalMeetingId) return;
+  if (window.external_meeting_id && window.external_meeting_id !== externalMeetingId) {
+    throw Object.assign(new Error('mtl_external_meeting_id_conflict'), { status: 409, current: window });
+  }
+  if (window.external_meeting_id) return;
+  window.external_meeting_id = externalMeetingId;
+  window.updated_at = new Date(nowMs).toISOString();
+  writeLiveStateFile(identity, env, state);
+}
+
 function startMeeting(
   identity: MtlReceiverIdentity,
   env: MtlReceiverEnv,
@@ -320,10 +345,12 @@ function startMeeting(
   const platform = normalizeMtlPlatform(requiredText(payload, 'platform'));
   const meetingId = requiredText(payload, 'meeting_id');
   const startedAtMs = requiredTime(payload, 'start_time_ms', nowMs);
+  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const state = readLiveStateFile(identity, env);
   const active = state.windows.find((window) => window.ended_at_ms === undefined);
   if (active) {
     if (active.platform === platform && active.meeting_id === meetingId) {
+      reconcileRepeatedStartExternalId(identity, env, state, active, externalMeetingId, nowMs);
       appendAudit(identity, env, 'meeting_session_start', payload, nowMs, { deduplicated: true });
       return { deduplicated: true, meeting: active };
     }
@@ -340,12 +367,12 @@ function startMeeting(
     && window.started_at_ms === startedAtMs
   ));
   if (prior) {
+    reconcileRepeatedStartExternalId(identity, env, state, prior, externalMeetingId, nowMs);
     appendAudit(identity, env, 'meeting_session_start', payload, nowMs, { deduplicated: true });
     return { deduplicated: true, meeting: prior };
   }
 
   const meetingUrl = canonicalUrl(payload.meeting_url);
-  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const title = clean(payload.title, 512);
   const detectorSource = clean(payload.detector_source, 256);
   const observerSurface = clean(payload.observer_surface, 128);

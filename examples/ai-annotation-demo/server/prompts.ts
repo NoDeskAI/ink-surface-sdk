@@ -185,6 +185,7 @@ export interface MeetingPanelSummaryHandwritingSections {
   pre_meeting: string[];
   in_meeting: Array<{ relative_time: string; text: string }>;
   post_meeting: string[];
+  omitted_count?: Partial<Record<'pre_meeting' | 'in_meeting' | 'post_meeting', number>>;
 }
 
 const MEETING_PANEL_HANDWRITING_CONTEXT = `<handwriting_context>
@@ -192,6 +193,7 @@ const MEETING_PANEL_HANDWRITING_CONTEXT = `<handwriting_context>
 - 在相关结论、风险、待决或后续中体现这些强调与补充，但不要让它们淹没转写主线，也不要把手写里没有写明的负责人、期限或结论补出来。
 - in_meeting 的 relative_time 是近似会议相对时刻，误差可能有几分钟；不要声称某条手写与某句转写精确对应。pre_meeting/post_meeting 不参与转写时间对齐。
 - 标为“无法识别的手写”或图形/圈画的内容只能说明用户在此处留过标注，不得推断其文字含义。
+- 存在 omitted_count 时只能依据已提供的手写内容，不得对被省略的手写下结论或补写其含义。
 </handwriting_context>`;
 
 export function buildMeetingPanelSummaryPrompts(input: {
@@ -206,6 +208,7 @@ export function buildMeetingPanelSummaryPrompts(input: {
     handwriting.pre_meeting.length > 0
     || handwriting.in_meeting.length > 0
     || handwriting.post_meeting.length > 0
+    || Object.values(handwriting.omitted_count || {}).some((count) => Number(count) > 0)
   );
   const system = hasHandwriting
     ? SYSTEM_PROMPTS.meeting_panel_summary.replace('<output_format>', `${MEETING_PANEL_HANDWRITING_CONTEXT}\n<output_format>`)

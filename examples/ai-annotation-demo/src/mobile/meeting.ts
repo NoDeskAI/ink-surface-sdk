@@ -59,6 +59,7 @@ import {
 import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-meeting-sync';
 import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomStatus } from '../integration/zoom/client';
 import { syncZoomMeetingLiveState, syncZoomMeetingSources } from './zoom-meeting-sync';
+import { createMeetingHomeSync } from './meeting-home-sync';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -907,7 +908,7 @@ async function healDuplicateLarkMeetings(): Promise<void> {
 }
 
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */
-async function syncHomeData(): Promise<void> {
+async function syncHomeDataRound(): Promise<void> {
   const statusBefore = new Map((await listAllMeetings()).map((meeting) => [meeting.meeting_id, meeting.status] as const));
   fsIdentityCache = await feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null);
   await refreshCoreSessionFromAuthority().catch(() => false); // 校准前端 core session=后端飞书身份（fsIdentityCache 只给会议 UI，不改 core session）
@@ -928,6 +929,8 @@ async function syncHomeData(): Promise<void> {
     if (meeting.status === 'ended' && statusBefore.get(meeting.meeting_id) !== 'ended') void triggerMeetingBoardOcr(meeting.meeting_id);
   }
 }
+
+const syncHomeData = createMeetingHomeSync(syncHomeDataRound);
 
 /** home 数据签名：workspace 名称/来源 + 会议状态/标题/时间/未读标记，任一变化才值得重渲（电纸屏免无谓刷新）。
  *  meetingPollTick 的变化判断也复用同一份定义，别各写一套（否则两处对「什么算变化」不一致）。 */

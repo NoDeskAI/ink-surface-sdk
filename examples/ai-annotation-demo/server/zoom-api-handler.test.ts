@@ -229,8 +229,9 @@ describe('zoom API routes', () => {
     const result = await invoke(handler, '/api/zoom/meeting-transcript?space_name=987654321&scheduled_at=2026-07-17T10%3A00%3A00Z');
     expect(result).toMatchObject({
       status: 200,
-      body: { status: 'no_record', reason: 'instance_not_found', participants: [] },
+      body: { status: 'no_record', reason: 'instance_not_found' },
     });
+    expect(result.body).not.toHaveProperty('participants');
   });
 
   it('propagates request abort into the meeting-sources fetch chain', async () => {

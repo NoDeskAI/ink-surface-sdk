@@ -34,12 +34,24 @@ describe('POST /api/ink/board-ocr', () => {
     expect(result.texts).toEqual({ mark_a: '结论', mark_b: 'next step' });
   });
 
-  it('fills a missing requested region with an empty string and ignores unknown keys', async () => {
+  it('omits a missing requested region and ignores unknown keys', async () => {
     const result = await processBoardOcrPayload(
       { image: jpeg(), regions },
       async () => 'prefix {"mark_a":"待办","other":"ignore"} suffix',
     );
-    expect(result.texts).toEqual({ mark_a: '待办', mark_b: '' });
+    expect(result.texts).toEqual({ mark_a: '待办' });
+  });
+
+  it('accepts an explicit empty string but rejects output without any known string key', async () => {
+    const explicitEmpty = await processBoardOcrPayload(
+      { image: jpeg(), regions },
+      async () => '{"mark_a":"","mark_b":42}',
+    );
+    expect(explicitEmpty.texts).toEqual({ mark_a: '' });
+    await expect(processBoardOcrPayload(
+      { image: jpeg(), regions },
+      async () => '{"other":"ignore","mark_a":42}',
+    )).rejects.toMatchObject({ status: 502, message: 'invalid_model_response' });
   });
 
   it('rejects byte and dimension limits with 413 before inference', async () => {

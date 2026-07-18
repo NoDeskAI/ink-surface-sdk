@@ -4,16 +4,20 @@ import type { PersistedMark, PersistedMeeting } from '../core/store-format';
 const mocks = vi.hoisted(() => ({
   getCachedMinute: vi.fn(),
   putCachedMinute: vi.fn(),
+  mutateMeeting: vi.fn(),
   updateMeeting: vi.fn(),
   getGoogleMeetingTranscript: vi.fn(),
   getFoldedMarksByContext: vi.fn(),
   triggerBoardOcr: vi.fn(),
+  isBoardOcrInFlight: vi.fn(),
+  meetings: new Map<string, PersistedMeeting>(),
 }));
 
 vi.mock('../local/store', async (importOriginal) => ({
   ...await importOriginal<typeof import('../local/store')>(),
   getCachedMinute: mocks.getCachedMinute,
   putCachedMinute: mocks.putCachedMinute,
+  mutateMeeting: mocks.mutateMeeting,
   updateMeeting: mocks.updateMeeting,
   getFoldedMarksByContext: mocks.getFoldedMarksByContext,
 }));
@@ -21,6 +25,7 @@ vi.mock('../local/store', async (importOriginal) => ({
 vi.mock('../capture/board-ocr', async (importOriginal) => ({
   ...await importOriginal<typeof import('../capture/board-ocr')>(),
   triggerBoardOcr: mocks.triggerBoardOcr,
+  isBoardOcrInFlight: mocks.isBoardOcrInFlight,
 }));
 
 vi.mock('../integration/google-meet/client', async (importOriginal) => ({
@@ -34,13 +39,14 @@ import {
   isFeishuReloginError,
   loadGoogleTranscript,
   meetingSummaryTranscriptCacheToken,
+  requestProviderPanelSummary,
   recapTranscriptMissingMessage,
   renderRecapCard,
   renderGoogleRecordingsHtml,
 } from './meeting-recap';
 
 function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting {
-  return {
+  const meeting: PersistedMeeting = {
     meeting_id: 'local-google-1',
     workspace_id: 'ws_schedule',
     title: 'Google review',
@@ -53,16 +59,28 @@ function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting 
     updated_at: '2026-07-15T00:00:00.000Z',
     ...patch,
   };
+  mocks.meetings.set(meeting.meeting_id, meeting);
+  return meeting;
 }
 
 describe('meeting recap Google transcript branch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.meetings.clear();
     mocks.getCachedMinute.mockResolvedValue(null);
     mocks.putCachedMinute.mockResolvedValue(undefined);
     mocks.updateMeeting.mockResolvedValue(null);
     mocks.getFoldedMarksByContext.mockResolvedValue([]);
     mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-google-1', marks: 0, ok: 0, empty: 0, ms: 0 });
+    mocks.isBoardOcrInFlight.mockReturnValue(false);
+    mocks.mutateMeeting.mockImplementation(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
+      const current = mocks.meetings.get(id);
+      if (!current) return null;
+      const patch = mutator(current);
+      if (!patch) return null;
+      Object.assign(current, patch);
+      return current;
+    });
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -203,9 +221,14 @@ describe('meeting recap Google transcript branch', () => {
     });
   });
 
-  it('continues with current handwriting after the 10 second OCR wait limit', async () => {
+  it('等待 10 秒后仍有手写 OCR 在途时推迟总结落库', async () => {
     vi.useFakeTimers();
     mocks.triggerBoardOcr.mockImplementation(() => new Promise(() => undefined));
+    mocks.isBoardOcrInFlight.mockReturnValue(true);
+    mocks.getFoldedMarksByContext.mockResolvedValue([{
+      mark_id: 'pending-mark', feature_type: 'handwriting', ocr_fingerprint: undefined, is_tombstone: false,
+      strokes: [{ tool: 'pen', points: [{ x: 0.1, y: 0.1, t: 0, pressure: 0.5 }] }],
+    } as PersistedMark]);
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       model: 'glm-test',
       summary: { conclusions: ['继续生成'], action_items: [], risks: [], open_questions: [], next_steps: [] },
@@ -218,10 +241,30 @@ describe('meeting recap Google transcript branch', () => {
     await vi.advanceTimersByTimeAsync(9_999);
     expect(fetchMock).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    await task;
+    await expect(task).resolves.toBeNull();
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(mocks.getFoldedMarksByContext).toHaveBeenCalledWith('mtg_local-google-1');
+  });
+
+  it('OCR 已失败时继续总结，账本读取失败时中止生成', async () => {
+    mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-google-1', marks: 1, ok: 0, empty: 0, ms: 20, failed: true });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      model: 'glm-test',
+      summary: { conclusions: ['使用现有文字'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureGooglePanelSummary(googleMeeting(), [
+      { index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '继续。', rawText: '继续。' },
+    ]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    mocks.getFoldedMarksByContext.mockRejectedValueOnce(new Error('账本损坏'));
+    await expect(ensureGooglePanelSummary(googleMeeting({ meeting_id: 'local-google-ledger-error' }), [
+      { index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '停止。', rawText: '停止。' },
+    ])).rejects.toThrow('账本损坏');
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('shares the in-flight generation and does not resend when a summary already exists', async () => {
@@ -245,6 +288,21 @@ describe('meeting recap Google transcript branch', () => {
     const cached = await ensureGooglePanelSummary(googleMeeting({ panel_summary: a! }), cues);
     expect(cached).toEqual(a);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('旧场请求失败前已改期时不把 Google 新场标成失败', async () => {
+    const meeting = googleMeeting();
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => {
+      meeting.scheduled_at = '2026-07-16T01:00:00.000Z';
+      throw new Error('总结请求失败');
+    }));
+
+    const result = await requestProviderPanelSummary(meeting, [{
+      index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '旧场内容', rawText: '旧场内容',
+    }]);
+
+    expect(result).toMatchObject({ summary: null, failurePersisted: false, occurrenceToken: '20260715T010000Z' });
+    expect(meeting.panel_summary_status).toBeUndefined();
   });
 
   it('caches ready SRT and patches provider-event t0 without undefined fields', async () => {
