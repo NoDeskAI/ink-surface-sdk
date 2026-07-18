@@ -10,13 +10,14 @@ import { bus, state, settings, setActiveContext, getActiveContext, currentStroke
 import { SurfaceContext } from '../app/surface-context';
 import { renderBlankSurface, renderBlankPage, resizeBlankSurface, reopenBook, openPdfFromUrl, importPdfFromUrl, cancelActiveRender } from '../surface/renderer';
 import { redrawInk } from '../capture/ink';
-import { flushRegion } from '../app/annotation-loop';
+import { flushBoardOcrMarks, flushRegion } from '../app/annotation-loop';
+import { triggerBoardOcr, type BoardOcrRunResult } from '../capture/board-ocr';
 import { flushBedrock, setBedrockDeferred } from '../local/bedrock-recorder';
 import { setRuntimeSyncHeld } from '../integration/inksurface/runtime-sync-host';
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
-  createMeeting, getMeeting, updateMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
+  createMeeting, getMeeting, mutateMeeting, updateMeeting, deleteMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
   createDiaryDoc, renameDiary, setActiveDoc, setLastReadPage, getDoc, upsertPanelWorkspace, upsertScheduleWorkspace,
   appendMarkEntry,
 } from '../local/store';
@@ -38,8 +39,15 @@ import { notePanelSyncOk, notePanelSyncError } from './meeting-sync-status';
 import type { NormBBox, StrokePoint } from '../core/contracts';
 import { DEVICE_ID, shortId } from '../core/ids';
 import { signalInkArea } from '../surface/eink';
-import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
-import { findMeetingForProviderSource, meetingPlatformOf, type MeetingPlatform } from './meeting-platform';
+import { effectiveMeetingEndIso, effectiveMeetingStatus, filterMeetingsByPlatform, meetingMarkPhase, MEETING_PROVIDER_LEAD_OPTIONS, meetingHomeBuckets, normalizeMeetingHomeFilter, type MeetingHomeFilter } from './meeting-home-model';
+import { markTime } from '../core/mark-time';
+import {
+  createMeetingKeyLock,
+  findMeetingForProviderSource,
+  meetingPlatformOf,
+  providerMeetingLockKey,
+  type MeetingPlatform,
+} from './meeting-platform';
 import { fitMeetingNotePage } from './meeting-note-layout';
 import {
   getMeetingLiveState,
@@ -49,6 +57,9 @@ import {
   startGoogleDeviceOAuth,
 } from '../integration/google-meet/client';
 import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-meeting-sync';
+import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomStatus } from '../integration/zoom/client';
+import { syncZoomMeetingLiveState, syncZoomMeetingSources } from './zoom-meeting-sync';
+import { createMeetingHomeSync } from './meeting-home-sync';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -242,7 +253,7 @@ let mv: { wsId?: string; mtgId?: string } = {};
 let readerCtx: SurfaceContext;
 // 会中
 let meetingCtx: SurfaceContext | null = null;
-let liveMtg: { id: string; title: string; chatId?: string; status: MeetingStatus; startedAt: number; frozenAt: number } | null = null;
+let liveMtg: { id: string; title: string; chatId?: string; status: MeetingStatus; startedAt: number; frozenAt: number; meeting: PersistedMeeting } | null = null;
 let clockTimer = 0;
 let prevGesture = true;
 let liveMarkCount = 0;
@@ -253,6 +264,12 @@ let bedrockAutoEnabled = false;   // 本次租约是我们替它开的 → 退�
 let bedrockUserOverride = false;  // 本场会议里用户手动设过 bedrock → 续租/退出都别动它（每场 enterMeeting 重置）
 const RULED = { ruledLines: false } as const;            // 同日记：引擎不画线，稿纸线走 CSS 叠层 #diary-lines
 const noteIdOf = (mtgId: string): string => 'mtgboard_' + mtgId; // 会议手记 doc id = 既有白板 marks 的 document_id（零迁移·createDiaryDoc 幂等）
+
+async function triggerMeetingBoardOcr(mtgId: string): Promise<BoardOcrRunResult> {
+  const documentId = noteIdOf(mtgId);
+  if (state.documentId === documentId && state.surfaceType === 'whiteboard') await flushBoardOcrMarks();
+  return triggerBoardOcr(documentId);
+}
 
 function setMtg(view: 'home' | 'detail' | 'live' | 'recap'): void {
   document.body.dataset.mtg = view;
@@ -279,20 +296,27 @@ const MEETING_PROVIDER_KEY = 'inkloop.meeting.provider.v1';
 const MEETING_PROVIDER_LABELS: Record<MeetingPlatform, string> = {
   lark: '飞书会议',
   google_meet: 'Google Meet',
+  zoom: 'Zoom',
+  microsoft_teams: 'Teams',
   manual: '本地记录',
 };
 const MEETING_PROVIDER_ICONS: Record<MeetingPlatform, string> = {
   lark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4L3 11l7 3 3 7 8-17z"/><path d="M10 14l11-10"/></svg>',
   google_meet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="10" rx="2"/><path d="M15 10.5l6-3.5v10l-6-3.5"/></svg>',
+  zoom: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="10" rx="2"/><path d="M15 10l6-3v10l-6-3z"/></svg>',
+  microsoft_teams: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="11" height="12" rx="2"/><path d="M8 10h7M11.5 10v6"/><circle cx="18.5" cy="8" r="2"/></svg>',
   manual: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
 };
 const MEETING_PROVIDER_HINTS: Record<MeetingPlatform, string> = {
   lark: '日程 · 妙记转写 · 群资料',
   google_meet: '日历日程 · 会后转写',
+  zoom: '会议 · 会后转写',
+  microsoft_teams: '日历日程 · 会后转写',
   manual: '手写记录 · 无需连接',
 };
+const MEETING_PROVIDERS: readonly MeetingPlatform[] = ['lark', 'google_meet', 'zoom', 'microsoft_teams', 'manual'];
 function normalizeMeetingProvider(value: unknown): MeetingPlatform {
-  return value === 'google_meet' || value === 'manual' ? value : 'lark';
+  return MEETING_PROVIDERS.includes(value as MeetingPlatform) ? value as MeetingPlatform : 'lark';
 }
 let selectedMeetingProvider: MeetingPlatform = (() => {
   try { return normalizeMeetingProvider(localStorage.getItem(MEETING_PROVIDER_KEY)); }
@@ -318,7 +342,10 @@ function rememberMeetingProvider(provider: MeetingPlatform): void {
 
 // ════ L1：panel 飞书会议同步（VC all_meeting_started/ended → 本地会议·带真 t0）════
 const PANEL_CURSOR_KEY = 'inkloop.panelMeeting.cursor.v1';
-const panelUpserts = new Map<string, Promise<void>>(); // 按 meeting_id 串行·防 events+active 并发同一会议重复建
+// 按会议 key 串行的共享锁：panel 事件路(upsertPanelMeeting)和 meeting-sources 路(syncMeetingSources)
+// 共用同一把——两路各自「查无此会→建卡」的 check-then-create 不原子，短会(started/ended 同窗口到达)
+// 实测撞出同 fid 两张卡（2026-07-16·55 秒测试会）。key=<platform>:<provider id>（两路同值域）。
+const withMeetingKeyLock = createMeetingKeyLock();
 type PanelMeetingUpsertType = 'started' | 'ended' | 'metadata'; // metadata=minute_bound/summary_ready 带来的元数据更新·不改 status/时间
 
 /** 事件内嵌会议上的当前妙记 token（顶层 minute_token 优先·回退 match.minute_token）。 */
@@ -332,13 +359,7 @@ async function findLocalPanelMeeting(panelMeetingId: string): Promise<PersistedM
 /** panel 会议 → 落成本地会议。靠 feishu_meeting_id 幂等去重·同一 meeting_id 串行（防并发重复建）。本地写失败会抛 → 上层不推 cursor。 */
 async function upsertPanelMeeting(mt: PanelFeishuMeeting, type: PanelMeetingUpsertType, occurredAt = 0): Promise<void> {
   if (!mt.meeting_id) return;
-  const key = mt.meeting_id;
-  const prev = panelUpserts.get(key) ?? Promise.resolve();
-  const job = prev.catch(() => {}).then(() => upsertPanelMeetingInner(mt, type, occurredAt)).finally(() => {
-    if (panelUpserts.get(key) === job) panelUpserts.delete(key);
-  });
-  panelUpserts.set(key, job);
-  await job;
+  await withMeetingKeyLock(providerMeetingLockKey('lark', mt.meeting_id), () => upsertPanelMeetingInner(mt, type, occurredAt));
 }
 
 /** 归群「两条腿」：① group_ids 自动归真群 → ② 认领映射 → ③ 已在真飞书群保持 → ④ 日历会议无群保持日程占位 → ⑤ 无群桶。 */
@@ -414,6 +435,7 @@ async function upsertPanelMeetingInner(mt: PanelFeishuMeeting, type: PanelMeetin
     devEmit('meeting', () => ({ ev: 'live_toast_shown', meeting_id: saved.meeting_id, title: saved.title, source: type }));
   }
   if (nextStatus === 'ended') dismissMobileToast(`meeting-live:${base.meeting_id}`);
+  if (nextStatus === 'ended' && existing?.status !== 'ended') void triggerMeetingBoardOcr(base.meeting_id);
   // 正在这场记录工作台里 → 事件迟到时热更 status/t0/结束时长（不强制跳页·用户还在画板·只更状态条/脊）。
   if (liveMtg && liveMtg.id === base.meeting_id) {
     liveMtg.status = nextStatus;
@@ -520,12 +542,15 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
   const res = await feishuGet<FeishuMeetingSourcesResponse>('/api/feishu/meeting-sources?lookback_days=30&lookahead_days=14&page_size=10');
   if (!res) return { connected: false, imported: 0 };
   const sources = (res.sources || []).filter((source) => source.scheduled_at && (source.feishu_meeting_id || source.meeting_no || source.calendar_event_id || source.meeting_url));
-  let all = await listAllMeetings();
   let imported = 0;
   for (const source of sources) {
-    const existing = existingMeetingForSource(all, source);
+    const meetingNo0 = source.meeting_no || meetingNoFromUrl(source.meeting_url);
+    // 与 panel 事件路共锁 + 锁内重查：check-then-create 必须在同一把锁里原子，否则短会两路并发各建一张卡。
+    const lockKey = providerMeetingLockKey('lark', String(source.feishu_meeting_id || source.calendar_event_id || meetingNo0 || source.source_id || source.meeting_url));
+    await withMeetingKeyLock(lockKey, async () => {
+    const existing = existingMeetingForSource(await listAllMeetings(), source);
     const ws = await sourceWorkspace(source, existing);
-    const meetingNo = source.meeting_no || meetingNoFromUrl(source.meeting_url);
+    const meetingNo = meetingNo0;
     const patch: Partial<PersistedMeeting> = {
       workspace_id: ws.workspace_id,
       title: source.title || existing?.title || '飞书会议',
@@ -547,14 +572,14 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
       ...(ws.source === 'feishu' ? { group_claimed_at: new Date().toISOString() } : {}),
     };
     if (existing) {
-      if (existing.source_kind === 'vc' && source.source !== 'lark_meeting_timeline' && source.status !== 'ended') continue;
+      if (existing.source_kind === 'vc' && source.source !== 'lark_meeting_timeline' && source.status !== 'ended') return;
       await updateMeeting(existing.meeting_id, patch);
     } else {
       const created = await createMeeting(ws.workspace_id, { title: patch.title || '飞书会议', scheduled_at: source.scheduled_at, status: patch.status || 'upcoming' });
       await updateMeeting(created.meeting_id, patch);
       imported += 1;
-      all = [...all, { ...created, ...patch, updated_at: new Date().toISOString() } as PersistedMeeting];
     }
+    });
   }
   const issue = res.errors?.find((error) => error.source === 'lark_meeting_timeline_search' || error.source === 'lark_meeting_timeline_lookup')?.message;
   return { connected: !!res.connected, imported, issue };
@@ -641,6 +666,25 @@ function rememberGoogleCalendarConnection(connected: boolean): void {
   } catch { /* storage unavailable: keep the in-memory connection state */ }
 }
 let googleConnectedCache = googleCalendarConnectionHint();
+const ZOOM_CONNECTED_KEY = 'inkloop.zoomConnected';
+function zoomConnectionHint(): boolean {
+  try { return localStorage.getItem(ZOOM_CONNECTED_KEY) === '1'; }
+  catch { return false; }
+}
+function rememberZoomConnection(connected: boolean): void {
+  try {
+    if (connected) localStorage.setItem(ZOOM_CONNECTED_KEY, '1');
+    else localStorage.removeItem(ZOOM_CONNECTED_KEY);
+  } catch { /* storage unavailable: keep the in-memory connection state */ }
+}
+let zoomConnectedCache = zoomConnectionHint();
+let zoomConfiguredCache = zoomConnectedCache;
+
+function updateZoomConnection(status: { connected: boolean; configured: boolean }): void {
+  zoomConnectedCache = status.connected;
+  zoomConfiguredCache = status.configured;
+  rememberZoomConnection(status.connected);
+}
 
 function feishuIdentityConnected(): boolean {
   const session = getSession();
@@ -652,11 +696,24 @@ function feishuIdentityConnected(): boolean {
 }
 
 function providerStatusHtml(provider: MeetingPlatform): string {
-  if (provider === 'manual') return '<span class="mp-status">无需连接</span>';
-  const connected = provider === 'lark' ? feishuIdentityConnected() : googleConnectedCache;
-  if (!connected) return '<span class="mp-status">未连接</span>';
-  const id = provider === 'lark' ? ' id="mp-feishu-identity"' : ' id="mp-google-identity"';
-  return `<button class="mp-status is-connected" type="button"${id}><span class="d"></span>已连接</button>`;
+  switch (provider) {
+    case 'manual':
+      return '<span class="mp-status">无需连接</span>';
+    case 'lark':
+      return feishuIdentityConnected()
+        ? '<button class="mp-status is-connected" type="button" id="mp-feishu-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
+    case 'google_meet':
+      return googleConnectedCache
+        ? '<button class="mp-status is-connected" type="button" id="mp-google-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
+    case 'zoom':
+      return zoomConnectedCache
+        ? '<button class="mp-status is-connected" type="button" id="mp-zoom-identity"><span class="d"></span>已连接</button>'
+        : '<span class="mp-status">未连接</span>';
+    case 'microsoft_teams':
+      return '<span class="mp-status">暂未接入</span>';
+  }
 }
 
 async function enterMeetingProviderHome(provider: MeetingPlatform): Promise<void> {
@@ -669,28 +726,49 @@ async function enterMeetingProviderHome(provider: MeetingPlatform): Promise<void
 
 async function chooseMeetingProvider(provider: MeetingPlatform): Promise<void> {
   rememberMeetingProvider(provider);
-  if (provider === 'lark' && !feishuIdentityConnected()) {
-    try { await startDeviceFeishuLogin(); }
-    catch (error) { await infoSheet({ title: '飞书登录失败', message: String((error as Error)?.message || error) }); }
-    return;
-  }
-  if (provider === 'google_meet' && !googleConnectedCache) {
-    await openGoogleCalendarConnection();
-    return;
+  switch (provider) {
+    case 'lark':
+      if (!feishuIdentityConnected()) {
+        try { await startDeviceFeishuLogin(); }
+        catch (error) { await infoSheet({ title: '飞书登录失败', message: String((error as Error)?.message || error) }); }
+        return;
+      }
+      break;
+    case 'google_meet':
+      if (!googleConnectedCache) {
+        await openGoogleCalendarConnection();
+        return;
+      }
+      break;
+    case 'zoom':
+      {
+        const status = await fetchZoomStatus().catch(() => null);
+        if (status) updateZoomConnection(status);
+      }
+      if (!zoomConfiguredCache) {
+        await infoSheet({ title: 'Zoom', message: 'Zoom 由服务器统一接入，请在 Cloud Hub 配置 S2S 凭据。' });
+        return;
+      }
+      break;
+    case 'microsoft_teams':
+    case 'manual':
+      break;
   }
   await enterMeetingProviderHome(provider);
 }
 
 async function refreshMeetingProviderLeadConnections(): Promise<void> {
-  const [identity, googleStatus] = await Promise.all([
+  const [identity, googleStatus, zoomStatus] = await Promise.all([
     feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null),
     googleCalendarConnectionHint() ? getGoogleOAuthStatus().catch(() => null) : Promise.resolve(null),
+    fetchZoomStatus().catch(() => null),
   ]);
   if (identity) fsIdentityCache = identity;
   if (googleStatus) {
     googleConnectedCache = googleStatus.connected;
     rememberGoogleCalendarConnection(googleStatus.connected);
   }
+  if (zoomStatus) updateZoomConnection(zoomStatus);
   if (meetingProviderLeadVisible && document.body.dataset.mode === 'meet' && document.body.dataset.mtg === 'home') {
     renderMeetingProviderLead(false);
   }
@@ -702,7 +780,7 @@ function renderMeetingProviderLead(refresh = true): void {
   mtgPagers.delete('home');
   const root = el('mv-home');
   root.classList.remove('has-vpages');
-  const providers: MeetingPlatform[] = ['lark', 'google_meet', 'manual'];
+  const providers = MEETING_PROVIDER_LEAD_OPTIONS;
   const rows = providers.map((provider) => {
     const selected = provider === selectedMeetingProvider;
     return `<div class="mp-option${selected ? ' is-default' : ''}" role="option" aria-selected="${selected}" tabindex="${selected ? '0' : '-1'}" data-meeting-provider="${provider}">`
@@ -731,6 +809,10 @@ function renderMeetingProviderLead(refresh = true): void {
     event.stopPropagation();
     void openGoogleCalendarConnection();
   });
+  root.querySelector('#mp-zoom-identity')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void infoSheet({ title: 'Zoom', message: 'Zoom 由服务器统一接入，当前已连接。' });
+  });
   root.querySelector<HTMLElement>('.mp-option.is-default')?.focus({ preventScroll: true });
   if (refresh) void refreshMeetingProviderLeadConnections();
 }
@@ -755,15 +837,79 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
     upsertScheduleWorkspace,
     createMeeting,
     updateMeeting,
+    mutateMeeting,
   });
   if (!response.mtl_token_configured) return;
   const liveState = await getMeetingLiveState();
   if (!liveState.connected) return;
-  await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, updateMeeting });
+  await syncGoogleMeetingLiveState(liveState.windows || [], { listAllMeetings, mutateMeeting });
+}
+
+async function syncZoomMeetings(): Promise<void> {
+  const status = await fetchZoomStatus();
+  updateZoomConnection(status);
+  if (!status.connected) return;
+  const response = await fetchZoomMeetingSources();
+  await syncZoomMeetingSources(response.sources || [], {
+    listAllMeetings,
+    upsertScheduleWorkspace,
+    createMeeting,
+    updateMeeting,
+    mutateMeeting,
+  });
+  const liveState = await fetchZoomMeetingLiveState();
+  if (!liveState.connected) return;
+  await syncZoomMeetingLiveState(liveState.windows || [], { listAllMeetings, mutateMeeting });
+}
+
+// ════ 重复卡自愈：历史竞态给同一场飞书会建过两张卡（锁上线前的存量+万一的漏网）。════
+// 合并原则：手记 doc 挂本地 meeting_id（noteIdOf），删错会孤儿化用户笔迹——有手记的必留；
+// 双方都有手记直接跳过（宁可重复不可丢数据）。字段并给保留者后删多余卡。幂等，每轮同步末尾跑。
+const DUP_MERGE_FIELDS: Array<keyof PersistedMeeting> = [
+  'ended_at', 'started_at', 'vc_meeting_start_t0', 't0_source', 'align_state', 'panel_meeting_start',
+  'feishu_meeting_no', 'calendar_meeting_no', 'feishu_topic', 'feishu_calendar_event_id',
+  'feishu_minute_token', 'feishu_minute_url', 'source_kind',
+];
+async function healDuplicateLarkMeetings(): Promise<void> {
+  const groups = new Map<string, PersistedMeeting[]>();
+  for (const m of await listAllMeetings()) {
+    if (meetingPlatformOf(m) !== 'lark' || !m.feishu_meeting_id) continue;
+    groups.set(m.feishu_meeting_id, [...(groups.get(m.feishu_meeting_id) ?? []), m]);
+  }
+  for (const [fid, dupes] of groups) {
+    if (dupes.length < 2) continue;
+    const scored = await Promise.all(dupes.map(async (m) => ({ m, note: !!(await getDoc(noteIdOf(m.meeting_id))) })));
+    if (scored.filter((x) => x.note).length > 1) {
+      devEmit('meeting', () => ({ ev: 'dup_heal_skipped', fid, reason: 'both_have_note', ids: dupes.map((d) => d.meeting_id) }));
+      continue;
+    }
+    const score = (x: { m: PersistedMeeting; note: boolean }): number =>
+      (x.note ? 8 : 0) + (x.m.panel_summary ? 4 : 0) + ((x.m.material_doc_ids?.length ?? 0) > 0 ? 2 : 0) + (x.m.ended_at ? 1 : 0);
+    scored.sort((a, b) => score(b) - score(a) || (a.m.created_at || '').localeCompare(b.m.created_at || ''));
+    const keeper = scored[0].m;
+    if (liveMtg && dupes.some((d) => d.meeting_id === liveMtg?.id) && keeper.meeting_id !== liveMtg.id) continue; // 正开着的会这轮不动
+    const losers = scored.slice(1).map((x) => x.m);
+    const patch: Partial<PersistedMeeting> = {};
+    for (const loser of losers) {
+      for (const k of DUP_MERGE_FIELDS) {
+        if (keeper[k] == null && loser[k] != null && patch[k] == null) {
+          (patch as Record<keyof PersistedMeeting, unknown>)[k] = loser[k];
+        }
+      }
+      if (loser.status === 'ended' && keeper.status !== 'ended') { patch.status = 'ended'; if (patch.ended_at == null) patch.ended_at = loser.ended_at; }
+      if (!keeper.panel_summary && loser.panel_summary) { patch.panel_summary = loser.panel_summary; patch.panel_summary_status = loser.panel_summary_status; }
+      const extraDocs = (loser.material_doc_ids || []).filter((d) => !(keeper.material_doc_ids || []).includes(d));
+      if (extraDocs.length) await addMeetingMaterialDocIds(keeper.meeting_id, extraDocs);
+    }
+    if (Object.keys(patch).length) await updateMeeting(keeper.meeting_id, patch);
+    for (const loser of losers) await deleteMeeting(loser.meeting_id);
+    devEmit('meeting', () => ({ ev: 'dup_heal_merged', fid, keeper: keeper.meeting_id, removed: losers.map((l) => l.meeting_id) }));
+  }
 }
 
 /** 同步会议数据：panel 事件 + 日历日程落库 + 飞书群→工作区。进入会议页 / 后台轮询时跑；切子页不跑。 */
-async function syncHomeData(): Promise<void> {
+async function syncHomeDataRound(): Promise<void> {
+  const statusBefore = new Map((await listAllMeetings()).map((meeting) => [meeting.meeting_id, meeting.status] as const));
   fsIdentityCache = await feishuGet<FeishuIdentityResponse>('/api/feishu/me').catch(() => null);
   await refreshCoreSessionFromAuthority().catch(() => false); // 校准前端 core session=后端飞书身份（fsIdentityCache 只给会议 UI，不改 core session）
   updateCloudClock(fsIdentityCache?.server_now_ms);
@@ -777,7 +923,14 @@ async function syncHomeData(): Promise<void> {
   fsConnectedCache = fsConnectedCache || meetingSources.connected;
   if (!fsCalendarIssue && meetingSources.issue) fsCalendarIssue = meetingSources.issue;
   await syncGoogleCalendarMeetings().catch(() => {});
+  await syncZoomMeetings().catch(() => {});
+  await healDuplicateLarkMeetings().catch(() => {}); // 重复卡自愈（存量清理+锁的漏网兜底）·幂等
+  for (const meeting of await listAllMeetings()) {
+    if (meeting.status === 'ended' && statusBefore.get(meeting.meeting_id) !== 'ended') void triggerMeetingBoardOcr(meeting.meeting_id);
+  }
 }
+
+const syncHomeData = createMeetingHomeSync(syncHomeDataRound);
 
 /** home 数据签名：workspace 名称/来源 + 会议状态/标题/时间/未读标记，任一变化才值得重渲（电纸屏免无谓刷新）。
  *  meetingPollTick 的变化判断也复用同一份定义，别各写一套（否则两处对「什么算变化」不一致）。 */
@@ -793,6 +946,7 @@ function homeSig(workspaces: PersistedWorkspace[], meetings: PersistedMeeting[])
     fsIdentityCache?.oauth?.connected ? 'connected' : 'disconnected',
     fsIdentityCache?.session?.feishu_open_id || '',
     googleConnectedCache ? 'google-connected' : 'google-disconnected',
+    zoomConnectedCache ? 'zoom-connected' : 'zoom-disconnected',
   ].join(':');
   return `${identity}@${clock}#${ws}#${mtg}`;
 }
@@ -1115,14 +1269,54 @@ async function refreshMeetNavBadge(): Promise<void> {
   if (tabBadge) tabBadge.hidden = !on;
 }
 
+/** live 画板只拉 MTL 小响应；日程列表、文件和 provider 详情仍留给 home 同步。 */
+async function syncActiveMeetingProviderLiveState(previousStatus: MeetingStatus | undefined): Promise<void> {
+  const active = liveMtg;
+  if (!active) return;
+  const platform = meetingPlatformOf(active.meeting);
+  if (platform === 'google_meet' || googleCalendarConnectionHint()) {
+    const state = await getMeetingLiveState().catch(() => null);
+    if (state?.connected) await syncGoogleMeetingLiveState(state.windows || [], { listAllMeetings, mutateMeeting }).catch(() => {});
+  }
+  if (platform === 'zoom' || zoomConfiguredCache) {
+    const state = await fetchZoomMeetingLiveState().catch(() => null);
+    if (state?.connected) await syncZoomMeetingLiveState(state.windows || [], { listAllMeetings, mutateMeeting }).catch(() => {});
+  }
+  const fresh = await getMeeting(active.id);
+  if (!fresh || liveMtg !== active) return;
+  active.meeting = fresh;
+  active.status = fresh.status;
+  const startMs = Number.isFinite(fresh.vc_meeting_start_t0)
+    ? (fresh.vc_meeting_start_t0 as number)
+    : Date.parse(fresh.started_at || '');
+  if (Number.isFinite(startMs) && startMs > 0) active.startedAt = startMs;
+  if (fresh.status === 'ended') {
+    const endedMs = Date.parse(fresh.ended_at || '');
+    active.frozenAt = Number.isFinite(endedMs) && endedMs > 0 ? endedMs : meetingNowMs();
+    stopMeetingBedrock();
+    if (previousStatus !== 'ended') void triggerMeetingBoardOcr(fresh.meeting_id);
+  } else if (fresh.status === 'live') {
+    active.frozenAt = 0;
+    startMeetingBedrock();
+  }
+  startClock();
+  void refreshSpine();
+}
+
 /** 一拍：同步 panel/日历（实时归类）→ 窗口内已归真群的会议抓群文件（节流）→ 数据变了才重渲首页（守翻页·不打断 ws/detail/live）。
  *  不在「会议」面时也要轻量收 panel started/ended 事件才能点亮 nav 徽标（M7·「第一时间通知」不能只在会议面里生效），
  *  但只做这一件事——不拉日历/不抓群文件/不重渲 home（不抢资源·不打断阅读/dev 当前活动）。 */
 async function meetingPollTick(): Promise<void> {
   if (document.hidden) return;
   if (document.body.dataset.mode !== 'meet') { await syncPanelMeetingsObserved().catch(() => {}); void refreshMeetNavBadge(); return; }
-  // 会中(记录工作台)也要消费 panel started/ended 事件(M1·status 飞书驱动)，但只轻量同步、不抓群文件/不重渲 home（保 P0 不抢资源/不打断画板）。
-  if (document.body.dataset.mtg === 'live') { await syncPanelMeetingsObserved().catch(() => {}); void refreshMeetNavBadge(); return; }
+  // 会中记录工作台消费 panel + 各 provider MTL 小窗口，热更状态条；不拉日程/文件、不重渲画板。
+  if (document.body.dataset.mtg === 'live') {
+    const previousStatus = liveMtg?.status;
+    await syncPanelMeetingsObserved().catch(() => {});
+    await syncActiveMeetingProviderLiveState(previousStatus);
+    void refreshMeetNavBadge();
+    return;
+  }
   try { await syncHomeData(); } catch { return; }
   for (const m of await listAllMeetings()) { // 文件捕获窗口：窗口内 + 已归真飞书群（会前1h只对已知群生效）
     const ws = m.workspace_id ? await getWorkspace(m.workspace_id) : null;
@@ -1369,6 +1563,13 @@ async function renderDetail(): Promise<void> {
 
 /** WS2-C：进「会后记录」阅读视图（时间脊为主体·左侧 #recap-nav 切到思路总结/panel总结整页）。返回=回 detail。 */
 async function openRecap(mtgId: string): Promise<void> {
+  // 会后总结直接读 marked_text：先给 OCR 最多 8s，超时只放行 UI，原 promise 不取消、稍后仍会写回。
+  let timer = 0;
+  await Promise.race([
+    triggerMeetingBoardOcr(mtgId),
+    new Promise<void>((resolve) => { timer = window.setTimeout(resolve, 8_000); }),
+  ]).catch(() => undefined);
+  window.clearTimeout(timer);
   setMtg('recap');
   // 顶栏返回：详情段视图先退回概览（recapHandleBack 处理）；已在概览/思路总结/panel总结才退出 recap 回 home。
   el('recap-back').onclick = () => { if (recapHandleBack()) return; resetRecapView(); setMtg('home'); void renderHome(); }; // 会后整合：recap 是 ended 主体·返回回 home 列表（不再回 detail）
@@ -1586,7 +1787,7 @@ async function enterMeeting(mtgId: string, material?: { docId: string; name: str
   const reviewing = status === 'ended';
   const endedAtMs = reviewing && m.ended_at ? Date.parse(m.ended_at) : NaN;
   const endedMs = Number.isFinite(endedAtMs) ? endedAtMs : 0;
-  liveMtg = { id: mtgId, title: decodeMeetingTitle(m.title), chatId: ws?.feishu_chat_id, status, startedAt: startedMs, frozenAt: startedMs > 0 ? (endedMs || (reviewing ? startedMs : 0)) : 0 };
+  liveMtg = { id: mtgId, title: decodeMeetingTitle(m.title), chatId: ws?.feishu_chat_id, status, startedAt: startedMs, frozenAt: startedMs > 0 ? (endedMs || (reviewing ? startedMs : 0)) : 0, meeting: m };
   liveMarkCount = 0;
   bedrockUserOverride = false; // 新会议：清上一场的手动接管标记
   if (status === 'live') startMeetingBedrock(); // 只有飞书已判 live 才录基岩；会前工作台 / 已结束回看不录。
@@ -1616,6 +1817,9 @@ async function enterMeeting(mtgId: string, material?: { docId: string; name: str
 
 function teardownLive(): void {
   if (!liveMtg) return;
+  const meetingId = liveMtg.id;
+  const leavingMeetingNote = document.body.classList.contains('mtg-note-open');
+  if (leavingMeetingNote) void triggerMeetingBoardOcr(meetingId);
   liveMtg = null;
   liveNoteDoc = null;
   stopClock();
@@ -1726,7 +1930,7 @@ async function mountSide(): Promise<void> {
 async function refreshSpine(): Promise<void> {
   const mtg = liveMtg; // capture：await 期间可能退会/切会，迟到结果不能用新 liveMtg 解释（跨会污染/空指针）
   if (!mtg) return;
-  const marks = (await getFoldedMarksByContext('mtg_' + mtg.id)).sort((a, b) => (a.abs_timestamp || 0) - (b.abs_timestamp || 0));
+  const marks = (await getFoldedMarksByContext('mtg_' + mtg.id)).sort((a, b) => markTime(a) - markTime(b));
   if (liveMtg !== mtg) return;
   setLiveMarkCount(marks.length);
   // surface 源标签：白板 + 各资料文件名，让聚合后的脊能区分笔来自哪儿
@@ -1735,7 +1939,9 @@ async function refreshSpine(): Promise<void> {
   if (liveMtg !== mtg) return;
   const labelFor = (docId: string): string => (docId === boardId ? (liveNoteDoc?.filename || '会议手记') : nameOf.get(docId) || '资料'); // 脊上手记来源标签跟手记名（升格后不再叫"白板"）
   const blocks = marks.map((mk: PersistedMark) => {
-    const rel = mtg.startedAt > 0 ? clk(Math.max(0, (mk.abs_timestamp || 0) - mtg.startedAt)) : '会前'; // M1·会前（t0 未定）笔标「会前」；精确会前段对齐留 M6(recap)
+    const phase = meetingMarkPhase(mk, mtg.meeting);
+    const relClock = mtg.startedAt > 0 ? clk(Math.max(0, markTime(mk) - mtg.startedAt)) : '';
+    const rel = phase === 'pre' ? '会前' : phase === 'post' ? `会后${relClock ? ` · ${relClock}` : ''}` : relClock || '会中';
     const lines = (mk.marked_text || '').split('\n').filter(Boolean);
     const body = lines.length ? lines.map((l) => `<div class="hw"${/[一-龥]/.test(l) ? ' style="font-size:24px"' : ''}>${esc(l)}</div>`).join('') : '<div class="hw" style="color:var(--mut2);font-size:20px">（图形标注）</div>';
     return `<div class="mblk"><span class="tk"></span><div class="t">${rel}</div><div class="c"><div class="src">${esc(labelFor(mk.document_id))}</div>${body}</div></div>`;
@@ -1834,7 +2040,8 @@ export async function createSyntheticMeetingEventMark(kind: SyntheticMeetingEven
   const bbox = bboxForMeetingPoints(points);
   const markId = shortId('evt');
   const text = (opts.text || SYNTHETIC_MEETING_EVENT_TEXT[kind]).trim();
-  const stroke: Stroke = { tool: 'pen', points };
+  const absTimestamp = Date.now();
+  const stroke: Stroke = { tool: 'pen', points, penDownAt: absTimestamp };
   currentStrokes().push(stroke);
   strokeMarkIds.set(stroke, markId);
   redrawInk();
@@ -1850,7 +2057,8 @@ export async function createSyntheticMeetingEventMark(kind: SyntheticMeetingEven
     color: '#111111',
     pointer_type: 'synthetic',
     device_id: DEVICE_ID,
-    abs_timestamp: Date.now(),
+    abs_timestamp: absTimestamp,
+    pen_down_at: absTimestamp,
     context_id: `mtg_${meetingId}`,
     feature_type: kind === 'note' ? 'handwriting' : 'markup',
     feature_confidence: 1,

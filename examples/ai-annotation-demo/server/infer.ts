@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { SYSTEM_PROMPTS, type PromptRole } from './prompts';
+import { buildMeetingPanelSummaryPrompts, SYSTEM_PROMPTS, type MeetingPanelSummaryHandwritingSections, type PromptRole } from './prompts';
 
 /**
  * 推理网关代理（Node 侧，仅 dev server 内运行）。
@@ -267,6 +267,7 @@ type ImgIn = { role?: string; data: string };
 const ROLE_LABEL: Record<string, string> = {
   ink: '【笔迹图·用户手写已从原文单独抽出、铺白底，识别手写就看这张】',
   composite: '【合成图·墨迹叠在原文上，判断画在哪、圈/划住了什么就看这张】',
+  board: '【完整白板页·白底笔迹，区域坐标在后续 JSON 中给出】',
   // page(原文层)已弃用——原文以整页文字 page_text 为准，不再单独发图
 };
 
@@ -430,19 +431,126 @@ export async function runReadingNotePostprocess(payload: any): Promise<{ title: 
   };
 }
 
-/** Google Meet 会后转写 → panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
+/** Provider 会后转写 -> panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
 export async function runMeetingPanelSummary(payload: any): Promise<{ summary: MeetingPanelSummary; model: string }> {
   const title = String(payload?.title || '').trim().slice(0, 300) || '(未命名会议)';
+  const platform = String(payload?.platform || 'google_meet').trim().slice(0, 64) || 'google_meet';
   const transcript = String(payload?.transcript || '').trim();
   const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
   if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
   const model = String(payload?.model || cfg().model);
-  const user = JSON.stringify({ meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
-  const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
+  const handwritingSections = normalizeMeetingPanelHandwritingSections(payload?.handwriting_sections);
+  const prompt = buildMeetingPanelSummaryPrompts({
+    platform,
+    meeting_title: title,
+    transcript,
+    ...(smartNote ? { smart_note: smartNote } : {}),
+    ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
+  });
+  const raw = await gateway(prompt.system, prompt.user, 1800, undefined, model);
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
+}
+
+type HandwritingSectionKey = 'pre_meeting' | 'in_meeting' | 'post_meeting';
+type PreparedHandwritingItem = { text: string; relative_time?: string; truncated: boolean };
+
+const HANDWRITING_TOTAL_CHARS = 8_000;
+const HANDWRITING_TOTAL_ITEMS = 80;
+const HANDWRITING_SECTION_ORDER = [1, 1, 1, 0, 2] as const;
+
+function fairHandwritingAllocation(
+  demands: readonly number[],
+  total: number,
+  reserved: readonly number[],
+): number[] {
+  const allocation = demands.map((demand, index) => Math.min(demand, reserved[index] || 0));
+  let remaining = Math.max(0, total - allocation.reduce((sum, value) => sum + value, 0));
+  while (remaining > 0) {
+    let progressed = false;
+    for (const index of HANDWRITING_SECTION_ORDER) {
+      if (remaining <= 0) break;
+      if ((allocation[index] || 0) >= (demands[index] || 0)) continue;
+      allocation[index] += 1;
+      remaining -= 1;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  return allocation;
+}
+
+function preparedTextItem(raw: unknown): PreparedHandwritingItem | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const original = raw.trim();
+  if (!original) return undefined;
+  return { text: original.slice(0, 500), truncated: original.length > 500 };
+}
+
+export function normalizeMeetingPanelHandwritingSections(value: unknown): MeetingPanelSummaryHandwritingSections | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  const textItems = (raw: unknown): PreparedHandwritingItem[] => Array.isArray(raw)
+    ? raw.flatMap((item) => preparedTextItem(item) || [])
+    : [];
+  const preItems = textItems(source.pre_meeting);
+  const inItems = Array.isArray(source.in_meeting) ? source.in_meeting.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const item = raw as Record<string, unknown>;
+    const prepared = preparedTextItem(item.text);
+    if (!prepared) return [];
+    const originalRelativeTime = typeof item.relative_time === 'string' ? item.relative_time.trim() : '';
+    return [{
+      ...prepared,
+      relative_time: originalRelativeTime.slice(0, 24),
+      truncated: prepared.truncated || originalRelativeTime.length > 24,
+    }];
+  }) : [];
+  const postItems = textItems(source.post_meeting);
+  const allItems = [preItems, inItems, postItems];
+  if (!allItems.some((items) => items.length)) return undefined;
+
+  const itemAllocation = fairHandwritingAllocation(
+    allItems.map((items) => items.length),
+    HANDWRITING_TOTAL_ITEMS,
+    [16, 48, 16],
+  );
+  const selectedItems = allItems.map((items, index) => items.slice(0, itemAllocation[index]));
+  const charAllocation = fairHandwritingAllocation(
+    selectedItems.map((items) => items.reduce((sum, item) => sum + item.text.length, 0)),
+    HANDWRITING_TOTAL_CHARS,
+    [1_600, 4_800, 1_600],
+  );
+  const omitted: Partial<Record<HandwritingSectionKey, number>> = {};
+  const sectionKeys: HandwritingSectionKey[] = ['pre_meeting', 'in_meeting', 'post_meeting'];
+  const emitted = selectedItems.map((items, sectionIndex) => {
+    let remaining = charAllocation[sectionIndex] || 0;
+    let omittedCount = allItems[sectionIndex].length - items.length;
+    const output = items.flatMap((item) => {
+      if (remaining <= 0) {
+        omittedCount += 1;
+        return [];
+      }
+      const text = item.text.slice(0, remaining);
+      remaining -= text.length;
+      if (item.truncated || text.length < item.text.length) omittedCount += 1;
+      return text ? [{ ...item, text }] : [];
+    });
+    if (omittedCount > 0) omitted[sectionKeys[sectionIndex]] = omittedCount;
+    return output;
+  });
+  const preMeeting = emitted[0].map((item) => item.text);
+  const inMeeting = emitted[1].map((item) => ({ relative_time: item.relative_time || '', text: item.text }));
+  const postMeeting = emitted[2].map((item) => item.text);
+  if (!preMeeting.length && !inMeeting.length && !postMeeting.length) return undefined;
+  return {
+    pre_meeting: preMeeting,
+    in_meeting: inMeeting,
+    post_meeting: postMeeting,
+    ...(Object.keys(omitted).length ? { omitted_count: omitted } : {}),
+  };
 }
 
 
@@ -593,6 +701,27 @@ export async function runOcrVlm(payload: any): Promise<{ text: string }> {
   }
   const text = await gateway(system, user, isPage ? 700 : 500, image, payload?.model); // 局部 OCR 随 inferModel 走（kimi/gemini A/B）
   return { text: text.trim() };
+}
+
+/**
+ * 整页白板 OCR：一页只调一次 VLM，整页供上下文，regions 保留 mark 级时间锚。
+ * 返回原始模型文本，码块/多余文字的防御解析统一留给 server/board-ocr.ts。
+ */
+export async function runBoardOcrVlm(payload: any): Promise<string> {
+  const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  if (!image || !regions.length) return '{}';
+  const langHint = typeof payload?.lang_hint === 'string' && payload.lang_hint.trim()
+    ? `\n语言提示：${payload.lang_hint.trim().slice(0, 64)}`
+    : '';
+  const user = `按下列区域转写手写，bbox=[x,y,w,h]且已归一化到 0–1：\n${JSON.stringify(regions)}${langHint}`;
+  return gateway(
+    SYSTEM_PROMPTS.board_ocr,
+    user,
+    Math.min(2400, Math.max(600, regions.length * 100)),
+    [{ role: 'board', data: `data:image/jpeg;base64,${image}` }],
+    payload?.model,
+  );
 }
 
 /**

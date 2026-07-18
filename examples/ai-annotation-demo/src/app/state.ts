@@ -210,6 +210,7 @@ export function resetSettings(): void {
 export interface Stroke {
   tool: Tool;
   points: StrokePoint[];
+  penDownAt?: number;
 }
 
 export const state = {

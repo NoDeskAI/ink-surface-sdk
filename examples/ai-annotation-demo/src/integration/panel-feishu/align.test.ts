@@ -107,11 +107,18 @@ describe('buildProximityIndex（时间窗模型）', () => {
     expect(idx.stats.matchedMarkCount).toBe(2);
   });
 
-  it('窗吸收偏移：30s 窗下落账偏后的笔仍能附近命中', () => {
-    const marks = [mk('late', 8070 + 25000)]; // 比 cue1 晚 25s（落账延迟）
+  it('窗吸收旧数据的收口偏移：30s 窗下仍能附近命中', () => {
+    const marks = [mk('late', 8070 + 25000)];
     const idx = buildProximityIndex({ marks, cues, t0AbsMs: t0, offsetMs: 0, windowMs: 30000 });
     expect(idx.markToNearbyCues.get('late')!.length).toBeGreaterThan(0);
     expect(idx.orphanMarkIds).not.toContain('late');
+  });
+
+  it('新数据用 pen_down_at 对齐，不受识别完成时间污染', () => {
+    const marks: AlignMark[] = [{ mark_id: 'real-down', pen_down_at: t0 + 8_500, abs_timestamp: t0 + 90_000 }];
+    const idx = buildProximityIndex({ marks, cues, t0AbsMs: t0, offsetMs: 0, windowMs: 1_000 });
+    expect(idx.markToNearbyCues.get('real-down')).toContain(1);
+    expect(idx.orphanMarkIds).not.toContain('real-down');
   });
 
   it('远离所有 cue 的笔 → orphan；无笔的 cue → unmatched', () => {

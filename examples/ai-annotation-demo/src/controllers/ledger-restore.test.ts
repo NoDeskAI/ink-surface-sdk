@@ -13,8 +13,20 @@ vi.mock('../local/store', () => ({
 vi.mock('../chat/buffer', () => ({ openBook: () => {}, appendMsg: () => {} }));
 vi.mock('../capture/session', () => ({ addMark: () => {} }));
 
-import { restoreLedgerState } from './ledger-restore';
+import { persistedToMark, restoreLedgerState } from './ledger-restore';
 import { getActiveContext } from '../app/state';
+import type { PersistedMark } from '../core/store-format';
+
+function persistedMark(times: { abs_timestamp: number; pen_down_at?: number }): PersistedMark {
+  return {
+    entry_id: 'ent_time', document_id: 'doc_time', page_id: 'pg_time_0', page_index: 0,
+    seq: 1, created_at: '2026-07-17T00:00:00.000Z', mark_id: 'mark_time',
+    strokes: [{ tool: 'pen', points: [{ x: 0.1, y: 0.2, t: 0, pressure: 0.5 }] }],
+    bbox: [0.1, 0.2, 0.01, 0.01], tool: 'pen', color: '#111', pointer_type: 'pen', device_id: 'dev',
+    feature_type: 'drawing', feature_confidence: 1, scored_type: 'stroke', scored_score: 1,
+    hmp: null, marked_text: '', is_tombstone: false, ...times,
+  };
+}
 
 describe('restoreLedgerState 竞态守卫（P0-5）', () => {
   it('恢复中途被同实例的新恢复抢占：迟到的账本读不再写回原实例', async () => {
@@ -30,5 +42,15 @@ describe('restoreLedgerState 竞态守卫（P0-5）', () => {
     // 旧恢复 alive() 失败 → 提前 return：既不 clear 既有内容、也不写入新页
     expect(ctxA.strokesByPage.has('existing-page')).toBe(true);
     expect(ctxA.strokesByPage.has('pg1')).toBe(false);
+  });
+});
+
+describe('persisted mark time restore', () => {
+  it('restores Mark.t from pen_down_at and falls back for v5 data', () => {
+    const penDown = 1_751_500_000_123;
+    const fallback = 1_751_500_009_000;
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback, pen_down_at: penDown })).t).toBe(penDown);
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback })).t).toBe(fallback);
+    expect(persistedToMark(persistedMark({ abs_timestamp: fallback, pen_down_at: 1_751_500_000 })).t).toBe(fallback);
   });
 });

@@ -5,6 +5,8 @@
 import { buildMeetingPlatformTimelineView as sdkBuildMeetingPlatformTimelineView } from '../../../vendor/meeting-timeline-sdk/adapters/platform-timeline-view.mjs';
 import type { PersistedMeeting } from '../../core/store-format';
 import { meetingPlatformOf, meetingTranscriptSource } from '../../mobile/meeting-platform';
+import { markTime } from '../../core/mark-time';
+import { meetingMarkPhase } from '../../mobile/meeting-home-model';
 import type { TranscriptCue } from '../panel-feishu/align';
 import { buildSegments, buildSegmentMarks, type RecapSegment, type SegmentMark } from '../panel-feishu/segment';
 
@@ -49,6 +51,7 @@ const buildMeetingPlatformTimelineView = sdkBuildMeetingPlatformTimelineView as 
 export interface EpaperTimelineMarkInput {
   mark_id: string;
   abs_timestamp: number;
+  pen_down_at?: number;
   feature_type?: string;
   marked_text?: string;
   page_index?: number;
@@ -121,8 +124,8 @@ function transcriptPayload(cues: TranscriptCue[], source: string): Array<Record<
 
 function markLabel(mark: SegmentMark): string {
   const text = mark.marked_text.trim();
-  if (text) return text;
-  return mark.feature_type === 'drawing' ? '图形标注 / 圈画' : '未识别手写';
+  const label = text || (mark.feature_type === 'drawing' ? '图形标注 / 圈画' : '未识别手写');
+  return mark.phase === 'pre' ? `会前准备 · ${label}` : mark.phase === 'post' ? `会后补充 · ${label}` : label;
 }
 
 function annotationPayload(marks: SegmentMark[], rawById: Map<string, EpaperTimelineMarkInput>): Array<Record<string, unknown>> {
@@ -131,7 +134,7 @@ function annotationPayload(marks: SegmentMark[], rawById: Map<string, EpaperTime
     return {
       id: mark.mark_id,
       time_ms: mark.relMs,
-      captured_at_ms: raw?.abs_timestamp,
+      captured_at_ms: raw ? markTime(raw) : undefined,
       kind: mark.feature_type || 'handwriting',
       label: markLabel(mark),
       source: 'hanwang_epaper',
@@ -140,6 +143,7 @@ function annotationPayload(marks: SegmentMark[], rawById: Map<string, EpaperTime
         page_index: mark.page_index,
         feature_type: mark.feature_type,
         marked_text: mark.marked_text,
+        phase: mark.phase,
       },
     };
   });
@@ -175,8 +179,9 @@ function marksFromSdkView(segmentMarks: SegmentMark[], view: EpaperSdkTimelineVi
 
 export function buildEpaperMeetingTimeline(input: EpaperMeetingTimelineInput): EpaperMeetingTimeline {
   const platform = meetingPlatformOf(input.meeting);
-  const rawById = new Map(input.marks.map((mark) => [mark.mark_id, mark] as const));
-  const localSegmentMarks = buildSegmentMarks(input.marks, input.t0AbsMs, input.offsetMs);
+  const phasedMarks = input.marks.map((mark) => ({ ...mark, phase: meetingMarkPhase(mark, input.meeting) }));
+  const rawById = new Map(phasedMarks.map((mark) => [mark.mark_id, mark] as const));
+  const localSegmentMarks = buildSegmentMarks(phasedMarks, input.t0AbsMs, input.offsetMs);
   const transcript = transcriptPayload(input.cues, meetingTranscriptSource(input.meeting));
   const annotations = annotationPayload(localSegmentMarks, rawById);
   const sdkView = buildMeetingPlatformTimelineView(platform, {

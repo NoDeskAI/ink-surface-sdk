@@ -22,8 +22,9 @@ import { homedir } from 'node:os';
 import { assertNonEmptyVaultRelease, guardPanelVaultReqUrl, panelVaultGuardPayload, resolvePanelVaultGuardUser } from './panel-vault-guard';
 import {
   runReflow, runReflowAi, reflowAiStream, chatStream,
-  runOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
+  runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
 } from './infer';
+import { handleBoardOcrHttp } from './board-ocr';
 import { runOcrLayout } from './ocr-layout-dev.mjs';
 import { createRuntimeSyncDevHandler } from './runtime-sync-dev';
 import { JsonlRuntimeSyncEventStore } from './runtime-sync-store';
@@ -67,6 +68,11 @@ import {
 } from './google-oauth-state';
 import { fetchGoogleMeetingSources, googleCalendarErrorPayload } from './google-calendar-sync';
 import { backfillGoogleMeetSmartNotes, fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload } from './google-meet-records';
+import { createZoomApiHandler } from './zoom-api-handler';
+import { backfillZoomMeetingTranscripts, zoomMeetingRecordsPath } from './zoom-meeting-records';
+import { zoomMeetingSyncPath } from './zoom-meeting-sync';
+import { zoomS2SConfigured } from './zoom-oauth-state';
+import { authorizedZoomHostUserIds } from './zoom-host-access';
 import {
   currentMtlToken,
   mintMtlToken,
@@ -74,11 +80,16 @@ import {
   revokeMtlToken,
   type MtlReceiverIdentity,
 } from './mtl-receiver-auth';
-import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows } from './mtl-receiver';
+import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows, mtlZoomAttendanceWindows } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import { exportLarkDocxToPdf } from './lark-docx-export';
 import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
-import { resolvePanelAuthBase, rewriteLegacyConvertSource } from './standalone-service-config';
+import {
+  MEETING_SUMMARY_MAX_BODY_BYTES,
+  meetingSummaryPayloadTooLargeError,
+  resolvePanelAuthBase,
+  rewriteLegacyConvertSource,
+} from './standalone-service-config';
 import {
   larkRealtimeMeetingSources,
   larkRealtimeMeetingStoreStatus,
@@ -938,7 +949,7 @@ function sendGoogleHtml(res: ServerResponse, status: number, title: string, mess
 async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url || '/api/google', 'http://inkloop.local');
   const path = url.pathname;
-  if (path === '/api/google/meeting-summary') {
+  if (path === '/api/google/meeting-summary' || path === '/api/meetings/summary') {
     if (req.method !== 'POST') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'POST only' } });
       return;
@@ -946,7 +957,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     const session = await requireDeviceSession(req, res);
     if (!session) return;
     try {
-      const payload = JSON.parse(await readBody(req, 64 * 1024));
+      const payload = JSON.parse(await readBody(
+        req,
+        MEETING_SUMMARY_MAX_BODY_BYTES,
+        meetingSummaryPayloadTooLargeError,
+      ));
       sendJson(res, 200, await runMeetingPanelSummary(payload));
     } catch (error) {
       const status = Number((error as { status?: number })?.status) || 502;
@@ -954,7 +969,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     }
     return;
   }
-  if (path === '/api/google/mtl-token') {
+  if (path === '/api/google/mtl-token' || path === '/api/meeting-providers/mtl-token') {
     if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'DELETE') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET/POST/DELETE only' } });
       return;
@@ -978,7 +993,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     } : { token: null, base_url: null });
     return;
   }
-  if (path === '/api/google/meeting-live-state') {
+  if (path === '/api/google/meeting-live-state' || path === '/api/meeting-providers/live-state') {
     if (req.method !== 'GET') {
       sendJson(res, 405, { error: { code: 'method_not_allowed', message: 'GET only' } });
       return;
@@ -988,10 +1003,11 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
     res.setHeader('cache-control', 'no-store');
     const identity = mtlReceiverIdentity(session);
     const configured = !!currentMtlToken(identity);
+    const platform = url.searchParams.get('platform') || undefined;
     sendJson(res, 200, {
       connected: configured,
       source: 'mtl_receiver',
-      windows: configured ? listMtlMeetingWindows(identity) : [],
+      windows: configured ? listMtlMeetingWindows(identity, process.env, platform) : [],
     });
     return;
   }
@@ -1141,6 +1157,16 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
 
   sendJson(res, 404, { error: { code: 'google_route_not_found', message: 'Google API route not found' } });
 }
+
+const handleZoomApi = createZoomApiHandler({
+  env: process.env,
+  requireDeviceSession,
+  resolveAuthorizedHostUserIds: (rawSession) => authorizedZoomHostUserIds(rawSession as InkLoopSessionContext),
+  resolveAttendanceWindows: (rawSession, meetingId, nowMs) => {
+    const session = rawSession as InkLoopSessionContext;
+    return mtlZoomAttendanceWindows(mtlReceiverIdentity(session), meetingId, process.env, nowMs);
+  },
+});
 function larkOAuthRedirectUri(_req?: IncomingMessage): string {
   const configured = String(process.env.LARK_CLOUD_HUB_REDIRECT_URI || process.env.INKLOOP_LARK_REDIRECT_URI || process.env.LARK_REDIRECT_URI || '').trim();
   if (configured) return configured;
@@ -1874,12 +1900,12 @@ async function handleConvertService(req: IncomingMessage, res: ServerResponse): 
 const AB_LOG = process.env.AB_LOG || resolve(ROOT, '.ab-intent.jsonl');
 
 const MAX_BODY = 25 * 1024 * 1024; // 25MB：页面图 / ink PNG dataURL
-function readBody(req: IncomingMessage, maxBody = MAX_BODY): Promise<string> {
+function readBody(req: IncomingMessage, maxBody = MAX_BODY, bodyTooLarge = () => new Error('body too large')): Promise<string> {
   return new Promise((res, rej) => {
     const chunks: Buffer[] = []; let size = 0;
     req.on('data', (c: Buffer) => {
       size += c.length;
-      if (size > maxBody) { rej(new Error('body too large')); req.destroy(); return; }
+      if (size > maxBody) { rej(bodyTooLarge()); req.destroy(); return; }
       chunks.push(c);
     });
     // 先 Buffer.concat 再一次性 decode：逐 chunk toString() 会在多字节 UTF-8（中文）跨 chunk 边界处插入替换字符，
@@ -2645,6 +2671,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (url.startsWith('/api/inkloop/auth')) { await handleInkLoopAuth(req, res); return; }
   // Google Calendar OAuth + meeting sources；callback 由 Google 直连，其余子路由在 handler 内校验设备 session。
   if (url.startsWith('/api/google')) { await handleGoogleApi(req, res); return; }
+  // provider-neutral aliases 复用现有 Google handler；旧路由继续保留。
+  if (url.startsWith('/api/meetings/summary') || url.startsWith('/api/meeting-providers/')) { await handleGoogleApi(req, res); return; }
+  // Zoom S2S 状态 + type=2 排期快照；所有子路由在 handler 内校验设备 session。
+  if (url.startsWith('/api/zoom/')) { await handleZoomApi(req, res); return; }
   // MTL browser extension receiver uses a per-user secret path and includes GET /api/state.
   if (url.startsWith('/api/mtl/')) { await handleMtlReceiver(req, res); return; }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）
@@ -2654,6 +2684,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // P0 安全止血：feishu-service / convert-service GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/feishu-svc')) { await handleFeishuService(req, res); return; }
   if (url.startsWith('/api/convert')) { await handleConvertService(req, res); return; }
+  // 白板 OCR 含整页手记图：必须先过设备 session 门，且绕开通用 25MB 推理 body 上限。
+  if (url === '/api/ink/board-ocr') {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return;
+    await handleBoardOcrHttp(req, res, runBoardOcrVlm);
+    return;
+  }
   if (req.method !== 'POST') { res.statusCode = 405; res.end('POST only'); return; }
 
   try {
@@ -2732,10 +2769,18 @@ async function runLarkMeetingReconcile(reason: string): Promise<void> {
           );
           return oauth.usable && oauth.token ? oauth.token : '';
         },
+        // 参会人兜底候选：owner/参会人都无 token 时（同事主持+参会人未采集）用全部已登录用户挨个试。
+        listFallbackOpenIds: () => {
+          try {
+            return readdirSync(resolve(ROOT, '.inkloop/lark-auth', LOCAL_AUTH_TENANT_ID))
+              .filter((name) => name.startsWith('feishu_'))
+              .map((name) => name.slice('feishu_'.length));
+          } catch { return []; }
+        },
         logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
       });
-      if (result.checked > 0 || result.errors.length > 0) {
-        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      if (result.checked > 0 || result.errors.length > 0 || result.enriched > 0) {
+        console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped} enriched=${result.enriched}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
       }
     });
   } catch (e) {
@@ -2784,6 +2829,33 @@ async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
   }
 }
 
+// Zoom 会后 instances/participants/transcript 不应依赖设备打开 recap；账号级快照由 hub 周期推进。
+const ZOOM_RECORDS_BACKFILL_MS = Math.max(0, Number(process.env.INKLOOP_ZOOM_RECORDS_BACKFILL_MS ?? 120_000));
+const ZOOM_RECORDS_BACKFILL_TIMEOUT_MS = positiveTimeoutMs(process.env.INKLOOP_ZOOM_RECORDS_BACKFILL_TIMEOUT_MS, 60_000);
+const zoomRecordsGate = createDeadlineSingleFlight({
+  timeoutMs: ZOOM_RECORDS_BACKFILL_TIMEOUT_MS,
+  label: 'Zoom meeting records backfill',
+});
+async function runZoomRecordsBackfill(reason: string): Promise<void> {
+  if (!zoomS2SConfigured(process.env)) return;
+  try {
+    await zoomRecordsGate.run(async (signal) => {
+      const fetchImpl: typeof fetch = (input, init) => fetch(input, { ...init, signal });
+      const result = await backfillZoomMeetingTranscripts(
+        process.env,
+        { path: zoomMeetingRecordsPath(process.env) },
+        { path: zoomMeetingSyncPath(process.env) },
+        { fetchImpl, signal },
+      );
+      if (result.scanned > 0 || result.errors.length > 0) {
+        console.log(`[inkloop proxy] provider_zoom_records_backfill provider_reason=${reason} provider_scanned=${result.scanned} provider_advanced=${result.advanced} provider_completed=${result.completed}${result.errors.length ? ` provider_errors=${result.errors.join('; ')}` : ''}`);
+      }
+    });
+  } catch (e) {
+    console.warn(`[inkloop proxy] provider_zoom_records_backfill_failed provider_reason=${reason} provider_error=${String((e as Error)?.message || e)}`);
+  }
+}
+
 const PORT = Number(process.env.PORT || 3000);
 server.listen(PORT, () => {
   console.log(`[inkloop proxy] :${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
@@ -2797,6 +2869,10 @@ server.listen(PORT, () => {
   if (GOOGLE_SMART_NOTE_BACKFILL_MS > 0) {
     setInterval(() => { void runGoogleSmartNoteBackfill('interval'); }, GOOGLE_SMART_NOTE_BACKFILL_MS).unref();
     setTimeout(() => { void runGoogleSmartNoteBackfill('boot'); }, 20_000).unref();
+  }
+  if (ZOOM_RECORDS_BACKFILL_MS > 0) {
+    setInterval(() => { void runZoomRecordsBackfill('interval'); }, ZOOM_RECORDS_BACKFILL_MS).unref();
+    setTimeout(() => { void runZoomRecordsBackfill('boot'); }, 25_000).unref();
   }
 });
 

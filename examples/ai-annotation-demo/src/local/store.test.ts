@@ -1,6 +1,6 @@
 import { IDBKeyRange, indexedDB } from 'fake-indexeddb';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import type { PersistedDoc, PersistedMark } from '../core/store-format';
+import type { PersistedDoc, PersistedMark, PersistedMeeting } from '../core/store-format';
 import { STORE_VERSION } from '../core/store-format';
 import { LOCAL_REFLOW_ENGINE, type ReflowBlock } from '../surface/reflow';
 
@@ -289,6 +289,7 @@ describe('mark ledger runtime hook', () => {
       seq: 2,
       is_tombstone: false,
       marked_text: 'local mark',
+      pen_down_at: 1_725_000_000_123,
     });
 
     await store.appendMarkEntry(remoteDraft, { notifyRuntime: false });
@@ -296,7 +297,62 @@ describe('mark ledger runtime hook', () => {
 
     await store.appendMarkEntry(localDraft);
     expect(hook).toHaveBeenCalledTimes(1);
-    expect(hook.mock.calls[0][0]).toMatchObject({ mark_id: 'evt_local' });
+    expect(hook.mock.calls[0][0]).toMatchObject({
+      mark_id: 'evt_local',
+      schema_version: '6',
+      pen_down_at: 1_725_000_000_123,
+    });
+  });
+
+  it('rejects an OCR revision when the captured mark was erased before recognition returned', async () => {
+    const store = await import('./store');
+    const base = markRecord({
+      mark_id: 'evt_ocr_erased',
+      document_id: 'doc_ocr_erased',
+      seq: 1,
+      is_tombstone: false,
+      marked_text: '手写 2 笔',
+      ai_eligible: false,
+    });
+    const { entry_id: _entryId, seq: _seq, created_at: _createdAt, ...baseDraft } = base;
+    await store.appendMarkEntry(baseDraft);
+    const captured = (await store.getLatestMarkRevisions(base.document_id))[0];
+    const { entry_id: _capturedEntry, seq: _capturedSeq, created_at: _capturedAt, ...tombstoneDraft } = captured;
+    await store.appendMarkEntry({ ...tombstoneDraft, is_tombstone: true });
+
+    const revision = await store.appendMarkRevisionIfCurrent(
+      base.document_id,
+      base.mark_id,
+      { seq: captured.seq },
+      { marked_text: '不应复活', ocr_fingerprint: 'bo1_old', ocr_empty: false },
+    );
+
+    expect(revision).toBeNull();
+    expect(await store.getFoldedMarks(base.document_id)).toEqual([]);
+  });
+});
+
+describe('meeting transactional mutation', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubGlobal('indexedDB', indexedDB);
+    vi.stubGlobal('IDBKeyRange', IDBKeyRange);
+    vi.stubGlobal('window', { setTimeout: () => 0, clearTimeout: () => {} });
+  });
+
+  it('passes the latest meeting value to the mutator in the same readwrite transaction', async () => {
+    const store = await import('./store');
+    const meeting = await store.createMeeting('ws_tx', { title: 'Txn', scheduled_at: '2026-07-18T01:00:00.000Z' });
+    await store.updateMeeting(meeting.meeting_id, { t0_source: 'provider_event', ended_at: '2026-07-18T02:00:00.000Z' });
+    const seen: Array<PersistedMeeting['t0_source']> = [];
+
+    const saved = await store.mutateMeeting(meeting.meeting_id, (current) => {
+      seen.push(current.t0_source);
+      return current.t0_source === 'provider_event' ? { status: 'ended' } : { ended_at: 'wrong' };
+    });
+
+    expect(seen).toEqual(['provider_event']);
+    expect(saved).toMatchObject({ status: 'ended', ended_at: '2026-07-18T02:00:00.000Z' });
   });
 });
 
