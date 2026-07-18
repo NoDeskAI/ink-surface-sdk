@@ -31,6 +31,7 @@ export interface ZoomApiHandlerOptions {
   nowMs?: () => number;
   minSyncIntervalMs?: number;
   requireDeviceSession: (req: IncomingMessage, res: ServerResponse) => Promise<unknown | null>;
+  resolveAuthorizedHostUserIds?: (session: unknown) => string[];
   resolveAttendanceWindows?: (session: unknown, meetingId: string, nowMs: number) => ZoomMeetingAttendanceWindow[];
 }
 
@@ -94,6 +95,43 @@ export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
       return true;
     }
 
+    const authorizedHostUserIds = new Set(
+      (options.resolveAuthorizedHostUserIds?.(session) || [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
+    const authorizedSources = () => readZoomMeetingSources(syncRef)
+      .filter((source) => authorizedHostUserIds.has(source.host_user_id));
+    if (!authorizedHostUserIds.size) {
+      sendJson(res, 403, {
+        configured: true,
+        connected: true,
+        ...(url.pathname === '/api/zoom/meeting-sources' ? { sources: [] } : {}),
+        error: {
+          code: 'zoom_identity_not_authorized',
+          message: 'This InkLoop user is not mapped to an authorized Zoom host',
+        },
+      });
+      return true;
+    }
+
+    const configuredHostUserIds = new Set(
+      String(env.ZOOM_HOST_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean),
+    );
+    if (configuredHostUserIds.size
+      && [...authorizedHostUserIds].some((hostUserId) => !configuredHostUserIds.has(hostUserId))) {
+      sendJson(res, 503, {
+        configured: true,
+        connected: false,
+        ...(url.pathname === '/api/zoom/meeting-sources' ? { sources: [] } : {}),
+        error: {
+          code: 'zoom_host_access_misconfigured',
+          message: 'The InkLoop Zoom host mapping is outside ZOOM_HOST_USER_IDS',
+        },
+      });
+      return true;
+    }
+
     if (url.pathname === '/api/zoom/meeting-transcript') {
       const meetingId = cleanMeetingId(url.searchParams.get('space_name'));
       const scheduledAt = normalizeTime(url.searchParams.get('scheduled_at'));
@@ -108,19 +146,26 @@ export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
       }
       const requestScope = requestAbortScope(req);
       try {
-        const source = readZoomMeetingSources(syncRef)
-          .filter((item) => item.meeting_id === meetingId)
-          .sort((left, right) => (
-            Math.abs(Date.parse(left.scheduled_at) - Date.parse(scheduledAt))
-            - Math.abs(Date.parse(right.scheduled_at) - Date.parse(scheduledAt))
-          ))[0];
-        const scheduledEndAt = source
-          ? new Date(Date.parse(source.scheduled_at) + Math.max(0, source.duration_minutes) * 60_000).toISOString()
-          : undefined;
+        const source = authorizedSources().find((item) => (
+          item.meeting_id === meetingId
+          && item.scheduled_at === scheduledAt
+        ));
+        if (!source) {
+          sendJson(res, 403, {
+            error: {
+              code: 'zoom_meeting_not_authorized',
+              message: 'The requested Zoom occurrence is not authorized for this InkLoop user',
+            },
+          });
+          return true;
+        }
+        const scheduledEndAt = new Date(
+          Date.parse(source.scheduled_at) + Math.max(0, source.duration_minutes) * 60_000,
+        ).toISOString();
         const result = await fetchZoomMeetingTranscript(env, recordsRef, {
           meetingId,
           scheduledAt,
-          ...(scheduledEndAt ? { scheduledEndAt } : {}),
+          scheduledEndAt,
           attendance: options.resolveAttendanceWindows?.(session, meetingId, nowMs) || [],
         }, {
           fetchImpl: options.fetchImpl,
@@ -147,7 +192,14 @@ export function createZoomApiHandler(options: ZoomApiHandlerOptions) {
         minIntervalMs: options.minSyncIntervalMs,
         signal: requestScope.signal,
       });
-      sendJson(res, 200, { configured: true, connected: true, ...result });
+      const sources = result.sources.filter((source) => authorizedHostUserIds.has(source.host_user_id));
+      sendJson(res, 200, {
+        configured: true,
+        connected: true,
+        ...result,
+        source_count: sources.length,
+        sources,
+      });
     } catch (error) {
       const failure = zoomMeetingSyncErrorPayload(error);
       sendJson(res, failure.status, { configured: true, connected: false, sources: [], ...failure.body });

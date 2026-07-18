@@ -45,7 +45,7 @@ describe('zoom meeting sync', () => {
     expect(zoomMeetingIdFromUrl('https://zoom.us/wc/987654321/join')).toBe('');
   });
 
-  it('filters type=2, follows list pagination, gets details, and never stores start_url', async () => {
+  it('syncs one-off and recurring occurrences, follows pagination, and never stores start_url', async () => {
     const path = statePath();
     const fetchImpl = vi.fn(async (input: string | URL) => {
       const url = new URL(String(input));
@@ -87,6 +87,22 @@ describe('zoom meeting sync', () => {
           occurrence_id: 'occ-201',
         });
       }
+      if (url.pathname === '/v2/meetings/800' && !url.searchParams.has('show_previous_occurrences')) {
+        return json({
+          id: 800,
+          type: 8,
+          topic: 'Recurring',
+          join_url: 'https://zoom.us/j/800',
+          host_id: 'host/one',
+          duration: 30,
+        });
+      }
+      if (url.pathname === '/v2/meetings/800' && url.searchParams.get('show_previous_occurrences') === 'true') {
+        return json({ occurrences: [
+          { occurrence_id: 'occ-800-a', start_time: '2026-07-18T01:00:00Z', duration: 30 },
+          { occurrence_id: 'occ-800-b', start_time: '2026-07-25T01:00:00Z', duration: 45 },
+        ] });
+      }
       throw new Error(`unexpected request ${url}`);
     });
 
@@ -96,6 +112,16 @@ describe('zoom meeting sync', () => {
       minIntervalMs: 0,
     });
     expect(result.sources).toEqual([
+      {
+        platform: 'zoom',
+        meeting_id: '800',
+        topic: 'Recurring',
+        scheduled_at: '2026-07-18T01:00:00.000Z',
+        duration_minutes: 30,
+        join_url: 'https://zoom.us/j/800',
+        host_user_id: 'host/one',
+        occurrence_id: 'occ-800-a',
+      },
       {
         platform: 'zoom',
         meeting_id: '200',
@@ -116,6 +142,16 @@ describe('zoom meeting sync', () => {
         host_user_id: 'host/one',
         occurrence_id: 'occ-201',
       },
+      {
+        platform: 'zoom',
+        meeting_id: '800',
+        topic: 'Recurring',
+        scheduled_at: '2026-07-25T01:00:00.000Z',
+        duration_minutes: 45,
+        join_url: 'https://zoom.us/j/800',
+        host_user_id: 'host/one',
+        occurrence_id: 'occ-800-b',
+      },
     ]);
     const storedText = readFileSync(path, 'utf8');
     expect(storedText).not.toContain('start_url');
@@ -123,7 +159,7 @@ describe('zoom meeting sync', () => {
     const apiPaths = fetchImpl.mock.calls
       .map(([input]) => new URL(String(input)).pathname)
       .filter((pathname) => pathname.startsWith('/v2/meetings/'));
-    expect(apiPaths).toEqual(['/v2/meetings/200', '/v2/meetings/201']);
+    expect(apiPaths).toEqual(['/v2/meetings/200', '/v2/meetings/800', '/v2/meetings/800', '/v2/meetings/201']);
   });
 
   it('keeps a missing meeting and marks missing_since instead of deleting it', async () => {
@@ -156,6 +192,33 @@ describe('zoom meeting sync', () => {
       missing_since: new Date(secondNow).toISOString(),
     });
     expect(JSON.parse(readFileSync(path, 'utf8')).meetings[0].missing_since).toBe(new Date(secondNow).toISOString());
+  });
+
+  it('prunes a missing meeting after the configured retention horizon', async () => {
+    const path = statePath();
+    let present = true;
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname.endsWith('/meetings') && url.pathname.includes('/users/')) {
+        return json({ meetings: present ? [{ id: 301, type: 2 }] : [] });
+      }
+      if (url.pathname === '/v2/meetings/301') {
+        return json({
+          id: 301, topic: 'Temporary meeting', start_time: '2026-07-17T01:00:00Z',
+          join_url: 'https://zoom.us/j/301', duration: 20,
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const retentionEnv = { ...env, ZOOM_MISSING_SOURCE_RETENTION_MS: '60000' };
+    await fetchZoomMeetingSources(retentionEnv, { path }, { fetchImpl: fetchImpl as typeof fetch, nowMs: NOW_MS, minIntervalMs: 0 });
+    present = false;
+    await fetchZoomMeetingSources(retentionEnv, { path }, { fetchImpl: fetchImpl as typeof fetch, nowMs: NOW_MS + 60_000, minIntervalMs: 0 });
+    const expired = await fetchZoomMeetingSources(retentionEnv, { path }, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: NOW_MS + 120_001, minIntervalMs: 0,
+    });
+    expect(expired.sources).toEqual([]);
   });
 
   it('honors Retry-After on 429 before retrying the same page', async () => {

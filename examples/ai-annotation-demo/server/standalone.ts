@@ -72,6 +72,7 @@ import { createZoomApiHandler } from './zoom-api-handler';
 import { backfillZoomMeetingTranscripts, zoomMeetingRecordsPath } from './zoom-meeting-records';
 import { zoomMeetingSyncPath } from './zoom-meeting-sync';
 import { zoomS2SConfigured } from './zoom-oauth-state';
+import { authorizedZoomHostUserIds } from './zoom-host-access';
 import {
   currentMtlToken,
   mintMtlToken,
@@ -1160,6 +1161,7 @@ async function handleGoogleApi(req: IncomingMessage, res: ServerResponse): Promi
 const handleZoomApi = createZoomApiHandler({
   env: process.env,
   requireDeviceSession,
+  resolveAuthorizedHostUserIds: (rawSession) => authorizedZoomHostUserIds(rawSession as InkLoopSessionContext),
   resolveAttendanceWindows: (rawSession, meetingId, nowMs) => {
     const session = rawSession as InkLoopSessionContext;
     return mtlZoomAttendanceWindows(mtlReceiverIdentity(session), meetingId, process.env, nowMs);

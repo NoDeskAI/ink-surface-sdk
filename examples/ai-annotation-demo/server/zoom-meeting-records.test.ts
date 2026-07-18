@@ -920,4 +920,61 @@ Lin: earlier short`);
     expect(result).toMatchObject({ scanned: 1, advanced: 1, completed: 0, errors: [] });
     expect(fetchImpl.mock.calls.map(([input]) => apiPath(input))).not.toContain('/v2/past_meetings/901/instances');
   });
+
+  it('does not make network requests for terminal jobs after the late-artifact window', async () => {
+    const { records, sync } = statePaths();
+    const scheduledAt = '2026-07-10T10:00:00.000Z';
+    writeFileSync(sync, JSON.stringify({
+      schema_version: 'inkloop.zoom_sync.v1',
+      meetings: [{
+        platform: 'zoom', meeting_id: '902', topic: 'Old terminal', scheduled_at: scheduledAt,
+        duration_minutes: 10, join_url: 'https://zoom.us/j/902', host_user_id: 'host',
+        missing_since: '2026-07-11T00:00:00.000Z',
+      }],
+    }), 'utf8');
+    writeFileSync(records, JSON.stringify({
+      schema_version: 'inkloop.zoom_meeting_records.v1',
+      meetings: {
+        [`902|${scheduledAt}`]: {
+          meeting_id: '902', scheduled_at: scheduledAt, scheduled_end_at: '2026-07-10T10:10:00.000Z',
+          selection_input_hash: 'old', candidates: [], status: 'no_record', attempt: 8,
+          terminal: true, updated_at: '2026-07-10T12:10:00.000Z',
+        },
+      },
+    }), 'utf8');
+    const fetchImpl = vi.fn(async () => { throw new Error('network must not be called'); });
+
+    const result = await backfillZoomMeetingTranscripts({
+      ...baseEnv,
+      ZOOM_TERMINAL_RECHECK_WINDOW_MS: String(24 * 60 * 60_000),
+      ZOOM_RECORDS_RETENTION_MS: String(30 * 24 * 60 * 60_000),
+    }, { path: records }, { path: sync }, {
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: Date.parse('2026-07-17T11:00:00.000Z'),
+    });
+
+    expect(result).toEqual({ scanned: 0, advanced: 0, completed: 0, errors: [] });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('prunes terminal record jobs after the records retention horizon', async () => {
+    const { records, sync } = statePaths();
+    const scheduledAt = '2026-06-01T10:00:00.000Z';
+    writeFileSync(sync, JSON.stringify({ schema_version: 'inkloop.zoom_sync.v1', meetings: [] }), 'utf8');
+    writeFileSync(records, JSON.stringify({
+      schema_version: 'inkloop.zoom_meeting_records.v1',
+      meetings: {
+        [`903|${scheduledAt}`]: {
+          meeting_id: '903', scheduled_at: scheduledAt, scheduled_end_at: '2026-06-01T10:10:00.000Z',
+          selection_input_hash: 'old', candidates: [], status: 'no_record', attempt: 8,
+          terminal: true, updated_at: '2026-06-01T12:10:00.000Z',
+        },
+      },
+    }), 'utf8');
+
+    await backfillZoomMeetingTranscripts({ ...baseEnv, ZOOM_RECORDS_RETENTION_MS: String(24 * 60 * 60_000) },
+      { path: records }, { path: sync }, { nowMs: Date.parse('2026-07-17T11:00:00.000Z') });
+
+    expect(JSON.parse(readFileSync(records, 'utf8')).meetings).toEqual({});
+  });
 });

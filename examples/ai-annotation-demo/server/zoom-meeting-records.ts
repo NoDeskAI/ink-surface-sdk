@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  atomicSaveProviderArtifactState,
   loadProviderArtifactState,
   mergeSaveProviderArtifactJob,
   providerArtifactNextPoll,
@@ -27,6 +28,8 @@ const ZOOM_API_BASE = 'https://api.zoom.us/v2';
 const DEFAULT_ZOOM_RECORDS_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../.inkloop/zoom-records/state.json');
 const MAX_ATTEMPTS = 3;
 const TERMINAL_RECHECK_MS = 10 * 60_000;
+const DEFAULT_TERMINAL_RECHECK_WINDOW_MS = 24 * 60 * 60_000;
+const DEFAULT_RECORDS_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const DEFAULT_SCHEDULED_DURATION_MS = 60 * 60_000;
 const CANDIDATE_WINDOW_TOLERANCE_MS = 4 * 60 * 60_000;
 const TIMESTAMP_MISMATCH_MIN_MS = 30_000;
@@ -39,6 +42,8 @@ export const ZOOM_MEETING_POLL_MINUTES = [1, 2, 5, 10, 20, 30, 60, 120] as const
 export interface ZoomMeetingRecordsEnv extends ZoomMeetingSyncEnv {
   ZOOM_RECORDS_STATE_PATH?: string;
   ZOOM_MEETING_TRANSCRIPT_PROBE?: string;
+  ZOOM_TERMINAL_RECHECK_WINDOW_MS?: string;
+  ZOOM_RECORDS_RETENTION_MS?: string;
 }
 
 export interface ZoomMeetingRecordsRef {
@@ -216,6 +221,11 @@ function cleanId(value: unknown): string {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
+function nonNegativeDuration(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function validIso(value: unknown): string | undefined {
   const raw = clean(value);
   const ms = Date.parse(raw);
@@ -248,6 +258,22 @@ function persistJob(path: string, key: string, job: ZoomMeetingJobState): void {
 
 function meetingKey(meetingId: string, scheduledAt: string): string {
   return `${meetingId}|${scheduledAt}`;
+}
+
+function jobScheduledEndMs(job: Pick<ZoomMeetingJobState, 'scheduled_at' | 'scheduled_end_at'>): number {
+  const explicit = Date.parse(job.scheduled_end_at || '');
+  if (Number.isFinite(explicit)) return explicit;
+  return Date.parse(job.scheduled_at) + DEFAULT_SCHEDULED_DURATION_MS;
+}
+
+function terminalRecheckAllowed(
+  job: Pick<ZoomMeetingJobState, 'scheduled_at' | 'scheduled_end_at'> | undefined,
+  nowMs: number,
+  env: ZoomMeetingRecordsEnv,
+): boolean {
+  if (!job) return false;
+  const windowMs = nonNegativeDuration(env.ZOOM_TERMINAL_RECHECK_WINDOW_MS, DEFAULT_TERMINAL_RECHECK_WINDOW_MS);
+  return nowMs <= jobScheduledEndMs(job) + windowMs;
 }
 
 function zoomUrl(resource: string, query: Record<string, string> = {}): string {
@@ -867,8 +893,14 @@ function pollAnchorMs(
   return Date.parse(requiredIso(value, 'zoom_meeting_poll_anchor'));
 }
 
-function probeRecheckDue(job: ZoomMeetingJobState | undefined, nowMs: number, enabled: boolean): boolean {
+function probeRecheckDue(
+  job: ZoomMeetingJobState | undefined,
+  nowMs: number,
+  enabled: boolean,
+  env: ZoomMeetingRecordsEnv,
+): boolean {
   if (!enabled || job?.status !== 'ready' || !job.chosen_instance_uuid || job.probe?.status === 'ready') return false;
+  if (!terminalRecheckAllowed(job, nowMs, env)) return false;
   return providerArtifactTerminalRecheckDue({ terminal: true, updated_at: job.probe?.checked_at || job.updated_at }, nowMs, TERMINAL_RECHECK_MS);
 }
 
@@ -917,8 +949,9 @@ async function runCatchUp(
   const selectionInputsChanged = !!current && current.selection_input_hash !== inputHash;
   const enabledProbe = probeEnabled(env);
   const terminalRetryDue = !!current?.terminal
+    && terminalRecheckAllowed(current, nowMs, env)
     && providerArtifactTerminalRecheckDue(current, nowMs, TERMINAL_RECHECK_MS);
-  const shouldRefreshProbe = probeRecheckDue(current, nowMs, enabledProbe);
+  const shouldRefreshProbe = probeRecheckDue(current, nowMs, enabledProbe, env);
   if (!selectionInputsChanged && ((current?.terminal && !terminalRetryDue && !shouldRefreshProbe)
     || (current?.next_check_at && nowMs < Date.parse(current.next_check_at)))) {
     return responseFromJob(current);
@@ -1045,10 +1078,28 @@ export async function backfillZoomMeetingTranscripts(
 ): Promise<ZoomMeetingTranscriptBackfillResult> {
   const nowMs = options.nowMs ?? Date.now();
   const result: ZoomMeetingTranscriptBackfillResult = { scanned: 0, advanced: 0, completed: 0, errors: [] };
+  let recordsState = loadState(recordsRef.path);
+  const recordsRetentionMs = nonNegativeDuration(env.ZOOM_RECORDS_RETENTION_MS, DEFAULT_RECORDS_RETENTION_MS);
+  const prunable = Object.entries(recordsState.meetings)
+    .filter(([, job]) => job.terminal && nowMs > jobScheduledEndMs(job) + recordsRetentionMs)
+    .map(([key]) => key);
+  if (prunable.length) {
+    // Re-read immediately before the atomic save so pruning cannot overwrite jobs completed by a
+    // concurrent request between the initial snapshot and this cleanup pass.
+    const fresh = loadState(recordsRef.path);
+    for (const key of prunable) {
+      const job = fresh.meetings[key];
+      if (job?.terminal && nowMs > jobScheduledEndMs(job) + recordsRetentionMs) delete fresh.meetings[key];
+    }
+    atomicSaveProviderArtifactState(recordsRef.path, fresh);
+    recordsState = fresh;
+  }
   for (const source of readZoomMeetingSources(syncRef)) {
     if (options.signal?.aborted) throw options.signal.reason;
     const scheduledEndAt = sourceScheduledEnd(source);
     if (Date.parse(scheduledEndAt) > nowMs) continue;
+    const existing = recordsState.meetings[meetingKey(source.meeting_id, source.scheduled_at)];
+    if (existing?.terminal && !terminalRecheckAllowed(existing, nowMs, env)) continue;
     result.scanned += 1;
     try {
       const transcript = await fetchZoomMeetingTranscript(env, recordsRef, {

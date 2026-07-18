@@ -55,6 +55,7 @@ export function zoomMeetingPatch(
     status,
     source_kind: 'calendar',
     provider_space_name: source.meeting_id,
+    ...(source.occurrence_id ? { provider_calendar_event_id: source.occurrence_id } : {}),
     ...(source.topic ? { topic: source.topic } : {}),
     ...(Number.isFinite(source.duration_minutes) ? { duration: source.duration_minutes } : {}),
     ...(source.join_url ? { meeting_url: source.join_url } : {}),
@@ -112,12 +113,20 @@ export async function syncZoomMeetingSources(
   const nowMs = dependencies.nowMs ?? Date.now();
 
   for (const source of usableSources) {
-    const existing = findMeetingForProviderSource(meetings, {
-      platform: 'zoom',
-      spaceName: source.meeting_id,
-      meetingUrl: source.join_url,
-      scheduledAt: source.scheduled_at,
-    });
+    const existing = source.occurrence_id
+      ? meetings.find((meeting) => (
+        meetingPlatformOf(meeting) === 'zoom'
+        && (meeting.provider_calendar_event_id === source.occurrence_id
+          || (!meeting.provider_calendar_event_id
+            && meeting.provider_space_name === source.meeting_id
+            && meeting.scheduled_at === source.scheduled_at))
+      ))
+      : findMeetingForProviderSource(meetings, {
+        platform: 'zoom',
+        spaceName: source.meeting_id,
+        meetingUrl: source.join_url,
+        scheduledAt: source.scheduled_at,
+      });
     if (source.missing_since) continue;
     if (existing) {
       const updated = await dependencies.mutateMeeting(existing.meeting_id, (current) => zoomMeetingPatch(source, nowMs, current));
@@ -181,15 +190,29 @@ function findMeetingForZoomWindow(
     || normalizeZoomMeetingId(window.external_meeting_id)
     || zoomMeetingIdFromUrl(window.meeting_url);
   if (numericId) {
-    const byMeetingId = findMeetingForProviderSource(meetings, { platform: 'zoom', spaceName: numericId });
+    const matching = meetings.filter((meeting) => (
+      meetingPlatformOf(meeting) === 'zoom' && meeting.provider_space_name === numericId
+    ));
+    const byMeetingId = matching.length > 1
+      ? matching
+        .map((meeting) => ({ meeting, distance: Math.abs(Date.parse(meeting.scheduled_at) - window.started_at_ms) }))
+        .filter((candidate) => Number.isFinite(candidate.distance) && candidate.distance <= 6 * 60 * 60_000)
+        .sort((left, right) => left.distance - right.distance)[0]?.meeting
+      : matching[0];
     if (byMeetingId) return byMeetingId;
   }
   const canonicalUrl = canonicalZoomJoinUrl(window.meeting_url);
   if (canonicalUrl) {
-    const byUrl = meetings.find((meeting) => (
+    const matching = meetings.filter((meeting) => (
       meetingPlatformOf(meeting) === 'zoom'
       && canonicalZoomJoinUrl(meeting.meeting_url) === canonicalUrl
     ));
+    const byUrl = matching.length > 1
+      ? matching
+        .map((meeting) => ({ meeting, distance: Math.abs(Date.parse(meeting.scheduled_at) - window.started_at_ms) }))
+        .filter((candidate) => Number.isFinite(candidate.distance) && candidate.distance <= 6 * 60 * 60_000)
+        .sort((left, right) => left.distance - right.distance)[0]?.meeting
+      : matching[0];
     if (byUrl) return byUrl;
   }
   return findMeetingForProviderSource(meetings, {

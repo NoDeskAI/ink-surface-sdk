@@ -134,6 +134,47 @@ describe('Zoom meeting source persistence', () => {
     });
   });
 
+  it('creates separate cards for recurring Zoom occurrences sharing one logical meeting id', async () => {
+    const state = dependencies([]);
+
+    const result = await syncZoomMeetingSources([
+      source('987654321', {
+        occurrence_id: 'occ-week-1',
+        scheduled_at: '2026-07-18T01:00:00.000Z',
+      }),
+      source('987654321', {
+        occurrence_id: 'occ-week-2',
+        scheduled_at: '2026-07-25T01:00:00.000Z',
+      }),
+    ], state.deps);
+
+    expect(result).toEqual({ imported: 2, updated: 0 });
+    expect(state.meetings).toHaveLength(2);
+    expect(state.meetings.map((item) => [item.provider_calendar_event_id, item.scheduled_at])).toEqual([
+      ['occ-week-1', '2026-07-18T01:00:00.000Z'],
+      ['occ-week-2', '2026-07-25T01:00:00.000Z'],
+    ]);
+  });
+
+  it('upgrades a legacy Zoom card to an occurrence id without duplicating it', async () => {
+    const legacy = meeting('legacy-recurring', {
+      platform: 'zoom',
+      provider_space_name: '987654321',
+      scheduled_at: '2026-07-18T01:00:00.000Z',
+      meeting_url: 'https://zoom.us/j/987654321?pwd=calendar-secret',
+    });
+    const state = dependencies([legacy]);
+
+    const result = await syncZoomMeetingSources([
+      source('987654321', { occurrence_id: 'occ-week-1' }),
+    ], state.deps);
+
+    expect(result).toEqual({ imported: 0, updated: 1 });
+    expect(state.createMeeting).not.toHaveBeenCalled();
+    expect(state.meetings).toHaveLength(1);
+    expect(state.meetings[0].provider_calendar_event_id).toBe('occ-week-1');
+  });
+
   it('does not create missing sources or mutate an existing card marked missing', async () => {
     const existing = meeting('zoom-existing', {
       platform: 'zoom',
@@ -251,6 +292,24 @@ describe('Zoom meeting source persistence', () => {
 });
 
 describe('Zoom MTL live window merge', () => {
+  it('matches the nearest recurring occurrence when cards share a meeting id and join URL', async () => {
+    const weekOne = meeting('zoom-week-1', {
+      platform: 'zoom', provider_space_name: '987654321', provider_calendar_event_id: 'occ-week-1',
+      meeting_url: 'https://zoom.us/j/987654321', scheduled_at: '2026-07-11T01:00:00.000Z', status: 'ended',
+    });
+    const weekTwo = meeting('zoom-week-2', {
+      platform: 'zoom', provider_space_name: '987654321', provider_calendar_event_id: 'occ-week-2',
+      meeting_url: 'https://zoom.us/j/987654321', scheduled_at: '2026-07-18T01:00:00.000Z',
+    });
+    const state = dependencies([weekOne, weekTwo]);
+
+    const result = await syncZoomMeetingLiveState([liveWindow()], state.deps);
+
+    expect(result).toEqual({ matched: 1, updated: 1 });
+    expect(state.meetings.find((item) => item.meeting_id === 'zoom-week-1')?.status).toBe('ended');
+    expect(state.meetings.find((item) => item.meeting_id === 'zoom-week-2')?.status).toBe('live');
+  });
+
   it('matches by numeric meeting id and merges live then ended state', async () => {
     const zoom = meeting('zoom-live', {
       platform: 'zoom',

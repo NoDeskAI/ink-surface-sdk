@@ -1,6 +1,6 @@
 /**
  * Zoom 排期会议快照同步：枚举显式/账号 Licensed 主持人，串行消费 List Meetings 分页并用
- * Get Meeting 补齐 type=2 会议；快照原子落盘，缺席项只标 missing_since 而不立即删除。
+ * Get Meeting 补齐单次/周期会议；快照原子落盘，缺席项短期标 missing_since 后按保留期删除。
  */
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,10 +23,12 @@ const MAX_ATTEMPTS = 3;
 const MAX_DISCOVERED_HOSTS = 10;
 const MAX_RETRY_AFTER_MS = 30_000;
 const MAX_PAGES = 100;
+const DEFAULT_MISSING_SOURCE_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 export interface ZoomMeetingSyncEnv extends ZoomS2SEnv {
   ZOOM_HOST_USER_IDS?: string;
   ZOOM_SYNC_STATE_PATH?: string;
+  ZOOM_MISSING_SOURCE_RETENTION_MS?: string;
 }
 
 export interface ZoomMeetingSource {
@@ -63,6 +65,8 @@ interface ZoomMeeting {
   duration?: number;
   host_id?: string;
   occurrence_id?: string;
+  status?: string;
+  occurrences?: ZoomMeeting[];
 }
 
 export interface ZoomMeetingSyncRef {
@@ -113,6 +117,11 @@ function clean(value: unknown): string {
 
 function cleanId(value: unknown): string {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
+
+function nonNegativeDuration(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 export function zoomMeetingIdFromUrl(value: string | undefined): string {
@@ -330,6 +339,29 @@ async function listHostMeetings(
   throw new ZoomMeetingSyncError('zoom_pagination_limit_exceeded', 502, 'Zoom meeting pagination limit exceeded');
 }
 
+async function listMeetingOccurrences(
+  meetingId: string,
+  env: ZoomMeetingSyncEnv,
+  options: ZoomRequestOptions,
+): Promise<ZoomMeeting[]> {
+  const occurrences: ZoomMeeting[] = [];
+  let nextPageToken = '';
+  const seenTokens = new Set<string>();
+  for (let pageCount = 0; pageCount < MAX_PAGES; pageCount += 1) {
+    const page = await fetchZoomJson(zoomUrl(`meetings/${zoomUuidPathSegment(meetingId)}`, {
+      show_previous_occurrences: 'true',
+      ...(nextPageToken ? { next_page_token: nextPageToken } : {}),
+    }), env, options);
+    if (Array.isArray(page.occurrences)) occurrences.push(...page.occurrences as ZoomMeeting[]);
+    const token = clean(page.next_page_token);
+    if (!token) return occurrences;
+    if (seenTokens.has(token)) throw new ZoomMeetingSyncError('zoom_pagination_token_loop', 502, 'Zoom occurrence pagination token repeated');
+    seenTokens.add(token);
+    nextPageToken = token;
+  }
+  throw new ZoomMeetingSyncError('zoom_pagination_limit_exceeded', 502, 'Zoom occurrence pagination limit exceeded');
+}
+
 function normalizeMeeting(detail: ZoomMeeting, listed: ZoomMeeting, hostUserId: string): ZoomMeetingSource | null {
   const meetingId = cleanId(detail.id ?? listed.id);
   const scheduledAt = normalizeScheduledAt(detail.start_time || listed.start_time);
@@ -345,7 +377,9 @@ function normalizeMeeting(detail: ZoomMeeting, listed: ZoomMeeting, hostUserId: 
     scheduled_at: scheduledAt,
     duration_minutes: Number.isFinite(duration) && duration >= 0 ? duration : 0,
     join_url: joinUrl,
-    host_user_id: clean(detail.host_id) || hostUserId,
+    // Preserve the lookup identity used by configuration/discovery. A configured host may be an
+    // email while Get Meeting returns an opaque host_id; authorization mappings must remain stable.
+    host_user_id: hostUserId,
     ...(occurrenceId ? { occurrence_id: occurrenceId } : {}),
     ...(timezone ? { timezone } : {}),
   };
@@ -375,19 +409,32 @@ async function runSync(
   for (const hostUserId of hostIds) {
     const listedMeetings = await listHostMeetings(hostUserId, env, requestOptions);
     for (const listed of listedMeetings) {
-      if (Number(listed.type) !== 2) continue;
+      if (![2, 8].includes(Number(listed.type))) continue;
       const meetingId = cleanId(listed.id);
       if (!meetingId) continue;
       const detail = await fetchZoomJson(zoomUrl(`meetings/${zoomUuidPathSegment(meetingId)}`), env, requestOptions) as ZoomMeeting;
-      const normalized = normalizeMeeting(detail, listed, hostUserId);
-      if (normalized) nextSources.set(sourceKey(normalized), normalized);
+      if (Number(listed.type) === 8) {
+        const occurrences = await listMeetingOccurrences(meetingId, env, requestOptions);
+        for (const occurrence of occurrences) {
+          if (clean(occurrence.status).toLowerCase() === 'deleted') continue;
+          const normalized = normalizeMeeting({ ...detail, ...occurrence, id: detail.id ?? listed.id }, listed, hostUserId);
+          if (normalized?.occurrence_id) nextSources.set(sourceKey(normalized), normalized);
+        }
+      } else {
+        const normalized = normalizeMeeting(detail, listed, hostUserId);
+        if (normalized) nextSources.set(sourceKey(normalized), normalized);
+      }
     }
   }
 
   const fetchedAt = new Date(nowMs).toISOString();
+  const missingRetentionMs = nonNegativeDuration(env.ZOOM_MISSING_SOURCE_RETENTION_MS, DEFAULT_MISSING_SOURCE_RETENTION_MS);
   for (const [key, previous] of currentSources) {
     if (!nextSources.has(key)) {
-      nextSources.set(key, { ...previous, missing_since: previous.missing_since || fetchedAt });
+      const missingSince = previous.missing_since || fetchedAt;
+      if (nowMs - Date.parse(missingSince) <= missingRetentionMs) {
+        nextSources.set(key, { ...previous, missing_since: missingSince });
+      }
     }
   }
   const state: ZoomSyncFile = {
