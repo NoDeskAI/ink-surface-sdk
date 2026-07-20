@@ -723,12 +723,15 @@ export async function runBoardOcrVlm(payload: any): Promise<string> {
     ? `\n语言提示：${payload.lang_hint.trim().slice(0, 64)}`
     : '';
   const user = `按下列区域转写手写，bbox=[x,y,w,h]且已归一化到 0–1：\n${JSON.stringify(regions)}${langHint}`;
+  // 大页（几十个 region）在慢模型上超过设备端 30s 请求超时→客户端掐断→整轮重试死循环。
+  // 服务端强制快 VLM（扫描页 OCR 同款）保住时限；BOARD_OCR_MODEL 可覆盖。
+  const model = process.env.BOARD_OCR_MODEL || 'gemini-3.1-flash-lite';
   return gateway(
     SYSTEM_PROMPTS.board_ocr,
     user,
     Math.min(2400, Math.max(600, regions.length * 100)),
     [{ role: 'board', data: `data:image/jpeg;base64,${image}` }],
-    payload?.model,
+    model,
   );
 }
 
