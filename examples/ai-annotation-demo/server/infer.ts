@@ -332,17 +332,23 @@ const readingNoteRawSchema = z.object({
   summary_md: z.string().catch(''),
 });
 const meetingPanelTextSchema = z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(600));
+/** 超限截断而非清空：.max().catch([]) 会在模型多给一条时把整组静默清空，改为保留前 N 条。 */
+const cappedArray = <T extends z.ZodTypeAny>(item: T, max: number) =>
+  z.array(item).catch([] as z.infer<T>[]).transform((arr) => arr.slice(0, max));
+
 const meetingPanelSummarySchema = z.object({
-  conclusions: z.array(meetingPanelTextSchema).max(8).catch([]),
-  action_items: z.array(z.object({
+  conclusions: cappedArray(meetingPanelTextSchema, 10),
+  action_items: cappedArray(z.object({
     task: meetingPanelTextSchema,
     owner: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).catch('未指定'),
     due: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).optional(),
     evidence: z.string().transform((value) => value.trim()).pipe(z.string().max(600)).optional(),
-  })).max(8).catch([]),
-  risks: z.array(meetingPanelTextSchema).max(6).catch([]),
-  open_questions: z.array(meetingPanelTextSchema).max(6).catch([]),
-  next_steps: z.array(meetingPanelTextSchema).max(8).catch([]),
+  }), 10),
+  risks: cappedArray(meetingPanelTextSchema, 10),
+  open_questions: cappedArray(meetingPanelTextSchema, 10),
+  next_steps: cappedArray(meetingPanelTextSchema, 10),
+  // 访谈模式：完整研究报告 markdown 原文（可选·zod 默认会剥未知键，必须显式声明才能透传到设备）
+  report_markdown: z.string().optional(),
 });
 
 export type MeetingPanelSummary = z.infer<typeof meetingPanelSummarySchema>;
@@ -448,7 +454,7 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
     ...(smartNote ? { smart_note: smartNote } : {}),
     ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
   });
-  const raw = await gateway(prompt.system, prompt.user, 1800, undefined, model);
+  const raw = await gateway(prompt.system, prompt.user, 20000, undefined, model);
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
