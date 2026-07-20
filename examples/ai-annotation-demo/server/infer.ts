@@ -454,7 +454,9 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
     ...(smartNote ? { smart_note: smartNote } : {}),
     ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
   });
-  const raw = await gateway(prompt.system, prompt.user, 20000, undefined, model);
+  // 长输出（访谈报告 20k tokens）非流式会撞网关 ~100s 空闲掐线（524）——走流式累积保活连接。
+  let raw = '';
+  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 20000, model })) raw += delta;
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
