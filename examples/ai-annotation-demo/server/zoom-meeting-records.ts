@@ -1146,7 +1146,8 @@ async function runCatchUp(
     && terminalRetryDue
     && !selectionInputsChanged
     && (!chosenStored || chosenStored.uuid === current.chosen_instance_uuid)
-    && !(current.timestamp_quality === 'companion_offset_anchor' && !!chosenStored?.recordings.length)) {
+    // companion 已就绪的终态只在真出现 TRANSCRIPT 文件时才走完整重跑升级；仅有 MP4/M4A 不足以升级，别为它反复全量重拉。
+    && !(current.timestamp_quality === 'companion_offset_anchor' && !!chosenStored && transcriptFiles(chosenStored).length > 0)) {
     const rechecked: ZoomMeetingJobState = {
       ...current,
       candidates,
@@ -1236,9 +1237,27 @@ async function runCatchUp(
       updated.fetched_at = new Date(nowMs).toISOString();
       delete updated.next_check_at;
       delete updated.reason;
+    } else if (enabledCompanion
+      && sameSelectedInstance
+      && current?.status === 'ready'
+      && current.timestamp_quality === 'companion_offset_anchor'
+      && current.transcript_lines?.length) {
+      // 录制已出现但 VTT 尚未生成（或下载未齐）：保住已下发的 companion 转写，别把 ready 打回 pending；
+      // 升级继续走轮询/终态复检，classic 齐了会整体覆盖。
+      updated.transcript_file_ids = current.transcript_file_ids;
+      updated.transcript_lines = current.transcript_lines;
+      updated.timestamp_quality = 'companion_offset_anchor';
+      updated.status = 'ready';
+      if (current.fetched_at) updated.fetched_at = current.fetched_at;
+      delete updated.reason;
     }
   }
 
+  if (!updated.terminal && poll.exhausted && updated.status === 'ready') {
+    // companion 转写在手、classic 升级窗口耗尽：接受 companion 为最终产物。
+    updated.terminal = true;
+    delete updated.next_check_at;
+  }
   if (!updated.terminal && poll.exhausted) {
     updated.status = chosenStored?.recordings.length ? 'not_generated' : 'no_record';
     updated.reason = !chosenStored

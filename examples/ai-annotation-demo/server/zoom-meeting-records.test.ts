@@ -585,6 +585,80 @@ Mengna Yao: 收尾`));
     expect(result.transcript?.lines[0].start_time).not.toContain('12:55');
   });
 
+  it('keeps Companion ready and upgrades to classic only when a TRANSCRIPT file appears', async () => {
+    const { records } = statePaths();
+    let phase: 'no_recording' | 'media_only' | 'vtt_ready' = 'no_recording';
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/208/instances') return json({ meetings: [{ uuid: 'race-upgrade' }] });
+      if (url.pathname === '/v2/past_meetings/race-upgrade') return json({ start_time: '2026-07-20T06:02:28Z', duration: 12 });
+      if (url.pathname === '/v2/meetings/race-upgrade/recordings') {
+        if (phase === 'no_recording') return json({ recording_files: [] });
+        if (phase === 'media_only') return json({ recording_files: [{ id: 'mp4-1', file_type: 'MP4', recording_start: '2026-07-20T06:02:39Z' }] });
+        return json({ recording_files: [{
+          id: 'vtt-1', file_type: 'TRANSCRIPT', recording_start: '2026-07-20T06:02:28Z',
+          recording_end: '2026-07-20T06:02:40Z', download_url: 'https://download.zoom.us/race-upgrade.vtt',
+        }] });
+      }
+      if (url.pathname === '/v2/past_meetings/race-upgrade/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/race-upgrade/transcript') return json({ download_url: 'https://download.zoom.us/race-companion.vtt' });
+      if (url.pathname === '/race-companion.vtt') return vtt('00:00:10.000 --> 00:00:12.000\nMengna Yao: companion 先行');
+      if (url.pathname === '/race-upgrade.vtt') return vtt('00:00:10.000 --> 00:00:12.000\nMengna Yao: classic 升级');
+      throw new Error(`unexpected ${url}`);
+    });
+    const env = { ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' };
+    const input = { meetingId: '208', scheduledAt: '2026-07-20T06:00:00Z' };
+
+    const first = await fetchZoomMeetingTranscript(env, { path: records }, input, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:15:00Z') });
+    expect(first).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+    expect(first.srt).toContain('companion 先行');
+
+    // 录制出现但只有 MP4：终态复检不得把 ready 打回 pending，也不重拉 companion。
+    phase = 'media_only';
+    const second = await fetchZoomMeetingTranscript(env, { path: records }, input, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:27:00Z') });
+    expect(second).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+    expect(second.srt).toContain('companion 先行');
+
+    // TRANSCRIPT 文件出现：完整重跑升级为 classic。
+    phase = 'vtt_ready';
+    const third = await fetchZoomMeetingTranscript(env, { path: records }, input, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:39:00Z') });
+    expect(third).toMatchObject({ status: 'ready', timestamp_quality: 'derived_no_pause' });
+    expect(third.srt).toContain('classic 升级');
+    expect(third.srt).not.toContain('companion 先行');
+  });
+
+  it('keeps Companion ready when the TRANSCRIPT file exists but is not yet parseable', async () => {
+    const { records } = statePaths();
+    let vttBroken = false;
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/209/instances') return json({ meetings: [{ uuid: 'race-hold' }] });
+      if (url.pathname === '/v2/past_meetings/race-hold') return json({ start_time: '2026-07-20T06:02:28Z', duration: 12 });
+      if (url.pathname === '/v2/meetings/race-hold/recordings') {
+        return vttBroken
+          ? json({ recording_files: [{ id: 'vtt-2', file_type: 'TRANSCRIPT', recording_start: '2026-07-20T06:02:39Z', download_url: 'https://download.zoom.us/race-hold.vtt' }] })
+          : json({ recording_files: [] });
+      }
+      if (url.pathname === '/v2/past_meetings/race-hold/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/race-hold/transcript') return json({ download_url: 'https://download.zoom.us/race-hold-companion.vtt' });
+      if (url.pathname === '/race-hold-companion.vtt') return vtt('00:00:10.000 --> 00:00:12.000\nMengna Yao: companion 保底');
+      if (url.pathname === '/race-hold.vtt') return new Response('processing', { status: 200, headers: { 'content-type': 'text/plain' } });
+      throw new Error(`unexpected ${url}`);
+    });
+    const env = { ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' };
+    const input = { meetingId: '209', scheduledAt: '2026-07-20T06:00:00Z' };
+
+    const first = await fetchZoomMeetingTranscript(env, { path: records }, input, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:15:00Z') });
+    expect(first).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+
+    vttBroken = true;
+    const second = await fetchZoomMeetingTranscript(env, { path: records }, input, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:27:00Z') });
+    expect(second).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+    expect(second.srt).toContain('companion 保底');
+  });
+
   it('revives a legacy recording_missing terminal row once when Companion becomes available', async () => {
     const { records } = statePaths();
     let companionReady = false;
