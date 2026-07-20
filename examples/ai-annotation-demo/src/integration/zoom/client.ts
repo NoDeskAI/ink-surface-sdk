@@ -50,7 +50,12 @@ export interface ZoomMeetingLiveStateResponse {
 }
 
 export type ZoomTranscriptStatus = 'ready' | 'pending' | 'not_generated' | 'no_record';
-export type ZoomTimestampQuality = 'derived_no_pause' | 'approximate_pause_unknown';
+export type ZoomTimestampQuality = 'derived_no_pause' | 'approximate_pause_unknown' | 'companion_offset_anchor';
+
+export interface ZoomMeetingSummaryDetail {
+  label: string;
+  summary: string;
+}
 
 export interface ZoomTranscriptParticipant {
   join_time?: string;
@@ -73,7 +78,7 @@ export interface ZoomTranscriptLine {
 
 export interface ZoomMeetingTranscriptResponse {
   status: ZoomTranscriptStatus;
-  reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
+  reason?: 'instance_not_found' | 'recording_missing' | 'recording_missing_companion_missing' | 'transcript_not_generated';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: {
     name: string;
@@ -88,6 +93,16 @@ export interface ZoomMeetingTranscriptResponse {
   ended_at?: string;
   srt?: string;
   timestamp_quality?: ZoomTimestampQuality;
+  smart_note?: {
+    title?: string;
+    text: string;
+    export_uri?: string;
+    overview?: string;
+    details: ZoomMeetingSummaryDetail[];
+    next_steps: string[];
+    created_time?: string;
+    fetched_at: string;
+  };
   next_check_at?: string;
 }
 

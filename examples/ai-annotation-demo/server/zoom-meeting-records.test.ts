@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   backfillZoomMeetingTranscripts,
   chooseZoomMeetingCandidate,
+  dedupeZoomCompanionCues,
   fetchZoomMeetingTranscript,
   parseZoomVtt,
+  zoomCompanionCuesToLines,
   type ZoomMeetingRecordsEnv,
 } from './zoom-meeting-records';
 import { resetZoomS2SStateForTests } from './zoom-oauth-state';
@@ -17,6 +19,7 @@ const baseEnv: ZoomMeetingRecordsEnv = {
   ZOOM_S2S_CLIENT_ID: 'client-id',
   ZOOM_S2S_CLIENT_SECRET: 'client-secret',
   ZOOM_MEETING_TRANSCRIPT_PROBE: '0',
+  ZOOM_COMPANION_TRANSCRIPT: '0',
 };
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -481,6 +484,239 @@ Lin: earlier short`);
     ]);
   });
 
+  it.each([
+    {
+      label: '双语对',
+      vtt: `00:00:01.000 --> 00:00:02.000\nMengna Yao: 先确认发布范围\n\n00:00:01.000 --> 00:00:02.000\nMengna Yao: Confirm the release scope\n\n00:00:03.000 --> 00:00:04.000\nMengna Yao: 再检查设备`,
+      expected: ['先确认发布范围', '再检查设备'],
+    },
+    {
+      label: '顺序颠倒',
+      vtt: `00:00:01.000 --> 00:00:02.000\nMengna Yao: Confirm the release scope\n\n00:00:01.000 --> 00:00:02.000\nMengna Yao: 先确认发布范围\n\n00:00:03.000 --> 00:00:04.000\nMengna Yao: 再检查设备`,
+      expected: ['先确认发布范围', '再检查设备'],
+    },
+    {
+      label: '无关英文幻觉',
+      vtt: `00:00:01.000 --> 00:00:02.000\nMengna Yao: 这个功能明天上线\n\n00:00:01.000 --> 00:00:02.000\nMengna Yao: Thank you for your attention\n\n00:00:03.000 --> 00:00:04.000\nMengna Yao: 负责人会跟进`,
+      expected: ['这个功能明天上线', '负责人会跟进'],
+    },
+    {
+      label: '单条无对',
+      vtt: `00:00:05.000 --> 00:00:06.000\nAda: standalone cue`,
+      expected: ['standalone cue'],
+    },
+  ])('deterministically selects the Companion language track for $label', ({ vtt: body, expected }) => {
+    expect(dedupeZoomCompanionCues(parseZoomVtt(`WEBVTT\n\n${body}`)).map((cue) => cue.text)).toEqual(expected);
+  });
+
+  it('anchors Companion cue offsets only to the selected instance start', () => {
+    const cues = dedupeZoomCompanionCues(parseZoomVtt(`WEBVTT
+
+00:07:26.000 --> 00:07:27.500
+Mengna Yao: 收尾`));
+    expect(zoomCompanionCuesToLines(cues, '2026-07-20T04:48:08.000Z')).toEqual([expect.objectContaining({
+      start_time: '2026-07-20T04:55:34.000Z',
+      end_time: '2026-07-20T04:55:35.500Z',
+      text: '收尾',
+      recording_file_id: 'zoom_ai_companion_transcript',
+    })]);
+  });
+
+  it('keeps the classic cloud-recording transcript ahead of the Companion route', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/205/instances') return json({ meetings: [{ uuid: 'classic-first' }] });
+      if (url.pathname === '/v2/past_meetings/classic-first') return json({ start_time: '2026-07-17T10:00:00Z', duration: 10 });
+      if (url.pathname === '/v2/meetings/classic-first/recordings') return json({ recording_files: [{
+        id: 'classic-tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        recording_end: '2026-07-17T10:00:05Z', download_url: 'https://download.zoom.us/classic-first.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/classic-first/participants') return json({ participants: [] });
+      if (url.pathname === '/classic-first.vtt') return vtt('00:00:00.000 --> 00:00:05.000\nAda: classic source');
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript({ ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' }, { path: records }, {
+      meetingId: '205', scheduledAt: '2026-07-17T10:00:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:10:00Z') });
+
+    expect(result).toMatchObject({ status: 'ready', timestamp_quality: 'derived_no_pause' });
+    expect(result.srt).toContain('classic source');
+    expect(fetchImpl.mock.calls.map(([input]) => apiPath(input))).not.toContain('/v2/meetings/classic-first/transcript');
+  });
+
+  it('falls back to Companion, deduplicates the language track, and ignores transcript metadata timestamps', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/206/instances') return json({ meetings: [{ uuid: '/companion' }] });
+      if (url.pathname === '/v2/past_meetings/%252Fcompanion') return json({ start_time: '2026-07-20T04:48:08Z', duration: 8 });
+      if (url.pathname === '/v2/meetings/%252Fcompanion/recordings') return json({ recording_files: [] });
+      if (url.pathname === '/v2/past_meetings/%252Fcompanion/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/%252Fcompanion/transcript') return json({
+        transcript_created_time: '2026-07-20T12:55:44Z',
+        download_url: 'https://download.zoom.us/companion.vtt',
+      });
+      if (url.pathname === '/companion.vtt') return vtt([
+        '00:07:26.000 --> 00:07:27.000\nMengna Yao: 收尾确认',
+        '00:07:26.000 --> 00:07:27.000\nMengna Yao: Thank you for your attention',
+        '00:07:28.000 --> 00:07:29.000\nMengna Yao: 下周继续',
+      ].join('\n\n'));
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript({ ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' }, { path: records }, {
+      meetingId: '206', scheduledAt: '2026-07-20T04:48:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T04:56:00Z') });
+
+    expect(result).toMatchObject({
+      status: 'ready',
+      timestamp_quality: 'companion_offset_anchor',
+      transcript: {
+        timestamp_quality: 'companion_offset_anchor',
+        lines: [
+          { start_time: '2026-07-20T04:55:34.000Z', text: '收尾确认', recording_file_id: 'zoom_ai_companion_transcript' },
+          { start_time: '2026-07-20T04:55:36.000Z', text: '下周继续', recording_file_id: 'zoom_ai_companion_transcript' },
+        ],
+      },
+    });
+    expect(result.srt).not.toContain('Thank you for your attention');
+    expect(result.transcript?.lines[0].start_time).not.toContain('12:55');
+  });
+
+  it('revives a legacy recording_missing terminal row once when Companion becomes available', async () => {
+    const { records } = statePaths();
+    let companionReady = false;
+    let transcriptCalls = 0;
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/207/instances') return json({ meetings: [{ uuid: 'legacy-no-record' }] });
+      if (url.pathname === '/v2/past_meetings/legacy-no-record') return json({ start_time: '2026-07-17T10:00:00Z', duration: 10 });
+      if (url.pathname === '/v2/meetings/legacy-no-record/recordings') return json({ recording_files: [] });
+      if (url.pathname === '/v2/past_meetings/legacy-no-record/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/legacy-no-record/transcript') {
+        transcriptCalls += 1;
+        return companionReady
+          ? json({ download_url: 'https://download.zoom.us/legacy-companion.vtt' })
+          : json({ message: 'NOT_READY' }, 404);
+      }
+      if (url.pathname === '/legacy-companion.vtt') return vtt('00:00:02.000 --> 00:00:03.000\nAda: revived');
+      throw new Error(`unexpected ${url}`);
+    });
+    const input = { meetingId: '207', scheduledAt: '2026-07-17T10:00:00Z' };
+    const legacy = await fetchZoomMeetingTranscript(baseEnv, { path: records }, input, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:10:00Z'),
+    });
+    expect(legacy).toMatchObject({ status: 'no_record', reason: 'recording_missing' });
+
+    companionReady = true;
+    const revived = await fetchZoomMeetingTranscript({ ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' }, { path: records }, input, {
+      fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:10:01Z'),
+    });
+    expect(revived).toMatchObject({ status: 'ready', srt: expect.stringContaining('revived') });
+    expect(transcriptCalls).toBe(1);
+  });
+
+  it('uses an honest terminal reason when both recording and Companion transcript are missing', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/208/instances') return json({ meetings: [{ uuid: 'nothing-generated' }] });
+      if (url.pathname === '/v2/past_meetings/nothing-generated') return json({ start_time: '2026-07-17T10:00:00Z', duration: 10 });
+      if (url.pathname === '/v2/meetings/nothing-generated/recordings') return json({ recording_files: [] });
+      if (url.pathname === '/v2/past_meetings/nothing-generated/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/nothing-generated/transcript') return json({ message: 'NOT_READY' }, 404);
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript({ ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' }, { path: records }, {
+      meetingId: '208', scheduledAt: '2026-07-17T10:00:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T12:10:00Z') });
+    expect(result).toMatchObject({ status: 'no_record', reason: 'recording_missing_companion_missing' });
+  });
+
+  it('fetches and persists the official Zoom meeting summary beside a ready transcript', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/209/instances') return json({ meetings: [{ uuid: 'with-summary' }] });
+      if (url.pathname === '/v2/past_meetings/with-summary') return json({
+        start_time: '2026-07-17T10:00:00Z', duration: 10, has_meeting_summary: true,
+      });
+      if (url.pathname === '/v2/meetings/with-summary/recordings') return json({ recording_files: [{
+        id: 'summary-tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        recording_end: '2026-07-17T10:00:05Z', download_url: 'https://download.zoom.us/summary.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/with-summary/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/with-summary/meeting_summary') return json({
+        summary_title: '发布复盘',
+        summary_overview: '确认发布节奏。',
+        summary_details: [{ label: '决定', summary: '周五上线。' }],
+        next_steps: ['Ada 完成真机验证'],
+        summary_content: '## 决定\n\n周五上线。',
+        summary_doc_url: 'https://zoom.us/meeting/summary-doc',
+        summary_created_time: '2026-07-17T18:10:00Z',
+      });
+      if (url.pathname === '/summary.vtt') return vtt('00:00:00.000 --> 00:00:05.000\nAda: ready with summary');
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '209', scheduledAt: '2026-07-17T10:00:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:10:00Z') });
+
+    expect(result).toMatchObject({
+      status: 'ready',
+      smart_note: {
+        title: '发布复盘',
+        text: '## 决定\n\n周五上线。',
+        export_uri: 'https://zoom.us/meeting/summary-doc',
+        overview: '确认发布节奏。',
+        details: [{ label: '决定', summary: '周五上线。' }],
+        next_steps: ['Ada 完成真机验证'],
+        created_time: '2026-07-17T18:10:00Z',
+      },
+    });
+    const job = Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as {
+      meeting_summary_status: string;
+      meeting_summary: { content: string; created_time: string };
+    };
+    expect(job).toMatchObject({
+      meeting_summary_status: 'ready',
+      meeting_summary: { content: '## 决定\n\n周五上线。', created_time: '2026-07-17T18:10:00Z' },
+    });
+  });
+
+  it('tolerates a 404 official summary without degrading the transcript', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/210/instances') return json({ meetings: [{ uuid: 'summary-late' }] });
+      if (url.pathname === '/v2/past_meetings/summary-late') return json({
+        start_time: '2026-07-17T10:00:00Z', duration: 10, has_meeting_summary: true,
+      });
+      if (url.pathname === '/v2/meetings/summary-late/recordings') return json({ recording_files: [{
+        id: 'late-summary-tx', file_type: 'TRANSCRIPT', recording_start: '2026-07-17T10:00:00Z',
+        recording_end: '2026-07-17T10:00:05Z', download_url: 'https://download.zoom.us/summary-late.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/summary-late/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/summary-late/meeting_summary') return json({ code: 3001 }, 404);
+      if (url.pathname === '/summary-late.vtt') return vtt('00:00:00.000 --> 00:00:05.000\nAda: transcript survives');
+      throw new Error(`unexpected ${url}`);
+    });
+    const result = await fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '210', scheduledAt: '2026-07-17T10:00:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-17T10:10:00Z') });
+
+    expect(result).toMatchObject({ status: 'ready', srt: expect.stringContaining('transcript survives') });
+    expect(result.smart_note).toBeUndefined();
+    const job = Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as { meeting_summary_status: string };
+    expect(job.meeting_summary_status).toBe('missing');
+  });
+
   it('consumes participant pagination immediately and preserves rejoin intervals and missing anonymous fields', async () => {
     const { records } = statePaths();
     const fetchImpl = vi.fn(async (input: string | URL) => {
@@ -616,10 +852,11 @@ Lin: earlier short`);
     });
     expect(second.status).toBe('pending');
     const job = Object.values(JSON.parse(readFileSync(records, 'utf8')).meetings)[0] as { probe: { status: string; cue_count: number } };
-    expect(job.probe).toMatchObject({ status: 'ready', cue_count: 1 });
+    expect(job.probe).toMatchObject({ status: 'ready', cue_count: 1, timestamp_quality: 'companion_offset_anchor' });
     expect(logger).toHaveBeenCalledWith('provider_zoom_transcript_probe', expect.objectContaining({
       provider_probe_cue_count: 1,
       provider_classic_cue_count: 0,
+      provider_timestamp_quality: 'companion_offset_anchor',
     }));
   });
 

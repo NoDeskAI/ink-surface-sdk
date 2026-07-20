@@ -1,7 +1,7 @@
 /**
  * Zoom 会后记录聚合：按数字 meeting id 发现全部实际 UUID，结合排期/MTL 窗口与转写可用性选场，
- * 拉取参会区间和经典云录制 VTT，并以实际会议开始时间为 t0 产出 SRT。终态会定期重查，允许晚到
- * UUID/TRANSCRIPT 翻转；Meeting transcript 新路线只做可关闭的对比探测，不替代经典产物。
+ * 拉取参会区间和经典云录制 VTT，并以实际会议开始时间为 t0 产出 SRT。无云录制时回落到
+ * AI Companion 转写；终态会定期重查，允许晚到 UUID/TRANSCRIPT/meeting summary 翻转。
  */
 import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
@@ -44,6 +44,7 @@ export interface ZoomMeetingRecordsEnv extends ZoomMeetingSyncEnv {
   ZOOM_MEETING_TRANSCRIPT_PROBE?: string;
   ZOOM_TERMINAL_RECHECK_WINDOW_MS?: string;
   ZOOM_RECORDS_RETENTION_MS?: string;
+  ZOOM_COMPANION_TRANSCRIPT?: string;
 }
 
 export interface ZoomMeetingRecordsRef {
@@ -70,6 +71,7 @@ export interface ZoomMeetingInstanceCandidate {
   start_time?: string;
   end_time?: string;
   duration_minutes?: number;
+  has_meeting_summary?: boolean;
   recordings: ZoomRecordingFile[];
 }
 
@@ -96,7 +98,23 @@ export interface ZoomTranscriptLine {
   recording_file_id: string;
 }
 
-export type ZoomTimestampQuality = 'derived_no_pause' | 'approximate_pause_unknown';
+export type ZoomTimestampQuality = 'derived_no_pause' | 'approximate_pause_unknown' | 'companion_offset_anchor';
+
+export interface ZoomMeetingSummaryDetail {
+  label: string;
+  summary: string;
+}
+
+export interface ZoomMeetingSummaryArtifact {
+  title?: string;
+  overview?: string;
+  details: ZoomMeetingSummaryDetail[];
+  next_steps: string[];
+  content: string;
+  doc_url?: string;
+  created_time?: string;
+  fetched_at: string;
+}
 
 export interface ZoomMeetingTranscriptProbeState {
   status: 'not_ready' | 'ready' | 'error';
@@ -104,7 +122,7 @@ export interface ZoomMeetingTranscriptProbeState {
   cue_count?: number;
   first_delta_ms?: number;
   last_delta_ms?: number;
-  timestamp_quality?: 'anchor_undocumented';
+  timestamp_quality?: 'companion_offset_anchor';
 }
 
 export interface ZoomMeetingJobState {
@@ -119,7 +137,12 @@ export interface ZoomMeetingJobState {
   transcript_lines?: ZoomTranscriptLine[];
   timestamp_quality?: ZoomTimestampQuality;
   probe?: ZoomMeetingTranscriptProbeState;
+  companion_checked_at?: string;
+  meeting_summary?: ZoomMeetingSummaryArtifact;
+  meeting_summary_status?: 'ready' | 'missing' | 'error';
+  meeting_summary_checked_at?: string;
   status: 'pending' | 'ready' | 'not_generated' | 'no_record';
+  reason?: 'instance_not_found' | 'recording_missing' | 'recording_missing_companion_missing' | 'transcript_not_generated';
   next_check_at?: string;
   attempt: number;
   terminal: boolean;
@@ -142,7 +165,7 @@ export interface ZoomMeetingRecordsOptions {
 
 export interface ZoomMeetingTranscriptResult {
   status: 'pending' | 'ready' | 'not_generated' | 'no_record';
-  reason?: 'instance_not_found' | 'recording_missing' | 'transcript_not_generated';
+  reason?: 'instance_not_found' | 'recording_missing' | 'recording_missing_companion_missing' | 'transcript_not_generated';
   record?: { name: string; start_time?: string; end_time?: string };
   transcript?: {
     name: string;
@@ -157,6 +180,16 @@ export interface ZoomMeetingTranscriptResult {
   ended_at?: string;
   srt?: string;
   timestamp_quality?: ZoomTimestampQuality;
+  smart_note?: {
+    title?: string;
+    text: string;
+    export_uri?: string;
+    overview?: string;
+    details: ZoomMeetingSummaryDetail[];
+    next_steps: string[];
+    created_time?: string;
+    fetched_at: string;
+  };
   next_check_at?: string;
 }
 
@@ -197,6 +230,12 @@ interface ParsedTranscriptFile {
 interface ProbeOutcome {
   state: ZoomMeetingTranscriptProbeState;
   cues: ParsedVttCue[];
+}
+
+interface MeetingSummaryOutcome {
+  status: 'ready' | 'missing' | 'error';
+  checkedAt: string;
+  summary?: ZoomMeetingSummaryArtifact;
 }
 
 export class ZoomMeetingRecordsError extends Error {
@@ -532,6 +571,7 @@ async function discoverCandidates(
     const startTime = validIso(detail.start_time) || validIso(instanceRecord.start_time)
       || recordings.files.map((file) => file.recording_start).find(Boolean);
     const durationMinutes = Number(detail.duration ?? instanceRecord.duration);
+    const hasMeetingSummary = detail.has_meeting_summary === true || instanceRecord.has_meeting_summary === true;
     let endTime = validIso(detail.end_time) || validIso(instanceRecord.end_time);
     if (!endTime && startTime && Number.isFinite(durationMinutes)) {
       endTime = new Date(Date.parse(startTime) + Math.max(0, durationMinutes) * 60_000).toISOString();
@@ -549,6 +589,7 @@ async function discoverCandidates(
         ...(startTime ? { start_time: startTime } : {}),
         ...(endTime ? { end_time: endTime } : {}),
         ...(Number.isFinite(durationMinutes) ? { duration_minutes: Math.max(0, durationMinutes) } : {}),
+        ...(hasMeetingSummary ? { has_meeting_summary: true } : {}),
         recordings: recordings.files,
       },
       ...(recordings.downloadAccessToken ? { downloadAccessToken: recordings.downloadAccessToken } : {}),
@@ -663,6 +704,51 @@ export function parseZoomVtt(vtt: string): ParsedVttCue[] {
   ));
 }
 
+type CompanionCueLanguage = 'zh' | 'other' | 'neutral';
+
+function companionCueLanguage(text: string): CompanionCueLanguage {
+  const han = (text.match(/[\u3400-\u9fff]/g) || []).length;
+  const latinWords = (text.match(/[A-Za-z]+/g) || []).length;
+  if (han > latinWords) return 'zh';
+  if (latinWords > han) return 'other';
+  return 'neutral';
+}
+
+/** Companion VTT 会把原文与机器翻译放进相同时间区间。先从全文判断多数语言，
+ * 再在每组里选同语言的第一条；全文平票或组内无对应语言时保留 Zoom 返回的第一条。 */
+export function dedupeZoomCompanionCues(cues: ParsedVttCue[]): ParsedVttCue[] {
+  const languageCounts = cues.reduce((counts, cue) => {
+    const language = companionCueLanguage(cue.text);
+    if (language !== 'neutral') counts[language] += 1;
+    return counts;
+  }, { zh: 0, other: 0 });
+  const preferred: Exclude<CompanionCueLanguage, 'neutral'> | undefined = languageCounts.zh === languageCounts.other
+    ? undefined
+    : languageCounts.zh > languageCounts.other ? 'zh' : 'other';
+  const groups = new Map<string, ParsedVttCue[]>();
+  for (const cue of cues) {
+    if (!cue.text.trim()) continue;
+    const key = `${cue.startOffsetMs}|${cue.endOffsetMs}`;
+    const group = groups.get(key) || [];
+    group.push(cue);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map((group) => (
+    (preferred ? group.find((cue) => companionCueLanguage(cue.text) === preferred) : undefined) || group[0]
+  ));
+}
+
+export function zoomCompanionCuesToLines(cues: ParsedVttCue[], instanceStart: string): ZoomTranscriptLine[] {
+  const startMs = Date.parse(requiredIso(instanceStart, 'zoom_instance_start'));
+  return cues.map((cue) => ({
+    start_time: new Date(startMs + cue.startOffsetMs).toISOString(),
+    end_time: new Date(startMs + cue.endOffsetMs).toISOString(),
+    speaker: cue.speaker,
+    text: cue.text,
+    recording_file_id: 'zoom_ai_companion_transcript',
+  })).sort((left, right) => Date.parse(left.start_time) - Date.parse(right.start_time));
+}
+
 async function fetchDirectWithRetry(url: string, options: RequestOptions): Promise<Response> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     const response = await zoomDownloadTokenFetch(url, { signal: options.signal }, { fetchImpl: options.fetchImpl });
@@ -772,6 +858,11 @@ function probeEnabled(env: ZoomMeetingRecordsEnv): boolean {
   return !['0', 'false', 'off', 'no'].includes(value);
 }
 
+function companionEnabled(env: ZoomMeetingRecordsEnv): boolean {
+  const value = clean(env.ZOOM_COMPANION_TRANSCRIPT).toLowerCase();
+  return !['0', 'false', 'off', 'no'].includes(value);
+}
+
 function notReadyProbe(body: Record<string, unknown>): boolean {
   const reason = clean(body.download_restriction_reason).toUpperCase();
   const message = clean(body.message).toUpperCase();
@@ -790,7 +881,7 @@ async function probeMeetingTranscript(
     if (!response.ok) {
       return { state: { status: notReadyProbe(body) ? 'not_ready' : 'error', checked_at: checkedAt }, cues: [] };
     }
-    if (body.can_download !== true || !clean(body.download_url)) {
+    if (!clean(body.download_url)) {
       return { state: { status: 'not_ready', checked_at: checkedAt }, cues: [] };
     }
     const download = await fetchZoomResponse(clean(body.download_url), env, options);
@@ -800,14 +891,14 @@ async function probeMeetingTranscript(
     if (!validZoomVttBody(downloadBody, contentType)) {
       return { state: { status: 'not_ready', checked_at: checkedAt }, cues: [] };
     }
-    const cues = parseZoomVtt(downloadBody);
+    const cues = dedupeZoomCompanionCues(parseZoomVtt(downloadBody));
     if (!cues.length) return { state: { status: 'not_ready', checked_at: checkedAt }, cues: [] };
     return {
       state: {
         status: 'ready',
         checked_at: checkedAt,
         cue_count: cues.length,
-        timestamp_quality: 'anchor_undocumented',
+        timestamp_quality: 'companion_offset_anchor',
       },
       cues,
     };
@@ -838,9 +929,70 @@ function finalizeProbe(
     provider_classic_cue_count: classicLines.length,
     ...(probe.first_delta_ms !== undefined ? { provider_first_delta_ms: probe.first_delta_ms } : {}),
     ...(probe.last_delta_ms !== undefined ? { provider_last_delta_ms: probe.last_delta_ms } : {}),
-    provider_timestamp_quality: 'anchor_undocumented',
+    provider_timestamp_quality: 'companion_offset_anchor',
   });
   return probe;
+}
+
+function normalizeMeetingSummary(body: Record<string, unknown>, fetchedAt: string): ZoomMeetingSummaryArtifact | undefined {
+  const content = clean(body.summary_content);
+  if (!content) return undefined;
+  const title = clean(body.summary_title);
+  const overview = clean(body.summary_overview);
+  const docUrl = clean(body.summary_doc_url);
+  // Zoom 当前把该字段的北京时间误标为 Z；只保留原文展示，禁止 Date.parse/归一化后参与锚定。
+  const createdTime = clean(body.summary_created_time);
+  const details = Array.isArray(body.summary_details)
+    ? body.summary_details.flatMap((value): ZoomMeetingSummaryDetail[] => {
+      if (!value || typeof value !== 'object') return [];
+      const item = value as Record<string, unknown>;
+      const label = clean(item.label);
+      const summary = clean(item.summary);
+      return label || summary ? [{ label, summary }] : [];
+    })
+    : [];
+  const nextSteps = Array.isArray(body.next_steps)
+    ? body.next_steps.map(clean).filter(Boolean)
+    : [];
+  return {
+    ...(title ? { title } : {}),
+    ...(overview ? { overview } : {}),
+    details,
+    next_steps: nextSteps,
+    content,
+    ...(docUrl ? { doc_url: docUrl } : {}),
+    ...(createdTime ? { created_time: createdTime } : {}),
+    fetched_at: fetchedAt,
+  };
+}
+
+async function fetchMeetingSummary(
+  uuid: string,
+  env: ZoomMeetingRecordsEnv,
+  options: RequestOptions,
+): Promise<MeetingSummaryOutcome> {
+  const checkedAt = new Date(options.nowMs).toISOString();
+  try {
+    const response = await fetchZoomResponse(zoomUrl(`meetings/${zoomUuidPathSegment(uuid)}/meeting_summary`), env, options);
+    if (response.status === 404) return { status: 'missing', checkedAt };
+    if (!response.ok) return { status: 'error', checkedAt };
+    const summary = normalizeMeetingSummary(await readJson(response), checkedAt);
+    return summary ? { status: 'ready', checkedAt, summary } : { status: 'missing', checkedAt };
+  } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason;
+    options.logger('provider_zoom_meeting_summary_error', {
+      provider_name: 'zoom',
+      provider_artifact: 'meeting_summary',
+      error: String((error as Error)?.message || error),
+    });
+    return { status: 'error', checkedAt };
+  }
+}
+
+function applyMeetingSummaryOutcome(job: ZoomMeetingJobState, outcome: MeetingSummaryOutcome): void {
+  job.meeting_summary_status = outcome.status;
+  job.meeting_summary_checked_at = outcome.checkedAt;
+  if (outcome.summary) job.meeting_summary = outcome.summary;
 }
 
 function candidateByUuid(job: ZoomMeetingJobState): ZoomMeetingInstanceCandidate | undefined {
@@ -852,9 +1004,9 @@ function responseFromJob(job: ZoomMeetingJobState): ZoomMeetingTranscriptResult 
   const result: ZoomMeetingTranscriptResult = {
     status: job.status,
     ...(job.status === 'no_record'
-      ? { reason: chosen ? 'recording_missing' as const : 'instance_not_found' as const }
+      ? { reason: job.reason || (chosen ? 'recording_missing' as const : 'instance_not_found' as const) }
       : job.status === 'not_generated'
-        ? { reason: 'transcript_not_generated' as const }
+        ? { reason: job.reason || 'transcript_not_generated' as const }
         : {}),
     ...(job.participants ? { participants: job.participants } : {}),
     ...(chosen ? {
@@ -868,6 +1020,16 @@ function responseFromJob(job: ZoomMeetingJobState): ZoomMeetingTranscriptResult 
       ...(chosen.end_time ? { ended_at: chosen.end_time } : {}),
     } : {}),
     ...(job.next_check_at && !job.terminal ? { next_check_at: job.next_check_at } : {}),
+    ...(job.meeting_summary ? { smart_note: {
+      ...(job.meeting_summary.title ? { title: job.meeting_summary.title } : {}),
+      text: job.meeting_summary.content,
+      ...(job.meeting_summary.doc_url ? { export_uri: job.meeting_summary.doc_url } : {}),
+      ...(job.meeting_summary.overview ? { overview: job.meeting_summary.overview } : {}),
+      details: job.meeting_summary.details,
+      next_steps: job.meeting_summary.next_steps,
+      ...(job.meeting_summary.created_time ? { created_time: job.meeting_summary.created_time } : {}),
+      fetched_at: job.meeting_summary.fetched_at,
+    } } : {}),
   };
   if (job.status === 'ready' && chosen?.start_time && job.transcript_lines && job.timestamp_quality) {
     const srt = zoomMeetingLinesToSrt(job.transcript_lines, chosen.start_time);
@@ -948,11 +1110,19 @@ async function runCatchUp(
   const inputHash = selectionInputHash(scheduledAt, scheduledEndAt, input.attendance);
   const selectionInputsChanged = !!current && current.selection_input_hash !== inputHash;
   const enabledProbe = probeEnabled(env);
+  const enabledCompanion = companionEnabled(env);
+  const currentChosen = current ? candidateByUuid(current) : undefined;
+  // v1 状态里没有 companion_checked_at：旧 recording_missing 终态在新版本部署后立即补查一次。
+  const legacyCompanionRetryDue = !!current?.terminal
+    && current.status === 'no_record'
+    && currentChosen?.recordings.length === 0
+    && enabledCompanion
+    && !current.companion_checked_at;
   const terminalRetryDue = !!current?.terminal
     && terminalRecheckAllowed(current, nowMs, env)
     && providerArtifactTerminalRecheckDue(current, nowMs, TERMINAL_RECHECK_MS);
   const shouldRefreshProbe = probeRecheckDue(current, nowMs, enabledProbe, env);
-  if (!selectionInputsChanged && ((current?.terminal && !terminalRetryDue && !shouldRefreshProbe)
+  if (!selectionInputsChanged && ((current?.terminal && !terminalRetryDue && !legacyCompanionRetryDue && !shouldRefreshProbe)
     || (current?.next_check_at && nowMs < Date.parse(current.next_check_at)))) {
     return responseFromJob(current);
   }
@@ -975,8 +1145,17 @@ async function runCatchUp(
   if (current?.status === 'ready'
     && terminalRetryDue
     && !selectionInputsChanged
-    && (!chosenStored || chosenStored.uuid === current.chosen_instance_uuid)) {
-    const rechecked = { ...current, updated_at: new Date(nowMs).toISOString() };
+    && (!chosenStored || chosenStored.uuid === current.chosen_instance_uuid)
+    && !(current.timestamp_quality === 'companion_offset_anchor' && !!chosenStored?.recordings.length)) {
+    const rechecked: ZoomMeetingJobState = {
+      ...current,
+      candidates,
+      ...(chosenStored ? { chosen_instance_uuid: chosenStored.uuid } : {}),
+      updated_at: new Date(nowMs).toISOString(),
+    };
+    if (chosenStored?.has_meeting_summary && !rechecked.meeting_summary) {
+      applyMeetingSummaryOutcome(rechecked, await fetchMeetingSummary(chosenStored.uuid, env, options));
+    }
     persistJob(recordsRef.path, key, rechecked);
     return responseFromJob(rechecked);
   }
@@ -985,14 +1164,26 @@ async function runCatchUp(
     nowMs,
     ZOOM_MEETING_POLL_MINUTES,
   );
+  const sameSelectedInstance = !!current
+    && current.chosen_instance_uuid === chosenStored?.uuid;
   const updated: ZoomMeetingJobState = {
     meeting_id: meetingId,
     scheduled_at: scheduledAt,
     ...(scheduledEndAt ? { scheduled_end_at: scheduledEndAt } : {}),
     selection_input_hash: inputHash,
     candidates,
+    ...(sameSelectedInstance && current.meeting_summary ? { meeting_summary: current.meeting_summary } : {}),
+    ...(sameSelectedInstance && current.meeting_summary_status ? { meeting_summary_status: current.meeting_summary_status } : {}),
+    ...(sameSelectedInstance && current.meeting_summary_checked_at ? { meeting_summary_checked_at: current.meeting_summary_checked_at } : {}),
     ...(chosenStored ? { chosen_instance_uuid: chosenStored.uuid } : {}),
-    status: chosenStored?.recordings.length ? 'pending' : 'no_record',
+    status: chosenStored
+      ? chosenStored.recordings.length || enabledCompanion ? 'pending' : 'no_record'
+      : 'no_record',
+    ...(!chosenStored
+      ? { reason: 'instance_not_found' as const }
+      : !chosenStored.recordings.length && !enabledCompanion
+        ? { reason: 'recording_missing' as const }
+        : {}),
     ...(poll.nextCheckAt ? { next_check_at: poll.nextCheckAt } : {}),
     attempt: poll.attempt,
     terminal: false,
@@ -1000,13 +1191,18 @@ async function runCatchUp(
   };
 
   if (chosen && chosenStored) {
-    const probePromise = enabledProbe
+    const transcriptRouteNeeded = enabledProbe || (enabledCompanion && chosenStored.recordings.length === 0);
+    const probePromise = transcriptRouteNeeded
       ? probeMeetingTranscript(chosenStored.uuid, env, options)
       : Promise.resolve<ProbeOutcome | undefined>(undefined);
-    const [participants, classic, probe] = await Promise.all([
+    const summaryPromise = chosenStored.has_meeting_summary
+      ? fetchMeetingSummary(chosenStored.uuid, env, options)
+      : Promise.resolve<MeetingSummaryOutcome | undefined>(undefined);
+    const [participants, classic, probe, summary] = await Promise.all([
       fetchParticipants(chosenStored.uuid, env, options),
       downloadClassicTranscripts(chosen, env, options),
       probePromise,
+      summaryPromise,
     ]);
     updated.participants = participants;
     const lines = sortedLines(classic.files);
@@ -1015,18 +1211,43 @@ async function runCatchUp(
       updated.transcript_lines = lines;
       updated.timestamp_quality = zoomTimestampQuality(classic.files);
     }
-    // classic 下载与 probe 并行；probe 的失败/NOT_READY 只落自身状态，不改变主链结果。
-    if (probe) updated.probe = finalizeProbe(probe, lines, chosenStored.start_time, options);
+    // 经典录制绝对优先；探针在经典路线只落遥测，在无录制路线才可成为正式回落产物。
+    if (probe && enabledProbe) updated.probe = finalizeProbe(probe, lines, chosenStored.start_time, options);
+    if (probe && enabledCompanion && chosenStored.recordings.length === 0) {
+      updated.companion_checked_at = probe.state.checked_at;
+    }
+    if (summary) applyMeetingSummaryOutcome(updated, summary);
     if (classic.complete) {
       updated.status = 'ready';
       updated.terminal = true;
       updated.fetched_at = new Date(nowMs).toISOString();
       delete updated.next_check_at;
+      delete updated.reason;
+    } else if (chosenStored.recordings.length === 0
+      && enabledCompanion
+      && probe?.state.status === 'ready'
+      && probe.cues.length
+      && chosenStored.start_time) {
+      updated.transcript_file_ids = ['zoom_ai_companion_transcript'];
+      updated.transcript_lines = zoomCompanionCuesToLines(probe.cues, chosenStored.start_time);
+      updated.timestamp_quality = 'companion_offset_anchor';
+      updated.status = 'ready';
+      updated.terminal = true;
+      updated.fetched_at = new Date(nowMs).toISOString();
+      delete updated.next_check_at;
+      delete updated.reason;
     }
   }
 
   if (!updated.terminal && poll.exhausted) {
     updated.status = chosenStored?.recordings.length ? 'not_generated' : 'no_record';
+    updated.reason = !chosenStored
+      ? 'instance_not_found'
+      : chosenStored.recordings.length
+        ? 'transcript_not_generated'
+        : enabledCompanion
+          ? 'recording_missing_companion_missing'
+          : 'recording_missing';
     updated.terminal = true;
     delete updated.next_check_at;
   }

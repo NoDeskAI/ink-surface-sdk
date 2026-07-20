@@ -79,6 +79,7 @@ export function zoomMeetingPatch(
         provider_transcript_status: undefined,
         provider_transcript_reason: undefined,
         provider_participants: undefined,
+        zoom_smart_note: undefined,
         vc_meeting_start_t0: undefined,
         t0_source: undefined,
         align_offset_ms: undefined,

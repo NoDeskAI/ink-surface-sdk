@@ -47,6 +47,8 @@ import {
   recapTranscriptSpeakerLabel,
   renderRecapCard,
   renderProviderParticipantsOverview,
+  renderZoomSmartNoteHtml,
+  zoomSmartNoteCardState,
   zoomTranscriptAlignmentLabel,
 } from './meeting-recap';
 
@@ -126,6 +128,16 @@ describe('meeting recap Zoom transcript branch', () => {
       started_at: '2026-07-18T01:02:00.000Z',
       ended_at: '2026-07-18T01:47:00.000Z',
       timestamp_quality: 'approximate_pause_unknown',
+      smart_note: {
+        title: 'Zoom 发布复盘',
+        text: '## 决定\n\n周五发布。',
+        export_uri: 'https://zoom.us/summary/zoom-instance-1',
+        overview: '确认发布时间。',
+        details: [{ label: '决定', summary: '周五发布。' }],
+        next_steps: ['Ada 完成验证'],
+        created_time: '2026-07-18T10:00:00Z',
+        fetched_at: '2026-07-18T02:00:05.000Z',
+      },
       transcript: {
         name: 'past_meetings/%2Fzoom-instance-1/transcripts',
         lines: [],
@@ -163,6 +175,16 @@ describe('meeting recap Zoom transcript branch', () => {
         name: 'Ada', identity: 'signed_in',
         joined_at: '2026-07-18T01:02:00.000Z', left_at: '2026-07-18T01:47:00.000Z',
       }],
+      zoom_smart_note: {
+        title: 'Zoom 发布复盘',
+        text: '## 决定\n\n周五发布。',
+        export_uri: 'https://zoom.us/summary/zoom-instance-1',
+        overview: '确认发布时间。',
+        details: [{ label: '决定', summary: '周五发布。' }],
+        next_steps: ['Ada 完成验证'],
+        created_time: '2026-07-18T10:00:00Z',
+        fetched_at: '2026-07-18T02:00:05.000Z',
+      },
     });
     expect(mocks.appliedPatches[0]).toEqual(expect.objectContaining({
       provider_participants: [{
@@ -307,6 +329,7 @@ describe('meeting recap Zoom transcript branch', () => {
   it.each([
     ['instance_not_found', 'no_record', '未找到实际召开的场次'],
     ['recording_missing', 'no_record', '该场次未开启云录制，没有转写'],
+    ['recording_missing_companion_missing', 'no_record', '该场次无云录制，Zoom AI Companion 也没有转写'],
     ['transcript_not_generated', 'not_generated', '转写尚未生成或未开启'],
   ] as const)('uses server reason %s for terminal copy', async (reason, status, message) => {
     mocks.fetchZoomMeetingTranscript.mockResolvedValue({ status, reason, participants: [] });
@@ -357,9 +380,10 @@ describe('meeting recap Zoom transcript branch', () => {
     expect(recapTranscriptRetryLabel({ platform: 'google_meet', provider_transcript_status: 'pending' })).toBe('重新检查');
     expect(zoomTranscriptAlignmentLabel('approximate_pause_unknown')).toBe('时间为近似（录制中断未校准）');
     expect(zoomTranscriptAlignmentLabel('derived_no_pause')).toBe('Zoom 场次时间对齐');
+    expect(zoomTranscriptAlignmentLabel('companion_offset_anchor')).toBe('Zoom AI Companion 场次时间对齐');
     expect(recapTranscriptSpeakerLabel({ platform: 'zoom' }, '')).toBe('未知说话人');
     expect(recapTranscriptSpeakerLabel({ platform: 'zoom' }, 'Unknown Speaker')).toBe('Unknown Speaker');
-    expect(recapTranscriptPageDescription({ platform: 'zoom' })).toBe('这里展示 Zoom 会后录制的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。');
+    expect(recapTranscriptPageDescription({ platform: 'zoom' })).toBe('这里展示 Zoom 会后逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。');
     expect(recapTranscriptPageDescription({ platform: 'google_meet' })).toBe('这里展示 Google Meet逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。');
     expect(renderRecapCard(zoomMeeting())).toContain('Zoom 会后转写');
     expect(renderRecapCard(zoomMeeting({ provider_transcript_status: 'no_record' }))).toContain('未找到实际召开的场次');
@@ -374,6 +398,30 @@ describe('meeting recap Zoom transcript branch', () => {
     expect(mocks.fetchZoomMeetingTranscript).not.toHaveBeenCalled();
   });
 
+  it('renders the Zoom official-summary slot with AI Companion attribution and source markdown', () => {
+    const meeting = zoomMeeting({
+      zoom_smart_note: {
+        title: '发布复盘',
+        text: '## 决定\n\n周五发布。',
+        export_uri: 'https://zoom.us/summary/doc',
+        overview: '确认发布时间。',
+        details: [{ label: '决定', summary: '周五发布。' }],
+        next_steps: ['完成真机验证'],
+        created_time: '2026-07-18T10:00:00Z',
+        fetched_at: '2026-07-18T02:00:05.000Z',
+      },
+    });
+
+    expect(zoomSmartNoteCardState(meeting)).toEqual({
+      meta: '已同步', body: '查看 Zoom AI Companion 官方纪要原文。', disabled: false,
+    });
+    expect(renderZoomSmartNoteHtml(meeting)).toContain('Zoom AI Companion');
+    expect(renderZoomSmartNoteHtml(meeting)).toContain('<b>决定</b>');
+    expect(renderZoomSmartNoteHtml(meeting)).not.toContain('## 决定');
+    expect(renderZoomSmartNoteHtml(meeting)).toContain('2026-07-18T10:00:00Z');
+    expect(renderZoomSmartNoteHtml(meeting)).toContain('href="https://zoom.us/summary/doc"');
+  });
+
   it('generates and persists the Zoom InkLoop summary through the provider-neutral endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       model: 'glm-test',
@@ -386,7 +434,16 @@ describe('meeting recap Zoom transcript branch', () => {
       },
     }), { status: 200, headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
-    const meeting = zoomMeeting({ provider_meeting_id: '/zoom-instance-1' });
+    const meeting = zoomMeeting({
+      provider_meeting_id: '/zoom-instance-1',
+      zoom_smart_note: {
+        title: 'Zoom 官方纪要',
+        text: 'AI Companion notes say the recovery path should ship first.',
+        details: [],
+        next_steps: [],
+        fetched_at: '2026-07-18T02:00:05.000Z',
+      },
+    });
     const cues = [{
       index: 1,
       startMs: 1_000,
@@ -402,7 +459,7 @@ describe('meeting recap Zoom transcript branch', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/api/meetings/summary');
     const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
     expect(request.transcript).toContain('[0:01]Ada：确认发布 Zoom 会后恢复。');
-    expect(request.smart_note).toBeUndefined();
+    expect(request.smart_note).toBe('AI Companion notes say the recovery path should ship first.');
     expect(request.handwriting_sections).toBeUndefined();
     expect(request.platform).toBe('zoom');
     expect(summary).toMatchObject({
