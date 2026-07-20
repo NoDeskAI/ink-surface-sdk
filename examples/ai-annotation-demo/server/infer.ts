@@ -726,7 +726,7 @@ export async function runBoardOcrVlm(payload: any): Promise<string> {
   // 大页（几十个 region）在慢模型上超过设备端 30s 请求超时→客户端掐断→整轮重试死循环。
   // 服务端强制指定模型（不吃设备 inferModel）：默认 kimi-k3（视觉识别质量优先·实测小图 ~8s）；
   // 若大页仍撞 30s 超时，BOARD_OCR_MODEL=gemini-3.1-flash-lite 兜底（实测 ~3s·扫描页 OCR 同款）。
-  const model = process.env.BOARD_OCR_MODEL || 'kimi-k3';
+  const model = process.env.BOARD_OCR_MODEL || 'claude-sonnet-4-6';
   return gateway(
     SYSTEM_PROMPTS.board_ocr,
     user,
