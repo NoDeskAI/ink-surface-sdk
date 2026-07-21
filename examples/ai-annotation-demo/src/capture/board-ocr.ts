@@ -195,7 +195,7 @@ export async function recognizeBoardDocument(documentId: string): Promise<BoardO
   const marks = await getFoldedMarks(documentId);
   return recognizeBoardMarks({ documentId, marks, pages: defaultPages(documentId, marks), model: settings.inferModel }, {
     rasterize: defaultRasterize,
-    request: (payload) => postJson('/api/ink/board-ocr', payload, { auth: true }),
+    request: (payload) => postJson('/api/ink/board-ocr', payload, { auth: true, timeoutMs: 150_000 }), // 整页 VLM+弱网上传常超默认 30s，掐断=整轮报废
     writeRevision: async (mark, patch, expectedFingerprint) => {
       if (boardOcrFingerprint(mark) !== expectedFingerprint) return false;
       const revision = await appendMarkRevisionIfCurrent(documentId, mark.mark_id, { seq: mark.seq }, patch);

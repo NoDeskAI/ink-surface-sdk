@@ -292,6 +292,88 @@ describe('zoom API routes', () => {
     `);
   });
 
+  it('serves Companion fallback and the official Zoom summary through the device API', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-companion-route-'));
+    roots.push(root);
+    const syncPath = join(root, 'sync.json');
+    writeFileSync(syncPath, JSON.stringify({
+      schema_version: 'inkloop.zoom_sync.v1',
+      meetings: [{
+        platform: 'zoom', meeting_id: '246813579', topic: 'Companion route',
+        scheduled_at: '2026-07-17T10:00:00.000Z', duration_minutes: 5,
+        join_url: 'https://zoom.us/j/246813579', host_user_id: 'host-a',
+      }],
+    }));
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') {
+        return new Response(JSON.stringify({ access_token: 'token', expires_in: 3600 }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/246813579/instances') {
+        return new Response(JSON.stringify({ meetings: [{ uuid: 'companion-route' }] }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/companion-route') {
+        return new Response(JSON.stringify({
+          start_time: '2026-07-17T10:00:00Z', duration: 5, has_meeting_summary: true,
+        }), { status: 200 });
+      }
+      if (url.pathname === '/v2/meetings/companion-route/recordings') {
+        return new Response(JSON.stringify({ recording_files: [] }), { status: 200 });
+      }
+      if (url.pathname === '/v2/past_meetings/companion-route/participants') {
+        return new Response(JSON.stringify({ participants: [] }), { status: 200 });
+      }
+      if (url.pathname === '/v2/meetings/companion-route/transcript') {
+        return new Response(JSON.stringify({ download_url: 'https://download.zoom.us/companion-route.vtt' }), { status: 200 });
+      }
+      if (url.pathname === '/v2/meetings/companion-route/meeting_summary') {
+        return new Response(JSON.stringify({
+          summary_title: 'Companion route summary',
+          summary_content: '## Decision\n\nShip the fallback.',
+          summary_details: [],
+          next_steps: ['Rebuild APK'],
+        }), { status: 200 });
+      }
+      if (url.pathname === '/companion-route.vtt') {
+        return new Response('WEBVTT\n\n00:00:03.000 --> 00:00:04.000\nAda: companion route', {
+          status: 200, headers: { 'content-type': 'text/vtt' },
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const handler = createZoomApiHandler({
+      env: {
+        ZOOM_S2S_ACCOUNT_ID: 'account',
+        ZOOM_S2S_CLIENT_ID: 'client',
+        ZOOM_S2S_CLIENT_SECRET: 'secret',
+        ZOOM_MEETING_TRANSCRIPT_PROBE: '0',
+      },
+      syncRef: { path: syncPath },
+      recordsRef: { path: join(root, 'records.json') },
+      fetchImpl: fetchImpl as typeof fetch,
+      nowMs: () => Date.parse('2026-07-17T10:05:00Z'),
+      requireDeviceSession: async () => ({ active: true }),
+      resolveAuthorizedHostUserIds: () => ['host-a'],
+    });
+
+    const result = await invoke(handler, '/api/zoom/meeting-transcript?space_name=246813579&scheduled_at=2026-07-17T10%3A00%3A00Z');
+    expect(result).toMatchObject({
+      status: 200,
+      body: {
+        status: 'ready',
+        timestamp_quality: 'companion_offset_anchor',
+        transcript: {
+          lines: [{ start_time: '2026-07-17T10:00:03.000Z', text: 'companion route' }],
+        },
+        smart_note: {
+          title: 'Companion route summary',
+          text: '## Decision\n\nShip the fallback.',
+          next_steps: ['Rebuild APK'],
+        },
+      },
+    });
+  });
+
   it('keeps no_record status compatible while exposing instance_not_found reason', async () => {
     const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-reason-route-'));
     roots.push(root);

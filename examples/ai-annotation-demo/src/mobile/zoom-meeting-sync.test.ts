@@ -208,6 +208,9 @@ describe('Zoom meeting source persistence', () => {
         name: '旧场成员', identity: 'signed_in',
         joined_at: '2026-07-17T07:10:00.000Z', left_at: '2026-07-17T07:50:00.000Z',
       }],
+      zoom_smart_note: {
+        text: '旧场官方纪要', details: [], next_steps: [], fetched_at: '2026-07-17T08:00:00.000Z',
+      },
       vc_meeting_start_t0: Date.parse('2026-07-17T07:10:00.000Z'),
       t0_source: 'provider_event',
       align_state: 'event',
@@ -237,6 +240,7 @@ describe('Zoom meeting source persistence', () => {
     expect(state.meetings[0].provider_meeting_id).toBeUndefined();
     expect(state.meetings[0].provider_transcript_ref).toBeUndefined();
     expect(state.meetings[0].provider_participants).toBeUndefined();
+    expect(state.meetings[0].zoom_smart_note).toBeUndefined();
     expect(state.meetings[0].t0_source).toBeUndefined();
   });
 

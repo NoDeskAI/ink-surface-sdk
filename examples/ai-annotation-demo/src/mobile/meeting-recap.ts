@@ -26,7 +26,7 @@ import { isBoardOcrInFlight, triggerBoardOcr } from '../capture/board-ocr';
 import { buildMeetingHandwritingSections, hasMeetingHandwritingSections, meetingHandwritingSectionLines } from '../features/meeting/meeting-summary-handwriting';
 import { aggregateProviderParticipants, providerParticipantLines } from '../features/meeting/provider-participants';
 
-const SUMMARY_TRANSCRIPT_CAP = 16000; // 喂 AI 的转写字数软上限（长转写分块留 P5）
+const SUMMARY_TRANSCRIPT_CAP = 48000; // 喂 AI 的转写字数软上限（16k 时一小时英文访谈只喂进前半场·后 132 句被砍——7-21 提到 48k；长转写分块留 P5）
 type ProviderMeetingSummaryResponse = { summary: PanelMeetingSummaryRecord['summary']; model: string };
 
 const ALIGN_LABEL: Record<NonNullable<PersistedMeeting['align_state']>, string> = {
@@ -237,6 +237,7 @@ interface RecapV2 {
   feishuSummary: FeishuNoteSummaryRecord | null; // 飞书官方智能纪要，和转写/InkLoop 总结分开展示。
   panelSummary: PanelMeetingSummaryRecord | null; // L5：panel 五要素总结（独立整页·和时间脊互补）
   panelSummaryStatus: string;   // loading / ready / not_generated / generating / failed（missing_minute 仅兼容旧缓存）
+  psumReportOpen?: boolean;     // panel 页「完整报告」视图开关（仅当 summary.report_markdown 存在时可开）
   timeline: EpaperMeetingTimeline;
   marksById: Map<string, PersistedMark>; // 详情页需要完整 strokes；时间线只保留轻量 SegmentMark。
   markSourceMeeting: PersistedMeeting | null; // 手写可能来自同系列会议的本地手记，用于恢复未重新关联的笔迹。
@@ -470,6 +471,19 @@ export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTra
       if (participants.length && JSON.stringify(participants) !== JSON.stringify(current.provider_participants || [])) {
         patch.provider_participants = participants;
       }
+      const zoomSmartNote = result.smart_note?.text.trim() ? {
+        ...(result.smart_note.title ? { title: result.smart_note.title } : {}),
+        text: result.smart_note.text,
+        ...(result.smart_note.export_uri ? { export_uri: result.smart_note.export_uri } : {}),
+        ...(result.smart_note.overview ? { overview: result.smart_note.overview } : {}),
+        details: result.smart_note.details || [],
+        next_steps: result.smart_note.next_steps || [],
+        ...(result.smart_note.created_time ? { created_time: result.smart_note.created_time } : {}),
+        fetched_at: result.smart_note.fetched_at || new Date().toISOString(),
+      } : undefined;
+      if (zoomSmartNote && JSON.stringify(zoomSmartNote) !== JSON.stringify(current.zoom_smart_note)) {
+        patch.zoom_smart_note = zoomSmartNote;
+      }
 
       const instanceChanged = !!result.instance_uuid && result.instance_uuid !== current.provider_meeting_id;
       const protectAnchor = current.align_state === 'manual'
@@ -478,6 +492,7 @@ export async function loadZoomTranscript(m: PersistedMeeting): Promise<LoadedTra
       if (instanceChanged) {
         patch.provider_meeting_id = result.instance_uuid;
         patch.provider_transcript_ref = result.transcript?.name || undefined;
+        if (!zoomSmartNote && current.zoom_smart_note) patch.zoom_smart_note = undefined;
         if (!protectAnchor) {
           patch.vc_meeting_start_t0 = t0Ms > 0 ? t0Ms : undefined;
           patch.started_at = startMs > 0 ? new Date(startMs).toISOString() : undefined;
@@ -643,6 +658,8 @@ export function recapTranscriptMissingMessage(meeting: Partial<PersistedMeeting>
 function zoomTerminalTranscriptMessage(meeting: Partial<PersistedMeeting>, sentence: boolean): string {
   const message = meeting.provider_transcript_reason === 'instance_not_found'
     ? '未找到实际召开的场次'
+    : meeting.provider_transcript_reason === 'recording_missing_companion_missing'
+      ? '该场次无云录制，Zoom AI Companion 也没有转写'
     : meeting.provider_transcript_reason === 'recording_missing'
       ? '该场次未开启云录制，没有转写'
       : meeting.provider_transcript_reason === 'transcript_not_generated'
@@ -669,7 +686,7 @@ export function recapTranscriptPageDescription(meeting: Partial<PersistedMeeting
     case 'lark':
       return '这里展示飞书会后记录里的逐句原始发言；不混入智能纪要，也不混入 InkLoop 后处理。';
     case 'zoom':
-      return '这里展示 Zoom 会后录制的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。';
+      return '这里展示 Zoom 会后逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。';
     case 'microsoft_teams':
     case 'manual':
       return '这里展示该来源已缓存的逐句原始发言；不混入官方纪要，也不混入 InkLoop 后处理。';
@@ -744,6 +761,10 @@ function updateProviderNoteState(state: RecapV2, error?: unknown): void {
       else state.noteLoad = { status: 'missing', message: '飞书未生成可读取的智能纪要。' };
       return;
     case 'zoom':
+      if (state.meeting.zoom_smart_note?.text.trim()) state.noteLoad = { status: 'ready', message: 'Zoom 官方纪要已同步。' };
+      else if (error) state.noteLoad = recapBlockFailure(error, false);
+      else state.noteLoad = { status: 'missing', message: 'Zoom AI Companion 尚未生成官方纪要。' };
+      return;
     case 'microsoft_teams':
     case 'manual':
       state.noteLoad = error
@@ -878,6 +899,7 @@ async function refreshTranscriptAfterInitialRender(seq: number, bodyEl: HTMLElem
       } else if (platform === 'zoom') {
         updateProviderNoteState(recapState);
         refreshRecapOverviewBlocks(bodyEl, ['#rc-feishu-block']);
+        if (recapState.view === 'feishu') renderRecap(bodyEl);
         if (recapState.cues.length && !recapState.panelSummary) void loadProviderPanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
       } else if (platform === 'lark') {
         if (loaded?.sourceToken === freshMeeting.feishu_minute_token && freshMeeting.feishu_meeting_id) {
@@ -1023,7 +1045,8 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   const sourceExpected = hasRemoteTranscriptSource(m) || canResolvePanelMeeting(m);
   const platform = meetingPlatformOf(m);
   const providerNoteReady = (platform === 'google_meet' || platform === 'lark')
-    && !!(m.feishu_note_summary?.content || m.google_smart_note?.text);
+    ? !!(m.feishu_note_summary?.content || m.google_smart_note?.text)
+    : platform === 'zoom' && !!m.zoom_smart_note?.text;
   const missingTranscriptMessage = platform === 'lark'
     ? '尚未关联飞书会议。关联后可读取会后记录。'
     : recapTranscriptMissingMessage(m);
@@ -1031,6 +1054,8 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
     ? '尚未关联飞书会议。'
     : platform === 'google_meet'
       ? 'Google 未生成智能纪要。'
+      : platform === 'zoom'
+        ? 'Zoom AI Companion 尚未生成官方纪要。'
       : '该来源暂不支持官方纪要拉取。';
   recapState = { meeting: m, segments: timeline.segments, cues: [], view: 'overview', detailIdx: 0, ovPage: 0, dtPage: 0, txPage: 0, bodyEl, transcriptMissing: true,
     feishuSummary: m.feishu_note_summary ?? null,
@@ -1349,7 +1374,26 @@ function wireFeishuSummaryImages(bodyEl: HTMLElement): void {
   });
 }
 
-/** 左侧 nav「飞书纪要」入口整页：飞书官方智能纪要原文，和文字记录/InkLoop 总结分开。 */
+export function renderZoomSmartNoteHtml(
+  meeting: Pick<PersistedMeeting, 'zoom_smart_note'>,
+): string {
+  const note = meeting.zoom_smart_note;
+  if (!note?.text.trim()) return '';
+  // summary_content 是 markdown；标题行转加粗展示，其余原样（不做更深的二次加工）。
+  const paragraphs = note.text.trim().split(/\n\s*\n+/).filter(Boolean)
+    .map((paragraph) => {
+      const heading = /^#{1,6}\s+(.+)$/.exec(paragraph.trim());
+      if (heading) return `<p class="rc-rich-p"><b>${esc(heading[1])}</b></p>`;
+      return `<p class="rc-rich-p">${esc(paragraph).replaceAll('\n', '<br>')}</p>`;
+    }).join('');
+  return `<div class="rc-msum"><div class="rc-msum-h"><b>${esc(note.title || 'Zoom 官方纪要')}</b><span class="mdl">Zoom AI Companion</span></div>`
+    + `<div class="rc-rich">${paragraphs}</div>`
+    + (note.created_time ? `<div class="rc-note">Zoom 标注时间：${esc(note.created_time)}</div>` : '')
+    + (note.export_uri ? `<a class="rc-smart-note-link" href="${esc(note.export_uri)}" target="_blank" rel="noopener">在 Zoom 查看</a>` : '')
+    + `</div>`;
+}
+
+/** 左侧 nav 纪要入口整页：各平台官方智能纪要原文，和文字记录/InkLoop 总结分开。 */
 function renderRecapFeishuPage(bodyEl: HTMLElement): void {
   if (!recapState) return;
   const platform = meetingPlatformOf(recapState.meeting);
@@ -1370,6 +1414,19 @@ function renderRecapFeishuPage(bodyEl: HTMLElement): void {
         ? (recapState.noteLoad.message || '正在拉取 Gemini 智能纪要…')
         : 'Google 智能纪要（Gemini）尚未生成或未同步；生成后这里会显示官方纪要原文。原始发言和 InkLoop 后处理不受影响。';
     bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>智能纪要</b><span class="mdl">Google Meet</span></div>`
+      + `<div class="empty">${esc(message)}</div></div>`;
+    return;
+  }
+  if (platform === 'zoom') {
+    const html = renderZoomSmartNoteHtml(recapState.meeting);
+    if (html) {
+      bodyEl.innerHTML = html;
+      return;
+    }
+    const message = recapState.noteLoad.status === 'loading'
+      ? (recapState.noteLoad.message || '正在拉取 Zoom 官方纪要…')
+      : 'Zoom AI Companion 官方纪要尚未生成或未同步；原始发言和 InkLoop 后处理不受影响。';
+    bodyEl.innerHTML = `<div class="rc-msum"><div class="rc-msum-h"><b>官方纪要</b><span class="mdl">Zoom AI Companion</span></div>`
       + `<div class="empty">${esc(message)}</div></div>`;
     return;
   }
@@ -1666,9 +1723,10 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
       title: m.title || '(未命名会议)',
       transcript: capped.lines.join('\n'),
       ...(platform === 'google_meet' && m.google_smart_note?.text ? { smart_note: m.google_smart_note.text } : {}),
+      ...(platform === 'zoom' && m.zoom_smart_note?.text ? { smart_note: m.zoom_smart_note.text } : {}),
       ...(hasMeetingHandwritingSections(handwritingSections) ? { handwriting_sections: handwritingSections } : {}),
       model: settings.inferModel,
-    }, { auth: true });
+    }, { auth: true, timeoutMs: 600_000 }); // 长报告（访谈模式 20k tokens·全量转写）流式生成实测可超 6 分钟，默认 30s 必掐断
     const summary: PanelMeetingSummaryRecord = {
       minute_token: transcriptToken,
       meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.provider_space_name || m.meeting_id,
@@ -1849,6 +1907,36 @@ function buildLocalPanelSummaryPreview(): PanelMeetingSummaryRecord | null {
   };
 }
 
+/** 极简 markdown → HTML（完整报告只读渲染：标题/加粗/列表/表格行等宽兜底；先转义防注入）。 */
+function reportMarkdownHtml(md: string): string {
+  const out: string[] = [];
+  let inList = false;
+  const closeList = (): void => { if (inList) { out.push('</ul>'); inList = false; } };
+  const inline = (t: string): string => esc(t).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  for (const raw of md.split('\n')) {
+    const line = raw.trimEnd();
+    if (/^#{1,6}\s/.test(line)) {
+      closeList();
+      const level = Math.min(4, (line.match(/^#+/) as RegExpMatchArray)[0].length);
+      out.push(`<div class="rc-rep-h${level}">${inline(line.replace(/^#+\s*/, ''))}</div>`);
+    } else if (/^\s*[-*]\s+/.test(line)) {
+      if (!inList) { out.push('<ul class="rc-rep-ul">'); inList = true; }
+      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
+    } else if (/^\s*\|/.test(line)) {
+      closeList();
+      out.push(`<div class="rc-rep-tr">${esc(line)}</div>`);
+    } else if (!line.trim()) {
+      closeList();
+      out.push('<div class="rc-rep-gap"></div>');
+    } else {
+      closeList();
+      out.push(`<div class="rc-rep-p">${inline(line)}</div>`);
+    }
+  }
+  closeList();
+  return out.join('');
+}
+
 /** L5：InkLoop 五要素总结块（左侧 nav「InkLoop」入口整页「会议讲了什么」·和时间脊「我何时写了什么」互补）。 */
 function panelSummaryHtml(): string {
   if (!recapState) return '';
@@ -1856,6 +1944,11 @@ function panelSummaryHtml(): string {
   const rec = recapState.panelSummary ?? fallback;
   const status = recapState.panelSummaryStatus === 'missing_minute' ? 'not_generated' : recapState.panelSummaryStatus;
   const box = (inner: string): string => `<div class="rc-psum">${inner}</div>`;
+  // 「完整报告」整页视图：五要素只是压缩摘要，长文报告在这里读。
+  if (recapState.psumReportOpen && rec?.summary?.report_markdown) {
+    return box(`<div class="rc-psum-h"><b>完整报告</b><button class="hbtn rc-psum-retry" id="ps-report-back">返回摘要</button></div>`
+      + `<div class="rc-report">${reportMarkdownHtml(rec.summary.report_markdown)}</div>`);
+  }
   if (rec?.summary) {
     const local = rec === fallback && !recapState.panelSummary;
     const s = rec.summary;
@@ -1864,7 +1957,8 @@ function panelSummaryHtml(): string {
     const ai = s.action_items.length
       ? `<div class="rc-blk"><span class="rc-blk-h">行动项</span>${s.action_items.map((a) => `<span class="rc-blk-li">${esc(a.task)}${a.owner && a.owner !== '未指定' ? `<span class="who">${esc(a.owner)}</span>` : ''}${a.due ? `<span class="who">${esc(a.due)}</span>` : ''}</span>`).join('')}</div>`
       : '';
-    return box(`<div class="rc-psum-h"><b>${local ? 'InkLoop 后处理预览' : 'InkLoop AI 总结'} · 会议讲了什么</b>${rec.model ? `<span class="mdl">${esc(rec.model)}</span>` : ''}</div>`
+    const reportBtn = s.report_markdown ? '<button class="hbtn rc-psum-retry" id="ps-report">查看完整报告</button>' : '';
+    return box(`<div class="rc-psum-h"><b>${local ? 'InkLoop 后处理预览' : 'InkLoop AI 总结'} · 会议讲了什么</b>${rec.model ? `<span class="mdl">${esc(rec.model)}</span>` : ''}${reportBtn}</div>`
       + (local ? '<div class="rc-local-note">Panel 后处理服务当前不可用，先基于飞书智能纪要与原始文字记录生成本地结构化预览；服务恢复后会替换为正式结果。</div>' : '')
       + blk('结论', s.conclusions) + ai + blk('风险', s.risks) + blk('待决', s.open_questions) + blk('后续', s.next_steps));
   }
@@ -1881,8 +1975,18 @@ function panelSummaryHtml(): string {
   return box('InkLoop 还没生成这场会议的结构化总结。<button class="hbtn rc-psum-retry" id="ps-gen">生成总结</button>');
 }
 
-/** 绑定 panel 总结块的按钮（生成 / 刷新重试）——正常态与空态共用。 */
+/** 绑定 panel 总结块的按钮（生成 / 刷新重试 / 完整报告开合）——正常态与空态共用。 */
 function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
+  bodyEl.querySelector('#ps-report')?.addEventListener('click', () => {
+    if (!recapState) return;
+    recapState.psumReportOpen = true;
+    renderRecap(bodyEl);
+  });
+  bodyEl.querySelector('#ps-report-back')?.addEventListener('click', () => {
+    if (!recapState) return;
+    recapState.psumReportOpen = false;
+    renderRecap(bodyEl);
+  });
   bodyEl.querySelector('#ps-login')?.addEventListener('click', () => {
     void promptFeishuRelogin(recapState?.panelSummaryError || '当前飞书身份不可用。');
   });
@@ -2024,6 +2128,14 @@ export function googleSmartNoteCardState(meeting: Pick<PersistedMeeting, 'google
   return { meta: '未接入', body: 'Google 智能纪要（Gemini）接入后会显示在这里。', disabled: true };
 }
 
+export function zoomSmartNoteCardState(meeting: Pick<PersistedMeeting, 'zoom_smart_note'>): {
+  meta: string; body: string; disabled: boolean;
+} {
+  return meeting.zoom_smart_note?.text.trim()
+    ? { meta: '已同步', body: '查看 Zoom AI Companion 官方纪要原文。', disabled: false }
+    : { meta: '无纪要', body: 'Zoom AI Companion 尚未生成官方纪要。', disabled: true };
+}
+
 export function googleRecordingLinks(meeting: Pick<PersistedMeeting, 'google_recordings'>): Array<{ export_uri: string; state: string }> {
   return (meeting.google_recordings || []).filter((recording) => !!recording.export_uri?.trim());
 }
@@ -2037,6 +2149,7 @@ export function renderGoogleRecordingsHtml(meeting: Pick<PersistedMeeting, 'goog
 }
 
 export function zoomTranscriptAlignmentLabel(timestampQuality?: ZoomTimestampQuality): string {
+  if (timestampQuality === 'companion_offset_anchor') return 'Zoom AI Companion 场次时间对齐';
   return timestampQuality === 'approximate_pause_unknown'
     ? '时间为近似（录制中断未校准）'
     : 'Zoom 场次时间对齐';
@@ -2068,6 +2181,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
     ? ` · 来自${recapState.markSourceMeeting.feishu_topic || recapState.markSourceMeeting.title || '相近会议'}`
     : '';
   const smartNoteCard = googleSmartNoteCardState(meeting);
+  const zoomNoteCard = zoomSmartNoteCardState(meeting);
   const feishuReady = !!(recapState.feishuSummary?.content || meeting.feishu_note_summary?.content);
   const conclusions = overviewConclusionItems();
   const conclusionHtml = conclusions.length
@@ -2139,7 +2253,9 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
       ? overviewCardHtml({ action: 'feishu', title: '智能纪要', meta: note.status === 'loading' ? '拉取中' : smartNoteCard.meta, body: note.message, disabled: note.status !== 'ready' && !noteActions && note.status !== 'loading' && !meeting.google_smart_note?.text, actions: noteActions })
       : lark
         ? overviewCardHtml({ action: 'feishu', title: '飞书智能纪要', meta: feishuReady ? '已同步' : note.status === 'loading' ? '拉取中' : '无纪要', body: feishuReady ? '查看飞书官方会后纪要原文、图片和待办。' : note.message, disabled: !feishuReady && !noteActions && note.status !== 'loading', actions: noteActions })
-        : overviewCardHtml({ action: 'feishu', title: '官方纪要', meta: '暂不支持', body: note.message, disabled: true }))
+        : zoom
+          ? overviewCardHtml({ action: 'feishu', title: '官方纪要', meta: note.status === 'loading' ? '拉取中' : zoomNoteCard.meta, body: note.status === 'ready' ? zoomNoteCard.body : note.message, disabled: note.status !== 'ready' && !noteActions && note.status !== 'loading', actions: noteActions })
+          : overviewCardHtml({ action: 'feishu', title: '官方纪要', meta: '暂不支持', body: note.message, disabled: true }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: marks.status === 'loading' ? '读取中' : inkCount ? `${inkCount} 处${markSource}` : '0 处', body: marks.status === 'ready' || marks.status === 'missing' ? inkBody : marks.message, disabled: inkPages.length === 0 && !marksActions, actions: marksActions })
     + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: panelBody })
     + `</section>`

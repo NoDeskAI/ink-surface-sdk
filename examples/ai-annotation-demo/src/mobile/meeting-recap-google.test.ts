@@ -143,7 +143,7 @@ describe('meeting recap Google transcript branch', () => {
       speaker: 'Ada',
       text: '确认先发布会议恢复能力，并补充真机验证。',
       rawText: 'Ada: 确认先发布会议恢复能力，并补充真机验证。',
-    }, ...Array.from({ length: 200 }, (_, index) => ({
+    }, ...Array.from({ length: 500 }, (_, index) => ({
       index: index + 2,
       startMs: (index + 2) * 1_000,
       endMs: (index + 3) * 1_000,
@@ -163,7 +163,7 @@ describe('meeting recap Google transcript branch', () => {
     const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
     expect(request.transcript).toContain('[0:01]Ada：确认先发布会议恢复能力');
     expect(request.transcript).toContain('转写在此截断');
-    expect(request.transcript.length).toBeLessThan(16_200);
+    expect(request.transcript.length).toBeLessThan(48_600);
     expect(request.smart_note).toBe('Gemini notes say the recovery path should ship first.');
     expect(request.handwriting_sections).toBeUndefined();
     expect(mocks.triggerBoardOcr).toHaveBeenCalledWith('mtgboard_local-google-1');
