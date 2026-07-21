@@ -456,7 +456,7 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
   });
   // 长输出（访谈报告 20k tokens）非流式会撞网关 ~100s 空闲掐线（524）——走流式累积保活连接。
   let raw = '';
-  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 20000, model })) raw += delta;
+  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 32000, model })) raw += delta; // 融合版双层文档（记录+分析）比单层长，20k 会截
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
