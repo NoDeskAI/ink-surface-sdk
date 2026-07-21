@@ -295,6 +295,15 @@ describe('zoom API routes', () => {
   it('serves Companion fallback and the official Zoom summary through the device API', async () => {
     const root = mkdtempSync(join(tmpdir(), 'inkloop-zoom-companion-route-'));
     roots.push(root);
+    const syncPath = join(root, 'sync.json');
+    writeFileSync(syncPath, JSON.stringify({
+      schema_version: 'inkloop.zoom_sync.v1',
+      meetings: [{
+        platform: 'zoom', meeting_id: '246813579', topic: 'Companion route',
+        scheduled_at: '2026-07-17T10:00:00.000Z', duration_minutes: 5,
+        join_url: 'https://zoom.us/j/246813579', host_user_id: 'host-a',
+      }],
+    }));
     const fetchImpl = vi.fn(async (input: string | URL) => {
       const url = new URL(String(input));
       if (url.hostname === 'zoom.us') {
@@ -339,10 +348,12 @@ describe('zoom API routes', () => {
         ZOOM_S2S_CLIENT_SECRET: 'secret',
         ZOOM_MEETING_TRANSCRIPT_PROBE: '0',
       },
+      syncRef: { path: syncPath },
       recordsRef: { path: join(root, 'records.json') },
       fetchImpl: fetchImpl as typeof fetch,
       nowMs: () => Date.parse('2026-07-17T10:05:00Z'),
       requireDeviceSession: async () => ({ active: true }),
+      resolveAuthorizedHostUserIds: () => ['host-a'],
     });
 
     const result = await invoke(handler, '/api/zoom/meeting-transcript?space_name=246813579&scheduled_at=2026-07-17T10%3A00%3A00Z');
