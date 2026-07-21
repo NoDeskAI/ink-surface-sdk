@@ -1726,7 +1726,7 @@ export async function ensureProviderPanelSummary(m: PersistedMeeting, cues: Tran
       ...(platform === 'zoom' && m.zoom_smart_note?.text ? { smart_note: m.zoom_smart_note.text } : {}),
       ...(hasMeetingHandwritingSections(handwritingSections) ? { handwriting_sections: handwritingSections } : {}),
       model: settings.inferModel,
-    }, { auth: true, timeoutMs: 360_000 }); // 长报告（访谈模式 20k tokens）流式生成要 3-6 分钟，默认 30s 必掐断
+    }, { auth: true, timeoutMs: 600_000 }); // 长报告（访谈模式 20k tokens·全量转写）流式生成实测可超 6 分钟，默认 30s 必掐断
     const summary: PanelMeetingSummaryRecord = {
       minute_token: transcriptToken,
       meeting_id: m.provider_meeting_id || m.calendar_meeting_no || m.provider_space_name || m.meeting_id,
