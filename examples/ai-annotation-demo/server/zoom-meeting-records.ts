@@ -241,12 +241,14 @@ interface MeetingSummaryOutcome {
 export class ZoomMeetingRecordsError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly upstreamStatus?: number;
 
-  constructor(code: string, status: number, message = code) {
+  constructor(code: string, status: number, message = code, upstreamStatus?: number) {
     super(message);
     this.name = 'ZoomMeetingRecordsError';
     this.status = status;
     this.code = code;
+    this.upstreamStatus = upstreamStatus;
   }
 }
 
@@ -774,7 +776,12 @@ async function downloadZoomText(
     response = await fetchDirectWithRetry(fallbackUrl.toString(), options);
   }
   if (!response.ok) {
-    throw new ZoomMeetingRecordsError('zoom_transcript_download_failed', 502, `Zoom transcript download failed (HTTP ${response.status})`);
+    throw new ZoomMeetingRecordsError(
+      'zoom_transcript_download_failed',
+      502,
+      `Zoom transcript download failed (HTTP ${response.status})`,
+      response.status,
+    );
   }
   return { body: await response.text(), contentType: clean(response.headers.get('content-type')).toLowerCase() };
 }
@@ -791,11 +798,25 @@ async function downloadClassicTranscripts(
   candidate: DiscoveredCandidate,
   env: ZoomMeetingRecordsEnv,
   options: RequestOptions,
+  tolerateUnavailable = false,
 ): Promise<{ files: ParsedTranscriptFile[]; complete: boolean }> {
   const files = transcriptFiles(candidate.stored);
   const downloadable = files.filter((file) => file.download_url && (file.recording_start || candidate.stored.start_time));
   const outcomes = await Promise.all(downloadable.map(async (file): Promise<ParsedTranscriptFile | null> => {
-    const downloaded = await downloadZoomText(file.download_url || '', env, options, candidate.downloadAccessToken);
+    let downloaded: { body: string; contentType: string };
+    try {
+      downloaded = await downloadZoomText(file.download_url || '', env, options, candidate.downloadAccessToken);
+    } catch (error) {
+      const upstreamStatus = error instanceof ZoomMeetingRecordsError ? error.upstreamStatus || 0 : 0;
+      if (tolerateUnavailable && (upstreamStatus === 403 || upstreamStatus === 404 || upstreamStatus === 429 || upstreamStatus >= 500)) {
+        options.logger('provider_zoom_classic_transcript_not_ready', {
+          recording_file_id: file.id,
+          upstream_status: upstreamStatus,
+        });
+        return null;
+      }
+      throw error;
+    }
     if (!validZoomVttBody(downloaded.body, downloaded.contentType)) return null;
     const cues = parseZoomVtt(downloaded.body);
     const usedInstanceStart = !file.recording_start;
@@ -1192,6 +1213,11 @@ async function runCatchUp(
   };
 
   if (chosen && chosenStored) {
+    const preserveCompanion = enabledCompanion
+      && sameSelectedInstance
+      && current?.status === 'ready'
+      && current.timestamp_quality === 'companion_offset_anchor'
+      && !!current.transcript_lines?.length;
     const transcriptRouteNeeded = enabledProbe || (enabledCompanion && chosenStored.recordings.length === 0);
     const probePromise = transcriptRouteNeeded
       ? probeMeetingTranscript(chosenStored.uuid, env, options)
@@ -1201,7 +1227,7 @@ async function runCatchUp(
       : Promise.resolve<MeetingSummaryOutcome | undefined>(undefined);
     const [participants, classic, probe, summary] = await Promise.all([
       fetchParticipants(chosenStored.uuid, env, options),
-      downloadClassicTranscripts(chosen, env, options),
+      downloadClassicTranscripts(chosen, env, options, preserveCompanion),
       probePromise,
       summaryPromise,
     ]);

@@ -147,6 +147,18 @@ async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTok
   return { text, thinking: String(message.reasoning_content || '').trim(), data };
 }
 
+function openAiMessageText(message: any): string {
+  return String(Array.isArray(message?.content)
+    ? message.content.map((part: any) => part?.text || '').join('')
+    : message?.content || '');
+}
+
+function openAiDeltaText(delta: any): string {
+  if (typeof delta?.content === 'string') return delta.content;
+  if (Array.isArray(delta?.content)) return delta.content.map((part: any) => part?.text || '').join('');
+  return '';
+}
+
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
 async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string }): Promise<any> {
   const { url, key } = cfg();
@@ -183,11 +195,98 @@ type GwEvent = { type: 'text' | 'thinking'; delta: string };
  *    Gemini 经 DMX 不回传思考摘要（请求也无益），故不请求。
  *  · 网关不支持 SSE 时退化为一次性读出 content 块（text + 可能的 thinking 块）。
  */
-async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
+export async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
   if (isOpenAiTransport()) {
-    const result = await callOpenAiGateway({ system: opts.system, messages: opts.messages, maxTokens: opts.maxTokens, model: opts.model });
-    if (result.thinking && opts.thinking) yield { type: 'thinking', delta: result.thinking };
-    yield { type: 'text', delta: result.text };
+    const { url, key } = cfg();
+    const model = opts.model || cfg().model;
+    if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
+    const requestId = `ai_${Date.now().toString(36)}_${++aiCallSeq}`;
+    const t0 = Date.now();
+    let status = 0;
+    let ok = false;
+    try {
+      const resp = await fetch(chatCompletionsUrl(url), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+        body: JSON.stringify({
+          model,
+          messages: openAiMessages(opts.system, opts.messages),
+          max_tokens: opts.maxTokens,
+          stream: true,
+          ...openAiExtras(model),
+        }),
+      });
+      status = resp.status;
+      ok = resp.ok;
+      const contentType = resp.headers.get('content-type') || '';
+      if (!resp.ok || !resp.body || !contentType.includes('event-stream')) {
+        const data: any = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
+        const message = data?.choices?.[0]?.message ?? {};
+        const thinking = String(message.reasoning_content || '');
+        const text = openAiMessageText(message);
+        if (thinking && opts.thinking) yield { type: 'thinking', delta: thinking };
+        if (!text.trim()) throw emptyTextError(model, data);
+        yield { type: 'text', delta: text };
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let emittedText = false;
+      let finalData: any = {};
+      let doneEvent = false;
+      const consumeLine = (line: string): GwEvent[] => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) return [];
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') {
+          doneEvent = true;
+          return [];
+        }
+        try {
+          const event = JSON.parse(payload);
+          finalData = event;
+          const delta = event?.choices?.[0]?.delta ?? {};
+          const events: GwEvent[] = [];
+          const thinking = String(delta.reasoning_content || '');
+          const text = openAiDeltaText(delta);
+          if (thinking && opts.thinking) events.push({ type: 'thinking', delta: thinking });
+          if (text) events.push({ type: 'text', delta: text });
+          return events;
+        } catch {
+          return [];
+        }
+      };
+      while (!doneEvent) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          for (const event of consumeLine(line)) {
+            if (event.type === 'text') emittedText = true;
+            yield event;
+          }
+          if (doneEvent) break;
+        }
+      }
+      if (!doneEvent && buffer.trim()) {
+        for (const event of consumeLine(buffer)) {
+          if (event.type === 'text') emittedText = true;
+          yield event;
+        }
+      }
+      if (!emittedText) throw emptyTextError(model, finalData);
+    } finally {
+      logAiCall({ requestId, model, provider: 'openai_chat_completions', ms: Date.now() - t0, ok, status });
+    }
     return;
   }
 

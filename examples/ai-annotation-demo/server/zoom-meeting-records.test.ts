@@ -659,6 +659,74 @@ Mengna Yao: 收尾`));
     expect(second.srt).toContain('companion 保底');
   });
 
+  it.each([403, 404, 500])('keeps Companion ready when the classic transcript download returns HTTP %i, then upgrades later', async (failureStatus) => {
+    const { records } = statePaths();
+    let phase: 'companion' | 'classic_unavailable' | 'classic_ready' = 'companion';
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/210/instances') return json({ meetings: [{ uuid: 'race-download' }] });
+      if (url.pathname === '/v2/past_meetings/race-download') return json({ start_time: '2026-07-20T06:02:28Z', duration: 12 });
+      if (url.pathname === '/v2/meetings/race-download/recordings') {
+        return phase === 'companion'
+          ? json({ recording_files: [] })
+          : json({ recording_files: [{
+            id: 'vtt-download', file_type: 'TRANSCRIPT', recording_start: '2026-07-20T06:02:28Z',
+            recording_end: '2026-07-20T06:02:40Z', download_url: 'https://download.zoom.us/race-download.vtt',
+          }] });
+      }
+      if (url.pathname === '/v2/past_meetings/race-download/participants') return json({ participants: [] });
+      if (url.pathname === '/v2/meetings/race-download/transcript') return json({ download_url: 'https://download.zoom.us/race-download-companion.vtt' });
+      if (url.pathname === '/race-download-companion.vtt') return vtt('00:00:10.000 --> 00:00:12.000\nMengna Yao: companion 保底');
+      if (url.pathname === '/race-download.vtt') {
+        return phase === 'classic_ready'
+          ? vtt('00:00:10.000 --> 00:00:12.000\nMengna Yao: classic 升级')
+          : new Response('not ready', { status: failureStatus });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const env = { ...baseEnv, ZOOM_COMPANION_TRANSCRIPT: '1' };
+    const input = { meetingId: '210', scheduledAt: '2026-07-20T06:00:00Z' };
+    const options = { fetchImpl: fetchImpl as typeof fetch, sleepImpl: vi.fn(async () => undefined) };
+
+    const first = await fetchZoomMeetingTranscript(env, { path: records }, input, { ...options, nowMs: Date.parse('2026-07-20T06:15:00Z') });
+    expect(first).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+
+    phase = 'classic_unavailable';
+    const second = await fetchZoomMeetingTranscript(env, { path: records }, input, { ...options, nowMs: Date.parse('2026-07-20T06:27:00Z') });
+    expect(second).toMatchObject({ status: 'ready', timestamp_quality: 'companion_offset_anchor' });
+    expect(second.srt).toContain('companion 保底');
+
+    phase = 'classic_ready';
+    const third = await fetchZoomMeetingTranscript(env, { path: records }, input, { ...options, nowMs: Date.parse('2026-07-20T06:39:00Z') });
+    expect(third).toMatchObject({ status: 'ready', timestamp_quality: 'derived_no_pause' });
+    expect(third.srt).toContain('classic 升级');
+  });
+
+  it('does not hide a classic transcript authorization failure without a cached Companion result', async () => {
+    const { records } = statePaths();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'zoom.us') return token();
+      if (url.pathname === '/v2/past_meetings/211/instances') return json({ meetings: [{ uuid: 'auth-failure' }] });
+      if (url.pathname === '/v2/past_meetings/auth-failure') return json({ start_time: '2026-07-20T06:02:28Z', duration: 12 });
+      if (url.pathname === '/v2/meetings/auth-failure/recordings') return json({ recording_files: [{
+        id: 'vtt-auth', file_type: 'TRANSCRIPT', recording_start: '2026-07-20T06:02:28Z',
+        download_url: 'https://download.zoom.us/auth-failure.vtt',
+      }] });
+      if (url.pathname === '/v2/past_meetings/auth-failure/participants') return json({ participants: [] });
+      if (url.pathname === '/auth-failure.vtt') return new Response('forbidden', { status: 403 });
+      throw new Error(`unexpected ${url}`);
+    });
+
+    await expect(fetchZoomMeetingTranscript(baseEnv, { path: records }, {
+      meetingId: '211', scheduledAt: '2026-07-20T06:00:00Z',
+    }, { fetchImpl: fetchImpl as typeof fetch, nowMs: Date.parse('2026-07-20T06:15:00Z') })).rejects.toMatchObject({
+      code: 'zoom_transcript_download_failed',
+      upstreamStatus: 403,
+    });
+  });
+
   it('revives a legacy recording_missing terminal row once when Companion becomes available', async () => {
     const { records } = statePaths();
     let companionReady = false;
