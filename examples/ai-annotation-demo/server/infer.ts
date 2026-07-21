@@ -444,7 +444,7 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
   const transcript = String(payload?.transcript || '').trim();
   const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
-  if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
+  if (transcript.length > 64_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 }); // 18k 时一小时访谈只进前半场（与设备端 SUMMARY_TRANSCRIPT_CAP=48k 配套留余量）
   const model = String(payload?.model || cfg().model);
   const handwritingSections = normalizeMeetingPanelHandwritingSections(payload?.handwriting_sections);
   const prompt = buildMeetingPanelSummaryPrompts({

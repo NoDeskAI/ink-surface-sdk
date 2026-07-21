@@ -287,6 +287,8 @@ export interface PanelMeetingSummaryFive {
   risks: string[];
   open_questions: string[];
   next_steps: string[];
+  /** 完整长文报告（访谈研究报告等模式下由服务端一并返回；五要素只是它的压缩摘要）。 */
+  report_markdown?: string;
 }
 export interface PanelMeetingSummaryRecord {
   minute_token?: string | null;

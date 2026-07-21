@@ -143,7 +143,7 @@ describe('meeting recap Google transcript branch', () => {
       speaker: 'Ada',
       text: '确认先发布会议恢复能力，并补充真机验证。',
       rawText: 'Ada: 确认先发布会议恢复能力，并补充真机验证。',
-    }, ...Array.from({ length: 200 }, (_, index) => ({
+    }, ...Array.from({ length: 500 }, (_, index) => ({
       index: index + 2,
       startMs: (index + 2) * 1_000,
       endMs: (index + 3) * 1_000,
