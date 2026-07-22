@@ -56,7 +56,7 @@ describe('e-paper meeting timeline bridge', () => {
     expect(timeline.segments.some((segment) => segment.kind === 'active' && segment.marks.length === 1)).toBe(true);
   });
 
-  it('keeps pre-meeting e-paper marks visible as uncalibrated SDK annotations', () => {
+  it('keeps pre-meeting e-paper marks visible with a plain phase label', () => {
     const timeline = buildEpaperMeetingTimeline({
       meeting,
       cues: [],
@@ -65,7 +65,8 @@ describe('e-paper meeting timeline bridge', () => {
       marks: [
         {
           mark_id: 'mk_before',
-          abs_timestamp: t0 - 30_000,
+          abs_timestamp: t0 - 11 * 60_000 + 30_000,
+          pen_down_at: t0 - 11 * 60_000,
           feature_type: 'drawing',
           marked_text: '',
           page_index: 0,
@@ -74,7 +75,8 @@ describe('e-paper meeting timeline bridge', () => {
     });
 
     expect(timeline.sdkView.diagnostics.uncalibrated_marker_count).toBe(1);
-    expect(timeline.segmentMarks[0]).toMatchObject({ mark_id: 'mk_before', relMs: -30_000, feature_type: 'drawing' });
-    expect(timeline.segments[0]).toMatchObject({ kind: 'active', startMs: -30_000 });
+    expect(timeline.segmentMarks[0]).toMatchObject({ mark_id: 'mk_before', relMs: -11 * 60_000, feature_type: 'drawing', phase: 'pre' });
+    expect(timeline.segments[0]).toMatchObject({ kind: 'active', startMs: -11 * 60_000 });
+    expect(timeline.sdkView.markers.find((marker) => marker.id === 'mk_before')?.label).toContain('会前准备');
   });
 });

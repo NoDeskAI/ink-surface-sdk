@@ -9,12 +9,13 @@ export const PROMPT_VERSIONS = {
   ink_classifier: 'v3',     // /api/interpret 笔迹「手写 vs 画」分类 + 转写 + 草图描述
   context_classifier: 'v3', // /api/classify-context respond/fold
   ocr: 'v3',                // /api/ocr-vlm 转写
+  board_ocr: 'v1',          // /api/ink/board-ocr 整页白板按 mark bbox 转写
   image_explain: 'v3',      // /api/explain-image 图解读
   reflow_refine: 'v3',      // /api/reflow 逐块精修
   reflow_structure: 'v3',   // /api/reflow-ai[-stream] 结构重建
   reflow_vlm: 'v3',         // /api/reflow-vlm 看图重排
   meeting_summary: 'v2',    // /api/chat 会后思路总结（WS2-C·无状态·不进书 buffer）；v2=禁 markdown 纯文本
-  meeting_panel_summary: 'v2', // Google 转写为主 + 可选 Gemini 智能纪要为辅 → InkLoop 五要素总结
+  meeting_panel_summary: 'v3', // provider 转写 + 可选官方纪要/设备手写 → InkLoop 五要素总结
   concept_extractor: 'v2',  // /api/chat 从一条笔记抽 1-3 个规范概念词（Obsidian 概念层·纯文本逐行·无状态·缓存键含此版本）；v2=治过度抽象/低上下文幻觉/错误复用（真 LLM 探针后）
   education_live_explanation: 'v2',
   education_class_summary: 'v2',

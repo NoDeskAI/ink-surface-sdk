@@ -1,16 +1,19 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { googleCalendarSyncPath, googleMeetRecordsPath, resolveAnyUserGoogleToken, type GoogleOAuthEnv } from './google-oauth-state';
 import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload, type GoogleMeetAttendanceWindow } from './google-meet-records';
 import { resolveMtlToken, type MtlReceiverAuthEnv, type MtlReceiverIdentity } from './mtl-receiver-auth';
+import { zoomMeetingIdFromUrl } from './zoom-meeting-sync';
 
 const DEFAULT_MTL_EVENTS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../.inkloop/mtl-events');
 const MAX_LIVE_WINDOWS = 20;
 const MAX_BATCH_SIZE = 200;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MIN_EPOCH_MS = Date.UTC(2000, 0, 1);
+const EPOCH_FUTURE_TOLERANCE_MS = 5 * 60_000;
 
 export interface MtlReceiverEnv extends MtlReceiverAuthEnv, GoogleOAuthEnv {
   MTL_EVENTS_ROOT?: string;
@@ -19,6 +22,7 @@ export interface MtlReceiverEnv extends MtlReceiverAuthEnv, GoogleOAuthEnv {
 export interface MtlLiveMeetingWindow {
   platform: string;
   meeting_id: string;
+  external_meeting_id?: string;
   meeting_code?: string;
   meeting_url?: string;
   title?: string;
@@ -60,6 +64,27 @@ function clean(value: unknown, maxLength = 512): string {
 
 function recordOf(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+export function isEpochMs(value: unknown, nowMs = Date.now()): boolean {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp)
+    && timestamp >= MIN_EPOCH_MS
+    && timestamp <= nowMs + EPOCH_FUTURE_TOLERANCE_MS;
+}
+
+function validateEpochTimeFields(value: unknown, nowMs: number): void {
+  if (Array.isArray(value)) {
+    for (const item of value) validateEpochTimeFields(item, nowMs);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  for (const [field, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (field.endsWith('_time_ms') && !isEpochMs(nested, nowMs)) {
+      throw Object.assign(new Error(`mtl_${field}_invalid`), { status: 400, field });
+    }
+    validateEpochTimeFields(nested, nowMs);
+  }
 }
 
 function safePathPart(value: string, fallback: string): string {
@@ -105,14 +130,25 @@ function writeLiveStateFile(identity: MtlReceiverIdentity, env: MtlReceiverEnv, 
   mkdirSync(dirname(path), { recursive: true });
   state.windows.sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
   state.windows = state.windows.slice(0, MAX_LIVE_WINDOWS);
-  writeFileSync(path, JSON.stringify(state, null, 2), 'utf8');
+  const temporaryPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch { /* 写入失败时清理尚存的临时文件 */ }
+    throw error;
+  }
 }
 
 export function listMtlMeetingWindows(
   identity: MtlReceiverIdentity,
   env: MtlReceiverEnv = process.env,
+  platform?: string,
 ): MtlLiveMeetingWindow[] {
-  return readLiveStateFile(identity, env).windows.map((window) => ({ ...window }));
+  const normalizedPlatform = normalizeMtlPlatform(clean(platform, 64));
+  return readLiveStateFile(identity, env).windows
+    .filter((window) => !normalizedPlatform || window.platform === normalizedPlatform)
+    .map((window) => ({ ...window }));
 }
 
 export function normalizeGoogleMeetCode(value: unknown): string | undefined {
@@ -196,6 +232,7 @@ function appendAudit(
   mkdirSync(dirname(path), { recursive: true });
   const platform = normalizeMtlPlatform(clean(payload.platform, 64));
   const meetingId = clean(payload.meeting_id, 256);
+  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const detectorSource = clean(payload.detector_source || payload.source, 256);
   const observerSurface = clean(payload.observer_surface, 128);
   const action = clean(payload.action, 128);
@@ -208,6 +245,7 @@ function appendAudit(
     received_at_ms: nowMs,
     ...(platform ? { platform } : {}),
     ...(meetingId ? { meeting_id: meetingId } : {}),
+    ...(externalMeetingId ? { external_meeting_id: externalMeetingId } : {}),
     ...(meetingCodeFromMtlPayload(payload) ? { meeting_code: meetingCodeFromMtlPayload(payload) } : {}),
     ...(canonicalUrl(payload.meeting_url) ? { meeting_url: canonicalUrl(payload.meeting_url) } : {}),
     ...(Number.isFinite(Number(payload.start_time_ms)) ? { start_time_ms: Number(payload.start_time_ms) } : {}),
@@ -272,12 +310,30 @@ function requiredText(payload: Record<string, unknown>, field: string): string {
   return value;
 }
 
-function requiredTime(payload: Record<string, unknown>, field: string): number {
+function requiredTime(payload: Record<string, unknown>, field: string, nowMs: number): number {
   const value = Number(payload[field]);
-  if (!Number.isFinite(value) || value <= 0) {
+  if (!isEpochMs(value, nowMs)) {
     throw Object.assign(new Error(`mtl_${field}_invalid`), { status: 400, field });
   }
   return Math.round(value);
+}
+
+function reconcileRepeatedStartExternalId(
+  identity: MtlReceiverIdentity,
+  env: MtlReceiverEnv,
+  state: MtlLiveStateFile,
+  window: MtlLiveMeetingWindow,
+  externalMeetingId: string,
+  nowMs: number,
+): void {
+  if (!externalMeetingId) return;
+  if (window.external_meeting_id && window.external_meeting_id !== externalMeetingId) {
+    throw Object.assign(new Error('mtl_external_meeting_id_conflict'), { status: 409, current: window });
+  }
+  if (window.external_meeting_id) return;
+  window.external_meeting_id = externalMeetingId;
+  window.updated_at = new Date(nowMs).toISOString();
+  writeLiveStateFile(identity, env, state);
 }
 
 function startMeeting(
@@ -288,11 +344,13 @@ function startMeeting(
 ): { deduplicated: boolean; meeting: MtlLiveMeetingWindow } {
   const platform = normalizeMtlPlatform(requiredText(payload, 'platform'));
   const meetingId = requiredText(payload, 'meeting_id');
-  const startedAtMs = requiredTime(payload, 'start_time_ms');
+  const startedAtMs = requiredTime(payload, 'start_time_ms', nowMs);
+  const externalMeetingId = clean(payload.external_meeting_id, 256);
   const state = readLiveStateFile(identity, env);
   const active = state.windows.find((window) => window.ended_at_ms === undefined);
   if (active) {
     if (active.platform === platform && active.meeting_id === meetingId) {
+      reconcileRepeatedStartExternalId(identity, env, state, active, externalMeetingId, nowMs);
       appendAudit(identity, env, 'meeting_session_start', payload, nowMs, { deduplicated: true });
       return { deduplicated: true, meeting: active };
     }
@@ -309,6 +367,7 @@ function startMeeting(
     && window.started_at_ms === startedAtMs
   ));
   if (prior) {
+    reconcileRepeatedStartExternalId(identity, env, state, prior, externalMeetingId, nowMs);
     appendAudit(identity, env, 'meeting_session_start', payload, nowMs, { deduplicated: true });
     return { deduplicated: true, meeting: prior };
   }
@@ -320,6 +379,7 @@ function startMeeting(
   const window: MtlLiveMeetingWindow = {
     platform,
     meeting_id: meetingId,
+    ...(externalMeetingId ? { external_meeting_id: externalMeetingId } : {}),
     ...(meetingCodeFromMtlPayload({ ...payload, platform, meeting_id: meetingId })
       ? { meeting_code: meetingCodeFromMtlPayload({ ...payload, platform, meeting_id: meetingId }) }
       : {}),
@@ -346,7 +406,7 @@ function endMeeting(
   const platform = payload.platform === undefined
     ? undefined
     : normalizeMtlPlatform(requiredText(payload, 'platform'));
-  const endedAtMs = requiredTime(payload, 'end_time_ms');
+  const endedAtMs = requiredTime(payload, 'end_time_ms', nowMs);
   const state = readLiveStateFile(identity, env);
   const activeIndex = state.windows.findIndex((window) => window.ended_at_ms === undefined);
   const active = activeIndex >= 0 ? state.windows[activeIndex] : undefined;
@@ -448,6 +508,19 @@ export function mtlAttendanceWindows(
   });
 }
 
+export function mtlZoomAttendanceWindows(
+  identity: MtlReceiverIdentity,
+  meetingId: string,
+  env: MtlReceiverEnv = process.env,
+  nowMs = Date.now(),
+): GoogleMeetAttendanceWindow[] {
+  return listMtlMeetingWindows(identity, env, 'zoom').flatMap((window) => {
+    const ids = [window.meeting_id, window.external_meeting_id, zoomMeetingIdFromUrl(window.meeting_url)];
+    if (!ids.includes(meetingId)) return [];
+    return [{ startMs: window.started_at_ms, endMs: window.ended_at_ms || nowMs }];
+  });
+}
+
 export async function runMtlGoogleTranscriptCatchUp(
   identity: MtlReceiverIdentity,
   window: MtlLiveMeetingWindow,
@@ -524,6 +597,7 @@ export async function handleMtlReceiver(
   const nowMs = options.now?.() ?? Date.now();
   try {
     const payload = await readJsonBody(req);
+    validateEpochTimeFields(payload, nowMs);
     if (path === '/api/meeting-session/start') {
       const result = startMeeting(identity, env, payload, nowMs);
       sendJson(res, 200, {

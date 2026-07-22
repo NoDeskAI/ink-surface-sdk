@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { SYSTEM_PROMPTS, type PromptRole } from './prompts';
+import { buildMeetingPanelSummaryPrompts, SYSTEM_PROMPTS, type MeetingPanelSummaryHandwritingSections, type PromptRole } from './prompts';
 
 /**
  * 推理网关代理（Node 侧，仅 dev server 内运行）。
@@ -148,6 +148,18 @@ async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTok
   return { text, thinking: String(message.reasoning_content || '').trim(), data };
 }
 
+function openAiMessageText(message: any): string {
+  return String(Array.isArray(message?.content)
+    ? message.content.map((part: any) => part?.text || '').join('')
+    : message?.content || '');
+}
+
+function openAiDeltaText(delta: any): string {
+  if (typeof delta?.content === 'string') return delta.content;
+  if (Array.isArray(delta?.content)) return delta.content.map((part: any) => part?.text || '').join('');
+  return '';
+}
+
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
 async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string; signal?: AbortSignal }): Promise<any> {
   const { url, key } = cfg();
@@ -185,11 +197,98 @@ type GwEvent = { type: 'text' | 'thinking'; delta: string };
  *    Gemini 经 DMX 不回传思考摘要（请求也无益），故不请求。
  *  · 网关不支持 SSE 时退化为一次性读出 content 块（text + 可能的 thinking 块）。
  */
-async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
+export async function* gatewayEventStream(opts: { system: string; messages: any[]; maxTokens: number; model?: string; thinking?: boolean }): AsyncGenerator<GwEvent> {
   if (isOpenAiTransport()) {
-    const result = await callOpenAiGateway({ system: opts.system, messages: opts.messages, maxTokens: opts.maxTokens, model: opts.model });
-    if (result.thinking && opts.thinking) yield { type: 'thinking', delta: result.thinking };
-    yield { type: 'text', delta: result.text };
+    const { url, key } = cfg();
+    const model = opts.model || cfg().model;
+    if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
+    const requestId = `ai_${Date.now().toString(36)}_${++aiCallSeq}`;
+    const t0 = Date.now();
+    let status = 0;
+    let ok = false;
+    try {
+      const resp = await fetch(chatCompletionsUrl(url), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+        body: JSON.stringify({
+          model,
+          messages: openAiMessages(opts.system, opts.messages),
+          max_tokens: opts.maxTokens,
+          stream: true,
+          ...openAiExtras(model),
+        }),
+      });
+      status = resp.status;
+      ok = resp.ok;
+      const contentType = resp.headers.get('content-type') || '';
+      if (!resp.ok || !resp.body || !contentType.includes('event-stream')) {
+        const data: any = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data?.error?.message || `网关返回 ${resp.status}`);
+        const message = data?.choices?.[0]?.message ?? {};
+        const thinking = String(message.reasoning_content || '');
+        const text = openAiMessageText(message);
+        if (thinking && opts.thinking) yield { type: 'thinking', delta: thinking };
+        if (!text.trim()) throw emptyTextError(model, data);
+        yield { type: 'text', delta: text };
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let emittedText = false;
+      let finalData: any = {};
+      let doneEvent = false;
+      const consumeLine = (line: string): GwEvent[] => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) return [];
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') {
+          doneEvent = true;
+          return [];
+        }
+        try {
+          const event = JSON.parse(payload);
+          finalData = event;
+          const delta = event?.choices?.[0]?.delta ?? {};
+          const events: GwEvent[] = [];
+          const thinking = String(delta.reasoning_content || '');
+          const text = openAiDeltaText(delta);
+          if (thinking && opts.thinking) events.push({ type: 'thinking', delta: thinking });
+          if (text) events.push({ type: 'text', delta: text });
+          return events;
+        } catch {
+          return [];
+        }
+      };
+      while (!doneEvent) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          for (const event of consumeLine(line)) {
+            if (event.type === 'text') emittedText = true;
+            yield event;
+          }
+          if (doneEvent) break;
+        }
+      }
+      if (!doneEvent && buffer.trim()) {
+        for (const event of consumeLine(buffer)) {
+          if (event.type === 'text') emittedText = true;
+          yield event;
+        }
+      }
+      if (!emittedText) throw emptyTextError(model, finalData);
+    } finally {
+      logAiCall({ requestId, model, provider: 'openai_chat_completions', ms: Date.now() - t0, ok, status });
+    }
     return;
   }
 
@@ -269,6 +368,7 @@ type ImgIn = { role?: string; data: string };
 const ROLE_LABEL: Record<string, string> = {
   ink: '【笔迹图·用户手写已从原文单独抽出、铺白底，识别手写就看这张】',
   composite: '【合成图·墨迹叠在原文上，判断画在哪、圈/划住了什么就看这张】',
+  board: '【完整白板页·白底笔迹，区域坐标在后续 JSON 中给出】',
   // page(原文层)已弃用——原文以整页文字 page_text 为准，不再单独发图
 };
 
@@ -333,17 +433,23 @@ const readingNoteRawSchema = z.object({
   summary_md: z.string().catch(''),
 });
 const meetingPanelTextSchema = z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(600));
+/** 超限截断而非清空：.max().catch([]) 会在模型多给一条时把整组静默清空，改为保留前 N 条。 */
+const cappedArray = <T extends z.ZodTypeAny>(item: T, max: number) =>
+  z.array(item).catch([] as z.infer<T>[]).transform((arr) => arr.slice(0, max));
+
 const meetingPanelSummarySchema = z.object({
-  conclusions: z.array(meetingPanelTextSchema).max(8).catch([]),
-  action_items: z.array(z.object({
+  conclusions: cappedArray(meetingPanelTextSchema, 10),
+  action_items: cappedArray(z.object({
     task: meetingPanelTextSchema,
     owner: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).catch('未指定'),
     due: z.string().transform((value) => value.trim()).pipe(z.string().max(120)).optional(),
     evidence: z.string().transform((value) => value.trim()).pipe(z.string().max(600)).optional(),
-  })).max(8).catch([]),
-  risks: z.array(meetingPanelTextSchema).max(6).catch([]),
-  open_questions: z.array(meetingPanelTextSchema).max(6).catch([]),
-  next_steps: z.array(meetingPanelTextSchema).max(8).catch([]),
+  }), 10),
+  risks: cappedArray(meetingPanelTextSchema, 10),
+  open_questions: cappedArray(meetingPanelTextSchema, 10),
+  next_steps: cappedArray(meetingPanelTextSchema, 10),
+  // 访谈模式：完整研究报告 markdown 原文（可选·zod 默认会剥未知键，必须显式声明才能透传到设备）
+  report_markdown: z.string().optional(),
 });
 
 export type MeetingPanelSummary = z.infer<typeof meetingPanelSummarySchema>;
@@ -538,19 +644,128 @@ export async function runReadingNotePostprocess(payload: any): Promise<{ title: 
   };
 }
 
-/** Google Meet 会后转写 → panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
+/** Provider 会后转写 -> panel_summary 五要素。窄端点调用；输入长度与输出 schema 都在服务端收口。 */
 export async function runMeetingPanelSummary(payload: any): Promise<{ summary: MeetingPanelSummary; model: string }> {
   const title = String(payload?.title || '').trim().slice(0, 300) || '(未命名会议)';
+  const platform = String(payload?.platform || 'google_meet').trim().slice(0, 64) || 'google_meet';
   const transcript = String(payload?.transcript || '').trim();
   const smartNote = String(payload?.smart_note || '').trim().slice(0, 8_000);
   if (!transcript) throw Object.assign(new Error('meeting_transcript_required'), { status: 400 });
-  if (transcript.length > 18_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 });
+  if (transcript.length > 64_000) throw Object.assign(new Error('meeting_transcript_too_large'), { status: 413 }); // 18k 时一小时访谈只进前半场（与设备端 SUMMARY_TRANSCRIPT_CAP=48k 配套留余量）
   const model = String(payload?.model || cfg().model);
-  const user = JSON.stringify({ meeting_title: title, transcript, ...(smartNote ? { smart_note: smartNote } : {}) });
-  const raw = await gateway(SYSTEM_PROMPTS.meeting_panel_summary, user, 1800, undefined, model);
+  const handwritingSections = normalizeMeetingPanelHandwritingSections(payload?.handwriting_sections);
+  const prompt = buildMeetingPanelSummaryPrompts({
+    platform,
+    meeting_title: title,
+    transcript,
+    ...(smartNote ? { smart_note: smartNote } : {}),
+    ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
+  });
+  // 长输出（访谈报告 20k tokens）非流式会撞网关 ~100s 空闲掐线（524）——走流式累积保活连接。
+  let raw = '';
+  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 32000, model })) raw += delta; // 融合版双层文档（记录+分析）比单层长，20k 会截
   const summary = meetingPanelSummarySchema.parse(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
+}
+
+type HandwritingSectionKey = 'pre_meeting' | 'in_meeting' | 'post_meeting';
+type PreparedHandwritingItem = { text: string; relative_time?: string; truncated: boolean };
+
+const HANDWRITING_TOTAL_CHARS = 8_000;
+const HANDWRITING_TOTAL_ITEMS = 80;
+const HANDWRITING_SECTION_ORDER = [1, 1, 1, 0, 2] as const;
+
+function fairHandwritingAllocation(
+  demands: readonly number[],
+  total: number,
+  reserved: readonly number[],
+): number[] {
+  const allocation = demands.map((demand, index) => Math.min(demand, reserved[index] || 0));
+  let remaining = Math.max(0, total - allocation.reduce((sum, value) => sum + value, 0));
+  while (remaining > 0) {
+    let progressed = false;
+    for (const index of HANDWRITING_SECTION_ORDER) {
+      if (remaining <= 0) break;
+      if ((allocation[index] || 0) >= (demands[index] || 0)) continue;
+      allocation[index] += 1;
+      remaining -= 1;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  return allocation;
+}
+
+function preparedTextItem(raw: unknown): PreparedHandwritingItem | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const original = raw.trim();
+  if (!original) return undefined;
+  return { text: original.slice(0, 500), truncated: original.length > 500 };
+}
+
+export function normalizeMeetingPanelHandwritingSections(value: unknown): MeetingPanelSummaryHandwritingSections | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  const textItems = (raw: unknown): PreparedHandwritingItem[] => Array.isArray(raw)
+    ? raw.flatMap((item) => preparedTextItem(item) || [])
+    : [];
+  const preItems = textItems(source.pre_meeting);
+  const inItems = Array.isArray(source.in_meeting) ? source.in_meeting.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const item = raw as Record<string, unknown>;
+    const prepared = preparedTextItem(item.text);
+    if (!prepared) return [];
+    const originalRelativeTime = typeof item.relative_time === 'string' ? item.relative_time.trim() : '';
+    return [{
+      ...prepared,
+      relative_time: originalRelativeTime.slice(0, 24),
+      truncated: prepared.truncated || originalRelativeTime.length > 24,
+    }];
+  }) : [];
+  const postItems = textItems(source.post_meeting);
+  const allItems = [preItems, inItems, postItems];
+  if (!allItems.some((items) => items.length)) return undefined;
+
+  const itemAllocation = fairHandwritingAllocation(
+    allItems.map((items) => items.length),
+    HANDWRITING_TOTAL_ITEMS,
+    [16, 48, 16],
+  );
+  const selectedItems = allItems.map((items, index) => items.slice(0, itemAllocation[index]));
+  const charAllocation = fairHandwritingAllocation(
+    selectedItems.map((items) => items.reduce((sum, item) => sum + item.text.length, 0)),
+    HANDWRITING_TOTAL_CHARS,
+    [1_600, 4_800, 1_600],
+  );
+  const omitted: Partial<Record<HandwritingSectionKey, number>> = {};
+  const sectionKeys: HandwritingSectionKey[] = ['pre_meeting', 'in_meeting', 'post_meeting'];
+  const emitted = selectedItems.map((items, sectionIndex) => {
+    let remaining = charAllocation[sectionIndex] || 0;
+    let omittedCount = allItems[sectionIndex].length - items.length;
+    const output = items.flatMap((item) => {
+      if (remaining <= 0) {
+        omittedCount += 1;
+        return [];
+      }
+      const text = item.text.slice(0, remaining);
+      remaining -= text.length;
+      if (item.truncated || text.length < item.text.length) omittedCount += 1;
+      return text ? [{ ...item, text }] : [];
+    });
+    if (omittedCount > 0) omitted[sectionKeys[sectionIndex]] = omittedCount;
+    return output;
+  });
+  const preMeeting = emitted[0].map((item) => item.text);
+  const inMeeting = emitted[1].map((item) => ({ relative_time: item.relative_time || '', text: item.text }));
+  const postMeeting = emitted[2].map((item) => item.text);
+  if (!preMeeting.length && !inMeeting.length && !postMeeting.length) return undefined;
+  return {
+    pre_meeting: preMeeting,
+    in_meeting: inMeeting,
+    post_meeting: postMeeting,
+    ...(Object.keys(omitted).length ? { omitted_count: omitted } : {}),
+  };
 }
 
 
@@ -701,6 +916,31 @@ export async function runOcrVlm(payload: any): Promise<{ text: string }> {
   }
   const text = await gateway(system, user, isPage ? 700 : 500, image, payload?.model); // 局部 OCR 随 inferModel 走（kimi/gemini A/B）
   return { text: text.trim() };
+}
+
+/**
+ * 整页白板 OCR：一页只调一次 VLM，整页供上下文，regions 保留 mark 级时间锚。
+ * 返回原始模型文本，码块/多余文字的防御解析统一留给 server/board-ocr.ts。
+ */
+export async function runBoardOcrVlm(payload: any): Promise<string> {
+  const image = payload?.image ? String(payload.image).replace(/^data:image\/[a-z]+;base64,/, '') : '';
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  if (!image || !regions.length) return '{}';
+  const langHint = typeof payload?.lang_hint === 'string' && payload.lang_hint.trim()
+    ? `\n语言提示：${payload.lang_hint.trim().slice(0, 64)}`
+    : '';
+  const user = `按下列区域转写手写，bbox=[x,y,w,h]且已归一化到 0–1：\n${JSON.stringify(regions)}${langHint}`;
+  // 大页（几十个 region）在慢模型上超过设备端 30s 请求超时→客户端掐断→整轮重试死循环。
+  // 服务端强制指定模型（不吃设备 inferModel）：默认 kimi-k3（视觉识别质量优先·实测小图 ~8s）；
+  // 若大页仍撞 30s 超时，BOARD_OCR_MODEL=gemini-3.1-flash-lite 兜底（实测 ~3s·扫描页 OCR 同款）。
+  const model = process.env.BOARD_OCR_MODEL || 'claude-sonnet-4-6';
+  return gateway(
+    SYSTEM_PROMPTS.board_ocr,
+    user,
+    Math.min(2400, Math.max(600, regions.length * 100)),
+    [{ role: 'board', data: `data:image/jpeg;base64,${image}` }],
+    model,
+  );
 }
 
 /**

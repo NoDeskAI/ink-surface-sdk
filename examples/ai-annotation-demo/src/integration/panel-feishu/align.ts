@@ -3,12 +3,13 @@
  *
  * ⚠️这是「近似对照」不是「精确对齐」（plan 头号风险）：
  *  - 录音真 t0 拿不到（机器人没入会）→ 用 panel 会议 start_time 近似·误差几秒~几分钟。
- *  - mark `abs_timestamp` 是 `await captureMark` 后落账时刻·比起笔系统性偏后·非笔级精确。
+ *  - 新 mark 用 `pen_down_at`，旧数据回退 `abs_timestamp`；仍是近似对照，不宣称逐句精确。
  * 故用**时间窗模型**（每笔取附近 ±windowMs 的转写段·非单句强对应）吸收这些误差，
  * 上层 UI 一律呈现「附近/同时段」+ 校准状态，绝不当精确关联。
  */
 
 import { parseFeishuTranscriptSpeakerMarker, type FeishuTranscriptSpeakerSource } from './transcript-speaker-marker';
+import { markTime } from '../../core/mark-time';
 
 // ── 转写 cue（解析自 SRT）──
 export interface TranscriptCue {
@@ -23,7 +24,7 @@ export interface TranscriptCue {
 }
 
 // ── 对照输入 ──
-export interface AlignMark { mark_id: string; abs_timestamp: number; document_id?: string; page_id?: string }
+export interface AlignMark { mark_id: string; abs_timestamp: number; pen_down_at?: number; document_id?: string; page_id?: string }
 export interface ProximityInput {
   marks: AlignMark[];
   cues: TranscriptCue[];
@@ -181,7 +182,7 @@ export function buildProximityIndex(input: ProximityInput): ProximityIndex {
   const orphanMarkIds: string[] = [];
 
   for (const mark of input.marks) {
-    const t = mark.abs_timestamp;
+    const t = markTime(mark);
     // 命中：mark 时刻落在 [cueStart−window, cueEnd+window] 内（窗吸收 t0/落账延迟误差）。
     // 二分定起点后只扫窗口附近段（避免 marks*cues 全量·长会议 UI 阻塞）。
     const hits: Array<{ index: number; gap: number }> = [];
@@ -242,15 +243,15 @@ export function inferInitialOffset(input: {
   if (!cues.length || !marks.length) {
     return { offsetMs: 0, confidence: 'low', reason: 'no_marks_or_cues', autoConfirm: false };
   }
-  const sortedMarks = [...marks].sort((a, b) => a.abs_timestamp - b.abs_timestamp);
-  const markSpanMs = sortedMarks[sortedMarks.length - 1].abs_timestamp - sortedMarks[0].abs_timestamp;
+  const sortedMarks = [...marks].sort((a, b) => markTime(a) - markTime(b));
+  const markSpanMs = markTime(sortedMarks[sortedMarks.length - 1]) - markTime(sortedMarks[0]);
 
   const candidates: Array<{ offset: number; reason: string }> = [
     { offset: 0, reason: 'trust_panel_start_time' },
   ];
   if (startedAtMs != null) candidates.push({ offset: startedAtMs - panelStartTimeMs, reason: 'align_inkloop_started_at' });
   const firstCue = [...cues].sort((a, b) => a.startMs - b.startMs)[0];
-  candidates.push({ offset: sortedMarks[0].abs_timestamp - panelStartTimeMs - firstCue.startMs, reason: 'align_first_mark_to_first_cue' });
+  candidates.push({ offset: markTime(sortedMarks[0]) - panelStartTimeMs - firstCue.startMs, reason: 'align_first_mark_to_first_cue' });
 
   const score = (offset: number): number => {
     const idx = buildProximityIndex({ marks: sortedMarks, cues, t0AbsMs: panelStartTimeMs, offsetMs: offset, windowMs: 1500 });

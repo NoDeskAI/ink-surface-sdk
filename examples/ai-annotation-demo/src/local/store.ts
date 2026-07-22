@@ -718,6 +718,87 @@ export function appendMarkEntry(
   });
 }
 
+/**
+ * 给可见 mark 追加一条折叠 revision。保留 canonical id/原始语义时间，不就地改账本。
+ * 调用方应传最新折叠条目；长耗时任务在调用前需重读，避免覆盖擦除/远端修订。
+ */
+export async function appendMarkRevision(
+  base: PersistedMark,
+  patch: Partial<Omit<PersistedMark, 'entry_id' | 'seq' | 'created_at' | 'schema_version' | 'document_id' | 'mark_id'>>,
+  options: { notifyRuntime?: boolean } = {},
+): Promise<Omit<PersistedMark, 'entry_id' | 'seq' | 'created_at'>> {
+  const { entry_id: _entryId, seq: _seq, created_at, schema_version: _schemaVersion, ...rest } = base;
+  const revision = {
+    ...rest,
+    ...patch,
+    document_id: base.document_id,
+    mark_id: base.mark_id,
+    source_created_at: base.source_created_at ?? created_at,
+  };
+  await appendMarkEntry(revision, options);
+  return revision;
+}
+
+type MarkRevisionPatch = Partial<Omit<PersistedMark, 'entry_id' | 'seq' | 'created_at' | 'schema_version' | 'document_id' | 'mark_id'>>;
+export type MarkRevisionExpectation = { seq: number; fingerprint?: never } | { seq?: never; fingerprint: string };
+
+/**
+ * 长耗时任务的条件 revision：读取最新条目、校验未删除和期望版本、追加新 revision 全在同一事务内。
+ * `fingerprint` 供已经把内容指纹写入账本的调用方使用；OCR 首次写回用捕获时的 `seq`。
+ */
+export async function appendMarkRevisionIfCurrent(
+  documentId: string,
+  markId: string,
+  expected: MarkRevisionExpectation,
+  patch: MarkRevisionPatch,
+  options: { notifyRuntime?: boolean } = {},
+): Promise<PersistedMark | null> {
+  const db = await openDB();
+  if (!db) return null;
+  const committed = await new Promise<PersistedMark | null>((resolve, reject) => {
+    try {
+      const tx = db.transaction(MARKS, 'readwrite');
+      const store = tx.objectStore(MARKS);
+      let revision: PersistedMark | null = null;
+      const req = store.index('by_doc').getAll(IDBKeyRange.only(documentId));
+      req.onsuccess = () => {
+        const latest = ((req.result as PersistedMark[]) ?? [])
+          .filter((entry) => entry.mark_id === markId)
+          .sort((left, right) => right.seq - left.seq)[0];
+        if (!latest || latest.is_tombstone) return;
+        if ('seq' in expected && expected.seq !== latest.seq) return;
+        if ('fingerprint' in expected && expected.fingerprint !== latest.ocr_fingerprint) return;
+        const { entry_id: _entryId, seq: _seq, created_at, schema_version: _schemaVersion, ...rest } = latest;
+        revision = {
+          ...rest,
+          ...patch,
+          document_id: latest.document_id,
+          mark_id: latest.mark_id,
+          source_created_at: latest.source_created_at ?? created_at,
+          schema_version: MARK_ENTRY_SCHEMA_VERSION,
+          entry_id: shortId('ent'),
+          seq: nextSeq(),
+          created_at: new Date().toISOString(),
+        };
+        store.add(revision);
+      };
+      tx.oncomplete = () => resolve(revision);
+      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB appendMarkRevisionIfCurrent failed: ${documentId}/${markId}`));
+      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB appendMarkRevisionIfCurrent aborted: ${documentId}/${markId}`));
+    } catch (error) {
+      reject(error);
+    }
+  });
+  if (!committed) return null;
+  if (committed.marked_text && committed.ai_eligible !== false) {
+    void vectorStore.upsert({ id: committed.entry_id, bookId: committed.document_id, pageIndex: committed.page_index, text: committed.marked_text, anchorRefs: committed.hmp?.target_object_refs });
+  }
+  if (options.notifyRuntime !== false && runtimeLedgerAppendHook) {
+    void Promise.resolve(runtimeLedgerAppendHook(committed)).catch((error) => console.warn('[runtime-sync] ledger bridge failed', error));
+  }
+  return committed;
+}
+
 /** 基岩：写一段录制头（每段一次）。 */
 export function appendInkSegment(seg: PersistedInkSegment): Promise<void> {
   return appendEntry(INK_SEGMENTS, seg);
@@ -1168,10 +1249,27 @@ export function listAllMeetings(): Promise<PersistedMeeting[]> {
 export function getMeeting(id: string): Promise<PersistedMeeting | null> {
   return getOneFrom<PersistedMeeting>(MEETINGS, id);
 }
+/** 删除一场会议记录（重复卡自愈合并用·只删 meetings 行，不碰手记/资料 doc——调用方负责先把引用并给保留者）。 */
+export async function deleteMeeting(id: string): Promise<void> {
+  const db = await openDB();
+  if (!db) return;
+  return new Promise<void>((resolve, reject) => {
+    try {
+      const tx = db.transaction(MEETINGS, 'readwrite');
+      tx.objectStore(MEETINGS).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB deleteMeeting failed: ${id}`));
+      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB deleteMeeting aborted: ${id}`));
+    } catch (e) { reject(e); }
+  });
+}
 /** 局部更新一场会议（合并 patch + 刷新 updated_at）。单个 readwrite 事务内 get→spread→put，
  *  防两次并发 updateMeeting（如 M7 openMeeting 清 live_unread 撞上后台 panel 轮询刷新其它字段）
  *  各自基于旧快照写回、后写者用旧值覆盖先写者的改动（lost update·真机 12s 轮询下实测触发过）。 */
-export async function updateMeeting(id: string, patch: Partial<PersistedMeeting>): Promise<PersistedMeeting | null> {
+export async function mutateMeeting(
+  id: string,
+  mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null,
+): Promise<PersistedMeeting | null> {
   const db = await openDB();
   if (!db) return null;
   return new Promise<PersistedMeeting | null>((resolve, reject) => {
@@ -1183,14 +1281,20 @@ export async function updateMeeting(id: string, patch: Partial<PersistedMeeting>
       req.onsuccess = () => {
         const cur = req.result as PersistedMeeting | undefined;
         if (!cur) return; // 不存在：tx 空转完成，next 仍 null
+        const patch = mutator(cur);
+        if (!patch) return;
         next = { ...cur, ...patch, updated_at: new Date().toISOString() };
         store.put(next);
       };
       tx.oncomplete = () => resolve(next);
-      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB updateMeeting failed: ${id}`));
-      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB updateMeeting aborted: ${id}`));
+      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB mutateMeeting failed: ${id}`));
+      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB mutateMeeting aborted: ${id}`));
     } catch (e) { reject(e); }
   });
+}
+
+export function updateMeeting(id: string, patch: Partial<PersistedMeeting>): Promise<PersistedMeeting | null> {
+  return mutateMeeting(id, () => patch);
 }
 
 /**

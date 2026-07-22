@@ -404,6 +404,16 @@
   .rc-msum-h .mdl,
   .rc-psum-h .mdl{font:10.5px var(--mono);color:var(--mut2);}
   .rc-smart-note-link{display:inline-block;margin-top:10px;font:12px var(--sans);color:var(--ink);text-decoration:underline;}
+  /* panel「完整报告」只读长文视图（e-ink 滚动阅读） */
+  .rc-report{max-width:900px;}
+  .rc-rep-h1{font:700 17px/1.4 var(--sans);color:var(--ink);margin:18px 0 10px;}
+  .rc-rep-h2{font:650 15px/1.4 var(--sans);color:var(--ink);margin:16px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--hair);}
+  .rc-rep-h3,.rc-rep-h4{font:650 13.5px/1.4 var(--sans);color:var(--ink);margin:12px 0 6px;}
+  .rc-rep-p{font:13.5px/1.7 var(--sans);color:var(--ink);margin:6px 0;}
+  .rc-rep-ul{margin:6px 0 6px 18px;padding:0;}
+  .rc-rep-ul li{font:13.5px/1.65 var(--sans);color:var(--ink);margin:3px 0;}
+  .rc-rep-tr{font:11.5px/1.6 var(--mono);color:var(--ink);white-space:pre;overflow-x:auto;}
+  .rc-rep-gap{height:6px;}
   .rc-blk{margin:14px 0;padding-top:10px;border-top:1px solid var(--hair);}
   .rc-blk:first-of-type{margin-top:0;}
   .rc-blk-h{display:block;font:650 12.5px var(--sans);color:var(--ink);margin-bottom:7px;}
@@ -455,6 +465,9 @@
   .rc-over-hero h2{margin:0;font:650 20px/1.22 var(--sans);color:var(--ink);}
   .rc-over-hero p{margin:5px 0 0;font:12px/1.45 var(--sans);color:var(--ink2);}
   .rc-over-focus{border-bottom:1px solid var(--hair);padding-bottom:12px;}
+  .rc-over-participants{border-bottom:1px solid var(--hair);padding-bottom:12px;}
+  .rc-participant-list{display:grid;gap:5px;}
+  .rc-participant-li{font:12.5px/1.5 var(--sans);color:var(--ink);overflow-wrap:anywhere;}
   .rc-over-list{display:grid;gap:6px;}
   .rc-over-li{display:block;position:relative;padding-left:12px;font:13px/1.55 var(--sans);color:var(--ink);overflow-wrap:anywhere;}
   .rc-over-li::before{content:"";position:absolute;left:0;top:.78em;width:4px;height:4px;border-radius:50%;background:var(--ink);}
@@ -1338,6 +1351,9 @@
     .rc-over-hero h2{font-size:31px;line-height:1.18;}
     .rc-over-hero p{font-size:19px;line-height:1.5;margin-top:9px;}
     .rc-over-focus{padding-bottom:20px;}
+    .rc-over-participants{padding-bottom:20px;}
+    .rc-participant-list{gap:8px;}
+    .rc-participant-li{font-size:19px;line-height:1.5;}
     .rc-over-list{gap:10px;}
     .rc-over-li{font-size:20px;line-height:1.5;padding-left:18px;}
     .rc-over-li::before{width:6px;height:6px;top:.75em;}

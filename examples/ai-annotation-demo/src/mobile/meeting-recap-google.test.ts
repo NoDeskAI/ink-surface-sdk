@@ -1,18 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PersistedMeeting } from '../core/store-format';
+import type { PersistedMark, PersistedMeeting } from '../core/store-format';
 
 const mocks = vi.hoisted(() => ({
   getCachedMinute: vi.fn(),
   putCachedMinute: vi.fn(),
+  mutateMeeting: vi.fn(),
   updateMeeting: vi.fn(),
   getGoogleMeetingTranscript: vi.fn(),
+  getFoldedMarksByContext: vi.fn(),
+  triggerBoardOcr: vi.fn(),
+  isBoardOcrInFlight: vi.fn(),
+  meetings: new Map<string, PersistedMeeting>(),
 }));
 
 vi.mock('../local/store', async (importOriginal) => ({
   ...await importOriginal<typeof import('../local/store')>(),
   getCachedMinute: mocks.getCachedMinute,
   putCachedMinute: mocks.putCachedMinute,
+  mutateMeeting: mocks.mutateMeeting,
   updateMeeting: mocks.updateMeeting,
+  getFoldedMarksByContext: mocks.getFoldedMarksByContext,
+}));
+
+vi.mock('../capture/board-ocr', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../capture/board-ocr')>(),
+  triggerBoardOcr: mocks.triggerBoardOcr,
+  isBoardOcrInFlight: mocks.isBoardOcrInFlight,
 }));
 
 vi.mock('../integration/google-meet/client', async (importOriginal) => ({
@@ -25,12 +38,15 @@ import {
   googleSmartNoteCardState,
   isFeishuReloginError,
   loadGoogleTranscript,
+  meetingSummaryTranscriptCacheToken,
+  requestProviderPanelSummary,
   recapTranscriptMissingMessage,
+  renderRecapCard,
   renderGoogleRecordingsHtml,
 } from './meeting-recap';
 
 function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting {
-  return {
+  const meeting: PersistedMeeting = {
     meeting_id: 'local-google-1',
     workspace_id: 'ws_schedule',
     title: 'Google review',
@@ -43,16 +59,33 @@ function googleMeeting(patch: Partial<PersistedMeeting> = {}): PersistedMeeting 
     updated_at: '2026-07-15T00:00:00.000Z',
     ...patch,
   };
+  mocks.meetings.set(meeting.meeting_id, meeting);
+  return meeting;
 }
 
 describe('meeting recap Google transcript branch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.meetings.clear();
     mocks.getCachedMinute.mockResolvedValue(null);
     mocks.putCachedMinute.mockResolvedValue(undefined);
     mocks.updateMeeting.mockResolvedValue(null);
+    mocks.getFoldedMarksByContext.mockResolvedValue([]);
+    mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-google-1', marks: 0, ok: 0, empty: 0, ms: 0 });
+    mocks.isBoardOcrInFlight.mockReturnValue(false);
+    mocks.mutateMeeting.mockImplementation(async (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => {
+      const current = mocks.meetings.get(id);
+      if (!current) return null;
+      const patch = mutator(current);
+      if (!patch) return null;
+      Object.assign(current, patch);
+      return current;
+    });
   });
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 
   it('preserves provider missing semantics instead of leaving a loading label', () => {
     expect(recapTranscriptMissingMessage(googleMeeting({ provider_transcript_status: 'not_generated' })))
@@ -65,11 +98,29 @@ describe('meeting recap Google transcript branch', () => {
       platform: 'lark',
       feishu_meeting_id: 'om_1',
     })).toContain('未检测到妙记');
+    expect(recapTranscriptMissingMessage({ platform: 'zoom' })).toBe('正在等待 Zoom 会后转写生成。');
+    expect(recapTranscriptMissingMessage({ platform: 'microsoft_teams' })).toBe('该来源暂不支持转写拉取。');
+    expect(renderRecapCard(googleMeeting({ platform: 'zoom' }))).not.toContain('飞书');
+    expect(renderRecapCard(googleMeeting({ platform: 'microsoft_teams' }))).not.toContain('飞书');
   });
 
   it('recognizes the production panel 409 reauth response', () => {
     expect(isFeishuReloginError({ status: 409, code: 'reauth_required' })).toBe(true);
     expect(isFeishuReloginError({ status: 502, message: 'upstream unavailable' })).toBe(false);
+  });
+
+  it('reads the renamed summary transcript token before the legacy field', () => {
+    expect(meetingSummaryTranscriptCacheToken({
+      summary_source: {
+        transcript_cache_token: 'google_meet:new',
+        feishu_minute_token: 'legacy',
+        mark_count: 1,
+        cue_count: 2,
+      },
+    })).toBe('google_meet:new');
+    expect(meetingSummaryTranscriptCacheToken({
+      summary_source: { feishu_minute_token: 'legacy', mark_count: 1, cue_count: 2 },
+    })).toBe('legacy');
   });
 
   it('generates and persists a structured InkLoop panel summary through the hub', async () => {
@@ -92,7 +143,7 @@ describe('meeting recap Google transcript branch', () => {
       speaker: 'Ada',
       text: '确认先发布会议恢复能力，并补充真机验证。',
       rawText: 'Ada: 确认先发布会议恢复能力，并补充真机验证。',
-    }, ...Array.from({ length: 200 }, (_, index) => ({
+    }, ...Array.from({ length: 500 }, (_, index) => ({
       index: index + 2,
       startMs: (index + 2) * 1_000,
       endMs: (index + 3) * 1_000,
@@ -108,12 +159,14 @@ describe('meeting recap Google transcript branch', () => {
     }), cues);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/google/meeting-summary');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/meetings/summary');
     const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
     expect(request.transcript).toContain('[0:01]Ada：确认先发布会议恢复能力');
     expect(request.transcript).toContain('转写在此截断');
-    expect(request.transcript.length).toBeLessThan(16_200);
+    expect(request.transcript.length).toBeLessThan(48_600);
     expect(request.smart_note).toBe('Gemini notes say the recovery path should ship first.');
+    expect(request.handwriting_sections).toBeUndefined();
+    expect(mocks.triggerBoardOcr).toHaveBeenCalledWith('mtgboard_local-google-1');
     expect(summary).toMatchObject({
       minute_token: 'google_meet:local-google-1',
       meeting_id: 'abc-defg-hij',
@@ -126,6 +179,94 @@ describe('meeting recap Google transcript branch', () => {
     }));
   });
 
+  it('awaits board OCR, reloads marks, and sends the shared three-section handwriting payload', async () => {
+    const order: string[] = [];
+    const t0 = Date.parse('2026-07-15T01:00:00.000Z');
+    const mark = {
+      mark_id: 'mark-ocr',
+      abs_timestamp: t0 + 32_000,
+      pen_down_at: t0 + 30_000,
+      marked_text: 'OCR 后的关键决策',
+      feature_type: 'handwriting',
+      is_tombstone: false,
+    } as PersistedMark;
+    mocks.triggerBoardOcr.mockImplementation(async () => {
+      order.push('ocr');
+      return { document_id: 'mtgboard_local-google-1', marks: 1, ok: 1, empty: 0, ms: 20 };
+    });
+    mocks.getFoldedMarksByContext.mockImplementation(async () => {
+      order.push('marks');
+      return [mark];
+    });
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      order.push('post');
+      return new Response(JSON.stringify({
+        model: 'glm-test',
+        summary: { conclusions: ['确认关键决策'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureGooglePanelSummary(googleMeeting({
+      started_at: new Date(t0).toISOString(),
+      ended_at: new Date(t0 + 60 * 60_000).toISOString(),
+    }), [{ index: 1, startMs: 0, endMs: 1_000, speaker: 'Ada', text: '继续。', rawText: 'Ada: 继续。' }]);
+
+    const request = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(order).toEqual(['ocr', 'marks', 'post']);
+    expect(request.handwriting_sections).toEqual({
+      pre_meeting: [],
+      in_meeting: [{ relative_time: '0:30', text: 'OCR 后的关键决策' }],
+      post_meeting: [],
+    });
+  });
+
+  it('等待 10 秒后仍有手写 OCR 在途时推迟总结落库', async () => {
+    vi.useFakeTimers();
+    mocks.triggerBoardOcr.mockImplementation(() => new Promise(() => undefined));
+    mocks.isBoardOcrInFlight.mockReturnValue(true);
+    mocks.getFoldedMarksByContext.mockResolvedValue([{
+      mark_id: 'pending-mark', feature_type: 'handwriting', ocr_fingerprint: undefined, is_tombstone: false,
+      strokes: [{ tool: 'pen', points: [{ x: 0.1, y: 0.1, t: 0, pressure: 0.5 }] }],
+    } as PersistedMark]);
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      model: 'glm-test',
+      summary: { conclusions: ['继续生成'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const task = ensureGooglePanelSummary(googleMeeting(), [
+      { index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '继续生成。', rawText: '继续生成。' },
+    ]);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(task).resolves.toBeNull();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.getFoldedMarksByContext).toHaveBeenCalledWith('mtg_local-google-1');
+  });
+
+  it('OCR 已失败时继续总结，账本读取失败时中止生成', async () => {
+    mocks.triggerBoardOcr.mockResolvedValue({ document_id: 'mtgboard_local-google-1', marks: 1, ok: 0, empty: 0, ms: 20, failed: true });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      model: 'glm-test',
+      summary: { conclusions: ['使用现有文字'], action_items: [], risks: [], open_questions: [], next_steps: [] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureGooglePanelSummary(googleMeeting(), [
+      { index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '继续。', rawText: '继续。' },
+    ]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    mocks.getFoldedMarksByContext.mockRejectedValueOnce(new Error('账本损坏'));
+    await expect(ensureGooglePanelSummary(googleMeeting({ meeting_id: 'local-google-ledger-error' }), [
+      { index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '停止。', rawText: '停止。' },
+    ])).rejects.toThrow('账本损坏');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it('shares the in-flight generation and does not resend when a summary already exists', async () => {
     let resolveFetch!: (response: Response) => void;
     const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
@@ -135,7 +276,7 @@ describe('meeting recap Google transcript branch', () => {
 
     const first = ensureGooglePanelSummary(meeting, cues);
     const second = ensureGooglePanelSummary(meeting, cues);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     resolveFetch(new Response(JSON.stringify({
       model: 'glm-test',
       summary: { conclusions: ['发布计划已讨论'], action_items: [], risks: [], open_questions: [], next_steps: [] },
@@ -147,6 +288,21 @@ describe('meeting recap Google transcript branch', () => {
     const cached = await ensureGooglePanelSummary(googleMeeting({ panel_summary: a! }), cues);
     expect(cached).toEqual(a);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('旧场请求失败前已改期时不把 Google 新场标成失败', async () => {
+    const meeting = googleMeeting();
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => {
+      meeting.scheduled_at = '2026-07-16T01:00:00.000Z';
+      throw new Error('总结请求失败');
+    }));
+
+    const result = await requestProviderPanelSummary(meeting, [{
+      index: 1, startMs: 0, endMs: 1_000, speaker: '', text: '旧场内容', rawText: '旧场内容',
+    }]);
+
+    expect(result).toMatchObject({ summary: null, failurePersisted: false, occurrenceToken: '20260715T010000Z' });
+    expect(meeting.panel_summary_status).toBeUndefined();
   });
 
   it('caches ready SRT and patches provider-event t0 without undefined fields', async () => {

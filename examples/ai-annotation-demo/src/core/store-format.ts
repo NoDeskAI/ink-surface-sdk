@@ -18,8 +18,8 @@ import type { RawRef } from './bedrock';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
 export const DB_VERSION = 11;     // v10→v11：library_sync（Cloud Hub/本地 Library manifest 状态）。任何升级都自愈缺表。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
-export type MarkEntrySchemaVersion = '3' | '4' | '5';
-export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '5'; // v4→v5：reader_px 笔迹可选带 reader_layout_id（引用阅读页视觉行布局快照，导出复现文字背景）。additive·不 bump STORE_VERSION·旧条目缺字段即可。
+export type MarkEntrySchemaVersion = '3' | '4' | '5' | '6';
+export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '6'; // v6 持续允许 additive 可选字段：pen_down_at + 白板 OCR 标记；不 bump STORE_VERSION。
 
 /** 一张图的解读：图本身可从 PDF 重渲，故只存 bbox + 文字解读。 */
 export interface PersistedImage {
@@ -174,7 +174,7 @@ export interface BaseEntry {
 
 /** 页账本条目 = 一次组装手势（marks store）。is_tombstone=true 表示擦除携同 mark_id。 */
 export interface PersistedMark extends BaseEntry {
-  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface 取证；v4=新增可选 entity_refs/topic_refs。新条目写 MARK_ENTRY_SCHEMA_VERSION。
+  schema_version?: MarkEntrySchemaVersion; // 老条目缺=v2；v3=双 surface；v4=entity refs；v5=reader layout；v6=可选 pen_down_at/OCR 标记。新条目写当前版本。
   mark_id: string;                  // = 代表 event 的 event_id，跨 reload 稳定引用
   strokes: PersistedStroke[];       // 构成笔（tool+points），redraw 保真（不存合并点）
   bbox: NormBBox;                   // union bbox
@@ -187,7 +187,8 @@ export interface PersistedMark extends BaseEntry {
   color: string;                    // 据 tool 派生的颜色（取证完整性；redraw 仍按 tool）
   pointer_type: string;             // pen / touch / mouse / unknown
   device_id: string;
-  abs_timestamp: number;            // 组装时 Date.now()（reload 折回 perf 时间线算关系）
+  abs_timestamp: number;            // 区域收口/落库时 Date.now()；不是落笔时刻。
+  pen_down_at?: number;             // 构成笔最早 pointerdown 的 epoch ms；旧条目缺时回退 abs_timestamp。
   context_id?: string;              // C2 时间脊：落笔时活跃 surface 实例 id（'__reader__' / 'mtg_<id>' / 日记…）；按会话取笔用，老条目缺=undefined
   feature_type: MarkFeatureType;    // markup / handwriting / drawing（路由/显示粗类型）
   feature_confidence: number;
@@ -198,6 +199,9 @@ export interface PersistedMark extends BaseEntry {
   hmp: HMP | null;                 // 取证（落库前剥掉 crop_ref/vector_ref，存料不存图）
   marked_text: string;             // 落笔当时解析好的"所标内容"
   ai_eligible?: boolean;           // 笔触划分（Phase P）：是否进 AI 管线。false=普通笔/荧光纯内容（不识别/不答问/不进 pending session）；true/缺=AI 笔触或旧自动判意（reload 仍可综合）。getPendingMarks 据此排除内容笔
+  ocr_at?: number;                 // 白板整页 OCR 最近一次成功返回（含空结果）的 epoch ms。v6 additive，不升格式版本。
+  ocr_fingerprint?: string;        // 当次 OCR 对应的笔迹内容指纹；内容未变时不重复请求。
+  ocr_empty?: boolean;             // 模型对该指纹返空；保留原占位文本，并阻止空结果重试风暴。
   origin?: 'pen' | 'ai_pen' | 'highlighter' | 'underline' | 'auto'; // 来源：普通笔 / AI 笔 / 荧光 / 下划线 / 自动判意模式。诊断+将来策略用；缺=旧条目
   raw_ref?: RawRef;                // → 基岩录像的对应段+seq 区间（仅 features/settings.bedrock 开时有；老条目缺=undefined）
   reflow_anchor_runs?: string[];   // 位置真相锚：重排面落笔时所在重排块的 source run ids → 重投影时认它定段（恒等·不靠坐标猜）。仅重排落笔有；原版落笔/老条目缺=undefined（退 nearestBlockByBbox 近似）
@@ -283,6 +287,8 @@ export interface PanelMeetingSummaryFive {
   risks: string[];
   open_questions: string[];
   next_steps: string[];
+  /** 完整长文报告（访谈研究报告等模式下由服务端一并返回；五要素只是它的压缩摘要）。 */
+  report_markdown?: string;
 }
 export interface PanelMeetingSummaryRecord {
   minute_token?: string | null;
@@ -331,6 +337,13 @@ export interface PersistedMeetingMaterialLink {
   error?: string;                  // 上一次尝试失败的原因（导出 PDF 403/超时等）
 }
 
+export interface PersistedMeetingProviderParticipant {
+  name: string;
+  joined_at: string;
+  left_at: string;
+  identity: 'signed_in' | 'external_email' | 'anonymous';
+}
+
 /** 一场会议：属某 workspace，引用资料（已导入书的 document_id），会后留手写档案 + 思路总结。 */
 export interface PersistedMeeting {
   meeting_id: string;               // 'mtg_'+shortId
@@ -338,22 +351,36 @@ export interface PersistedMeeting {
   title: string;
   scheduled_at: string;             // ISO 计划时间（日程聚合 + 状态派生用）
   status: MeetingStatus;
-  started_at?: string;              // ISO 真实「开始会议」墙钟（时间脊原点：会中每笔的相对时刻 = abs_timestamp − started_at；会后与飞书录音对轴的 t0）
+  started_at?: string;              // ISO 真实「开始会议」墙钟（时间脊原点：会中每笔的相对时刻 = markTime − started_at；会后与飞书录音对轴的 t0）
   ended_at?: string;                // ISO 真实「结束会议」墙钟
   material_doc_ids: string[];       // 可能有用的文件（指向 docs/pdf_blobs 的 document_id）
   material_links?: PersistedMeetingMaterialLink[]; // 链接型资料（妙记 docx 等·不强求可批注·见 PersistedMeetingMaterialLink）
   summary?: string;                 // 会后「思路总结」（AI 综合，先空）
   // ── 多平台会议标识（optional·零迁移；缺省按存量飞书字段推断）──
-  platform?: 'lark' | 'google_meet' | 'manual'; // 会议平台；存量飞书会议可不写
-  provider_meeting_id?: string;        // 平台会议场次主键；Google Meet 使用 conferenceRecord.name
-  provider_calendar_event_id?: string; // 平台日历实例 id；Google Meet 使用 Calendar event instance id
-  provider_space_name?: string;        // 平台会议空间；Google Meet 使用 spaces/{id}
-  provider_transcript_ref?: string;    // 平台转写工件引用；Google Meet 使用 transcripts/{id}
+  platform?: 'lark' | 'google_meet' | 'zoom' | 'microsoft_teams' | 'manual'; // 会议平台；存量飞书会议可不写
+  provider_meeting_id?: string;        // 平台会议场次 ID；Google conferenceRecord.name，Teams attendanceReport.id
+  provider_calendar_event_id?: string; // 平台日历实例 ID；Google Calendar event instance id，Teams Outlook immutable event id
+  provider_space_name?: string;        // 平台逻辑会议容器 ID；Google space.name，Teams onlineMeeting.id，Zoom meeting id
+  provider_transcript_ref?: string;    // 平台转写工件 ID；Google transcript.name，Teams callTranscript.id
   provider_transcript_status?: 'ready' | 'pending' | 'not_generated' | 'no_record';
+  provider_transcript_reason?: 'instance_not_found' | 'recording_missing' | 'recording_missing_companion_missing' | 'transcript_not_generated';
+  provider_participants?: PersistedMeetingProviderParticipant[]; // 平台参会区间；optional additive，旧记录零迁移
   google_smart_note?: { text: string; export_uri?: string; fetched_at: string }; // Gemini 官方智能纪要纯文本（Drive export）
   google_smart_note_scope_missing?: boolean; // 旧 OAuth token 缺 drive.readonly，提示用户重授权
   google_recordings?: Array<{ export_uri: string; state: string }>; // Meet 录像 Drive 引用；只存可打开链接
+  zoom_smart_note?: { // Zoom AI Companion 官方纪要；summary_created_time 仅展示，不作为时间锚
+    title?: string;
+    text: string;
+    export_uri?: string;
+    overview?: string;
+    details: Array<{ label: string; summary: string }>;
+    next_steps: string[];
+    created_time?: string;
+    fetched_at: string;
+  };
   meeting_url?: string;                // 平台通用入会链接；飞书与 Google Meet 均可使用
+  topic?: string;                      // provider 原始会议主题；卡片标题可由它派生但仍保留原值
+  duration?: number;                   // provider 计划时长（分钟）；当前 Zoom List Meetings 使用
   // ── WS2-C 飞书妙记对照（optional·零迁移；近似对照非精确对齐·见 integration/panel-feishu）──
   feishu_meeting_id?: string;       // 关联的飞书 VC 会议 id
   feishu_meeting_no?: string;       // 9 位会议号
@@ -368,7 +395,15 @@ export interface PersistedMeeting {
   align_state?: 'uncalibrated' | 'approx' | 'estimated' | 'event' | 'manual'; // 校准状态（event=会议事件 t0·录音残差未消除·UI 明示防假精确）
   feishu_match_confirmed_at?: string; // 用户确认关联的时刻
   summary_generated_at?: string;    // summary 生成时刻（防 stale）
-  summary_source?: { feishu_minute_token?: string; align_offset_ms?: number; mark_count: number; cue_count: number; transcript_truncated?: boolean; used_cue_count?: number };
+  summary_source?: {
+    transcript_cache_token?: string;
+    feishu_minute_token?: string; // 兼容旧记录；新写入统一使用 transcript_cache_token
+    align_offset_ms?: number;
+    mark_count: number;
+    cue_count: number;
+    transcript_truncated?: boolean;
+    used_cue_count?: number;
+  };
   // ── L5 panel 总结缓存（recap 顶部显示·离线不丢·optional 零迁移）──
   panel_summary?: PanelMeetingSummaryRecord;
   panel_summary_fetched_at?: string;

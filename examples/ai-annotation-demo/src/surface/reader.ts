@@ -21,6 +21,7 @@ import { takeHqSocketStroke, type HqSocketPoint } from '../capture/m103-hqhw-soc
 import { publishM103RawPenStroke, type M103RawPenSource } from '../capture/m103-raw-pen-adapter';
 import { isM103Device, isOnyxPaperDevice } from '../capture/m103-device';
 import { isLikelyStylusPointer, shouldPersistNativeStrokeFromDrain } from '../capture/input-policy';
+import { estimatePenDownAt } from '../capture/stroke-time';
 import { DEVICE_ID, SESSION_ID, shortId } from '../core/ids';
 import { pageCss } from '../core/transform';
 import { devEmit } from '../core/dev-telemetry';
@@ -119,9 +120,9 @@ function nearestBlockByBbox(bb: NormBBox): BlockRef | null {
 /** 重排面一笔：内容坐标 px + 每点真实压感/时间（喂 styleFor 压感线宽、喂 Tier2 运笔方式），tool 随笔走（钢笔/荧光笔）。 */
 interface RPoint { x: number; y: number; pressure: number; t: number }
 /** committed = onPenUp 发往 reader:gesture 的那条页坐标笔（strokeMarkIds 的 key）；橡皮据此回查整 mark。 */
-interface ReaderStroke { tool: Tool; points: RPoint[]; committed?: Stroke }
+interface ReaderStroke { tool: Tool; points: RPoint[]; penDownAt?: number; committed?: Stroke }
 const inkStrokes: ReaderStroke[] = []; // 已落的笔迹（内容坐标）
-let live: { tool: Tool; t0: number; points: RPoint[]; skipLiveDraw: boolean; nativeInput: boolean } | null = null;
+let live: { tool: Tool; t0: number; penDownAt: number; points: RPoint[]; skipLiveDraw: boolean; nativeInput: boolean } | null = null;
 /** 持久笔 → 重排面工具：保住 highlighter 与 aipen（AI 笔靛蓝），其余归 pen。否则重载/切重排后 AI 笔被降级成普通黑笔。 */
 function persistedTool(ps: PersistedStroke): Tool {
   return ps.tool === 'highlighter' || ps.tool === 'underline' || ps.tool === 'aipen' ? ps.tool : 'pen';
@@ -1483,7 +1484,7 @@ function onPenUp(st: ReaderStroke): void {
   // 像素语义，不该随 canonical 除数变化。老法 pageCss 恰好约掉所以曾"顺带正确"，块本地 scale 后必须显式解耦。
   const ptsCls = raw.map((p) => ({ x: p.x / CLS_BASIS, y: p.y / CLS_BASIS, t: p.t, pressure: p.pressure }));
   const scored = classifyScored(ptsCls, bboxOf(ptsCls), CLS_BASIS, CLS_BASIS);
-  const stroke: Stroke = { tool: st.tool, points: pts };
+  const stroke: Stroke = { tool: st.tool, points: pts, penDownAt: st.penDownAt };
   st.committed = stroke; // 橡皮用：命中此重排笔 → strokeMarkIds.get(committed) 拿整 mark
   // 遥测·重排锚定：每笔命中哪个块 + 屏幕中心（看一个 mark 的多笔是否命中**不同**块 → 逐笔块锚的依据）。
   devEmit('reflow', () => ({ at: 'draw', block: ref.id, runs: ref.runIds.slice(0, 5), nr: ref.runIds.length,
@@ -1823,7 +1824,7 @@ export function initReader(readerEl: HTMLElement, opts?: { notePlacement?: 'marg
     // 命中时跳过 WebView live draw。T10/ONYX TouchHelper 会返回 true，但部分固件原生实时层不出墨；
     // 若这里也跳过 canvas，重排页就只能等抬笔后 finishCommittedR 补画整笔。
     const skipLiveDraw = shouldUseOsdOnlyForStroke(e);
-    live = { tool: state.tool, t0: performance.now(), points: [{ ...contentPoint(e), pressure: e.pressure || 0, t: 0 }], skipLiveDraw, nativeInput: isPhysicalPenContact(e) };
+    live = { tool: state.tool, t0: performance.now(), penDownAt: Date.now(), points: [{ ...contentPoint(e), pressure: e.pressure || 0, t: 0 }], skipLiveDraw, nativeInput: isPhysicalPenContact(e) };
     if (!live.skipLiveDraw) resizeInk('live'); // 首点即恢复/显示 reader-ink，避免空画布 1px 状态导致移动中不可见
     bedrockTapR(e, 'down');
   });
@@ -1914,7 +1915,7 @@ export function initReader(readerEl: HTMLElement, opts?: { notePlacement?: 'marg
       const points = socketToReader(nativeStroke.points);
       if (!points.length) continue;
       publishNativePhysicalPenStroke(nativeStroke, el.getBoundingClientRect(), state.pageId);
-      const stroke: ReaderStroke = { tool: state.tool, points };
+      const stroke: ReaderStroke = { tool: state.tool, points, penDownAt: estimatePenDownAt(points) };
       inkStrokes.push(stroke);
       resizeInk('osd-clear');
       onPenUp(stroke);

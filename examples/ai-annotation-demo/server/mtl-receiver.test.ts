@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mintMtlToken, type MtlReceiverIdentity } from './mtl-receiver-auth';
 import {
   handleMtlReceiver,
+  isEpochMs,
   listMtlMeetingWindows,
   mtlEventsAuditPath,
+  mtlZoomAttendanceWindows,
   type MtlLiveMeetingWindow,
   type MtlReceiverEnv,
 } from './mtl-receiver';
@@ -178,6 +180,102 @@ describe('MTL receiver', () => {
     expect(audit).not.toContain('DO_NOT_STORE_FULL_DOM');
     expect(audit).not.toContain('PRIVATE_SPEAKER_LABEL');
     expect(audit).not.toContain('snapshot');
+  });
+
+  it('atomically supplements a missing external meeting id on a repeated active start', async () => {
+    const { env, identity, token, call } = await fixture();
+    const payload = {
+      platform: 'zoom',
+      meeting_id: 'detector-window',
+      start_time_ms: Date.parse('2026-07-15T03:00:00.000Z'),
+    };
+    await call(`${token}/api/meeting-session/start`, { method: 'POST', body: payload });
+    const supplemented = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: { ...payload, external_meeting_id: 'zoom-session/uuid-42' },
+    });
+
+    expect(supplemented.status).toBe(200);
+    expect(supplemented.json()).toMatchObject({
+      ok: true,
+      deduplicated: true,
+      meeting: { external_meeting_id: 'zoom-session/uuid-42' },
+    });
+    expect(listMtlMeetingWindows(identity, env)).toEqual([
+      expect.objectContaining({ external_meeting_id: 'zoom-session/uuid-42' }),
+    ]);
+  });
+
+  it('supplements historical starts and rejects a conflicting external meeting id', async () => {
+    const { env, identity, token, call } = await fixture();
+    const payload = {
+      platform: 'zoom',
+      meeting_id: 'historical-window',
+      start_time_ms: Date.parse('2026-07-15T03:00:00.000Z'),
+    };
+    await call(`${token}/api/meeting-session/start`, { method: 'POST', body: payload });
+    await call(`${token}/api/meeting-session/end`, {
+      method: 'POST',
+      body: { meeting_id: payload.meeting_id, end_time_ms: Date.parse('2026-07-15T03:30:00.000Z') },
+    });
+    const supplemented = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: { ...payload, external_meeting_id: 'zoom-session/original' },
+    });
+    expect(supplemented.json()).toMatchObject({
+      deduplicated: true,
+      meeting: { external_meeting_id: 'zoom-session/original' },
+    });
+
+    const conflict = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: { ...payload, external_meeting_id: 'zoom-session/different' },
+    });
+    expect(conflict.status).toBe(409);
+    expect(conflict.json()).toMatchObject({ error: { code: 'mtl_external_meeting_id_conflict' } });
+    expect(listMtlMeetingWindows(identity, env)[0]?.external_meeting_id).toBe('zoom-session/original');
+  });
+
+  it('matches a Zoom attendance window whose numeric id exists only in meeting_url', async () => {
+    const { env, identity, token, call } = await fixture();
+    const startedAt = Date.parse('2026-07-15T03:00:00.000Z');
+    const response = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: {
+        platform: 'zoom',
+        meeting_id: 'detector-window-alias',
+        meeting_url: 'https://acme.zoom.us/j/987654321?pwd=secret',
+        start_time_ms: startedAt,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(mtlZoomAttendanceWindows(
+      identity,
+      '987654321',
+      env,
+      Date.parse('2026-07-15T04:00:00.000Z'),
+    )).toEqual([{ startMs: startedAt, endMs: Date.parse('2026-07-15T04:00:00.000Z') }]);
+  });
+
+  it('rejects second-scale and implausibly future *_time_ms values', async () => {
+    const { token, call } = await fixture();
+    const nowMs = Date.parse('2026-07-15T04:00:00.000Z');
+    expect(isEpochMs(nowMs, nowMs)).toBe(true);
+    expect(isEpochMs(Math.floor(nowMs / 1000), nowMs)).toBe(false);
+
+    const seconds = await call(`${token}/api/meeting-session/start`, {
+      method: 'POST',
+      body: { platform: 'zoom', meeting_id: '123', start_time_ms: Math.floor(nowMs / 1000) },
+    });
+    expect(seconds.status).toBe(400);
+    expect(seconds.json()).toMatchObject({ error: { code: 'mtl_start_time_ms_invalid' } });
+
+    const future = await call(`${token}/api/meeting-platform/runtime-events`, {
+      method: 'POST',
+      body: { detector: { observed_time_ms: nowMs + 5 * 60_000 + 1 } },
+    });
+    expect(future.status).toBe(400);
+    expect(future.json()).toMatchObject({ error: { code: 'mtl_observed_time_ms_invalid' } });
   });
 
   it('rejects an end event whose normalized platform does not match the active meeting', async () => {

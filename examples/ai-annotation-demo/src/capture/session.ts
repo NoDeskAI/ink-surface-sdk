@@ -25,7 +25,7 @@ export interface Mark {
   event: AnnotationEvent; // 代表 event（union bbox + 合并笔点）
   feature: StrokeFeature; // markup / handwriting / drawing
   scored: ScoredGesture;  // 中性几何形状（+ 箭头方向）
-  t: number;             // 组装时刻 performance.now() ms
+  t: number;             // 构成笔最早 pointerdown 的 epoch ms
   hmp: HMP | null;        // 落笔当时建好+取证（含 crop/转写）；跨页 session 不能在提交时重取
   markedText: string;     // 落笔当时解析好的"所标内容"（结构原文+转写）
   trace?: PipelineStage[]; // 落笔当时这笔经手的组件阶段（识别/OCR兜底/取证），提交时拼进整轮流水线（仅 DEV）
@@ -85,8 +85,9 @@ export function makeMark(
   scored: ScoredGesture,
   hmp: HMP | null,
   markedText: string,
+  t = Date.now(),
 ): Mark {
-  return { id: event.event_id, event, feature, scored, t: performance.now(), hmp, markedText };
+  return { id: event.event_id, event, feature, scored, t, hmp, markedText };
 }
 
 /** 按时间间隔把 session 的 mark 切成多段 burst（间隔 > BURST_GAP_MS 断开）。 */

@@ -1,5 +1,11 @@
 import type { NormBBox, OcrTextBlock } from '../core/contracts';
 
+const HANDWRITING_PLACEHOLDER = /^手写\s+\d+\s*笔$/;
+
+export function isUnrecognizedHandwritingText(mark: { marked_text?: string; ocr_empty?: boolean }): boolean {
+  return mark.ocr_empty === true || HANDWRITING_PLACEHOLDER.test((mark.marked_text || '').trim());
+}
+
 function overlapArea(a: NormBBox, b: NormBBox): number {
   const x = Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]));
   const y = Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));

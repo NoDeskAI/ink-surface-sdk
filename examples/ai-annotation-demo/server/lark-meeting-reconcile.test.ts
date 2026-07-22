@@ -112,6 +112,62 @@ describe('lark meeting reconcile', () => {
     }
   });
 
+  it('falls back to authorized users when owner/participants have no usable token, and merges real participants', async () => {
+    const root = seedRoot();
+    try {
+      seedLiveMeeting(root, { owner_open_id: 'ou_colleague' }); // 同事主持·参会人未采集（普通会飞书不投 join/leave）
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        code: 0,
+        data: { meeting: { id: 'm_evening', status: 3, end_time: '1784299500', participants: [{ id: 'ou_me' }, { id: 'ou_colleague' }] } },
+      }), { status: 200 }));
+      const result = await reconcileLarkLiveMeetings({
+        root,
+        nowMs: NOW_MS,
+        resolveUserToken: async (openId) => (openId === 'ou_me' ? 'token_me' : ''),
+        listFallbackOpenIds: () => ['ou_me'],
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+
+      expect(result).toMatchObject({ checked: 1, ended: 1, skipped: 0, enriched: 1 });
+      const [, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+      expect((init.headers as Record<string, string>).authorization).toBe('Bearer token_me');
+      const [record] = listLarkRealtimeMeetings(root, { nowMs: NOW_MS });
+      expect(record.status).toBe('ended');
+      expect(record.participant_open_ids).toEqual(expect.arrayContaining(['ou_me', 'ou_colleague']));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('enriches already-ended meetings missing participants in the second pass', async () => {
+    const root = seedRoot();
+    try {
+      seedLiveMeeting(root, { status: 'ended', ended_at: new Date(NOW_MS - 60_000).toISOString(), owner_open_id: 'ou_owner' });
+      const fetchImpl = vi.fn(async (url: string) => {
+        expect(url).toContain('with_participants=true');
+        expect(url).toContain('user_id_type=open_id');
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { meeting: { id: 'm_evening', status: 3, participants: [{ id: 'ou_owner' }, { id: 'ou_guest' }] } },
+        }), { status: 200 });
+      });
+      const result = await reconcileLarkLiveMeetings({
+        root,
+        nowMs: NOW_MS,
+        resolveUserToken: async (openId) => (openId === 'ou_owner' ? 'token_owner' : ''),
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+
+      expect(result).toMatchObject({ checked: 0, ended: 0, enriched: 1 });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [record] = listLarkRealtimeMeetings(root, { nowMs: NOW_MS });
+      expect(record.participant_open_ids).toEqual(expect.arrayContaining(['ou_owner', 'ou_guest']));
+      expect(record.status).toBe('ended');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('ignores meetings younger than minLiveAgeMs and non-live records', () => {
     const root = seedRoot();
     try {

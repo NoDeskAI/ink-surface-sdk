@@ -72,12 +72,80 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     }))).toEqual(['google_meet:local-google-meeting']);
   });
 
+  it('Zoom 与 Teams 导出只读取各自平台缓存 token', () => {
+    expect(meetingTranscriptCacheTokens(meeting({
+      platform: 'zoom',
+      meeting_id: 'local-zoom-meeting',
+      feishu_minute_token: 'must-not-leak',
+    }))).toEqual(['zoom:local-zoom-meeting:20231114T221320Z']);
+    expect(meetingTranscriptCacheTokens(meeting({
+      platform: 'microsoft_teams',
+      meeting_id: 'local-teams-meeting',
+      feishu_minute_token: 'must-not-leak',
+    }))).toEqual(['microsoft_teams:local-teams-meeting']);
+  });
+
+  it('会议 markdown 投影在有参会数据时增加聚合区间，无数据时不增加', async () => {
+    const withParticipants = await assembleMeetingL1Export(input({
+      meeting: meeting({
+        platform: 'zoom',
+        provider_participants: [
+          { name: 'Ada', joined_at: '2026-07-18T09:00:00', left_at: '2026-07-18T09:20:00', identity: 'signed_in' },
+          { name: 'Ada', joined_at: '2026-07-18T09:30:00', left_at: '2026-07-18T09:45:00', identity: 'signed_in' },
+          { name: '外部同事', joined_at: '2026-07-18T09:05:00', left_at: '2026-07-18T09:15:00', identity: 'anonymous' },
+        ],
+      }),
+    }), OPTS);
+    const participantBlocks = withParticipants.documentProjections.document_projections[0].blocks.slice(0, 3)
+      .map(({ kind, heading_level, text_md }) => ({ kind, heading_level, text_md }));
+
+    expect(participantBlocks).toMatchInlineSnapshot(`
+      [
+        {
+          "heading_level": 2,
+          "kind": "heading",
+          "text_md": "参会（2 人）",
+        },
+        {
+          "heading_level": undefined,
+          "kind": "paragraph",
+          "text_md": "Ada · 共 35 分钟 · 2 段：09:00–09:20、09:30–09:45",
+        },
+        {
+          "heading_level": undefined,
+          "kind": "paragraph",
+          "text_md": "外部同事（访客） · 共 10 分钟 · 09:05–09:15",
+        },
+      ]
+    `);
+    const withoutParticipants = await assembleMeetingL1Export(input(), OPTS);
+    expect(withoutParticipants.documentProjections.document_projections[0].blocks.some((block) => block.text_md.startsWith('参会（'))).toBe(false);
+  });
+
   it('手写零丢失：每笔 → 一条 annotation KO', async () => {
     const out = await assembleMeetingL1Export(input(), OPTS);
     const anns = out.knowledgeExport.objects.filter((k) => k.kind === 'annotation');
     expect(anns).toHaveLength(3); // a/b/c
     expect(out.diagnostics.annotationKoCount).toBe(3);
     expect(out.diagnostics.markCount).toBe(3);
+  });
+
+  it('三段手写 KO 只给会中标注转写时钟', async () => {
+    const out = await assembleMeetingL1Export(input({
+      marks: [
+        mk('pre', -120, '会前记录'),
+        mk('in', 30, '会中记录'),
+        mk('post', 800, '会后记录'),
+      ],
+    }), OPTS);
+
+    expect(out.knowledgeExport.objects.filter((item) => item.kind === 'annotation').map((item) => item.body_md)).toMatchInlineSnapshot(`
+      [
+        "会前记录　（会前准备手写）",
+        "会中记录　（约 0:30 处手写）",
+        "会后记录　（会后补充手写）",
+      ]
+    `);
   });
 
   it('会议输出候选 -> 一条 summary KO', async () => {
@@ -170,6 +238,15 @@ describe('assembleMeetingL1Export（会议→L1）', () => {
     expect(out.diagnostics.transcriptMissing).toBe(true);
     expect(out.knowledgeExport.objects.filter((k) => k.kind === 'annotation')).toHaveLength(3);
   });
+
+  it('does not export an OCR placeholder as literal user text', async () => {
+    const out = await assembleMeetingL1Export(input({
+      marks: [{ ...mkInk('ocr-empty', 15), marked_text: '手写 4 笔', ocr_empty: true }],
+    }), OPTS);
+    const annotation = out.knowledgeExport.objects.find((item) => item.kind === 'annotation');
+    expect(annotation?.body_md).toContain('无法识别的手写·别推断其文字含义');
+    expect(annotation?.body_md).not.toContain('手写 4 笔');
+  });
 });
 
 describe('assembleMeetingL1Export（存储原生拓扑：KO-KO 关系层 same_context，零 LLM）', () => {
@@ -203,7 +280,12 @@ describe('assembleMeetingL1Export（存储原生拓扑：KO-KO 关系层 same_co
 
 describe('assembleMeetingL1Export（笔迹 SVG 内嵌导出：visualModel）', () => {
   it('带 strokes 的手写 mark → visualModel 里对应 ko_id 挂上 visual_strokes', async () => {
-    const out = await assembleMeetingL1Export(input({ marks: [mkInk('a', 15)] }), OPTS);
+    const out = await assembleMeetingL1Export(input({ marks: [mkInk('a', 15, {
+      pen_down_at: T0 + 15_000,
+      ocr_at: T0 + 20_000,
+      ocr_fingerprint: 'bo1_export',
+      ocr_empty: false,
+    })] }), OPTS);
     const annKo = out.knowledgeExport.objects.find((k) => k.kind === 'annotation')!;
     const annotations = out.visualModel.blocks.flatMap((b) => b.annotations);
     const mine = annotations.find((a) => a.ko_id === annKo.ko_id);
@@ -211,6 +293,12 @@ describe('assembleMeetingL1Export（笔迹 SVG 内嵌导出：visualModel）', (
     expect(mine!.visual_strokes).toHaveLength(1);
     expect(mine!.visual_strokes![0].points).toHaveLength(2);
     expect(mine!.render_mode).toBe('stroke_only');
+    expect((mine as typeof mine & { inkloop_mark?: Record<string, unknown> })?.inkloop_mark).toMatchObject({
+      pen_down_at: T0 + 15_000,
+      ocr_at: T0 + 20_000,
+      ocr_fingerprint: 'bo1_export',
+      ocr_empty: false,
+    });
   });
 
   it('surface_points 存在时同时填 surface_strokes', async () => {

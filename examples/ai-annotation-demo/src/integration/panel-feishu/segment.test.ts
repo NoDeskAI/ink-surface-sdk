@@ -136,4 +136,12 @@ describe('buildSegmentMarks（relMs 换算）', () => {
     const out = buildSegmentMarks([{ mark_id: 'x', abs_timestamp: t0 + 30_000 }], t0, 10_000);
     expect(out[0].relMs).toBe(20_000);
   });
+
+  it('新数据用 pen_down_at，旧数据仍回退 abs_timestamp', () => {
+    const out = buildSegmentMarks([
+      { mark_id: 'new', abs_timestamp: t0 + 90_000, pen_down_at: t0 + 12_000 },
+      { mark_id: 'old', abs_timestamp: t0 + 20_000 },
+    ], t0, 0);
+    expect(out.map((m) => [m.mark_id, m.relMs])).toEqual([['new', 12_000], ['old', 20_000]]);
+  });
 });
