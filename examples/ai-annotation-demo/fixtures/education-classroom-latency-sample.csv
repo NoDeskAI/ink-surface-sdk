@@ -1,0 +1,13 @@
+run_id,scenario,device_id,event_id,teacher_sample_timestamp_ms,render_commit_timestamp_ms,dropped
+education_fixture,browser_simulation,student_1,ink_1,1000,1042,false
+education_fixture,browser_simulation,student_2,ink_1,1000,1051,false
+education_fixture,browser_simulation,student_1,ink_2,1100,1140,false
+education_fixture,browser_simulation,student_2,ink_2,1100,1158,false
+education_fixture,browser_simulation,student_1,ink_3,1200,1247,false
+education_fixture,browser_simulation,student_2,ink_3,1200,1261,false
+education_fixture,browser_simulation,student_1,ink_4,1300,1346,false
+education_fixture,browser_simulation,student_2,ink_4,1300,1369,false
+education_fixture,browser_simulation,student_1,ink_5,1400,1449,false
+education_fixture,browser_simulation,student_2,ink_5,1400,1476,false
+education_fixture,browser_simulation,student_1,ink_6,1500,1554,false
+education_fixture,browser_simulation,student_2,ink_6,1500,1580,false

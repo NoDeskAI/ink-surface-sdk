@@ -2,6 +2,7 @@
 // 原为 mobile.html 末尾的内联 <script>，抽出成模块（正规化）。行为与原内联脚本逐条等价，仅加空值守卫。
 // 真数据/钻取（会议进入、dev 段切换、settings 绑定）仍由 mobile/meeting.ts、mobile/dev.ts controller 接管。
 import { setTool, type Tool } from '../app/state';
+import { inkToolFromControlKey } from '../core/ink-tool-controls';
 
 const B = document.body;
 
@@ -11,18 +12,6 @@ const byId = (v: string): HTMLElement | null => document.getElementById(v);
 const FLOATING_TOOLS_KEY = 'inkloop.mobile.floating-tools.v1';
 const FLOATING_TOOLS_DRAG_THRESHOLD_PX = 6;
 const FLOATING_TOOLS_CLICK_SUPPRESS_MS = 500;
-const TOOL_MAP: Record<string, Tool> = {
-  pen: 'pen',
-  ai: 'aipen',
-  aipen: 'aipen',
-  hi: 'highlighter',
-  highlighter: 'highlighter',
-  ul: 'underline',
-  underline: 'underline',
-  er: 'eraser',
-  eraser: 'eraser',
-  hand: 'hand',
-};
 
 /** 设/清一个导航按钮的 on/dim 态 + 其所属 .rl-item 的 cur 态（与原内联脚本同义）。 */
 function setBtn(b: HTMLElement, on: boolean): void {
@@ -240,7 +229,7 @@ export function initMobileShell(): void {
   });
   for (const b of $$('[data-tool]')) {
     b.addEventListener('click', () => {
-      const tool = b.dataset.tool ? TOOL_MAP[b.dataset.tool] : undefined;
+      const tool = inkToolFromControlKey(b.dataset.tool) as Tool | undefined;
       if (tool) setTool(tool);
       for (const x of $$('[data-tool]')) x.classList.remove('on');
       b.classList.add('on');

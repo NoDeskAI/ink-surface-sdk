@@ -88,7 +88,7 @@ function localReferencesFromHtml(relativeHtmlPath) {
 }
 
 function verifyEntrypoints() {
-  const entries = ['ai-pen-demo.html', 'index.html', 'mobile.html'];
+  const entries = ['ai-pen-demo.html', 'index.html', 'mobile.html', 'teacher-classroom.html', 'student-classroom.html'];
   if (!mustExist(distDir, 'dist directory')) return;
   if (!mustExist(androidAssetDir, 'Android assets directory')) return;
   for (const entry of entries) {

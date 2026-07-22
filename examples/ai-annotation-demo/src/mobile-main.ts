@@ -14,12 +14,13 @@ import { initReader, readerFlip, readerArmBackward, readerVInfo, readerSetVPage,
 import { initDevOverlay } from './dev/dev-overlay';
 import { wireAnnotationLoop, flushBoardOcrMarks, flushRegion } from './app/annotation-loop';
 import { triggerBoardOcr } from './capture/board-ocr';
-import { setTool, getActiveContext, state, settings, saveSettings, bus, currentStrokes, strokeMarkIds, type Stroke, type Tool } from './app/state';
+import { setTool, getActiveContext, state, settings, saveSettings, bus, currentStrokes, strokeMarkIds, type Stroke } from './app/state';
 import type { NormBBox, ScreenOverlay, StrokePoint } from './core/contracts';
 import { DEVICE_ID, pageIdFor, shortId } from './core/ids';
 import { appendAiTurnEntry, appendMarkEntry, createDiaryDoc, flushActiveDoc, getBookAiTurns, getFoldedMarks, getLibrarySyncRecord, listDiaries, listBooks, listLibraryItems, listLibrarySyncRecords, loadPdfBlob, setActiveDoc, setLastReadPage, setReadingProgress, setDiaryPageCount, setDocCoverImageDataUrl, renameDiary, deleteDiary, type LibraryShelfItem } from './local/store';
 import { confirmSheet, confirmSheetWithOption, infoSheet } from './mobile/sheet';
 import { redrawInk, undoStroke } from './capture/ink';
+import { inkToolFromControlKey, syncInkToolControls } from './core/ink-tool-controls';
 import { restoreLedgerState } from './controllers/ledger-restore';
 import { initEinkMirror, signalInkArea } from './surface/eink';
 import { disarmM103HqHwAreaNow, initM103HqHwArea } from './capture/m103-hqhw-area';
@@ -389,20 +390,13 @@ bus.on('context:switched', (ctx) => {
 });
 
 // 左缘工具格子（data-tool）→ 引擎 setTool：自由笔 / 文本锚定标记 / 擦。
-const TOOL: Record<string, Tool> = { pen: 'pen', ai: 'aipen', hi: 'highlighter', ul: 'underline', er: 'eraser' };
-const TOOL_KEY: Record<Tool, string> = { pen: 'pen', aipen: 'ai', highlighter: 'hi', underline: 'ul', eraser: 'er', hand: 'hand' };
 const toolButtons = [...document.querySelectorAll<HTMLElement>('[data-tool]')];
 if (state.tool === 'hand') setTool('pen');
 function syncToolButtons(): void {
-  const active = TOOL_KEY[state.tool] ?? 'pen';
-  for (const b of toolButtons) {
-    const on = b.dataset.tool === active;
-    b.classList.toggle('on', on);
-    b.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
+  syncInkToolControls(toolButtons, state.tool);
 }
 for (const b of toolButtons) {
-  b.addEventListener('click', () => { const t = TOOL[b.dataset.tool ?? '']; if (t) setTool(t); });
+  b.addEventListener('click', () => { const t = inkToolFromControlKey(b.dataset.tool); if (t) setTool(t); });
 }
 bus.on('tool', () => syncToolButtons());
 syncToolButtons();

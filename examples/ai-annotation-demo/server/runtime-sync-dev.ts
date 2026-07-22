@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { validateRuntimeSyncEvent, type RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import { validateRuntimeSyncEvent, type RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import { MemoryRuntimeSyncEventStore, type RuntimeSyncEventStore, type RuntimeSyncNamespace, type StoredRuntimeEvent } from './runtime-sync-store';
 
 export interface RuntimeSyncSessionContext {

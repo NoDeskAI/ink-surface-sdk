@@ -23,7 +23,7 @@ import {
   type LessonGraph,
   type MeetingGraph,
   type RuntimeSchemaValidationIssue,
-} from '../../../packages/runtime-schema/src/index';
+} from 'ink-surface-sdk/runtime-schema';
 
 type WorkerStatus = 'completed' | 'retry_scheduled' | 'rejected';
 

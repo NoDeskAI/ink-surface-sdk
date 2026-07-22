@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import type { RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 
 const execFileAsync = promisify(execFile);
 

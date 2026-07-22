@@ -2,6 +2,11 @@ export const RUNTIME_SYNC_EVENT_SCHEMA_VERSION = 'inkloop.runtime_sync_event.v1'
 export const RUNTIME_SURFACE_OBJECT_SCHEMA_VERSION = 'inkloop.surface_object.v1' as const;
 export const INKLOOP_AI_PEN_CONTRACT_VERSION = 'inkloop.ai_pen.v1' as const;
 export const AI_GRAPH_JOB_SCHEMA_VERSION = 'inkloop.ai_graph_job.v1' as const;
+export const CLASSROOM_SCHEMA_VERSION = 'inkloop.classroom.v1' as const;
+export const CLASSROOM_MAX_STROKE_POINTS = 4_096;
+export const CLASSROOM_MAX_PREVIEW_POINTS = 256;
+export const CLASSROOM_WORLD_COORDINATE_LIMIT = 1_000_000;
+export const CLASSROOM_WORLD_GEOMETRY_VERSION = 'classroom_page_world_v1' as const;
 
 export interface RuntimeSchemaValidationIssue {
   path: string;
@@ -9,6 +14,33 @@ export interface RuntimeSchemaValidationIssue {
 }
 
 export type RuntimeNormBBox = [number, number, number, number];
+export type ClassroomWorldBBox = [number, number, number, number];
+
+export interface ClassroomWorldPoint {
+  x_world: number;
+  y_world: number;
+  t_ms: number;
+  pressure?: number;
+}
+
+export interface ClassroomSpatialRegion {
+  coordinate_space: typeof CLASSROOM_WORLD_GEOMETRY_VERSION;
+  surface: ClassroomSurfaceRef;
+  bbox_world: ClassroomWorldBBox;
+}
+
+export interface ClassroomPageViewport {
+  center_x_world: number;
+  center_y_world: number;
+  zoom_scale: number;
+}
+
+export interface ClassroomPageGeometry {
+  page_index: number;
+  width_world: number;
+  height_world: number;
+  rotation: 0 | 90 | 180 | 270;
+}
 
 export type InkLoopSessionMode = 'teach' | 'meeting' | 'paper';
 
@@ -83,6 +115,8 @@ export interface InkEvent {
     color?: string;
     tool?: 'pen' | 'highlighter' | 'underline' | 'eraser';
     mode?: InkLoopSessionMode;
+    /** Tombstones produced by an eraser/undo action. Source strokes remain in the append-only ledger. */
+    erased_event_ids?: string[];
   };
 }
 
@@ -152,6 +186,7 @@ export type InkLoopSourceRef =
       ts_start_ms: number;
       ts_end_ms: number;
       bbox_norm?: RuntimeNormBBox;
+      spatial_region?: ClassroomSpatialRegion;
     }
   | {
       type: 'board_object';
@@ -167,6 +202,13 @@ export type InkLoopSourceRef =
       end_ms: number;
       speaker?: string;
       transcript_ref?: string;
+    }
+  | {
+      type: 'material_page';
+      session_id: string;
+      material_id: string;
+      page_index: number;
+      bbox_norm?: RuntimeNormBBox;
     }
   | {
       type: 'project_memory';
@@ -306,6 +348,350 @@ export interface AiGraphJob {
   updated_at: string;
   completed_at?: string;
   error?: string;
+}
+
+export type ClassroomStatus = 'draft' | 'live' | 'ended';
+export type ClassroomRole = 'teacher' | 'participant';
+
+export interface ClassroomCapabilities {
+  textbook: boolean;
+  recognition: boolean;
+  audio: boolean;
+  transcript: boolean;
+}
+
+export type ClassroomSurfaceRef =
+  | { kind: 'teacher_board' }
+  | { kind: 'textbook_page'; material_id: string; page_index: number }
+  | { kind: 'scratch'; scratch_id: string; linked_material_id?: string; linked_page_index?: number; linked_bbox_norm?: RuntimeNormBBox };
+
+export interface ClassroomMaterial {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  material_id: string;
+  title: string;
+  mime_type: 'application/pdf';
+  byte_size: number;
+  content_hash: `sha256:${string}`;
+  page_count: number;
+  page_geometries?: ClassroomPageGeometry[];
+  source: 'builtin' | 'teacher_upload';
+  published_at: string;
+}
+
+export interface ClassroomTeacherView {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  material_id: string;
+  page_index: number;
+  zoom_mode: 'fit-page' | 'fit-width' | 'percent';
+  zoom_percent: number;
+  viewport?: ClassroomPageViewport;
+  page_viewports?: Record<string, ClassroomPageViewport>;
+  active_surface: ClassroomSurfaceRef;
+  revision: number;
+  updated_at: string;
+}
+
+export interface ClassroomConfirmedFocus {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  focus_id: string;
+  material_id: string;
+  page_index: number;
+  bbox_norm?: RuntimeNormBBox;
+  spatial_region?: ClassroomSpatialRegion;
+  confirmed_at: string;
+}
+
+export type ClassroomRecognitionStatus = 'pending' | 'confirmed' | 'corrected' | 'dismissed' | 'failed';
+
+export interface ClassroomRecognitionRevision {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  recognition_id: string;
+  revision: number;
+  status: ClassroomRecognitionStatus;
+  kind: 'formula' | 'text' | 'mixed';
+  text: string;
+  latex?: string;
+  confidence: number;
+  provider: string;
+  processing_mode: 'local' | 'external';
+  event_ids: string[];
+  surface: ClassroomSurfaceRef;
+  bbox_norm?: RuntimeNormBBox;
+  spatial_region?: ClassroomSpatialRegion;
+  error_code?: string;
+  original_revision?: number;
+  created_at: string;
+  reviewed_at?: string;
+}
+
+export interface ClassroomRecordingState {
+  recording_id: string;
+  classroom_id: string;
+  classroom_generation: number;
+  recording_generation: number;
+  state: 'recording' | 'stopped' | 'interrupted';
+  health: 'healthy' | 'incomplete';
+  sample_rate?: number;
+  channels?: number;
+  chunk_count: number;
+  byte_count: number;
+  last_sequence: number;
+  last_relative_end_ms: number;
+  started_at: string;
+  stopped_at?: string;
+  interrupted_at?: string;
+}
+
+export type ClassroomTranscriptRevisionStatus = 'provisional' | 'final' | 'corrected';
+
+export interface ClassroomTranscriptRevision {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  transcript_id: string;
+  revision: number;
+  status: ClassroomTranscriptRevisionStatus;
+  recording_id: string;
+  recording_generation: number;
+  chunk_id: string;
+  chunk_hash: `sha256:${string}`;
+  relative_start_ms: number;
+  relative_end_ms: number;
+  text: string;
+  confidence: number;
+  language: string;
+  provider: string;
+  processing_mode: 'local' | 'external';
+  original_revision?: number;
+  created_at: string;
+  corrected_at?: string;
+}
+
+export interface ClassroomTranscriptionState {
+  classroom_id: string;
+  recording_id: string;
+  recording_generation: number;
+  state: 'transcribing' | 'ready' | 'delayed' | 'failed';
+  provider: string;
+  processing_mode: 'local' | 'external';
+  processed_chunk_count: number;
+  failed_chunk_count: number;
+  retryable_chunk_ids?: string[];
+  last_error_code?: string;
+  audio_available: boolean;
+  audio_deleted_at?: string;
+  updated_at: string;
+}
+
+export type ClassroomDeliveryMode = 'audio_with_subtitles' | 'subtitles_only' | 'textbook_board_only';
+
+export type ClassroomTimelineEntry =
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'board_event_ref';
+      occurred_at: string;
+      board_sequence: number;
+      event_id: string;
+      surface: ClassroomSurfaceRef;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'teacher_view';
+      occurred_at: string;
+      teacher_view: ClassroomTeacherView;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'confirmed_focus';
+      occurred_at: string;
+      confirmed_focus: ClassroomConfirmedFocus;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'material_published';
+      occurred_at: string;
+      material: ClassroomMaterial;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'recognition_revision';
+      occurred_at: string;
+      recognition: ClassroomRecognitionRevision;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'recording_state';
+      occurred_at: string;
+      recording: ClassroomRecordingState;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'transcript_revision';
+      occurred_at: string;
+      transcript: ClassroomTranscriptRevision;
+    }
+  | {
+      schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+      classroom_id: string;
+      timeline_sequence: number;
+      kind: 'transcription_state';
+      occurred_at: string;
+      transcription: ClassroomTranscriptionState;
+    };
+
+export interface ClassroomSharedState {
+  capabilities: ClassroomCapabilities;
+  timeline_sequence: number;
+  materials: ClassroomMaterial[];
+  teacher_view?: ClassroomTeacherView;
+  confirmed_focus?: ClassroomConfirmedFocus;
+  recognitions?: ClassroomRecognitionRevision[];
+  recording?: ClassroomRecordingState;
+  transcripts?: ClassroomTranscriptRevision[];
+  transcription?: ClassroomTranscriptionState;
+}
+
+export interface ClassroomSessionSummary {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  class_code?: string;
+  title?: string;
+  status: ClassroomStatus;
+  role: ClassroomRole;
+  created_at: string;
+  started_at?: string;
+  ended_at?: string;
+  latest_sequence: number;
+  capabilities?: ClassroomCapabilities;
+}
+
+export interface ClassroomLegacyBoardEvent {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  sequence: number;
+  client_event_id: string;
+  accepted_at: string;
+  event: InkEvent;
+  stroke: InkLoopStroke;
+  surface?: ClassroomSurfaceRef;
+  geometry_version?: 'normalized_v1';
+}
+
+export interface ClassroomWorldBoardEvent {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  sequence: number;
+  client_event_id: string;
+  accepted_at: string;
+  geometry_version: typeof CLASSROOM_WORLD_GEOMETRY_VERSION;
+  surface: Extract<ClassroomSurfaceRef, { kind: 'textbook_page' }>;
+  event: Omit<InkEvent, 'bbox_norm'> & { bbox_world: ClassroomWorldBBox };
+  stroke: Omit<InkLoopStroke, 'points' | 'bbox_norm'> & { points_world: ClassroomWorldPoint[]; bbox_world: ClassroomWorldBBox };
+}
+
+export type ClassroomBoardEvent = ClassroomLegacyBoardEvent | ClassroomWorldBoardEvent;
+export type ClassroomBoardEventInput =
+  | Omit<ClassroomLegacyBoardEvent, 'sequence' | 'accepted_at'>
+  | Omit<ClassroomWorldBoardEvent, 'sequence' | 'accepted_at'>;
+
+export interface ClassroomLegacyPreview {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  client_event_id: string;
+  revision: number;
+  points: InkLoopStrokePoint[];
+  tool: 'pen' | 'highlighter' | 'underline' | 'eraser';
+  color?: string;
+  expires_at_ms: number;
+  surface?: ClassroomSurfaceRef;
+  geometry_version?: 'normalized_v1';
+}
+
+export interface ClassroomWorldPreview {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  client_event_id: string;
+  revision: number;
+  geometry_version: typeof CLASSROOM_WORLD_GEOMETRY_VERSION;
+  points_world: ClassroomWorldPoint[];
+  tool: 'pen' | 'highlighter' | 'underline' | 'eraser';
+  color?: string;
+  expires_at_ms: number;
+  surface: Extract<ClassroomSurfaceRef, { kind: 'textbook_page' }>;
+}
+
+export type ClassroomPreview = ClassroomLegacyPreview | ClassroomWorldPreview;
+
+export interface ClassroomSnapshot {
+  schema_version: typeof CLASSROOM_SCHEMA_VERSION;
+  classroom_id: string;
+  classroom_status: ClassroomStatus;
+  snapshot_sequence: number;
+  board_events: ClassroomBoardEvent[];
+  capabilities?: ClassroomCapabilities;
+  timeline_sequence?: number;
+  materials?: ClassroomMaterial[];
+  teacher_view?: ClassroomTeacherView;
+  confirmed_focus?: ClassroomConfirmedFocus;
+  recognitions?: ClassroomRecognitionRevision[];
+  recording?: ClassroomRecordingState;
+  transcripts?: ClassroomTranscriptRevision[];
+  transcription?: ClassroomTranscriptionState;
+  generated_at: string;
+}
+
+export interface ClassroomEvidenceCheckpoint {
+  checkpoint_id: string;
+  classroom_id: string;
+  sequence_start: number;
+  sequence_end: number;
+  time_start_ms: number;
+  time_end_ms: number;
+  selection_bbox_norm?: RuntimeNormBBox;
+  selection_region?: ClassroomSpatialRegion;
+  source_refs: InkLoopSourceRef[];
+  recognition_revision_fingerprint?: string;
+  transcript_revision_fingerprint?: string;
+  evidence_revision_fingerprint?: string;
+}
+
+export type ClassroomEvidenceIntent = 'current_step' | 'selected_region' | 'missed_segment' | 'class_summary' | 'practice' | 'lesson_graph';
+export type ClassroomEvidenceTrustStatus = 'trusted' | 'needs_confirmation' | 'insufficient';
+
+export interface ClassroomEvidenceBundle {
+  intent: ClassroomEvidenceIntent;
+  classroom_id: string;
+  checkpoint: ClassroomEvidenceCheckpoint;
+  fingerprint: string;
+  trust_status: ClassroomEvidenceTrustStatus;
+  missing_sources: Array<'material' | 'trusted_formula' | 'trusted_transcript'>;
+  material?: {
+    material_id: string;
+    title: string;
+    page_index: number;
+    bbox_norm?: RuntimeNormBBox;
+  };
+  events: ClassroomBoardEvent[];
+  recognitions: ClassroomRecognitionRevision[];
+  transcripts: ClassroomTranscriptRevision[];
+  source_refs: InkLoopSourceRef[];
 }
 
 export type InkLoopAiResultKind =
@@ -645,6 +1031,413 @@ function diagramEvidenceCount(sourceRefs: readonly InkLoopSourceRef[]): number {
     if (ref.type !== 'board_object') return false;
     return ['diagram_node', 'diagram_edge', 'arrow', 'shape'].includes(String(ref.object_type));
   }).length;
+}
+
+function validateNonEmptyString(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (typeof value !== 'string' || value.trim() === '') issues.push({ path, message: 'must be a non-empty string' });
+}
+
+function validateIntegerAtLeast(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[], minimum: number): void {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum) {
+    issues.push({ path, message: `must be an integer greater than or equal to ${minimum}` });
+  }
+}
+
+function validateNormBBox(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!Array.isArray(value) || value.length !== 4) {
+    issues.push({ path, message: 'must be a normalized [x, y, width, height] tuple' });
+    return;
+  }
+  if (value.some((item) => typeof item !== 'number' || !Number.isFinite(item) || item < 0 || item > 1)) {
+    issues.push({ path, message: 'all values must be finite numbers between 0 and 1' });
+    return;
+  }
+  if (value[0] + value[2] > 1 || value[1] + value[3] > 1) {
+    issues.push({ path, message: 'rectangle must remain inside normalized bounds' });
+  }
+}
+
+function validateWorldBBox(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!Array.isArray(value) || value.length !== 4) {
+    issues.push({ path, message: 'must be a world [x, y, width, height] tuple' });
+    return;
+  }
+  if (value.some((item) => typeof item !== 'number' || !Number.isFinite(item))) {
+    issues.push({ path, message: 'all values must be finite numbers' });
+    return;
+  }
+  if (Math.abs(value[0]) > CLASSROOM_WORLD_COORDINATE_LIMIT || Math.abs(value[1]) > CLASSROOM_WORLD_COORDINATE_LIMIT
+    || value[2] < 0 || value[3] < 0 || value[2] > CLASSROOM_WORLD_COORDINATE_LIMIT || value[3] > CLASSROOM_WORLD_COORDINATE_LIMIT
+    || Math.abs(value[0] + value[2]) > CLASSROOM_WORLD_COORDINATE_LIMIT || Math.abs(value[1] + value[3]) > CLASSROOM_WORLD_COORDINATE_LIMIT) {
+    issues.push({ path, message: `must remain within ±${CLASSROOM_WORLD_COORDINATE_LIMIT} world units with non-negative size` });
+  }
+}
+
+function validateWorldPoint(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) { issues.push({ path, message: 'must be an object' }); return; }
+  validateNumberRange(value.x_world, `${path}.x_world`, issues, -CLASSROOM_WORLD_COORDINATE_LIMIT, CLASSROOM_WORLD_COORDINATE_LIMIT);
+  validateNumberRange(value.y_world, `${path}.y_world`, issues, -CLASSROOM_WORLD_COORDINATE_LIMIT, CLASSROOM_WORLD_COORDINATE_LIMIT);
+  validateFiniteNumber(value.t_ms, `${path}.t_ms`, issues);
+  if (value.pressure !== undefined) validateNumberRange(value.pressure, `${path}.pressure`, issues, 0, 1);
+}
+
+function validateClassroomPoint(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) {
+    issues.push({ path, message: 'must be an object' });
+    return;
+  }
+  validateNumberRange(value.x_norm, `${path}.x_norm`, issues, 0, 1);
+  validateNumberRange(value.y_norm, `${path}.y_norm`, issues, 0, 1);
+  validateFiniteNumber(value.t_ms, `${path}.t_ms`, issues);
+  if (value.pressure !== undefined) validateNumberRange(value.pressure, `${path}.pressure`, issues, 0, 1);
+}
+
+function validateClassroomSurface(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) { issues.push({ path, message: 'must be an object' }); return; }
+  if (value.kind === 'teacher_board') return;
+  if (value.kind === 'textbook_page') {
+    validateNonEmptyString(value.material_id, `${path}.material_id`, issues);
+    validateIntegerAtLeast(value.page_index, `${path}.page_index`, issues, 0);
+    return;
+  }
+  if (value.kind === 'scratch') {
+    validateNonEmptyString(value.scratch_id, `${path}.scratch_id`, issues);
+    if (value.linked_material_id !== undefined) validateNonEmptyString(value.linked_material_id, `${path}.linked_material_id`, issues);
+    if (value.linked_page_index !== undefined) validateIntegerAtLeast(value.linked_page_index, `${path}.linked_page_index`, issues, 0);
+    if (value.linked_bbox_norm !== undefined) validateNormBBox(value.linked_bbox_norm, `${path}.linked_bbox_norm`, issues);
+    return;
+  }
+  issues.push({ path: `${path}.kind`, message: 'must be teacher_board, textbook_page, or scratch' });
+}
+
+function validateClassroomSpatialRegion(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) { issues.push({ path, message: 'must be an object' }); return; }
+  if (value.coordinate_space !== CLASSROOM_WORLD_GEOMETRY_VERSION) issues.push({ path: `${path}.coordinate_space`, message: `must be ${CLASSROOM_WORLD_GEOMETRY_VERSION}` });
+  validateClassroomSurface(value.surface, `${path}.surface`, issues);
+  validateWorldBBox(value.bbox_world, `${path}.bbox_world`, issues);
+}
+
+function validateClassroomPageViewport(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) { issues.push({ path, message: 'must be an object' }); return; }
+  validateNumberRange(value.center_x_world, `${path}.center_x_world`, issues, -CLASSROOM_WORLD_COORDINATE_LIMIT, CLASSROOM_WORLD_COORDINATE_LIMIT);
+  validateNumberRange(value.center_y_world, `${path}.center_y_world`, issues, -CLASSROOM_WORLD_COORDINATE_LIMIT, CLASSROOM_WORLD_COORDINATE_LIMIT);
+  validateNumberRange(value.zoom_scale, `${path}.zoom_scale`, issues, 0.5, 4);
+}
+
+export function validateClassroomTeacherView(value: unknown, path = 'teacher_view'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateNonEmptyString(value.material_id, `${path}.material_id`, issues);
+  validateIntegerAtLeast(value.page_index, `${path}.page_index`, issues, 0);
+  if (!['fit-page', 'fit-width', 'percent'].includes(String(value.zoom_mode))) issues.push({ path: `${path}.zoom_mode`, message: 'must be fit-page, fit-width, or percent' });
+  validateNumberRange(value.zoom_percent, `${path}.zoom_percent`, issues, 50, 400);
+  if (value.viewport !== undefined) validateClassroomPageViewport(value.viewport, `${path}.viewport`, issues);
+  if (value.page_viewports !== undefined) {
+    if (!isRecord(value.page_viewports)) issues.push({ path: `${path}.page_viewports`, message: 'must be an object' });
+    else for (const [key, viewport] of Object.entries(value.page_viewports)) {
+      if (!/^[A-Za-z0-9_-]+:[0-9]+$/.test(key)) issues.push({ path: `${path}.page_viewports.${key}`, message: 'must use material_id:page_index keys' });
+      validateClassroomPageViewport(viewport, `${path}.page_viewports.${key}`, issues);
+    }
+  }
+  validateClassroomSurface(value.active_surface, `${path}.active_surface`, issues);
+  if (isRecord(value.active_surface) && value.active_surface.kind === 'textbook_page'
+    && (value.active_surface.material_id !== value.material_id || value.active_surface.page_index !== value.page_index)) {
+    issues.push({ path: `${path}.active_surface`, message: 'must match teacher_view material_id and page_index' });
+  }
+  validateIntegerAtLeast(value.revision, `${path}.revision`, issues, 1);
+  validateNonEmptyString(value.updated_at, `${path}.updated_at`, issues);
+  return issues;
+}
+
+export function validateClassroomConfirmedFocus(value: unknown, path = 'confirmed_focus'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateNonEmptyString(value.focus_id, `${path}.focus_id`, issues);
+  validateNonEmptyString(value.material_id, `${path}.material_id`, issues);
+  validateIntegerAtLeast(value.page_index, `${path}.page_index`, issues, 0);
+  if (value.bbox_norm === undefined && value.spatial_region === undefined) issues.push({ path, message: 'must include bbox_norm or spatial_region' });
+  if (value.bbox_norm !== undefined) validateNormBBox(value.bbox_norm, `${path}.bbox_norm`, issues);
+  if (value.spatial_region !== undefined) validateClassroomSpatialRegion(value.spatial_region, `${path}.spatial_region`, issues);
+  if (isRecord(value.spatial_region) && isRecord(value.spatial_region.surface) && value.spatial_region.surface.kind === 'textbook_page'
+    && (value.spatial_region.surface.material_id !== value.material_id || value.spatial_region.surface.page_index !== value.page_index)) {
+    issues.push({ path: `${path}.spatial_region.surface`, message: 'must match confirmed focus material_id and page_index' });
+  }
+  validateNonEmptyString(value.confirmed_at, `${path}.confirmed_at`, issues);
+  return issues;
+}
+
+export function validateClassroomRecognitionRevision(value: unknown, path = 'recognition'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateNonEmptyString(value.recognition_id, `${path}.recognition_id`, issues);
+  validateIntegerAtLeast(value.revision, `${path}.revision`, issues, 1);
+  if (!['pending', 'confirmed', 'corrected', 'dismissed', 'failed'].includes(String(value.status))) issues.push({ path: `${path}.status`, message: 'must be a supported recognition status' });
+  if (!['formula', 'text', 'mixed'].includes(String(value.kind))) issues.push({ path: `${path}.kind`, message: 'must be formula, text, or mixed' });
+  if (value.status !== 'failed' && value.status !== 'dismissed') validateNonEmptyString(value.text, `${path}.text`, issues);
+  else if (typeof value.text !== 'string') issues.push({ path: `${path}.text`, message: 'must be a string' });
+  if (value.latex !== undefined && typeof value.latex !== 'string') issues.push({ path: `${path}.latex`, message: 'must be a string' });
+  validateNumberRange(value.confidence, `${path}.confidence`, issues, 0, 1);
+  validateNonEmptyString(value.provider, `${path}.provider`, issues);
+  if (!['local', 'external'].includes(String(value.processing_mode))) issues.push({ path: `${path}.processing_mode`, message: 'must be local or external' });
+  if (!Array.isArray(value.event_ids) || value.event_ids.length === 0 || value.event_ids.length > 24) issues.push({ path: `${path}.event_ids`, message: 'must contain 1 to 24 event IDs' });
+  else value.event_ids.forEach((eventId, index) => validateNonEmptyString(eventId, `${path}.event_ids.${index}`, issues));
+  validateClassroomSurface(value.surface, `${path}.surface`, issues);
+  if (value.bbox_norm === undefined && value.spatial_region === undefined) issues.push({ path, message: 'must include bbox_norm or spatial_region' });
+  if (value.bbox_norm !== undefined) validateNormBBox(value.bbox_norm, `${path}.bbox_norm`, issues);
+  if (value.spatial_region !== undefined) validateClassroomSpatialRegion(value.spatial_region, `${path}.spatial_region`, issues);
+  if (value.original_revision !== undefined) validateIntegerAtLeast(value.original_revision, `${path}.original_revision`, issues, 1);
+  validateNonEmptyString(value.created_at, `${path}.created_at`, issues);
+  if (['confirmed', 'corrected', 'dismissed'].includes(String(value.status))) validateNonEmptyString(value.reviewed_at, `${path}.reviewed_at`, issues);
+  if (value.status === 'failed') validateNonEmptyString(value.error_code, `${path}.error_code`, issues);
+  return issues;
+}
+
+export function validateClassroomRecordingState(value: unknown, path = 'recording'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  validateNonEmptyString(value.recording_id, `${path}.recording_id`, issues);
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateIntegerAtLeast(value.classroom_generation, `${path}.classroom_generation`, issues, 1);
+  validateIntegerAtLeast(value.recording_generation, `${path}.recording_generation`, issues, 1);
+  if (!['recording', 'stopped', 'interrupted'].includes(String(value.state))) issues.push({ path: `${path}.state`, message: 'must be recording, stopped, or interrupted' });
+  if (!['healthy', 'incomplete'].includes(String(value.health))) issues.push({ path: `${path}.health`, message: 'must be healthy or incomplete' });
+  if (value.sample_rate !== undefined && ![16_000, 24_000, 44_100, 48_000].includes(Number(value.sample_rate))) issues.push({ path: `${path}.sample_rate`, message: 'must be a supported PCM sample rate' });
+  if (value.channels !== undefined && ![1, 2].includes(Number(value.channels))) issues.push({ path: `${path}.channels`, message: 'must be mono or stereo' });
+  for (const key of ['chunk_count', 'byte_count', 'last_sequence', 'last_relative_end_ms']) validateIntegerAtLeast(value[key], `${path}.${key}`, issues, 0);
+  validateNonEmptyString(value.started_at, `${path}.started_at`, issues);
+  if (value.stopped_at !== undefined) validateNonEmptyString(value.stopped_at, `${path}.stopped_at`, issues);
+  if (value.interrupted_at !== undefined) validateNonEmptyString(value.interrupted_at, `${path}.interrupted_at`, issues);
+  if (value.state === 'stopped' && value.stopped_at === undefined) issues.push({ path: `${path}.stopped_at`, message: 'is required when recording is stopped' });
+  if (value.state === 'interrupted' && value.interrupted_at === undefined) issues.push({ path: `${path}.interrupted_at`, message: 'is required when recording is interrupted' });
+  return issues;
+}
+
+export function validateClassroomTranscriptRevision(value: unknown, path = 'transcript'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  for (const key of ['classroom_id', 'transcript_id', 'recording_id', 'chunk_id', 'text', 'language', 'provider', 'created_at']) validateNonEmptyString(value[key], `${path}.${key}`, issues);
+  validateIntegerAtLeast(value.revision, `${path}.revision`, issues, 1);
+  validateIntegerAtLeast(value.recording_generation, `${path}.recording_generation`, issues, 1);
+  if (!['provisional', 'final', 'corrected'].includes(String(value.status))) issues.push({ path: `${path}.status`, message: 'must be provisional, final, or corrected' });
+  if (typeof value.chunk_hash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.chunk_hash)) issues.push({ path: `${path}.chunk_hash`, message: 'must be a sha256 content hash' });
+  validateIntegerAtLeast(value.relative_start_ms, `${path}.relative_start_ms`, issues, 0);
+  validateIntegerAtLeast(value.relative_end_ms, `${path}.relative_end_ms`, issues, 1);
+  if (typeof value.relative_start_ms === 'number' && typeof value.relative_end_ms === 'number' && value.relative_end_ms <= value.relative_start_ms) issues.push({ path: `${path}.relative_end_ms`, message: 'must be after relative_start_ms' });
+  validateNumberRange(value.confidence, `${path}.confidence`, issues, 0, 1);
+  if (!['local', 'external'].includes(String(value.processing_mode))) issues.push({ path: `${path}.processing_mode`, message: 'must be local or external' });
+  if (value.original_revision !== undefined) validateIntegerAtLeast(value.original_revision, `${path}.original_revision`, issues, 1);
+  if (value.status === 'corrected') {
+    if (value.original_revision === undefined) issues.push({ path: `${path}.original_revision`, message: 'is required for corrected transcripts' });
+    validateNonEmptyString(value.corrected_at, `${path}.corrected_at`, issues);
+  }
+  return issues;
+}
+
+export function validateClassroomTranscriptionState(value: unknown, path = 'transcription'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  for (const key of ['classroom_id', 'recording_id', 'provider', 'updated_at']) validateNonEmptyString(value[key], `${path}.${key}`, issues);
+  validateIntegerAtLeast(value.recording_generation, `${path}.recording_generation`, issues, 1);
+  if (!['transcribing', 'ready', 'delayed', 'failed'].includes(String(value.state))) issues.push({ path: `${path}.state`, message: 'must be a supported transcription state' });
+  if (!['local', 'external'].includes(String(value.processing_mode))) issues.push({ path: `${path}.processing_mode`, message: 'must be local or external' });
+  validateIntegerAtLeast(value.processed_chunk_count, `${path}.processed_chunk_count`, issues, 0);
+  validateIntegerAtLeast(value.failed_chunk_count, `${path}.failed_chunk_count`, issues, 0);
+  if (value.retryable_chunk_ids !== undefined) {
+    if (!Array.isArray(value.retryable_chunk_ids) || value.retryable_chunk_ids.length > 64) issues.push({ path: `${path}.retryable_chunk_ids`, message: 'must be an array with at most 64 chunk IDs' });
+    else value.retryable_chunk_ids.forEach((chunkId, index) => validateNonEmptyString(chunkId, `${path}.retryable_chunk_ids.${index}`, issues));
+  }
+  if (typeof value.audio_available !== 'boolean') issues.push({ path: `${path}.audio_available`, message: 'must be boolean' });
+  if (value.audio_deleted_at !== undefined) validateNonEmptyString(value.audio_deleted_at, `${path}.audio_deleted_at`, issues);
+  if (value.audio_available === false && value.audio_deleted_at === undefined) issues.push({ path: `${path}.audio_deleted_at`, message: 'is required when audio is unavailable' });
+  if (['delayed', 'failed'].includes(String(value.state))) validateNonEmptyString(value.last_error_code, `${path}.last_error_code`, issues);
+  return issues;
+}
+
+export function validateClassroomTimelineEntry(value: unknown, path = 'timeline'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateIntegerAtLeast(value.timeline_sequence, `${path}.timeline_sequence`, issues, 1);
+  validateNonEmptyString(value.occurred_at, `${path}.occurred_at`, issues);
+  if (value.kind === 'board_event_ref') {
+    validateIntegerAtLeast(value.board_sequence, `${path}.board_sequence`, issues, 1);
+    validateNonEmptyString(value.event_id, `${path}.event_id`, issues);
+    validateClassroomSurface(value.surface, `${path}.surface`, issues);
+  } else if (value.kind === 'teacher_view') {
+    issues.push(...validateClassroomTeacherView(value.teacher_view, `${path}.teacher_view`));
+  } else if (value.kind === 'confirmed_focus') {
+    issues.push(...validateClassroomConfirmedFocus(value.confirmed_focus, `${path}.confirmed_focus`));
+  } else if (value.kind === 'material_published') {
+    validateClassroomMaterial(value.material, `${path}.material`, issues);
+  } else if (value.kind === 'recognition_revision') {
+    issues.push(...validateClassroomRecognitionRevision(value.recognition, `${path}.recognition`));
+  } else if (value.kind === 'recording_state') {
+    issues.push(...validateClassroomRecordingState(value.recording, `${path}.recording`));
+  } else if (value.kind === 'transcript_revision') {
+    issues.push(...validateClassroomTranscriptRevision(value.transcript, `${path}.transcript`));
+  } else if (value.kind === 'transcription_state') {
+    issues.push(...validateClassroomTranscriptionState(value.transcription, `${path}.transcription`));
+  } else issues.push({ path: `${path}.kind`, message: 'must be a supported timeline kind' });
+  if ('points' in value || 'stroke' in value) issues.push({ path, message: 'timeline entries must reference board events without copying stroke points' });
+  return issues;
+}
+
+function validateClassroomMaterial(value: unknown, path: string, issues: RuntimeSchemaValidationIssue[]): void {
+  if (!isRecord(value)) { issues.push({ path, message: 'must be an object' }); return; }
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateNonEmptyString(value.material_id, `${path}.material_id`, issues);
+  validateNonEmptyString(value.title, `${path}.title`, issues);
+  if (value.mime_type !== 'application/pdf') issues.push({ path: `${path}.mime_type`, message: 'must be application/pdf' });
+  validateIntegerAtLeast(value.byte_size, `${path}.byte_size`, issues, 1);
+  if (typeof value.content_hash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.content_hash)) issues.push({ path: `${path}.content_hash`, message: 'must be a sha256 content hash' });
+  validateIntegerAtLeast(value.page_count, `${path}.page_count`, issues, 1);
+  if (value.page_geometries !== undefined) {
+    if (!Array.isArray(value.page_geometries) || value.page_geometries.length !== value.page_count) issues.push({ path: `${path}.page_geometries`, message: 'must contain exactly one geometry per page' });
+    else value.page_geometries.forEach((geometry, index) => {
+      if (!isRecord(geometry)) { issues.push({ path: `${path}.page_geometries.${index}`, message: 'must be an object' }); return; }
+      if (geometry.page_index !== index) issues.push({ path: `${path}.page_geometries.${index}.page_index`, message: 'must match array index' });
+      validateNumberRange(geometry.width_world, `${path}.page_geometries.${index}.width_world`, issues, 1, CLASSROOM_WORLD_COORDINATE_LIMIT);
+      validateNumberRange(geometry.height_world, `${path}.page_geometries.${index}.height_world`, issues, 1, CLASSROOM_WORLD_COORDINATE_LIMIT);
+      if (![0, 90, 180, 270].includes(Number(geometry.rotation))) issues.push({ path: `${path}.page_geometries.${index}.rotation`, message: 'must be 0, 90, 180, or 270' });
+    });
+  }
+  if (!['builtin', 'teacher_upload'].includes(String(value.source))) issues.push({ path: `${path}.source`, message: 'must be builtin or teacher_upload' });
+  validateNonEmptyString(value.published_at, `${path}.published_at`, issues);
+}
+
+export function validateClassroomBoardEvent(value: unknown, path = 'board_event'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateIntegerAtLeast(value.sequence, `${path}.sequence`, issues, 1);
+  validateNonEmptyString(value.client_event_id, `${path}.client_event_id`, issues);
+  validateNonEmptyString(value.accepted_at, `${path}.accepted_at`, issues);
+  if (value.surface !== undefined) validateClassroomSurface(value.surface, `${path}.surface`, issues);
+
+  const world = value.geometry_version === CLASSROOM_WORLD_GEOMETRY_VERSION;
+  if (value.geometry_version !== undefined && !world && value.geometry_version !== 'normalized_v1') issues.push({ path: `${path}.geometry_version`, message: 'must be normalized_v1 or classroom_page_world_v1' });
+  if (world && (!isRecord(value.surface) || value.surface.kind !== 'textbook_page')) issues.push({ path: `${path}.surface`, message: 'world geometry requires a textbook_page surface' });
+  if (!isRecord(value.event)) {
+    issues.push({ path: `${path}.event`, message: 'must be an object' });
+  } else {
+    validateNonEmptyString(value.event.event_id, `${path}.event.event_id`, issues);
+    validateNonEmptyString(value.event.session_id, `${path}.event.session_id`, issues);
+    if (world) validateWorldBBox(value.event.bbox_world, `${path}.event.bbox_world`, issues);
+    else validateNormBBox(value.event.bbox_norm, `${path}.event.bbox_norm`, issues);
+    validateFiniteNumber(value.event.ts_start_ms, `${path}.event.ts_start_ms`, issues);
+    validateFiniteNumber(value.event.ts_end_ms, `${path}.event.ts_end_ms`, issues);
+    if (typeof value.event.ts_start_ms === 'number' && typeof value.event.ts_end_ms === 'number' && value.event.ts_end_ms < value.event.ts_start_ms) {
+      issues.push({ path: `${path}.event.ts_end_ms`, message: 'must be greater than or equal to ts_start_ms' });
+    }
+    if (value.event.session_id !== value.classroom_id) issues.push({ path: `${path}.event.session_id`, message: 'must match classroom_id' });
+  }
+
+  if (!isRecord(value.stroke)) {
+    issues.push({ path: `${path}.stroke`, message: 'must be an object' });
+  } else {
+    validateNonEmptyString(value.stroke.stroke_id, `${path}.stroke.stroke_id`, issues);
+    validateNonEmptyString(value.stroke.session_id, `${path}.stroke.session_id`, issues);
+    if (world) validateWorldBBox(value.stroke.bbox_world, `${path}.stroke.bbox_world`, issues);
+    else validateNormBBox(value.stroke.bbox_norm, `${path}.stroke.bbox_norm`, issues);
+    validateFiniteNumber(value.stroke.ts_start_ms, `${path}.stroke.ts_start_ms`, issues);
+    validateFiniteNumber(value.stroke.ts_end_ms, `${path}.stroke.ts_end_ms`, issues);
+    if (typeof value.stroke.ts_start_ms === 'number' && typeof value.stroke.ts_end_ms === 'number' && value.stroke.ts_end_ms < value.stroke.ts_start_ms) {
+      issues.push({ path: `${path}.stroke.ts_end_ms`, message: 'must be greater than or equal to ts_start_ms' });
+    }
+    const points = world ? value.stroke.points_world : value.stroke.points;
+    const pointsPath = world ? `${path}.stroke.points_world` : `${path}.stroke.points`;
+    if (!Array.isArray(points) || points.length === 0) {
+      issues.push({ path: pointsPath, message: 'must contain at least one point' });
+    } else {
+      if (points.length > CLASSROOM_MAX_STROKE_POINTS) {
+        issues.push({ path: pointsPath, message: `must contain at most ${CLASSROOM_MAX_STROKE_POINTS} points` });
+      }
+      points.forEach((point, index) => world ? validateWorldPoint(point, `${pointsPath}.${index}`, issues) : validateClassroomPoint(point, `${pointsPath}.${index}`, issues));
+    }
+    if (value.stroke.session_id !== value.classroom_id) issues.push({ path: `${path}.stroke.session_id`, message: 'must match classroom_id' });
+  }
+  return issues;
+}
+
+export function validateClassroomPreview(value: unknown, path = 'preview'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  validateNonEmptyString(value.client_event_id, `${path}.client_event_id`, issues);
+  validateIntegerAtLeast(value.revision, `${path}.revision`, issues, 0);
+  const world = value.geometry_version === CLASSROOM_WORLD_GEOMETRY_VERSION;
+  if (value.geometry_version !== undefined && !world && value.geometry_version !== 'normalized_v1') issues.push({ path: `${path}.geometry_version`, message: 'must be normalized_v1 or classroom_page_world_v1' });
+  const points = world ? value.points_world : value.points;
+  const pointsPath = world ? `${path}.points_world` : `${path}.points`;
+  if (!Array.isArray(points) || points.length === 0) issues.push({ path: pointsPath, message: 'must contain at least one point' });
+  else {
+    if (points.length > CLASSROOM_MAX_PREVIEW_POINTS) issues.push({ path: pointsPath, message: `must contain at most ${CLASSROOM_MAX_PREVIEW_POINTS} points` });
+    points.forEach((point, index) => world ? validateWorldPoint(point, `${pointsPath}.${index}`, issues) : validateClassroomPoint(point, `${pointsPath}.${index}`, issues));
+  }
+  if (!['pen', 'highlighter', 'underline', 'eraser'].includes(String(value.tool))) issues.push({ path: `${path}.tool`, message: 'must be a supported tool' });
+  validateFiniteNumber(value.expires_at_ms, `${path}.expires_at_ms`, issues);
+  if (value.surface !== undefined) validateClassroomSurface(value.surface, `${path}.surface`, issues);
+  if (world && (!isRecord(value.surface) || value.surface.kind !== 'textbook_page')) issues.push({ path: `${path}.surface`, message: 'world geometry requires a textbook_page surface' });
+  return issues;
+}
+
+export function validateClassroomSnapshot(value: unknown, path = 'snapshot'): RuntimeSchemaValidationIssue[] {
+  const issues: RuntimeSchemaValidationIssue[] = [];
+  if (!isRecord(value)) return [{ path, message: 'must be an object' }];
+  if (value.schema_version !== CLASSROOM_SCHEMA_VERSION) issues.push({ path: `${path}.schema_version`, message: `must be ${CLASSROOM_SCHEMA_VERSION}` });
+  validateNonEmptyString(value.classroom_id, `${path}.classroom_id`, issues);
+  if (!['draft', 'live', 'ended'].includes(String(value.classroom_status))) issues.push({ path: `${path}.classroom_status`, message: 'must be draft, live, or ended' });
+  validateIntegerAtLeast(value.snapshot_sequence, `${path}.snapshot_sequence`, issues, 0);
+  if (!Array.isArray(value.board_events)) {
+    issues.push({ path: `${path}.board_events`, message: 'must be an array' });
+  } else {
+    let previous = 0;
+    value.board_events.forEach((event, index) => {
+      if (!isRecord(event) || event.sequence !== previous + 1 || (typeof value.snapshot_sequence === 'number' && Number(event.sequence) > value.snapshot_sequence)) {
+        issues.push({ path: `${path}.board_events.${index}`, message: 'must contain contiguous ordered events through snapshot_sequence' });
+      }
+      if (isRecord(event) && typeof event.sequence === 'number') previous = event.sequence;
+      issues.push(...validateClassroomBoardEvent(event, `${path}.board_events.${index}`));
+    });
+    if (value.board_events.length === 0 && value.snapshot_sequence !== 0) issues.push({ path: `${path}.board_events`, message: 'cannot be empty when snapshot_sequence is non-zero' });
+  }
+  validateNonEmptyString(value.generated_at, `${path}.generated_at`, issues);
+  if (value.timeline_sequence !== undefined) validateIntegerAtLeast(value.timeline_sequence, `${path}.timeline_sequence`, issues, 0);
+  if (value.capabilities !== undefined) {
+    if (!isRecord(value.capabilities)) issues.push({ path: `${path}.capabilities`, message: 'must be an object' });
+    else for (const key of ['textbook', 'recognition', 'audio', 'transcript']) if (typeof value.capabilities[key] !== 'boolean') issues.push({ path: `${path}.capabilities.${key}`, message: 'must be boolean' });
+  }
+  if (value.materials !== undefined) {
+    if (!Array.isArray(value.materials)) issues.push({ path: `${path}.materials`, message: 'must be an array' });
+    else value.materials.forEach((material, index) => validateClassroomMaterial(material, `${path}.materials.${index}`, issues));
+  }
+  if (value.teacher_view !== undefined) issues.push(...validateClassroomTeacherView(value.teacher_view, `${path}.teacher_view`));
+  if (value.confirmed_focus !== undefined) issues.push(...validateClassroomConfirmedFocus(value.confirmed_focus, `${path}.confirmed_focus`));
+  if (value.recognitions !== undefined) {
+    if (!Array.isArray(value.recognitions)) issues.push({ path: `${path}.recognitions`, message: 'must be an array' });
+    else value.recognitions.forEach((recognition, index) => issues.push(...validateClassroomRecognitionRevision(recognition, `${path}.recognitions.${index}`)));
+  }
+  if (value.recording !== undefined) issues.push(...validateClassroomRecordingState(value.recording, `${path}.recording`));
+  if (value.transcripts !== undefined) {
+    if (!Array.isArray(value.transcripts)) issues.push({ path: `${path}.transcripts`, message: 'must be an array' });
+    else value.transcripts.forEach((transcript, index) => issues.push(...validateClassroomTranscriptRevision(transcript, `${path}.transcripts.${index}`)));
+  }
+  if (value.transcription !== undefined) issues.push(...validateClassroomTranscriptionState(value.transcription, `${path}.transcription`));
+  for (const forbidden of ['participant_id', 'private_jobs', 'private_results']) {
+    if (forbidden in value) issues.push({ path: `${path}.${forbidden}`, message: 'private participant state is forbidden in shared snapshots' });
+  }
+  return issues;
 }
 
 export function validateRawPenFrame(value: unknown, path = 'frame'): RuntimeSchemaValidationIssue[] {

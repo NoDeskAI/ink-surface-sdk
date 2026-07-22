@@ -21,6 +21,6 @@ export default defineConfig({
   resolve: { alias: sdkAliases },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'server/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'server/**/*.test.ts', 'shared/**/*.test.ts'],
   },
 });

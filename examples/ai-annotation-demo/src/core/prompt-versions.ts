@@ -17,6 +17,11 @@ export const PROMPT_VERSIONS = {
   meeting_summary: 'v2',    // /api/chat 会后思路总结（WS2-C·无状态·不进书 buffer）；v2=禁 markdown 纯文本
   meeting_panel_summary: 'v3', // provider 转写 + 可选官方纪要/设备手写 → InkLoop 五要素总结
   concept_extractor: 'v2',  // /api/chat 从一条笔记抽 1-3 个规范概念词（Obsidian 概念层·纯文本逐行·无状态·缓存键含此版本）；v2=治过度抽象/低上下文幻觉/错误复用（真 LLM 探针后）
+  education_live_explanation: 'v2',
+  education_class_summary: 'v2',
+  education_practice: 'v2',
+  education_lesson_graph: 'v3',
+  education_formula_recognition: 'v1',
 } as const;
 
 export type PromptRole = keyof typeof PROMPT_VERSIONS;

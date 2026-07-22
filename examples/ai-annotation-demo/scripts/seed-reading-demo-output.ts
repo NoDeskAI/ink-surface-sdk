@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { RUNTIME_SYNC_EVENT_SCHEMA_VERSION, type RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import { RUNTIME_SYNC_EVENT_SCHEMA_VERSION, type RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 
 const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
 const CLOUD_HUB = process.env.INKLOOP_CLOUD_HUB_URL || 'http://127.0.0.1:8731';

@@ -17,7 +17,7 @@ import {
   validateRawPenFrame,
   type RawPenFrame,
   type RuntimeSchemaValidationIssue,
-} from '../../../packages/runtime-schema/src/index';
+} from 'ink-surface-sdk/runtime-schema';
 
 interface FrameRecord {
   line: number;

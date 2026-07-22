@@ -7,10 +7,10 @@ import { promisify } from 'node:util';
 import {
   type DocumentProjection,
   type KnowledgeObject,
-} from '../../../packages/knowledge-schema/src/index';
-import { renderVaultMarkdown } from '../../../packages/adapter-obsidian/src/index';
-import type { RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
-import type { InkLoopVisualStroke } from '../../../packages/surface-model/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
+import { renderVaultMarkdown } from 'ink-surface-sdk/adapters/obsidian';
+import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
+import type { InkLoopVisualStroke } from 'ink-surface-sdk/surface-model';
 
 const execFileAsync = promisify(execFile);
 

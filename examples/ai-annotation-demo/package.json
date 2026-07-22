@@ -14,7 +14,7 @@
     "lint:ci": "biome check --error-on-warnings .",
     "format": "biome format --write .",
     "audit": "npm audit --audit-level=high",
-    "verify": "npm run check && npm run lint:ci && npm run test && vite build && npm run verify:android-paper-assets && npm run smoke:runtime-sync-flow && npm run smoke:ai-pen-v1 && npm run smoke:ai-graph-worker && npm run smoke:ai-pen-evidence && npm run smoke:capture-surface-evidence && npm run smoke:live-board-latency-evidence && npm run smoke:reward-pricing-evidence && npm run smoke:gtm-metrics-evidence && npm run smoke:demo-review-evidence",
+    "verify": "npm run check && npm run lint:ci && npm run test && vite build && npm run verify:android-paper-assets && npm run smoke:runtime-sync-flow && npm run smoke:ai-pen-v1 && npm run smoke:ai-graph-worker && npm run smoke:education-classroom-browser && npm run smoke:ai-pen-evidence && npm run smoke:capture-surface-evidence && npm run smoke:live-board-latency-evidence && npm run smoke:reward-pricing-evidence && npm run smoke:gtm-metrics-evidence && npm run smoke:demo-review-evidence",
     "verify:v1-product": "npm run check && npm run smoke:runtime-sync-flow && npm run smoke:cloud-hub-device-session && npm run smoke:cloud-hub-device-status && npm run smoke:cloud-hub-multi-user && npm run smoke:cloud-hub-controlled-writeback && npm run smoke:obsidian-reading-kind-coverage && npm run verify:reader-reflow-trust-loop && npm run smoke:v1-product-e2e && npm run smoke:meeting-v1-e2e",
     "verify:v1-product:paper": "npm run verify:v1-product && npm run smoke:m103-web-import-formats-device && npm run smoke:m103-lan-import-formats-device && npm run smoke:m103-cloud-library-device && npm run smoke:paper-reading-mark-types-device && npm run smoke:m103-meeting-device",
     "audit:v1-product-acceptance": "tsx scripts/verify-v1-product-acceptance.ts",
@@ -67,7 +67,13 @@
     "smoke:gtm-metrics-evidence": "tsx scripts/analyze-gtm-metrics.ts fixtures/gtm-metrics-sample.csv",
     "smoke:demo-review-evidence": "tsx scripts/analyze-demo-review.ts fixtures/demo-review-sample.csv",
     "smoke:ai-pen-browser": "vite build && tsx scripts/smoke-ai-pen-browser.ts",
+    "smoke:education-classroom-browser": "vite build && tsx scripts/smoke-education-classroom-browser.ts",
+    "evidence:education-classroom-latency": "tsx scripts/analyze-classroom-browser-latency.ts",
+    "verify:education-classroom-real-ai": "tsx scripts/verify-education-classroom-e2e.ts",
     "serve": "tsx server/standalone.ts",
+    "setup:classroom-transcription": "tsx scripts/setup-classroom-transcription.ts",
+    "setup:classroom-transcription:whisper": "INKLOOP_CLASSROOM_TRANSCRIPTION_PROVIDER=whisper tsx scripts/setup-classroom-transcription.ts",
+    "serve:classroom:https": "npm run build && tsx scripts/start-secure-classroom.ts",
     "serve:lark-sdk": "node scripts/start-lark-meeting-sdk.mjs",
     "postinstall": "node scripts/copy-pdfjs-assets.mjs"
   },
@@ -77,6 +83,9 @@
     "pdfjs-dist": "^4.6.82",
     "qrcode": "^1.5.4",
     "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "sherpa-onnx-node": "1.13.4"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

@@ -9,6 +9,7 @@
 | AI Pen Kickstarter V1 | `http://localhost:8765/ai-pen-demo.html` | Capture Host, Live Board, education LessonGraph, meeting MeetingGraph, source_refs validator |
 | Source document reading | `http://localhost:8765/` | PDF/EPUB/Markdown import, reading marks, local annotation loop, legacy evidence pipeline |
 | InkLoop Paper runtime reuse | `http://localhost:8765/mobile.html` | Android/e-paper WebView shell for reading/review, Wi-Fi import, local cache, meeting surface reuse |
+| Education classroom example | `https://localhost:8872/classroom` | Two-Web teacher/student classroom, textbook canvas, live ink/audio/subtitles and post-class AI |
 
 ---
 
@@ -18,12 +19,20 @@
 npm install
 cp .env.example .env      # 然后填入网关 Key（见下「团队上手」）
 npm run dev               # http://localhost:8765
+npm run serve:classroom:https # build + trusted same-origin classroom launcher on https://localhost:8872/classroom
 ```
 
 - AI Pen Kickstarter V1 演示入口：`http://localhost:8765/ai-pen-demo.html`
+- 双 Web 课堂音频验收入口：`https://localhost:8872/classroom`。首次运行后把终端打印的根 CA `classroom.cert.pem`（不是 `classroom-server.cert.pem`）加入系统钥匙串并设为“始终信任”；HTTP 8765 仅用于课本/板书开发，不会请求麦克风。首次启用本地实时字幕先运行 `npm run setup:classroom-transcription` 下载多语种 Whisper 模型，之后 HTTPS 启动器会自动启动本地转写服务。
+- 教育课堂全部实现位于本 `examples/ai-annotation-demo` 应用宿主；SDK 只保留跨宿主可复用的笔迹、来源和 LessonGraph 等产品合同。默认教材是自制讲义；如仅在本机使用完整教材，设置 `INKLOOP_CLASSROOM_TEXTBOOK_PATH`，完整教材不会进入 Git 或 npm 包。
+- 学生解释、课堂总结、练习和教师 LessonGraph 默认使用本地确定性降级，不会静默外发课堂证据。只有部署方完成教师授权与供应商披露后，才可设置 `INKLOOP_CLASSROOM_EXTERNAL_AI_ENABLED=1` 启用已配置网关。
+- 实时字幕默认连接 `.env` 中的 `INKLOOP_CLASSROOM_TRANSCRIPTION_URL`（建议 loopback Whisper-compatible 服务）。固定中文语音样例为 `fixtures/education-completing-square-audio.wav`。外部模式除服务端配置外，还要求教师在本次录音前显式勾选数据发送同意。
 - `?dev=1` 或按 `d` 唤出**开发面板**（provider 切换 / 行为设置 / 坐标自测 / 延迟 / trace）。
 - `npm run check` 跑 TS 严格类型检查；`npm run build` 类型检查 + 生产构建。
 - `npm run smoke:ai-pen-browser` 用本机 Chrome 打开构建后的 AI Pen 页面，点击 Education/Meeting 两条链路并输出截图。
+- `npm run smoke:education-classroom-browser` 用四个隔离 Chrome profile 验收双 Web 课堂的课本、焦点、学生私人动作、恢复、权限和删除。
+- `npm run verify:education-classroom-real-ai` 使用固定 `x² + 4x - 5 = 0` 多模态证据，分别判定当前步骤、框选解释、总结、练习和原始 LessonGraph 的真实 AI 数学语义与来源白名单。
+- `npm run evidence:education-classroom-latency -- test-results/education-classroom-latency.csv --out test-results/education-classroom-latency.json` 输出浏览器同步样本量和 P50/P95；真实 STT/HWR 的样本量与 P50/P95 必须由实际 provider 单独记录，fixture 不算通过。
 - `npm run evidence:ai-pen-run -- /path/to/raw-pen-run.jsonl` 分析真实 AI Pen RawPenFrame 日志，输出 schema、stroke 完整性和 pen-to-host latency 报告。
 - `npm run evidence:capture-surface -- /path/to/calibration.csv` 分析 Capture Surface 校准点表，输出 A2/A3 误差分布、边角覆盖和稳定率报告。
 - `npm run evidence:live-board-latency -- /path/to/live-board-timing.csv` 分析从 AI Pen 原始帧到 Live Board render commit 的端到端延迟和分阶段延迟。

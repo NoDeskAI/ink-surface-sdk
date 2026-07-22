@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { DocumentProjection, KnowledgeObject } from '../../../packages/knowledge-schema/src/index';
+import type { DocumentProjection, KnowledgeObject } from 'ink-surface-sdk/knowledge-schema';
 import type { CloudAiTurnRecord, CloudKnowledgeNamespace, JsonCloudKnowledgeStore } from './cloud-knowledge-store';
 
 interface KnowledgeSessionContext {

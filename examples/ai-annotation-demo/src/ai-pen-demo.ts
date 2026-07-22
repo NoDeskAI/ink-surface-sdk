@@ -783,6 +783,7 @@ function renderRef(ref: InkLoopSourceRef): string {
   if (ref.type === 'ink_event') return `<span class="ref">ink:${ref.event_id.slice(-6)}</span>`;
   if (ref.type === 'board_object') return `<span class="ref">${ref.object_type}:${ref.object_id.slice(-6)}</span>`;
   if (ref.type === 'audio_segment') return '<span class="ref">audio</span>';
+  if (ref.type === 'material_page') return `<span class="ref">material:p${ref.page_index + 1}</span>`;
   return '<span class="ref">memory</span>';
 }
 

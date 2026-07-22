@@ -119,7 +119,7 @@ function emptyTextError(model: string, data: any): Error {
   return new Error(`网关返回空正文 model=${model} finish=${finish}${reasoning ? ' reasoning_content_present=true' : ''}${usage}`);
 }
 
-async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTokens: number; model?: string }): Promise<{ text: string; thinking: string; data: any }> {
+async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTokens: number; model?: string; signal?: AbortSignal }): Promise<{ text: string; thinking: string; data: any }> {
   const { url, key } = cfg();
   const model = opts.model || cfg().model;
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
@@ -135,6 +135,7 @@ async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTok
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json' },
     body: JSON.stringify(body),
+    signal: opts.signal,
   });
   const data: any = await resp.json().catch(() => ({}));
   logAiCall({ requestId, model, provider: 'openai_chat_completions', ms: Date.now() - t0, ok: resp.ok, status: resp.status });
@@ -160,7 +161,7 @@ function openAiDeltaText(delta: any): string {
 }
 
 /** 低层网关调用：传完整 messages（可带 tools），返回完整响应 data。 */
-async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string }): Promise<any> {
+async function callGateway(opts: { system: string; messages: any[]; maxTokens: number; tools?: any[]; model?: string; signal?: AbortSignal }): Promise<any> {
   const { url, key } = cfg();
   const model = opts.model || cfg().model; // 模型可由调用方覆盖(dev 面板选的)，route() 按前缀分渠道
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
@@ -175,6 +176,7 @@ async function callGateway(opts: { system: string; messages: any[]; maxTokens: n
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
     body: JSON.stringify(body),
+    signal: opts.signal,
   });
   const data: any = await resp.json().catch(() => ({}));
   logAiCall({ requestId, model, provider: channel, ms: Date.now() - t0, ok: resp.ok, status: resp.status });
@@ -387,15 +389,15 @@ function imageBlocks(images: ImgIn[]): any[] {
 }
 
 /** 单发：images 可为多图(带角色)数组，或单张已 strip 的 b64 字符串(旧调用方)。图在前、文字在后。 */
-async function gateway(system: string, user: string, maxTokens: number, image?: string | ImgIn[], model?: string): Promise<string> {
+async function gateway(system: string, user: string, maxTokens: number, image?: string | ImgIn[], model?: string, signal?: AbortSignal): Promise<string> {
   const blocks = Array.isArray(image)
     ? imageBlocks(image)
     : (image ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } }] : []);
   const content = blocks.length ? [...blocks, { type: 'text', text: user }] : user;
   if (isOpenAiTransport()) {
-    return (await callOpenAiGateway({ system, messages: [{ role: 'user', content }], maxTokens, model })).text;
+    return (await callOpenAiGateway({ system, messages: [{ role: 'user', content }], maxTokens, model, signal })).text;
   }
-  const text = textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model }));
+  const text = textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model, signal }));
   if (!text) throw emptyTextError(model || cfg().model, {});
   return text;
 }
@@ -451,6 +453,112 @@ const meetingPanelSummarySchema = z.object({
 });
 
 export type MeetingPanelSummary = z.infer<typeof meetingPanelSummarySchema>;
+
+const educationSectionSchema = z.object({
+  content: z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(2_000)),
+  event_ids: z.array(z.string().min(1).max(160)).min(1).max(24),
+});
+const educationStructuredResultSchema = z.object({
+  title: z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(160)),
+  sections: z.array(educationSectionSchema).min(1).max(12),
+});
+export type EducationStructuredGatewayResult = z.infer<typeof educationStructuredResultSchema>;
+const educationLessonCandidateSchema = z.object({
+  kind: z.enum(['definition', 'example', 'derivation', 'formula', 'diagram', 'conclusion']),
+  content: z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(4_000)),
+  latex: z.string().max(1_000).optional(),
+  confidence: z.number().min(0).max(1),
+  event_ids: z.array(z.string().min(1).max(160)).min(1).max(24),
+});
+const educationLessonResultSchema = z.object({ candidates: z.array(educationLessonCandidateSchema).min(3).max(24) });
+export type EducationLessonGatewayResult = z.infer<typeof educationLessonResultSchema>;
+const educationRecognitionResultSchema = z.object({
+  kind: z.enum(['formula', 'text', 'mixed']),
+  text: z.string().transform((value) => value.trim()).pipe(z.string().min(1).max(2_000)),
+  latex: z.string().max(1_000).optional(),
+  confidence: z.number().min(0).max(1),
+  event_ids: z.array(z.string().min(1).max(160)).min(1).max(24),
+});
+export type EducationRecognitionGatewayResult = z.infer<typeof educationRecognitionResultSchema>;
+
+export function educationStructuredEvidencePayload(payload: {
+  kind: 'live_explanation' | 'class_summary' | 'practice';
+  evidence: unknown[];
+  recognitions?: unknown[];
+  intent?: string;
+  material?: unknown;
+  time_window?: unknown;
+  transcripts?: unknown[];
+  missing_sources?: unknown[];
+}): Record<string, unknown> {
+  return {
+    intent: payload.intent ?? payload.kind,
+    material: payload.material,
+    time_window: payload.time_window,
+    evidence: payload.evidence,
+    trusted_recognitions: payload.recognitions ?? [],
+    trusted_transcripts: payload.transcripts ?? [],
+    missing_sources: payload.missing_sources ?? [],
+  };
+}
+
+export function educationLessonEvidencePayload(evidence: unknown[]): Record<string, unknown> {
+  const allowedEventIds = evidence.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const eventId = (item as { event_id?: unknown }).event_id;
+    return typeof eventId === 'string' && eventId.length > 0 ? [eventId] : [];
+  });
+  return { allowed_event_ids: [...new Set(allowedEventIds)], evidence };
+}
+
+export async function runEducationStructured(payload: {
+  kind: 'live_explanation' | 'class_summary' | 'practice';
+  evidence: unknown[];
+  recognitions?: unknown[];
+  intent?: string;
+  material?: unknown;
+  time_window?: unknown;
+  transcripts?: unknown[];
+  missing_sources?: unknown[];
+  model?: string;
+  signal?: AbortSignal;
+}): Promise<EducationStructuredGatewayResult> {
+  const roles = {
+    live_explanation: 'education_live_explanation',
+    class_summary: 'education_class_summary',
+    practice: 'education_practice',
+  } as const;
+  if (!Array.isArray(payload.evidence) || payload.evidence.length === 0) throw new Error('education_evidence_required');
+  const raw = await gateway(SYSTEM_PROMPTS[roles[payload.kind]], JSON.stringify(educationStructuredEvidencePayload(payload)), 1_800, undefined, payload.model, payload.signal);
+  if (raw.length > 128_000) throw new Error('education_response_too_large');
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('education_invalid_json');
+  let parsed: unknown;
+  try { parsed = JSON.parse(match[0]); } catch { throw new Error('education_invalid_json'); }
+  return educationStructuredResultSchema.parse(parsed);
+}
+
+export async function runEducationLessonStructured(payload: { evidence: unknown[]; model?: string; signal?: AbortSignal }): Promise<EducationLessonGatewayResult> {
+  if (!Array.isArray(payload.evidence) || payload.evidence.length < 3) throw new Error('education_evidence_required');
+  const raw = await gateway(SYSTEM_PROMPTS.education_lesson_graph, JSON.stringify(educationLessonEvidencePayload(payload.evidence)), 2_400, undefined, payload.model, payload.signal);
+  if (raw.length > 128_000) throw new Error('education_response_too_large');
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('education_invalid_json');
+  let parsed: unknown;
+  try { parsed = JSON.parse(match[0]); } catch { throw new Error('education_invalid_json'); }
+  return educationLessonResultSchema.parse(parsed);
+}
+
+export async function runEducationRecognitionStructured(payload: { evidence: unknown; eventIds: string[]; imageBase64?: string; model?: string; signal?: AbortSignal }): Promise<EducationRecognitionGatewayResult> {
+  if (!Array.isArray(payload.eventIds) || payload.eventIds.length === 0) throw new Error('education_evidence_required');
+  const raw = await gateway(SYSTEM_PROMPTS.education_formula_recognition, JSON.stringify({ evidence: payload.evidence, allowed_event_ids: payload.eventIds }), 1_200, payload.imageBase64, payload.model, payload.signal);
+  if (raw.length > 64_000) throw new Error('education_response_too_large');
+  const match = raw.match(/\{[\s\S]*\}/); if (!match) throw new Error('education_invalid_json');
+  let parsed: unknown; try { parsed = JSON.parse(match[0]); } catch { throw new Error('education_invalid_json'); }
+  const result = educationRecognitionResultSchema.parse(parsed);
+  if (new Set(result.event_ids).size !== payload.eventIds.length || result.event_ids.some((id) => !payload.eventIds.includes(id))) throw new Error('education_source_ref_invalid');
+  return result;
+}
 
 
 

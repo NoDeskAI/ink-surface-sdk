@@ -78,6 +78,14 @@ const projectMemoryRef: InkLoopSourceRef = {
   title: 'Prior architecture notes',
 };
 
+const materialPageRef: InkLoopSourceRef = {
+  type: 'material_page',
+  session_id: 'sess_ai_pen_demo',
+  material_id: 'material_math_9',
+  page_index: 12,
+  bbox_norm: [0.15, 0.25, 0.5, 0.2],
+};
+
 describe('AI graph KnowledgeObject projection', () => {
   it('computes stable SHA-256 when crypto.subtle is unavailable', async () => {
     const hash = await withoutSubtle(() => sha256Hex('abc'));
@@ -260,6 +268,20 @@ describe('AI graph KnowledgeObject projection', () => {
     expect(objects[0]?.kind).toBe('formula_step');
     expect(objects[0]?.body_md).toContain('Formula: (x + 1)^2');
     expect(objects[0]?.body_md).toContain('Backlink: inkloop://doc/doc_ai_pen_lesson');
+  });
+
+  it('projects material-page evidence with stable deduplication and anchors', async () => {
+    const lesson: LessonGraph = {
+      lesson_id: 'lesson_material', session_id: 'sess_ai_pen_demo', title: 'Textbook lesson',
+      steps: [{ step_id: 'step_material', order: 1, kind: 'derivation', content: 'Follow the textbook example.', board_object_refs: [], source_refs: [inkRef, materialPageRef, materialPageRef], confidence: 0.9 }],
+      concepts: [],
+    };
+    const [object] = await buildLessonGraphKnowledgeObjects(lesson, {
+      documentId: 'doc_material_lesson', documentTitle: 'Textbook lesson', now: '2026-07-02T00:00:00.000Z', statusById: { step_material: 'accepted' },
+    });
+    expect(object.source.object_refs).toEqual(['evt_board_mark', 'material_material_math_9_12']);
+    expect(object.source.anchor_bbox).toEqual(inkRef.bbox_norm);
+    expect(object.body_md.match(/material:material_math_9#page=13/g)).toHaveLength(1);
   });
 });
 

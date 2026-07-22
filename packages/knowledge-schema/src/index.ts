@@ -620,6 +620,7 @@ function sourceRefKey(ref: InkLoopSourceRef): string {
   if (ref.type === 'ink_event') return ref.event_id;
   if (ref.type === 'board_object') return ref.object_id;
   if (ref.type === 'audio_segment') return `audio_${ref.start_ms}_${ref.end_ms}`;
+  if (ref.type === 'material_page') return `material_${ref.material_id}_${ref.page_index}`;
   return ref.memory_id;
 }
 
@@ -627,18 +628,19 @@ function sourceRefLabel(ref: InkLoopSourceRef): string {
   if (ref.type === 'ink_event') return `ink_event:${ref.event_id}`;
   if (ref.type === 'board_object') return `${ref.object_type}:${ref.object_id}`;
   if (ref.type === 'audio_segment') return `audio:${ref.start_ms}-${ref.end_ms}${ref.speaker ? ` ${ref.speaker}` : ''}`;
+  if (ref.type === 'material_page') return `material:${ref.material_id}#page=${ref.page_index + 1}`;
   return `memory:${ref.title}`;
 }
 
 function firstAnchorBBox(refs: readonly InkLoopSourceRef[]): NormBBox | undefined {
   for (const ref of refs) {
-    if ((ref.type === 'ink_event' || ref.type === 'board_object') && ref.bbox_norm) return [...ref.bbox_norm] as NormBBox;
+    if ((ref.type === 'ink_event' || ref.type === 'board_object' || ref.type === 'material_page') && ref.bbox_norm) return [...ref.bbox_norm] as NormBBox;
   }
   return undefined;
 }
 
 function sourceRefsMarkdown(refs: readonly InkLoopSourceRef[]): string {
-  return refs.map((ref) => `- ${sourceRefLabel(ref)}`).join('\n');
+  return [...new Map(refs.map((ref) => [sourceRefKey(ref), ref])).values()].map((ref) => `- ${sourceRefLabel(ref)}`).join('\n');
 }
 
 function canPromote(status: KnowledgeStatus | undefined): status is 'accepted' | 'edited' | 'follow_up' {
