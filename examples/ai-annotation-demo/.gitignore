@@ -3,6 +3,7 @@ dist/
 test-results/
 .inkloop/
 .inkloop-smoke-runs/
+.codex-tmp/
 .DS_Store
 *.log
 .idea/
@@ -20,6 +21,10 @@ test-results/
 # pdfjs CMap/字体资产：postinstall 自动从 node_modules 拷入，不入库（见 scripts/copy-pdfjs-assets.mjs）
 public/cmaps/
 public/standard_fonts/
+
+# Local-only copyrighted reference textbooks. Keep the InkLoop-authored handout
+# and documented excerpt in source; full external books require separate rights.
+public/demo/education/textbooks/*.pdf
 
 # 协作方 InkSurface SDK（WS3）：独立项目·自带 git 仓库，不进我们这个仓库。接线产物走 src/integration/inksurface/。
 ink-surface-sdk-main/

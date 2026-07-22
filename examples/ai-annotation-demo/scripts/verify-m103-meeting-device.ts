@@ -3,10 +3,10 @@ import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import net from 'node:net';
 import { promisify } from 'node:util';
-import type { RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
-import type { InkLoopVisualModel } from '../../../packages/surface-model/src/index';
-import type { DocumentProjection, KnowledgeObject } from '../../../packages/knowledge-schema/src/index';
-import { renderVaultMarkdown } from '../../../packages/adapter-obsidian/src/index';
+import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
+import type { InkLoopVisualModel } from 'ink-surface-sdk/surface-model';
+import type { DocumentProjection, KnowledgeObject } from 'ink-surface-sdk/knowledge-schema';
+import { renderVaultMarkdown } from 'ink-surface-sdk/adapters/obsidian';
 
 const execFileAsync = promisify(execFile);
 

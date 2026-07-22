@@ -11,9 +11,9 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarRuntimeStore } from '../../../packages/offline-store/src/file-sidecar-store';
-import { LocalEventLogTransport, RuntimeSyncRunner } from '../../../packages/sync-client/src/index';
-import type { RuntimeDocumentSnapshot, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import { SidecarRuntimeStore } from 'ink-surface-sdk/offline-store/file-sidecar';
+import { LocalEventLogTransport, RuntimeSyncRunner } from 'ink-surface-sdk/sync-client';
+import type { RuntimeDocumentSnapshot, RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import { RuntimeStoreInbox } from '../src/integration/inksurface/runtime-inbox';
 
 function snapshot(docId: string, options: { includeWebAnnotation?: boolean } = {}): RuntimeDocumentSnapshot {

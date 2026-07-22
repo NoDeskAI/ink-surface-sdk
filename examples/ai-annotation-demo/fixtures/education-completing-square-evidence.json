@@ -1,0 +1,24 @@
+{
+  "fixture_id": "completing-square-x2-plus-4x-minus-5",
+  "title": "配方法解 x² + 4x - 5 = 0",
+  "material_id": "builtin_completing_square",
+  "page_index": 0,
+  "surface": {
+    "kind": "textbook_page",
+    "material_id": "builtin_completing_square",
+    "page_index": 0
+  },
+  "lines": [
+    { "order": 1, "event_ids": ["ink_formula_01"], "bbox_norm": [0.12, 0.18, 0.48, 0.07], "text": "x² + 4x - 5 = 0", "latex": "x^2+4x-5=0" },
+    { "order": 2, "event_ids": ["ink_formula_02"], "bbox_norm": [0.12, 0.29, 0.40, 0.07], "text": "x² + 4x = 5", "latex": "x^2+4x=5" },
+    { "order": 3, "event_ids": ["ink_formula_03"], "bbox_norm": [0.12, 0.40, 0.50, 0.07], "text": "x² + 4x + 4 = 9", "latex": "x^2+4x+4=9" },
+    { "order": 4, "event_ids": ["ink_formula_04"], "bbox_norm": [0.12, 0.51, 0.38, 0.07], "text": "(x + 2)² = 9", "latex": "(x+2)^2=9" },
+    { "order": 5, "event_ids": ["ink_formula_05"], "bbox_norm": [0.12, 0.62, 0.40, 0.07], "text": "x + 2 = ±3", "latex": "x+2=\\pm3" },
+    { "order": 6, "event_ids": ["ink_formula_06"], "bbox_norm": [0.12, 0.73, 0.48, 0.07], "text": "x = 1 或 x = -5", "latex": "x=1\\text{ or }x=-5" }
+  ],
+  "acceptance": {
+    "all_lines_require_teacher_confirmation": true,
+    "low_confidence_example": { "order": 5, "provider_text": "x + 2 = +3", "corrected_text": "x + 2 = ±3" },
+    "pending_blocks": ["class_summary", "practice", "lesson_graph"]
+  }
+}

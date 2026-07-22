@@ -11,6 +11,7 @@ test-results/
 !.env.example
 .inkloop-smoke-runs/
 .context/
+.codex-tmp/
 
 # dev-only 调试通道遥测（server/debug.mjs 落盘，仅本地定位问题用）
 .dev-telemetry.jsonl
@@ -21,6 +22,11 @@ test-results/
 # pdfjs CMap/字体资产：demo postinstall 自动从 node_modules 拷入，不入库。
 **/public/cmaps/
 **/public/standard_fonts/
+
+# Third-party classroom textbooks/excerpts have no redistribution grant in the
+# referenced upstream repository. Keep them local and use the authored handout by default.
+examples/ai-annotation-demo/public/demo/education/pep-grade9-math-completing-square-excerpt.pdf
+examples/ai-annotation-demo/public/demo/education/textbooks/*.pdf
 
 # 外部参考仓库/SDK 本地副本。代码里通过适配层接入，目录本身不要混入主仓库。
 examples/ai-annotation-demo/Lark-Meeting-Timeline-main/

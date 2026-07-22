@@ -32,6 +32,16 @@ import { JsonCloudLibraryStore } from './cloud-library-store';
 import { createCloudKnowledgeHandler } from './cloud-knowledge-handler';
 import { createCloudDeviceHandler } from './cloud-device-handler';
 import { JsonCloudDeviceStore } from './cloud-device-store';
+import { createClassroomHandler } from './classroom-handler';
+import { ClassroomService } from './classroom-service';
+import { JsonClassroomStore } from './classroom-store';
+import { ClassroomAiService } from './classroom-ai';
+import { ClassroomLessonService } from './classroom-lesson';
+import { ClassroomMaterialService } from './classroom-materials';
+import { ClassroomRecognitionService } from './classroom-recognition';
+import { ClassroomAudioService } from './classroom-audio';
+import { ClassroomTranscriptionService, createHttpTranscriptionProvider } from './classroom-transcription';
+import { createClassroomStaticHandler } from './classroom-static';
 import { fetchFeishuBotCalendarEvents } from './feishu-bot-calendar';
 import {
   fetchFeishuBotMessageResource,
@@ -101,7 +111,7 @@ import {
 import { isMeetingRuntimeDocumentId, shouldPostprocessRuntimeAnnotation } from './runtime-postprocess-policy';
 import { prepareRuntimeAnnotationUpdate } from './runtime-annotation-postprocess';
 import { createDeadlineSingleFlight } from './background-worker';
-import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import type { RuntimeSurfaceBlock, RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import {
   buildInkloopDocUri,
   canonicalJson,
@@ -116,7 +126,7 @@ import {
   type KnowledgeObject,
   type KnowledgeStatus,
   type NormBBox,
-} from '../../../packages/knowledge-schema/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
 
 // ── .env：把项目根 .env 注入 process.env（只填未设的键），与 vite.config 行为一致 ──
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -2494,6 +2504,33 @@ const cloudDeviceHandler = createCloudDeviceHandler({
   resolveSession: resolveDeviceSession,
   requireSession: process.env.INKLOOP_DEVICE_REQUIRE_SESSION === '1',
 });
+const classroomStore = await JsonClassroomStore.open(process.env.INKLOOP_CLASSROOM_STORE || resolve(ROOT, '.inkloop/classrooms'));
+const classroomAi = new ClassroomAiService(classroomStore);
+const classroomService = new ClassroomService(classroomStore);
+const classroomTranscription = new ClassroomTranscriptionService(classroomStore, classroomService, {
+  processingMode: process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_MODE === 'external' ? 'external' : 'local',
+  ...(process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_URL ? { provider: createHttpTranscriptionProvider({
+    baseUrl: process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_URL,
+    mode: process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_MODE === 'external' ? 'external' : 'local',
+    externalOptIn: process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_EXTERNAL_OPT_IN === '1',
+    apiKey: process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_API_KEY,
+  }) } : {}),
+});
+const classroomAudio = new ClassroomAudioService(classroomStore, classroomTranscription);
+await classroomTranscription.recover();
+const classroomStatic = createClassroomStaticHandler(resolve(ROOT, 'dist'));
+const classroomHandler = createClassroomHandler({
+  store: classroomStore,
+  service: classroomService,
+  ai: classroomAi,
+  lesson: new ClassroomLessonService(classroomStore),
+  materials: new ClassroomMaterialService(classroomStore, classroomService),
+  recognition: new ClassroomRecognitionService(classroomStore),
+  audio: classroomAudio,
+  transcription: classroomTranscription,
+  allowOrigins: (process.env.INKLOOP_CLASSROOM_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
+  requireSecureTransport: Number(process.env.INKLOOP_HTTPS_PORT || 0) > 0,
+});
 
 function isAuthorizedInternalLoopbackRequest(req: IncomingMessage): boolean {
   // 内部端点必须同时满足直连 loopback 和共享密钥；forwarded 头说明请求经过代理，一律按外部处理。
@@ -2510,6 +2547,8 @@ function isAuthorizedInternalLoopbackRequest(req: IncomingMessage): boolean {
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = (req.url || '/').split('?')[0];
+  if (await classroomHandler(req, res)) return;
+  if (classroomStatic(req, res)) return;
   setCors(req, res);
   if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
   if (req.method === 'GET' && url === '/healthz') {

@@ -13,6 +13,15 @@ import { createCloudLibraryHandler } from './server/cloud-library-handler';
 import { JsonCloudLibraryStore } from './server/cloud-library-store';
 import { createCloudKnowledgeHandler } from './server/cloud-knowledge-handler';
 import { JsonCloudKnowledgeStore } from './server/cloud-knowledge-store';
+import { createClassroomHandler } from './server/classroom-handler';
+import { ClassroomService } from './server/classroom-service';
+import { JsonClassroomStore } from './server/classroom-store';
+import { ClassroomAiService } from './server/classroom-ai';
+import { ClassroomLessonService } from './server/classroom-lesson';
+import { ClassroomMaterialService } from './server/classroom-materials';
+import { ClassroomRecognitionService } from './server/classroom-recognition';
+import { ClassroomAudioService } from './server/classroom-audio';
+import { ClassroomTranscriptionService, createHttpTranscriptionProvider } from './server/classroom-transcription';
 import { fetchFeishuBotCalendarEvents } from './server/feishu-bot-calendar';
 import {
   fetchFeishuBotWorkspaces,
@@ -685,6 +694,50 @@ function cloudKnowledgeDevServer(env: Record<string, string>): Plugin {
   };
 }
 
+function classroomDevServer(env: Record<string, string>): Plugin {
+  const storePromise = JsonClassroomStore.open(env.INKLOOP_CLASSROOM_STORE || process.env.INKLOOP_CLASSROOM_STORE || join(process.cwd(), '.inkloop/classrooms'));
+  const origins = (env.INKLOOP_CLASSROOM_ORIGINS || process.env.INKLOOP_CLASSROOM_ORIGINS || '')
+    .split(',').map((origin) => origin.trim()).filter(Boolean);
+  return {
+    name: 'inkloop-classroom-dev-server',
+    configureServer(server) {
+      let handlerPromise: Promise<ReturnType<typeof createClassroomHandler>> | null = null;
+      server.middlewares.use((req, res, next) => {
+        const pathname = new URL(req.url || '/', 'http://classroom.local').pathname;
+        if (pathname !== '/classroom' && pathname !== '/classroom/') { next(); return; }
+        res.statusCode = 302; res.setHeader('location', '/teacher-classroom.html'); res.end();
+      });
+      server.middlewares.use((req, res, next) => {
+        handlerPromise ??= storePromise.then((store) => {
+          const service = new ClassroomService(store);
+          const transcriptionUrl = env.INKLOOP_CLASSROOM_TRANSCRIPTION_URL || process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_URL;
+          const transcription = new ClassroomTranscriptionService(store, service, {
+            ...(transcriptionUrl ? { provider: createHttpTranscriptionProvider({
+              baseUrl: transcriptionUrl,
+              mode: (env.INKLOOP_CLASSROOM_TRANSCRIPTION_MODE || process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_MODE) === 'external' ? 'external' : 'local',
+              externalOptIn: (env.INKLOOP_CLASSROOM_TRANSCRIPTION_EXTERNAL_OPT_IN || process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_EXTERNAL_OPT_IN) === '1',
+              apiKey: env.INKLOOP_CLASSROOM_TRANSCRIPTION_API_KEY || process.env.INKLOOP_CLASSROOM_TRANSCRIPTION_API_KEY,
+            }) } : {}),
+          });
+          void transcription.recover();
+          return createClassroomHandler({
+            store,
+            service,
+            ai: new ClassroomAiService(store),
+            lesson: new ClassroomLessonService(store),
+            materials: new ClassroomMaterialService(store, service),
+            recognition: new ClassroomRecognitionService(store),
+            audio: new ClassroomAudioService(store, transcription),
+            transcription,
+            allowOrigins: origins,
+          });
+        });
+        void handlerPromise.then((handler) => handler(req, res)).then((handled) => { if (!handled) next(); }).catch(next);
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
@@ -713,7 +766,13 @@ export default defineConfig(({ mode }) => {
       target: 'es2022',
       rollupOptions: {
         // 多页：桌面 web=index.html（浏览器）；电纸屏移动版=mobile.html（安卓壳加载这个）。两页共享 pdfjs 等 chunk。
-        input: { main: 'index.html', mobile: 'mobile.html', aiPen: 'ai-pen-demo.html' },
+        input: {
+          main: 'index.html',
+          mobile: 'mobile.html',
+          aiPen: 'ai-pen-demo.html',
+          teacherClassroom: 'teacher-classroom.html',
+          studentClassroom: 'student-classroom.html',
+        },
         output: {
           // pdfjs-dist 本体(~数百KB)拆出主包，否则 index.js 触发 >500KB 警告。
           // worker(.mjs)本就独立加载，这里拆的是主线程那半。
@@ -723,6 +782,6 @@ export default defineConfig(({ mode }) => {
         },
       },
     },
-    plugins: [runtimeSyncDevServer(env), cloudLibraryDevServer(env), cloudKnowledgeDevServer(env), inkloopAuthProxy(env), panelFeishuProxy(env), panelVaultProxy(env), inferenceProxy(env), feishuServiceProxy(env), convertServiceProxy(env)],
+    plugins: [classroomDevServer(env), runtimeSyncDevServer(env), cloudLibraryDevServer(env), cloudKnowledgeDevServer(env), inkloopAuthProxy(env), panelFeishuProxy(env), panelVaultProxy(env), inferenceProxy(env), feishuServiceProxy(env), convertServiceProxy(env)],
   };
 });

@@ -7,7 +7,7 @@ import {
   type KnowledgeObject,
   type KnowledgeRiskStatus,
   type KnowledgeStatus,
-} from '../../../packages/knowledge-schema/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
 
 export interface CloudKnowledgeNamespace {
   tenant_id?: string;

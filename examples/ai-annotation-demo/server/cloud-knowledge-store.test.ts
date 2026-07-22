@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { DocumentProjection, KnowledgeObject } from '../../../packages/knowledge-schema/src/index';
+import type { DocumentProjection, KnowledgeObject } from 'ink-surface-sdk/knowledge-schema';
 import { JsonCloudKnowledgeStore, type CloudAiTurnRecord } from './cloud-knowledge-store';
 
 function object(id = 'ko_cloud_patch', documentId = 'doc_cloud_patch', aiTurnId = 'turn_1', markId = 'mark_1'): KnowledgeObject {

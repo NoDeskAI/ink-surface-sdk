@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 
 export interface RuntimeSyncNamespace {
   tenant_id?: string;

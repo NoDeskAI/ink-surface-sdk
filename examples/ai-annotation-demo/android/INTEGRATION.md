@@ -52,7 +52,7 @@ INKLOOP_ANDROID_LOCAL_DEMO_AUTH=1 npm run android:assemble:debug
 node scripts/sync-android-assets.mjs
 ```
 把 `dist/`（+ 端侧 `models/`、`dictionaries/`）拷进 `android/app/src/main/assets/`（gitignore，不入库）。
-页面地址：debug = `http://appassets.androidplatform.net/assets/mobile.html`，release = `https://appassets.androidplatform.net/assets/mobile.html`。桌面 Web 仍用 `index.html`，AI Pen Kickstarter V1 演示仍用 `ai-pen-demo.html`；Android 默认壳承载 InkLoop Paper 本地优先阅读/标记/本机与 Wi-Fi 导入小闭环。
+页面地址：debug = `http://appassets.androidplatform.net/assets/mobile.html`，release = `https://appassets.androidplatform.net/assets/mobile.html`。桌面 Web 仍用 `index.html`，AI Pen Kickstarter V1 演示仍用 `ai-pen-demo.html`。教育课堂另行构建 `teacher-classroom.html` 与 `student-classroom.html`；电子纸兼容验证只显式打开 `student-classroom.html`，Android 默认启动地址继续是 `mobile.html`，不改变 InkLoop Paper 阅读/标记流程。
 
 文件选择器按前端 `<input accept>` 放行类型：`mobile.html` 主要选择 PDF；`ai-pen-demo.html` 的 bench/QA 路径可以选择 RawPenFrame JSON/JSONL，用来验证 AI Pen 原始日志导入链路。这个能力不改变 Android/e-paper 的 V1 边界：Kickstarter 首发捕捉主路径仍是 AI Pen + Capture Surface + Web/Desktop Capture Host。
 

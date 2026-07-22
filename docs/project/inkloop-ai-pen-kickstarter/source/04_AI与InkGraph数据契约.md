@@ -453,6 +453,11 @@ type InkLoopSourceRef =
       ts_start_ms: number;
       ts_end_ms: number;
       bbox_norm?: [number, number, number, number];
+      spatial_region?: {
+        coordinate_space: "classroom_page_world_v1";
+        surface: { kind: "textbook_page"; material_id: string; page_index: number };
+        bbox_world: [number, number, number, number];
+      };
     }
   | {
       type: "board_object";
@@ -468,6 +473,13 @@ type InkLoopSourceRef =
       end_ms: number;
       speaker?: string;
       transcript_ref?: string;
+    }
+  | {
+      type: "material_page";
+      session_id: string;
+      material_id: string;
+      page_index: number;
+      bbox_norm?: [number, number, number, number];
     }
   | {
       type: "project_memory";

@@ -10,18 +10,18 @@
  */
 import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { renderVaultMarkdown } from '../../../packages/adapter-obsidian/src/index';
+import { renderVaultMarkdown } from 'ink-surface-sdk/adapters/obsidian';
 import {
   buildLessonGraphKnowledgeObjects,
   buildMeetingGraphKnowledgeObjects,
-} from '../../../packages/knowledge-schema/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
 import {
   validateLessonGraphSourceRefs,
   validateMeetingGraphSourceRefs,
   type InkLoopSourceRef,
   type LessonGraph,
   type MeetingGraph,
-} from '../../../packages/runtime-schema/src/index';
+} from 'ink-surface-sdk/runtime-schema';
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);

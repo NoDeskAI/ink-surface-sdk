@@ -1,16 +1,38 @@
 import { describe, expect, it } from 'vitest';
 import {
   AI_GRAPH_JOB_SCHEMA_VERSION,
+  CLASSROOM_SCHEMA_VERSION,
+  CLASSROOM_WORLD_GEOMETRY_VERSION,
   assertRuntimeSyncEvent,
   INKLOOP_AI_PEN_CONTRACT_VERSION,
   isRuntimeSyncEvent,
   validateInkLoopSourceRefs,
   validateAiGraphJob,
+  validateClassroomBoardEvent,
+  validateClassroomPreview,
+  validateClassroomSnapshot,
+  validateClassroomTeacherView,
+  validateClassroomConfirmedFocus,
+  validateClassroomTimelineEntry,
+  validateClassroomRecognitionRevision,
+  validateClassroomRecordingState,
+  validateClassroomTranscriptRevision,
+  validateClassroomTranscriptionState,
   validateLessonGraphSourceRefs,
   validateMeetingGraphSourceRefs,
   validateRawPenFrame,
   validateRuntimeSyncEvent,
   type AiGraphJob,
+  type ClassroomBoardEvent,
+  type ClassroomPreview,
+  type ClassroomSnapshot,
+  type ClassroomTeacherView,
+  type ClassroomConfirmedFocus,
+  type ClassroomTimelineEntry,
+  type ClassroomRecognitionRevision,
+  type ClassroomRecordingState,
+  type ClassroomTranscriptRevision,
+  type ClassroomTranscriptionState,
   type InkEvent,
   type InkLoopSourceRef,
   type LessonGraph,
@@ -60,6 +82,258 @@ function snapshot(): RuntimeDocumentSnapshot {
 }
 
 describe('runtime schema', () => {
+  it('validates textbook surfaces, teacher views, confirmed focus, and point-free timeline references', () => {
+    const view: ClassroomTeacherView = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      material_id: 'material_1',
+      page_index: 1,
+      zoom_mode: 'percent',
+      zoom_percent: 150,
+      active_surface: { kind: 'textbook_page', material_id: 'material_1', page_index: 1 },
+      revision: 2,
+      updated_at: '2026-07-19T00:00:00.000Z',
+    };
+    const focus: ClassroomConfirmedFocus = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      focus_id: 'focus_1',
+      material_id: 'material_1',
+      page_index: 1,
+      bbox_norm: [0.1, 0.2, 0.5, 0.2],
+      confirmed_at: '2026-07-19T00:00:01.000Z',
+    };
+    const timeline: ClassroomTimelineEntry = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      timeline_sequence: 1,
+      kind: 'board_event_ref',
+      occurred_at: '2026-07-19T00:00:02.000Z',
+      board_sequence: 4,
+      event_id: 'ink_4',
+      surface: { kind: 'textbook_page', material_id: 'material_1', page_index: 1 },
+    };
+
+    expect(validateClassroomTeacherView(view)).toEqual([]);
+    expect(validateClassroomTeacherView({
+      ...view,
+      zoom_percent: 400,
+      viewport: { center_x_world: 0, center_y_world: 0, zoom_scale: 4 },
+    })).toEqual([]);
+    expect(validateClassroomTeacherView({
+      ...view,
+      zoom_percent: 401,
+      viewport: { center_x_world: 0, center_y_world: 0, zoom_scale: 4 },
+    }).map((issue) => issue.path)).toContain('teacher_view.zoom_percent');
+    expect(validateClassroomConfirmedFocus(focus)).toEqual([]);
+    expect(validateClassroomTeacherView({
+      ...view,
+      active_surface: { kind: 'textbook_page', material_id: 'material_1', page_index: 0 },
+    }).map((issue) => issue.path)).toContain('teacher_view.active_surface');
+    expect(validateClassroomConfirmedFocus({
+      ...focus,
+      bbox_norm: undefined,
+      spatial_region: {
+        coordinate_space: 'classroom_page_world_v1',
+        surface: { kind: 'textbook_page', material_id: 'material_2', page_index: 1 },
+        bbox_world: [0, 0, 10, 10],
+      },
+    }).map((issue) => issue.path)).toContain('confirmed_focus.spatial_region.surface');
+    expect(validateClassroomTimelineEntry(timeline)).toEqual([]);
+    expect(JSON.stringify(timeline)).not.toContain('points');
+    expect(validateClassroomTimelineEntry({ ...timeline, surface: { kind: 'textbook_page', material_id: '', page_index: -1 } }).map((issue) => issue.path)).toEqual(expect.arrayContaining([
+      'timeline.surface.material_id', 'timeline.surface.page_index',
+    ]));
+  });
+
+  it('validates append-only formula recognition revisions and rejects unbound trust', () => {
+    const revision: ClassroomRecognitionRevision = {
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', recognition_id: 'recognition_1', revision: 1,
+      status: 'pending', kind: 'formula', text: 'x² + 4x = 5', latex: 'x^2+4x=5', confidence: 0.82,
+      provider: 'test_fixture', processing_mode: 'local', event_ids: ['ink_1'],
+      surface: { kind: 'textbook_page', material_id: 'material_1', page_index: 0 }, bbox_norm: [0.1, 0.2, 0.5, 0.1], created_at: '2026-07-19T00:00:00.000Z',
+    };
+    expect(validateClassroomRecognitionRevision(revision)).toEqual([]);
+    expect(validateClassroomRecognitionRevision({ ...revision, status: 'corrected', text: '', reviewed_at: undefined })).not.toEqual([]);
+    expect(validateClassroomRecognitionRevision({ ...revision, event_ids: [] })).not.toEqual([]);
+  });
+
+  it('validates recording lifecycle state in snapshots and point-free timeline entries', () => {
+    const recording: ClassroomRecordingState = {
+      recording_id: 'recording_1', classroom_id: 'classroom_1', classroom_generation: 2, recording_generation: 1,
+      state: 'recording', health: 'healthy', sample_rate: 16_000, channels: 1, chunk_count: 2, byte_count: 6_400,
+      last_sequence: 2, last_relative_end_ms: 200, started_at: '2026-07-19T00:00:00.000Z',
+    };
+    const timeline: ClassroomTimelineEntry = {
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', timeline_sequence: 1,
+      kind: 'recording_state', occurred_at: recording.started_at, recording,
+    };
+    expect(validateClassroomRecordingState(recording)).toEqual([]);
+    expect(validateClassroomTimelineEntry(timeline)).toEqual([]);
+    expect(validateClassroomSnapshot({
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', classroom_status: 'live',
+      snapshot_sequence: 0, board_events: [], timeline_sequence: 1, recording,
+      generated_at: '2026-07-19T00:00:01.000Z',
+    })).toEqual([]);
+    expect(JSON.stringify(timeline)).not.toMatch(/pcm|base64|sdp|candidate|points/i);
+    expect(validateClassroomRecordingState({ ...recording, sample_rate: 12_345, channels: 8 }).map((issue) => issue.path)).toEqual(expect.arrayContaining(['recording.sample_rate', 'recording.channels']));
+    expect(validateClassroomRecordingState({ ...recording, state: 'stopped' }).map((issue) => issue.path)).toContain('recording.stopped_at');
+    expect(validateClassroomRecordingState({ ...recording, state: 'interrupted', health: 'incomplete' }).map((issue) => issue.path)).toContain('recording.interrupted_at');
+  });
+
+  it('validates append-only transcript revisions and transcription degradation state', () => {
+    const transcript: ClassroomTranscriptRevision = {
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', transcript_id: 'transcript_chunk_1_0', revision: 1,
+      status: 'final', recording_id: 'recording_1', recording_generation: 1, chunk_id: 'chunk_1',
+      chunk_hash: `sha256:${'a'.repeat(64)}`, relative_start_ms: 100, relative_end_ms: 900, text: '两边加九',
+      confidence: 0.93, language: 'zh-CN', provider: 'loopback_whisper', processing_mode: 'local', created_at: '2026-07-19T00:00:01.000Z',
+    };
+    const transcription: ClassroomTranscriptionState = {
+      classroom_id: 'classroom_1', recording_id: 'recording_1', recording_generation: 1, state: 'ready',
+      provider: 'loopback_whisper', processing_mode: 'local', processed_chunk_count: 1, failed_chunk_count: 0,
+      audio_available: true, updated_at: '2026-07-19T00:00:01.000Z',
+    };
+    expect(validateClassroomTranscriptRevision(transcript)).toEqual([]);
+    expect(validateClassroomTranscriptionState(transcription)).toEqual([]);
+    expect(validateClassroomTranscriptRevision({ ...transcript, status: 'corrected', original_revision: undefined, corrected_at: undefined })).not.toEqual([]);
+    expect(validateClassroomTranscriptRevision({ ...transcript, relative_end_ms: 50 })).not.toEqual([]);
+    expect(validateClassroomTranscriptionState({ ...transcription, state: 'failed', last_error_code: undefined })).not.toEqual([]);
+    expect(validateClassroomTimelineEntry({
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', timeline_sequence: 2,
+      kind: 'transcript_revision', occurred_at: transcript.created_at, transcript,
+    })).toEqual([]);
+  });
+
+  it('validates classroom board, preview, snapshot, AI job, and teacher review contracts', () => {
+    const stroke = {
+      stroke_id: 'stroke_classroom_1',
+      session_id: 'classroom_1',
+      surface_id: 'board_1',
+      pen_id: 'teacher_pointer',
+      points: [{ x_norm: 0.1, y_norm: 0.2, t_ms: 100 }, { x_norm: 0.4, y_norm: 0.5, t_ms: 180, pressure: 0.8 }],
+      bbox_norm: [0.1, 0.2, 0.3, 0.3] as [number, number, number, number],
+      ts_start_ms: 100,
+      ts_end_ms: 180,
+    };
+    const boardEvent: ClassroomBoardEvent = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      sequence: 1,
+      client_event_id: 'client_event_1',
+      accepted_at: '2026-07-17T00:00:00.000Z',
+      event: {
+        event_id: 'ink_event_1',
+        trace_id: 'trace_1',
+        session_id: 'classroom_1',
+        surface_id: 'board_1',
+        pen_id: 'teacher_pointer',
+        event_type: 'stroke',
+        stroke_refs: [stroke.stroke_id],
+        bbox_norm: stroke.bbox_norm,
+        ts_start_ms: 100,
+        ts_end_ms: 180,
+        source: { device: 'web_demo', localization: 'manual_mock', confidence: 1 },
+        metadata: { mode: 'teach', tool: 'pen', color: '#111111' },
+      },
+      stroke,
+    };
+    const preview: ClassroomPreview = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      client_event_id: 'client_event_1',
+      revision: 2,
+      points: stroke.points,
+      tool: 'pen',
+      color: '#111111',
+      expires_at_ms: 1_800,
+    };
+    const snapshot: ClassroomSnapshot = {
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      classroom_status: 'live',
+      snapshot_sequence: 1,
+      board_events: [boardEvent],
+      generated_at: '2026-07-17T00:00:01.000Z',
+    };
+    expect(validateClassroomBoardEvent(boardEvent)).toEqual([]);
+    expect(validateClassroomPreview(preview)).toEqual([]);
+    expect(validateClassroomSnapshot(snapshot)).toEqual([]);
+  });
+
+  it('validates classroom-only world records without loosening normalized Ink contracts', () => {
+    const world: ClassroomBoardEvent = {
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', sequence: 1, client_event_id: 'world_1', accepted_at: '2026-07-20T00:00:00.000Z',
+      geometry_version: CLASSROOM_WORLD_GEOMETRY_VERSION, surface: { kind: 'textbook_page', material_id: 'material_1', page_index: 0 },
+      event: { event_id: 'ink_world_1', trace_id: 'trace_world_1', session_id: 'classroom_1', surface_id: 'page', pen_id: 'teacher', event_type: 'stroke', stroke_refs: ['stroke_world_1'], bbox_world: [310, -20, 120, 40], ts_start_ms: 1, ts_end_ms: 2, source: { device: 'web_demo', localization: 'manual_mock', confidence: 1 } },
+      stroke: { stroke_id: 'stroke_world_1', session_id: 'classroom_1', surface_id: 'page', pen_id: 'teacher', points_world: [{ x_world: 310, y_world: -20, t_ms: 1 }, { x_world: 430, y_world: 20, t_ms: 2 }], bbox_world: [310, -20, 120, 40], ts_start_ms: 1, ts_end_ms: 2 },
+    };
+    expect(validateClassroomBoardEvent(world)).toEqual([]);
+    expect(validateClassroomBoardEvent({ ...world, surface: { kind: 'teacher_board' } } as unknown).map((issue) => issue.path)).toContain('board_event.surface');
+    expect(validateClassroomBoardEvent({ ...world, stroke: { ...world.stroke, points_world: [{ x_world: Number.POSITIVE_INFINITY, y_world: 0, t_ms: 1 }] } } as unknown).map((issue) => issue.path)).toContain('board_event.stroke.points_world.0.x_world');
+    expect(validateClassroomPreview({ schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', client_event_id: 'preview_world', revision: 1, geometry_version: CLASSROOM_WORLD_GEOMETRY_VERSION, points_world: world.stroke.points_world, tool: 'pen', expires_at_ms: 100, surface: world.surface })).toEqual([]);
+
+    const legacyInk: InkEvent = { ...world.event, bbox_norm: [0, 0, 1, 1] };
+    delete (legacyInk as unknown as Record<string, unknown>).bbox_world;
+    expect(legacyInk.bbox_norm).toEqual([0, 0, 1, 1]);
+  });
+
+  it('rejects malformed classroom coordinates, ordering, private stream state, and unsupported AI evidence', () => {
+    const boardIssues = validateClassroomBoardEvent({
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      sequence: 0,
+      client_event_id: 'event_1',
+      accepted_at: 'now',
+      event: {
+        event_id: 'ink_1', trace_id: 'trace_1', session_id: 'classroom_1', surface_id: 'board_1', pen_id: 'teacher',
+        event_type: 'stroke', stroke_refs: ['stroke_1'], bbox_norm: [-0.1, 0, 1.1, 1], ts_start_ms: 20, ts_end_ms: 10,
+        source: { device: 'web_demo', localization: 'manual_mock', confidence: 1 },
+      },
+      stroke: {
+        stroke_id: 'stroke_1', session_id: 'classroom_1', surface_id: 'board_1', pen_id: 'teacher', points: [],
+        bbox_norm: [0, 0, 1, 1], ts_start_ms: 20, ts_end_ms: 10,
+      },
+    });
+    const previewIssues = validateClassroomPreview({
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1',
+      client_event_id: 'event_1',
+      revision: -1,
+      points: [{ x_norm: Number.NaN, y_norm: 2, t_ms: 1 }],
+      tool: 'pen', color: '#000', expires_at_ms: 1,
+    });
+    const snapshotIssues = validateClassroomSnapshot({
+      schema_version: CLASSROOM_SCHEMA_VERSION,
+      classroom_id: 'classroom_1', classroom_status: 'live', snapshot_sequence: 2,
+      board_events: [{ sequence: 2 }, { sequence: 1 }], generated_at: 'now',
+      private_jobs: [{ job_id: 'must_not_leak' }],
+    });
+
+    expect(boardIssues.map((issue) => issue.path)).toEqual(expect.arrayContaining(['board_event.sequence', 'board_event.event.bbox_norm', 'board_event.event.ts_end_ms', 'board_event.stroke.points']));
+    expect(previewIssues.map((issue) => issue.path)).toEqual(expect.arrayContaining(['preview.revision', 'preview.points.0.x_norm', 'preview.points.0.y_norm']));
+    expect(snapshotIssues.map((issue) => issue.path)).toEqual(expect.arrayContaining(['snapshot.board_events.0', 'snapshot.board_events.1', 'snapshot.private_jobs']));
+  });
+
+  it('bounds durable stroke and ephemeral preview point counts', () => {
+    const oversizedPoints = Array.from({ length: 4_097 }, (_, index) => ({ x_norm: 0.5, y_norm: 0.5, t_ms: index }));
+    const boardIssues = validateClassroomBoardEvent({
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', sequence: 1, client_event_id: 'event_1', accepted_at: 'now',
+      event: {
+        event_id: 'ink_1', trace_id: 'trace_1', session_id: 'classroom_1', surface_id: 'board_1', pen_id: 'teacher', event_type: 'stroke',
+        stroke_refs: ['stroke_1'], bbox_norm: [0, 0, 1, 1], ts_start_ms: 0, ts_end_ms: 4_096,
+        source: { device: 'web_demo', localization: 'manual_mock', confidence: 1 },
+      },
+      stroke: { stroke_id: 'stroke_1', session_id: 'classroom_1', surface_id: 'board_1', pen_id: 'teacher', points: oversizedPoints, bbox_norm: [0, 0, 1, 1], ts_start_ms: 0, ts_end_ms: 4_096 },
+    });
+    const previewIssues = validateClassroomPreview({
+      schema_version: CLASSROOM_SCHEMA_VERSION, classroom_id: 'classroom_1', client_event_id: 'event_1', revision: 257,
+      points: oversizedPoints.slice(0, 257), tool: 'pen', expires_at_ms: 5_000,
+    });
+
+    expect(boardIssues).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'board_event.stroke.points', message: expect.stringContaining('at most 4096') })]));
+    expect(previewIssues).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'preview.points', message: expect.stringContaining('at most 256') })]));
+  });
+
   it('validates the current runtime sync event contract', () => {
     const value = event();
 

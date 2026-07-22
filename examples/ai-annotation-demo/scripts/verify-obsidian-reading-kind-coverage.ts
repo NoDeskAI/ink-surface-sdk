@@ -13,13 +13,13 @@ import {
   type KnowledgeKind,
   type KnowledgeObject,
   type MarkdownCallout,
-} from '../../../packages/knowledge-schema/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
 import {
   OBSIDIAN_CONTROLLED_FIELDS_MARKER,
   parseObsidianControlledKnowledgeEdit,
   renderVaultMarkdown,
   type RenderedFile,
-} from '../../../packages/adapter-obsidian/src/index';
+} from 'ink-surface-sdk/adapters/obsidian';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(SCRIPT_DIR, '..');

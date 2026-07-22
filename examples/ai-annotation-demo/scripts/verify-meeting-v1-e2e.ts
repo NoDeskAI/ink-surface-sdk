@@ -13,7 +13,7 @@ import {
 } from '../src/integration/lark-meeting-timeline/adapter';
 import type { KnowledgeKind } from '../src/knowledge/knowledge-object';
 import type { PersistedMeeting } from '../src/core/store-format';
-import { renderVaultMarkdown } from '../../../packages/adapter-obsidian/src/index';
+import { renderVaultMarkdown } from 'ink-surface-sdk/adapters/obsidian';
 import {
   buildKnowledgeObjectFromPostProcessResult,
   validateMeetingPostProcessSourceRefs,
@@ -22,7 +22,7 @@ import {
   type KnowledgeObject,
   type PostProcessResult,
   type ProjectMemoryRef,
-} from '../../../packages/knowledge-schema/src/index';
+} from 'ink-surface-sdk/knowledge-schema';
 
 interface CloudAiTurnRecord {
   schema_version: 'inkloop.cloud_hub.ai_turn.v1';

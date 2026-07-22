@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import net from 'node:net';
-import type { RuntimeSyncEvent } from '../../../packages/runtime-schema/src/index';
+import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(SCRIPT_DIR, '..');
