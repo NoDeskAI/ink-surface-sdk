@@ -883,8 +883,8 @@ describe('meeting media streaming ingress', () => {
     });
 
     const first = frame(0);
-    const second = frame(1);
     await firstStarted;
+    const second = frame(1);
     expect(seen).toEqual([0]);
     releaseFirst();
     await Promise.all([first, second]);
