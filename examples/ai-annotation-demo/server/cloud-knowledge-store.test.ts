@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -79,6 +79,43 @@ function projection(id: string, documentId: string, koId: string, markId = 'mark
 }
 
 describe('JsonCloudKnowledgeStore', () => {
+  it('persists document deletion and rejects late projection writes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inkloop-knowledge-delete-'));
+    const namespace = { tenant_id: 'tenant', user_id: 'user' };
+    try {
+      const first = new JsonCloudKnowledgeStore(root);
+      await first.upsertAiTurn(namespace, aiTurn('turn_deleted_document', 'mtgdoc_deleted'));
+      await first.deleteDocument(namespace, 'mtgdoc_deleted');
+      const restarted = new JsonCloudKnowledgeStore(root);
+
+      await expect(restarted.upsertAiTurn(namespace, aiTurn('turn_late', 'mtgdoc_deleted')))
+        .rejects.toThrow('knowledge_document_deleted');
+      await expect(restarted.upsertKnowledgeObject(namespace, object('ko_late', 'mtgdoc_deleted', 'turn_late')))
+        .rejects.toThrow('knowledge_document_deleted');
+      await expect(restarted.upsertDocumentProjection(namespace, projection('dp_late', 'mtgdoc_deleted', 'ko_late')))
+        .rejects.toThrow('knowledge_document_deleted');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when the durable knowledge index is corrupt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inkloop-knowledge-corrupt-'));
+    const namespace = { tenant_id: 'tenant', user_id: 'user' };
+    try {
+      const directory = join(root, 'tenant', 'user');
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, 'index.json'), '{"schema_version":', 'utf8');
+      const store = new JsonCloudKnowledgeStore(root);
+
+      await expect(store.listAiTurns(namespace)).rejects.toBeInstanceOf(SyntaxError);
+      await expect(store.upsertAiTurn(namespace, aiTurn('turn_after_corruption', 'doc')))
+        .rejects.toBeInstanceOf(SyntaxError);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('patches controlled Obsidian fields onto persisted KnowledgeObjects', async () => {
     const root = await mkdtemp(join(tmpdir(), 'inkloop-knowledge-store-'));
     try {

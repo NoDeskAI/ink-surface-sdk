@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   canonicalJson,
@@ -35,6 +36,7 @@ export interface CloudKnowledgeIndex {
   ai_turns: CloudAiTurnRecord[];
   knowledge_objects: KnowledgeObject[];
   document_projections: DocumentProjection[];
+  document_deletions: Record<string, { deleted_at: string }>;
 }
 
 export interface CloudKnowledgeObjectPatch {
@@ -75,6 +77,7 @@ function emptyIndex(namespace: CloudKnowledgeNamespace): CloudKnowledgeIndex {
     ai_turns: [],
     knowledge_objects: [],
     document_projections: [],
+    document_deletions: {},
   };
 }
 
@@ -218,22 +221,37 @@ export class JsonCloudKnowledgeStore {
           ai_turns: Array.isArray(parsed.ai_turns) ? parsed.ai_turns : [],
           knowledge_objects: Array.isArray(parsed.knowledge_objects) ? parsed.knowledge_objects : [],
           document_projections: Array.isArray(parsed.document_projections) ? parsed.document_projections : [],
+          document_deletions: parsed.document_deletions && typeof parsed.document_deletions === 'object' ? parsed.document_deletions : {},
         };
       }
-    } catch {
-      // Missing or partially written knowledge indexes should not block source-file sync.
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     return emptyIndex(namespace);
   }
 
   private async writeIndex(namespace: CloudKnowledgeNamespace, index: CloudKnowledgeIndex): Promise<void> {
-    await mkdir(this.namespaceDir(namespace), { recursive: true });
-    await writeFile(this.indexPath(namespace), JSON.stringify({ ...index, updated_at: new Date().toISOString() }, null, 2), 'utf8');
+    const directory = this.namespaceDir(namespace);
+    const path = this.indexPath(namespace);
+    const temporaryPath = join(directory, `.index.${process.pid}.${randomUUID()}.tmp`);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    try {
+      await writeFile(
+        temporaryPath,
+        JSON.stringify({ ...index, updated_at: new Date().toISOString() }, null, 2),
+        { encoding: 'utf8', mode: 0o600 },
+      );
+      await rename(temporaryPath, path);
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async upsertAiTurn(namespace: CloudKnowledgeNamespace, turn: CloudAiTurnRecord): Promise<CloudAiTurnRecord> {
     return this.withWriteLock(namespace, async () => {
       const index = await this.readIndex(namespace);
+      this.assertDocumentWritable(index, turn.document_id);
       const next = index.ai_turns.filter((item) => item.ai_turn_id !== turn.ai_turn_id);
       next.push(turn);
       await this.writeIndex(namespace, { ...index, ai_turns: next });
@@ -249,6 +267,7 @@ export class JsonCloudKnowledgeStore {
   async upsertKnowledgeObject(namespace: CloudKnowledgeNamespace, object: KnowledgeObject): Promise<KnowledgeObject> {
     return this.withWriteLock(namespace, async () => {
       const index = await this.readIndex(namespace);
+      this.assertDocumentWritable(index, object.source.document_id);
       const existing = index.knowledge_objects.find((item) => item.ko_id === object.ko_id);
       const nextObject = mergeKnowledgeObject(existing, object);
       const next = index.knowledge_objects.filter((item) => item.ko_id !== object.ko_id);
@@ -280,6 +299,7 @@ export class JsonCloudKnowledgeStore {
   async upsertDocumentProjection(namespace: CloudKnowledgeNamespace, projection: DocumentProjection): Promise<DocumentProjection> {
     return this.withWriteLock(namespace, async () => {
       const index = await this.readIndex(namespace);
+      this.assertDocumentWritable(index, projection.document_id);
       const next = index.document_projections.filter((item) => item.projection_id !== projection.projection_id);
       next.push(projection);
       await this.writeIndex(namespace, { ...index, document_projections: next });
@@ -290,6 +310,31 @@ export class JsonCloudKnowledgeStore {
   async listDocumentProjections(namespace: CloudKnowledgeNamespace, documentId?: string): Promise<DocumentProjection[]> {
     return byDocumentId((await this.readIndex(namespace)).document_projections, documentId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  async deleteDocument(namespace: CloudKnowledgeNamespace, documentId: string): Promise<{ ai_turns: number; knowledge_objects: number; document_projections: number }> {
+    return this.withWriteLock(namespace, async () => {
+      const index = await this.readIndex(namespace);
+      const result = {
+        ai_turns: index.ai_turns.filter((item) => item.document_id === documentId).length,
+        knowledge_objects: index.knowledge_objects.filter((item) => item.source.document_id === documentId).length,
+        document_projections: index.document_projections.filter((item) => item.document_id === documentId).length,
+      };
+      await this.writeIndex(namespace, {
+        ...index,
+        ai_turns: index.ai_turns.filter((item) => item.document_id !== documentId),
+        knowledge_objects: index.knowledge_objects.filter((item) => item.source.document_id !== documentId),
+        document_projections: index.document_projections.filter((item) => item.document_id !== documentId),
+        document_deletions: { ...index.document_deletions, [documentId]: { deleted_at: new Date().toISOString() } },
+      });
+      return result;
+    });
+  }
+
+  private assertDocumentWritable(index: CloudKnowledgeIndex, documentId: string): void {
+    if (index.document_deletions[documentId]) {
+      throw Object.assign(new Error('knowledge_document_deleted'), { status: 410 });
+    }
   }
 
   async deleteByRuntimeRefs(namespace: CloudKnowledgeNamespace, input: CloudKnowledgeDeleteByRuntimeRefInput): Promise<CloudKnowledgeDeleteByRuntimeRefResult> {

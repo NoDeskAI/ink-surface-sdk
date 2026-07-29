@@ -48,7 +48,35 @@ export type NativeBridgeRequest =
       request_id: string;
       type: 'sync.status.get';
       doc_id?: string;
+    }
+  | {
+      protocol_version: typeof NATIVE_BRIDGE_PROTOCOL_VERSION;
+      request_id: string;
+      type: 'meeting.recording.status.get';
+    }
+  | {
+      protocol_version: typeof NATIVE_BRIDGE_PROTOCOL_VERSION;
+      request_id: string;
+      type: 'meeting.recording.preference.set';
+      automatically_record_supported_meetings: boolean;
+    }
+  | {
+      protocol_version: typeof NATIVE_BRIDGE_PROTOCOL_VERSION;
+      request_id: string;
+      type: 'meeting.recording.stop';
+      session_id: string;
+      reason: 'manual';
     };
+
+export interface NativeBridgeMeetingRecordingStatusPayload {
+  state: 'idle' | 'detected' | 'recording' | 'paused' | 'degraded' | 'sealed' | 'error';
+  automatically_record_supported_meetings: boolean;
+  session_id?: string;
+  platform?: 'google_meet' | 'zoom';
+  active_tracks?: Array<'mic' | 'remote'>;
+  unavailable_tracks?: Array<'mic' | 'remote'>;
+  message?: string;
+}
 
 export interface NativeBridgeDocumentSnapshotPayload {
   doc_id: string;
@@ -118,7 +146,17 @@ export function validateNativeBridgeRequest(value: unknown): NativeBridgeValidat
   } else if (value.type === 'asset.get') {
     requireString(value, 'doc_id', issues);
     requireString(value, 'asset_id', issues);
-  } else if (value.type !== 'sync.status.get') {
+  } else if (value.type === 'meeting.recording.preference.set') {
+    if (typeof value.automatically_record_supported_meetings !== 'boolean') {
+      issues.push({
+        path: 'automatically_record_supported_meetings',
+        message: 'must be a boolean',
+      });
+    }
+  } else if (value.type === 'meeting.recording.stop') {
+    requireString(value, 'session_id', issues);
+    if (value.reason !== 'manual') issues.push({ path: 'reason', message: 'must be manual' });
+  } else if (value.type !== 'sync.status.get' && value.type !== 'meeting.recording.status.get') {
     issues.push({ path: 'type', message: 'must be a supported bridge request type' });
   }
 

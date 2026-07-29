@@ -94,6 +94,20 @@ function dependencies(initial: PersistedMeeting[]) {
 }
 
 describe('Zoom meeting source persistence', () => {
+  it('does not recreate a deleted recurring occurrence', async () => {
+    const state = dependencies([]);
+    const isProviderOccurrenceDeleted = vi.fn(async (identity: { provider_calendar_event_id?: string }) => identity.provider_calendar_event_id === 'occ-deleted');
+
+    const result = await syncZoomMeetingSources([
+      source('987654321', { occurrence_id: 'occ-deleted' }),
+      source('987654321', { occurrence_id: 'occ-next', scheduled_at: '2026-07-25T01:00:00.000Z' }),
+    ], { ...state.deps, isProviderOccurrenceDeleted });
+
+    expect(result).toEqual({ imported: 1, updated: 0 });
+    expect(state.meetings).toHaveLength(1);
+    expect(state.meetings[0].provider_calendar_event_id).toBe('occ-next');
+  });
+
   it('creates a schedule card with the logical meeting id and no UUID session key', async () => {
     const state = dependencies([]);
 

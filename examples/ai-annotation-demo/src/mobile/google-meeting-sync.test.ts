@@ -93,6 +93,19 @@ function dependencies(initial: PersistedMeeting[]) {
 }
 
 describe('Google meeting source persistence', () => {
+  it('does not recreate a deleted Calendar occurrence', async () => {
+    const state = dependencies([]);
+    const isProviderOccurrenceDeleted = vi.fn(async () => true);
+
+    const result = await syncGoogleMeetingSources([source('google-event-deleted')], { ...state.deps, isProviderOccurrenceDeleted });
+
+    expect(result).toEqual({ imported: 0, updated: 0, cancelled: 0 });
+    expect(state.createMeeting).not.toHaveBeenCalled();
+    expect(isProviderOccurrenceDeleted).toHaveBeenCalledWith(expect.objectContaining({
+      platform: 'google_meet', provider_calendar_event_id: 'google-event-deleted', meeting_code: 'abc-defg-hij',
+    }));
+  });
+
   it('maps Calendar identity and meeting code without claiming a provider meeting instance', async () => {
     const state = dependencies([]);
 

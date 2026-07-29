@@ -17,6 +17,7 @@ export interface LarkMeetingReconcileOptions {
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
   logger?: (event: string, details?: unknown) => void;
+  onEnded?: (meeting: LarkRealtimeMeetingRecord) => Promise<void>;
 }
 
 export interface LarkMeetingReconcileResult {
@@ -159,7 +160,7 @@ export async function reconcileLarkLiveMeetings(options: LarkMeetingReconcileOpt
       continue;
     }
     const endedAt = checked.endTime || new Date(nowMs).toISOString();
-    upsertLarkRealtimeMeeting(options.root, {
+    const endedRecord = upsertLarkRealtimeMeeting(options.root, {
       feishu_meeting_id: meeting.feishu_meeting_id,
       scheduled_at: meeting.scheduled_at,
       status: 'ended',
@@ -169,6 +170,7 @@ export async function reconcileLarkLiveMeetings(options: LarkMeetingReconcileOpt
       source_transport: 'lark_rest_reconcile',
     }, nowMs);
     result.ended += 1;
+    await options.onEnded?.(endedRecord);
     if (checked.participants.length) result.enriched += 1;
     options.logger?.('lark-meeting-reconcile:ended', {
       id: meeting.id,

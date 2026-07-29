@@ -8,6 +8,7 @@ export interface ZoomMeetingSyncDependencies {
   createMeeting: (workspaceId: string, input: { title: string; scheduled_at: string; status?: MeetingStatus }) => Promise<PersistedMeeting>;
   updateMeeting: (id: string, patch: Partial<PersistedMeeting>) => Promise<PersistedMeeting | null>;
   mutateMeeting: (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => Promise<PersistedMeeting | null>;
+  isProviderOccurrenceDeleted?: (identity: { platform: 'zoom'; provider_calendar_event_id?: string; provider_space_name: string; scheduled_at: string }) => Promise<boolean>;
   nowMs?: number;
 }
 
@@ -114,6 +115,10 @@ export async function syncZoomMeetingSources(
   const nowMs = dependencies.nowMs ?? Date.now();
 
   for (const source of usableSources) {
+    if (await dependencies.isProviderOccurrenceDeleted?.({
+      platform: 'zoom', provider_calendar_event_id: source.occurrence_id,
+      provider_space_name: source.meeting_id, scheduled_at: source.scheduled_at,
+    })) continue;
     const existing = source.occurrence_id
       ? meetings.find((meeting) => (
         meetingPlatformOf(meeting) === 'zoom'

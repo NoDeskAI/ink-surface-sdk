@@ -427,7 +427,7 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
   return async function handleRuntimeSyncDev(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
-    if (pathname !== '/v1/runtime/events:push' && pathname !== '/v1/runtime/events:pull') return false;
+    if (pathname !== '/v1/runtime/events:push' && pathname !== '/v1/runtime/events:pull' && pathname !== '/v1/runtime/document') return false;
     writeCorsHeaders(req, res, options);
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;
@@ -438,6 +438,22 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
     const started = Date.now();
     try {
       const session = await assertAuthorized(req, url, options);
+
+      if (pathname === '/v1/runtime/document') {
+        if (req.method !== 'DELETE') {
+          sendJson(res, 405, { error: 'DELETE only' });
+          return true;
+        }
+        const documentId = url.searchParams.get('document_id')?.trim() || '';
+        if (!documentId) {
+          sendJson(res, 400, { error: { code: 'document_id_required' } });
+          return true;
+        }
+        const namespace = namespaceOf(session);
+        const deleted = await store.deleteDocument(namespace, documentId);
+        sendJson(res, 200, { deleted, document_id: documentId });
+        return true;
+      }
 
       if (pathname === '/v1/runtime/events:push') {
         if (req.method !== 'POST') {
@@ -464,6 +480,14 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
           }
           const event = raw as RuntimeSyncEvent;
           const namespace = namespaceOf(session);
+          if (await store.isDocumentDeleted(namespace, event.doc_id)) {
+            const latest = await store.latestSequence(namespace);
+            acks.push({
+              event_id: event.event_id, ok: true, ack_id: 'dev_ack_drop_document_deleted',
+              server_sequence: latest ?? 0, dropped: true, reason: 'document_deleted',
+            });
+            continue;
+          }
           if (shouldDropInvalidAnnotationAdd(event)) {
             const latest = await store.latestSequence(namespace);
             acks.push({
@@ -482,7 +506,12 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
             if (inserted) accepted.push(eventToStore);
             acks.push({ event_id: event.event_id, ok: true, ack_id: `dev_ack_${record.sequence}`, server_sequence: record.sequence });
           } catch (error) {
-            acks.push({ event_id: event.event_id, ok: false, error: String((error as Error)?.message || error) });
+            if (String((error as Error)?.message || error) === 'runtime_document_deleted') {
+              const latest = await store.latestSequence(namespace);
+              acks.push({ event_id: event.event_id, ok: true, ack_id: 'dev_ack_drop_document_deleted', server_sequence: latest ?? 0, dropped: true, reason: 'document_deleted' });
+            } else {
+              acks.push({ event_id: event.event_id, ok: false, error: String((error as Error)?.message || error) });
+            }
           }
         }
         log('push', accepted, started, { device_id: String(body.device_id || '') || undefined, tenant_id: session?.tenant_id, user_id: session?.user_id });
@@ -494,14 +523,19 @@ export function createRuntimeSyncDevHandler(options: RuntimeSyncDevHandlerOption
         sendJson(res, 405, { error: 'GET only' });
         return true;
       }
-      const cursor = parseCursor(url.searchParams.get('cursor'));
-      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit') || 100) || 100));
       const namespace = namespaceOf(session);
+      const rawCursor = url.searchParams.get('cursor');
+      // Live consumers may subscribe at the current tail to avoid replaying
+      // unrelated historical meetings before a meeting scope is known.
+      const cursor = rawCursor === 'latest'
+        ? await store.latestSequence(namespace) ?? 0
+        : parseCursor(rawCursor);
+      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit') || 100) || 100));
       const selected = await store.eventsAfter(namespace, cursor, limit);
       const latestSequence = await store.latestSequence(namespace);
       const nextCursor = String(selected.at(-1)?.sequence ?? latestSequence ?? cursor);
       const payloadEvents = selected.map((item) => ({ ...item.event }));
-      log('pull', payloadEvents, started, { device_id: url.searchParams.get('device_id') || undefined, cursor: url.searchParams.get('cursor') || undefined, tenant_id: session?.tenant_id, user_id: session?.user_id });
+      log('pull', payloadEvents, started, { device_id: url.searchParams.get('device_id') || undefined, cursor: rawCursor || undefined, tenant_id: session?.tenant_id, user_id: session?.user_id });
       sendJson(res, 200, {
         schema_version: 'inkloop.runtime_sync_pull.v1',
         events: payloadEvents,

@@ -118,23 +118,27 @@ export function promptSheet(opts: { title: string; placeholder?: string; value?:
 /** 多字段表单（如 会议标题 + 计划时间）。返回 key→值；取消返回 null。 */
 export function formSheet(opts: {
   title: string;
-  fields: Array<{ key: string; label: string; placeholder?: string; value?: string }>;
+  fields: Array<{ key: string; label: string; placeholder?: string; value?: string; multiline?: boolean; rows?: number; hint?: string }>;
   confirm?: string;
 }): Promise<Record<string, string> | null> {
   return new Promise((resolve) => {
     const rows = opts.fields.map((f) =>
       `<label class="msheet-field"><span class="msheet-lab">${esc(f.label)}</span>`
-      + `<input class="msheet-in" data-key="${esc(f.key)}" type="text" value="${esc(f.value ?? '')}" placeholder="${esc(f.placeholder ?? '')}" /></label>`
+      + (f.multiline
+        ? `<textarea class="msheet-in msheet-area" data-key="${esc(f.key)}" rows="${Math.max(2, Math.min(8, f.rows || 3))}" placeholder="${esc(f.placeholder ?? '')}">${esc(f.value ?? '')}</textarea>`
+        : `<input class="msheet-in" data-key="${esc(f.key)}" type="text" value="${esc(f.value ?? '')}" placeholder="${esc(f.placeholder ?? '')}" />`)
+      + (f.hint ? `<span class="msheet-hint">${esc(f.hint)}</span>` : '')
+      + `</label>`
     ).join('');
     const h = mountSheet(esc(opts.title), rows, opts.confirm ?? '确定');
-    const inputs = [...h.body.querySelectorAll<HTMLInputElement>('.msheet-in')];
+    const inputs = [...h.body.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('.msheet-in')];
     const collect = (): Record<string, string> => {
       const out: Record<string, string> = {};
       for (const i of inputs) out[i.dataset.key || ''] = i.value.trim();
       return out;
     };
     wire(h, () => resolve(null), () => { resolve(collect()); });
-    inputs.forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter' && i === inputs[inputs.length - 1]) { resolve(collect()); h.close(); } }));
+    inputs.forEach((i) => i.addEventListener('keydown', (event) => { const e = event as KeyboardEvent; if (e.key === 'Enter' && !(i instanceof HTMLTextAreaElement) && i === inputs[inputs.length - 1]) { resolve(collect()); h.close(); } }));
     requestAnimationFrame(() => { inputs[0]?.focus(); inputs[0]?.select(); });
   });
 }

@@ -22,6 +22,7 @@ process.env.PORT ||= '8731';
 process.env.INKLOOP_HTTPS_PORT ||= '8732';
 process.env.INKLOOP_LOCAL_DEVICE_AUTH ||= '1';
 process.env.INKLOOP_LOCAL_DEVICE_AUTH_AUTO_APPROVE ||= '1';
+process.env.INKLOOP_LOCAL_DEVICE_AUTH_TOKEN ||= 'local-demo-token';
 process.env.INKLOOP_LIBRARY_REQUIRE_SESSION ||= '1';
 process.env.INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION ||= '1';
 process.env.INKLOOP_KNOWLEDGE_REQUIRE_SESSION ||= '1';

@@ -21,6 +21,9 @@ const INSTALL_KEY = 'inkloop.install_id.v1';
 const listeners = new Set<AuthListener>();
 const LOCAL_DEMO_TENANT_ID = (import.meta.env.VITE_INKLOOP_LOCAL_DEMO_TENANT_ID as string | undefined) || 'local';
 const LOCAL_DEMO_USER_ID = (import.meta.env.VITE_INKLOOP_LOCAL_DEMO_USER_ID as string | undefined) || 'local_demo';
+const LOCAL_DEMO_SESSION_TOKEN = (
+  import.meta.env.VITE_INKLOOP_LOCAL_DEMO_SESSION_TOKEN as string | undefined
+) || 'local-demo-token';
 
 function localDevHost(): boolean {
   if (!import.meta.env.DEV || import.meta.env.VITE_INKLOOP_LOCAL_DEMO_AUTH === '0') return false;
@@ -50,7 +53,7 @@ function localDevSessionFallback(): InkLoopSession | null {
   if (!localDevHost()) return null;
   return {
     sessionId: 'local-demo-session',
-    sessionToken: 'local-demo-token',
+    sessionToken: LOCAL_DEMO_SESSION_TOKEN,
     tenantId: LOCAL_DEMO_TENANT_ID,
     userId: LOCAL_DEMO_USER_ID,
     deviceId: `web-${installId()}`,

@@ -1,6 +1,9 @@
 import { defineConfig, loadEnv } from 'vite';
 import type { Plugin } from 'vite';
-import { runReflow, runReflowAi, reflowAiStream, chatStream, runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReflowVlm } from './server/infer';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { runReflow, runReflowAi, reflowAiStream, chatStream, runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runMeetingPostprocessJson, runReflowVlm } from './server/infer';
+import { createMeetingPostprocessMarketService } from './server/meeting-postprocess/market-service';
 import { handleBoardOcrHttp } from './server/board-ocr';
 import { debugEvent, debugSnapshot } from './server/debug.mjs';
 import { runOcrLayout } from './server/ocr-layout-dev.mjs'; // dev-only：扫描页带坐标 OCR（mac_runner），不进生产代理
@@ -47,6 +50,28 @@ const sdkAliases: Record<string, string> = {
   'ink-surface-sdk/adapters/obsidian': sdkPath('packages/adapter-obsidian/src/index.ts'),
   'ink-surface-sdk': sdkPath('src/index.ts'),
 };
+
+/**
+ * 本地 Vite 调试与 standalone/验收脚本复用同一套 NoDesk 网关配置。
+ * 只补充当前进程尚未设置的变量，显式 shell env 和项目 .env 始终优先。
+ */
+function loadLocalGatewayEnvironment(env: Record<string, string>): void {
+  for (const key of ['LLM_GATEWAY_URL', 'LLM_GATEWAY_KEY', 'LLM_GATEWAY_TRANSPORT', 'LLM_MODEL', 'NODESK_API_KEY']) {
+    if (env[key] && !process.env[key]) process.env[key] = env[key];
+  }
+  try {
+    const raw = readFileSync(new URL('.hermes/.env', `file://${homedir()}/`), 'utf8');
+    for (const line of raw.split('\n')) {
+      const match = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
+      if (!match || process.env[match[1]]) continue;
+      process.env[match[1]] = match[2].replace(/^["']|["']$/g, '');
+    }
+  } catch { /* ~/.hermes/.env is optional outside local development. */ }
+  if (!process.env.LLM_GATEWAY_KEY && process.env.NODESK_API_KEY) process.env.LLM_GATEWAY_KEY = process.env.NODESK_API_KEY;
+  if (!process.env.LLM_GATEWAY_URL) process.env.LLM_GATEWAY_URL = 'https://llm-gateway-api.nodesk.tech/default/v1';
+  if (!process.env.LLM_GATEWAY_TRANSPORT) process.env.LLM_GATEWAY_TRANSPORT = 'openai_chat_completions';
+  if (!process.env.LLM_MODEL) process.env.LLM_MODEL = 'gpt-5.5';
+}
 
 /** dev-only：WS2 妙记对轴代理——浏览器 GET /api/panel-feishu/* → panel 飞书事件中枢，注入 x-inkloop-secret（留服务端）。 */
 function panelFeishuProxy(env: Record<string, string>): Plugin {
@@ -241,9 +266,7 @@ function inferenceProxy(env: Record<string, string>): Plugin {
   return {
     name: 'inkloop-inference-proxy',
     configureServer(server) {
-      for (const k of ['LLM_GATEWAY_URL', 'LLM_GATEWAY_KEY', 'LLM_MODEL']) {
-        if (env[k] && !process.env[k]) process.env[k] = env[k];
-      }
+      loadLocalGatewayEnvironment(env);
       const post = (path: string, fn: (body: unknown) => Promise<unknown>) =>
         server.middlewares.use(path, (req, res) => {
           if (req.method !== 'POST') { res.statusCode = 405; res.end('POST only'); return; }
@@ -346,6 +369,38 @@ function inferenceProxy(env: Record<string, string>): Plugin {
             else { try { res.write(JSON.stringify({ k: 'e', d: msg }) + '\n'); } catch { /* 客户端已断 */ } res.end(); } // 已写出 token 后出错：发 error 帧让客户端丢弃半截
           }
         });
+      });
+    },
+  };
+}
+
+function meetingPostprocessMarketDevServer(env: Record<string, string>): Plugin {
+  return {
+    name: 'inkloop-meeting-postprocess-market-dev-server',
+    configureServer(server) {
+      loadLocalGatewayEnvironment(env);
+      const handler = createMeetingPostprocessMarketService({
+        root: process.cwd(),
+        defaultModel: process.env.LLM_MODEL || 'gpt-5.5',
+        generate: runMeetingPostprocessJson,
+        readBody: async (req, max = 2_200_000) => await new Promise<string>((resolveBody, reject) => {
+          const chunks: Buffer[] = [];
+          let bytes = 0;
+          req.on('data', (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (bytes > max) {
+              reject(Object.assign(new Error('market_request_too_large'), { status: 413 }));
+              req.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf8')));
+          req.on('error', reject);
+        }),
+      });
+      server.middlewares.use((req, res, next) => {
+        void handler(req, res).then((handled) => { if (!handled) next(); }).catch(next);
       });
     },
   };
@@ -785,6 +840,8 @@ export default defineConfig(({ mode }) => {
           aiPen: 'ai-pen-demo.html',
           teacherClassroom: 'teacher-classroom.html',
           studentClassroom: 'student-classroom.html',
+          meetingLiveBoard: 'meeting-live-board.html',
+          meetingPostprocessMarket: 'meeting-postprocess-market.html',
         },
         output: {
           // pdfjs-dist 本体(~数百KB)拆出主包，否则 index.js 触发 >500KB 警告。
@@ -795,6 +852,6 @@ export default defineConfig(({ mode }) => {
         },
       },
     },
-    plugins: [classroomDevServer(env), runtimeSyncDevServer(env), cloudLibraryDevServer(env), cloudKnowledgeDevServer(env), inkloopAuthProxy(env), panelFeishuProxy(env), panelVaultProxy(env), inferenceProxy(env), feishuServiceProxy(env), convertServiceProxy(env)],
+    plugins: [classroomDevServer(env), runtimeSyncDevServer(env), cloudLibraryDevServer(env), cloudKnowledgeDevServer(env), inkloopAuthProxy(env), panelFeishuProxy(env), panelVaultProxy(env), meetingPostprocessMarketDevServer(env), inferenceProxy(env), feishuServiceProxy(env), convertServiceProxy(env)],
   };
 });

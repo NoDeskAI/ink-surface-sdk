@@ -55,7 +55,11 @@ Use the schema from the CE compound workflow:
 
 ## Current Solutions
 
+- [Critical Reliability Patterns](./patterns/critical-patterns.md)
 - [Stabilize Obsidian Ink Rendering and Vault Opening](./integration-issues/obsidian-ink-rendering-stability-2026-06-28.md)
+- [Runtime Sync Canonical Path](./integration-issues/runtime-sync-canonical-path-2026-07-02.md)
+- [Source-file-centered V1 Product Boundary](./best-practices/source-file-centered-v1-product-boundary-2026-07-02.md)
+- [Project Docs Boundary and Feishu Projection](./documentation-gaps/project-docs-boundary-and-feishu-projection-2026-07-02.md)
 
 ## When to Add a Solution
 

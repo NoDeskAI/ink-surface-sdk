@@ -35,6 +35,7 @@ const INK_SAMPLES = 'ink_samples';   // 基岩：采样块（批量 flush）
 const MEETING_MINUTES = 'meeting_minutes'; // WS2-C：飞书妙记转写缓存（会后离线复盘）
 const ENTITIES = 'canonical_entities'; // 存储原生拓扑：跨文档实体注册表（可更新 registry，非 append-only）
 const LIBRARY_SYNC = 'library_sync'; // Cloud Hub/本地 Library manifest 与同步状态
+const MEETING_PROVIDER_DELETIONS = 'meeting_provider_deletions'; // 外部 provider occurrence 墓碑
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 export type RuntimeLedgerAppendHook = (mark: PersistedMark) => void | Promise<void>;
 export type AiTurnAppendHook = (turn: PersistedAiTurn) => void | Promise<void>;
@@ -85,6 +86,7 @@ function openDB(): Promise<IDBDatabase | null> {
         ensureStore(db, MEETING_MINUTES, 'minute_token');                        // WS2-C 妙记转写缓存
         ensureStore(db, ENTITIES, 'entity_id');                                  // 存储原生拓扑：跨文档实体注册表
         ensureStore(db, LIBRARY_SYNC, 'document_id');                            // Cloud Hub/本地 Library 同步索引
+        ensureStore(db, MEETING_PROVIDER_DELETIONS, 'occurrence_key');           // 已删外部会议场次，阻止日历重建
 
         // ② 阶梯迁移：每次 DB_VERSION 升级追加一块 if (oldV < N) {...}——给已存在 store 加 index /
         //    字段级 backfill（须恰好跑一次的数据迁移放这）。
@@ -562,6 +564,172 @@ export async function listInspectableDocs(): Promise<InspectableDoc[]> {
  *  删的是当前活跃文档则连 saveTimer 一起清，防去抖回写把已删文档复活。 */
 export async function deleteDiary(documentId: string): Promise<void> {
   await deletePersistedDocumentData([documentId], { deleteBlob: false, deleteLibrarySync: false });
+}
+
+export interface LocalMeetingDeletionResult {
+  meeting: boolean;
+  meeting_board: boolean;
+  context_marks: number;
+  context_ai_turns: number;
+  cached_minutes: number;
+}
+
+export interface MeetingProviderOccurrenceIdentity {
+  platform?: PersistedMeeting['platform'];
+  provider_meeting_id?: string;
+  provider_calendar_event_id?: string;
+  provider_space_name?: string;
+  meeting_code?: string;
+  feishu_meeting_id?: string;
+  feishu_calendar_event_id?: string;
+  feishu_meeting_no?: string;
+  scheduled_at?: string;
+}
+
+interface PersistedMeetingProviderDeletion {
+  occurrence_key: string;
+  meeting_id: string;
+  deleted_at: string;
+}
+
+function occurrenceValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function meetingProviderOccurrenceKeys(identity: MeetingProviderOccurrenceIdentity): string[] {
+  const platform = occurrenceValue(identity.platform) || (identity.feishu_meeting_id || identity.feishu_calendar_event_id || identity.feishu_meeting_no ? 'lark' : '');
+  if (!platform) return [];
+  const scheduled = occurrenceValue(identity.scheduled_at);
+  const keys = new Set<string>();
+  const exact = [
+    ['calendar', identity.provider_calendar_event_id],
+    ['instance', identity.provider_meeting_id],
+    ['lark-calendar', identity.feishu_calendar_event_id],
+    ['lark-instance', identity.feishu_meeting_id],
+  ] as const;
+  for (const [kind, raw] of exact) {
+    const value = occurrenceValue(raw);
+    if (value) keys.add(`${platform}:${kind}:${value}`);
+  }
+  const logical = occurrenceValue(identity.provider_space_name || identity.meeting_code || identity.feishu_meeting_no);
+  // Logical room/meeting numbers recur, so they are only safe when anchored to
+  // this occurrence's scheduled time.
+  if (logical && scheduled) keys.add(`${platform}:logical:${logical}:${scheduled}`);
+  return [...keys].sort();
+}
+
+export async function isMeetingProviderOccurrenceDeleted(identity: MeetingProviderOccurrenceIdentity): Promise<boolean> {
+  const keys = meetingProviderOccurrenceKeys(identity);
+  if (!keys.length) return false;
+  const db = await openDB();
+  if (!db) return false;
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const store = db.transaction(MEETING_PROVIDER_DELETIONS, 'readonly').objectStore(MEETING_PROVIDER_DELETIONS);
+      let remaining = keys.length;
+      let found = false;
+      for (const key of keys) {
+        const request = store.getKey(key);
+        request.onsuccess = () => {
+          found ||= request.result !== undefined;
+          remaining -= 1;
+          if (found || remaining === 0) resolve(found);
+        };
+        request.onerror = () => { remaining -= 1; if (remaining === 0) resolve(found); };
+      }
+    } catch { resolve(false); }
+  });
+}
+
+/** Permanently remove device-local data owned by one meeting while preserving
+ * shared source documents. Marks/AI turns written on shared material are
+ * removed by meeting context instead of deleting the material itself. */
+export async function deleteMeetingLocalData(meetingId: string): Promise<LocalMeetingDeletionResult> {
+  const db = await openDB();
+  if (!db) return { meeting: false, meeting_board: false, context_marks: 0, context_ai_turns: 0, cached_minutes: 0 };
+  const meeting = await getOneFrom<PersistedMeeting>(MEETINGS, meetingId);
+  const providerOccurrenceKeys = meeting ? meetingProviderOccurrenceKeys({
+    platform: meeting.platform,
+    provider_meeting_id: meeting.provider_meeting_id,
+    provider_calendar_event_id: meeting.provider_calendar_event_id,
+    provider_space_name: meeting.provider_space_name,
+    meeting_code: meeting.calendar_meeting_no,
+    feishu_meeting_id: meeting.feishu_meeting_id,
+    feishu_calendar_event_id: meeting.feishu_calendar_event_id,
+    feishu_meeting_no: meeting.feishu_meeting_no || meeting.calendar_meeting_no,
+    scheduled_at: meeting.scheduled_at,
+  }) : [];
+  const meetingBoardId = `mtgboard_${meetingId}`;
+  const meetingContextId = `mtg_${meetingId}`;
+  if (current?.document_id === meetingBoardId) {
+    window.clearTimeout(saveTimer);
+    saveTimer = undefined;
+    current = null;
+  }
+  const result: LocalMeetingDeletionResult = { meeting: false, meeting_board: false, context_marks: 0, context_ai_turns: 0, cached_minutes: 0 };
+  const markKeys = new Set<IDBValidKey>();
+  const turnKeys = new Set<IDBValidKey>();
+  return await new Promise<LocalMeetingDeletionResult>((resolve, reject) => {
+    try {
+      const stores = [MEETINGS, STORE, MARKS, TURNS, INK_SEGMENTS, INK_SAMPLES, MEETING_MINUTES, MEETING_PROVIDER_DELETIONS];
+      const tx = db.transaction(stores, 'readwrite');
+      const deletedAt = new Date().toISOString();
+      for (const occurrenceKey of providerOccurrenceKeys) tx.objectStore(MEETING_PROVIDER_DELETIONS).put({
+        occurrence_key: occurrenceKey, meeting_id: meetingId, deleted_at: deletedAt,
+      } satisfies PersistedMeetingProviderDeletion);
+      tx.objectStore(MEETINGS).delete(meetingId);
+      result.meeting = true;
+      tx.objectStore(STORE).delete(meetingBoardId);
+      result.meeting_board = true;
+      const removeByIndex = (storeName: string, indexName: string, value: string): void => {
+        const store = tx.objectStore(storeName);
+        const request = store.index(indexName).getAllKeys(IDBKeyRange.only(value));
+        request.onsuccess = () => {
+          const keys = (request.result as IDBValidKey[]) || [];
+          const collected = storeName === MARKS ? markKeys : turnKeys;
+          for (const key of keys) { collected.add(key); store.delete(key); }
+          result.context_marks = markKeys.size;
+          result.context_ai_turns = turnKeys.size;
+        };
+      };
+      // The meeting board is wholly owned by the meeting. Shared document
+      // annotations are owned through context_id and must be removed too.
+      for (const storeName of [MARKS, TURNS]) removeByIndex(storeName, 'by_doc', meetingBoardId);
+      removeByIndex(MARKS, 'by_context', meetingContextId);
+      const contextMarks = tx.objectStore(MARKS).index('by_context').getAll(IDBKeyRange.only(meetingContextId));
+      contextMarks.onsuccess = () => {
+        const ownedMarkIds = new Set(((contextMarks.result as PersistedMark[]) || []).map((mark) => mark.mark_id));
+        if (!ownedMarkIds.size) return;
+        const turnStore = tx.objectStore(TURNS);
+        const turns = turnStore.getAll();
+        turns.onsuccess = () => {
+          for (const turn of (turns.result as PersistedAiTurn[]) || []) {
+            if (!turn.anchor?.mark_ids?.some((markId) => ownedMarkIds.has(markId))) continue;
+            turnKeys.add(turn.entry_id);
+            turnStore.delete(turn.entry_id);
+          }
+          result.context_ai_turns = turnKeys.size;
+        };
+      };
+      for (const storeName of [INK_SEGMENTS, INK_SAMPLES]) {
+        const store = tx.objectStore(storeName);
+        const request = store.index('by_doc').getAllKeys(IDBKeyRange.only(meetingBoardId));
+        request.onsuccess = () => { for (const key of (request.result as IDBValidKey[]) || []) store.delete(key); };
+      }
+      const minuteStore = tx.objectStore(MEETING_MINUTES);
+      const minutes = minuteStore.getAll();
+      minutes.onsuccess = () => {
+        for (const minute of (minutes.result as PersistedMeetingMinute[]) || []) {
+          if (minute.meeting_id !== meetingId) continue;
+          minuteStore.delete(minute.minute_token);
+          result.cached_minutes += 1;
+        }
+      };
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error ?? new Error(`IndexedDB deleteMeetingLocalData failed: ${meetingId}`));
+      tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB deleteMeetingLocalData aborted: ${meetingId}`));
+    } catch (error) { reject(error); }
+  });
 }
 
 /** 记阅读位置（去抖落盘）。 */

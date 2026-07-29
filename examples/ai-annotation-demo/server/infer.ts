@@ -27,7 +27,7 @@ function cfg() {
   return {
     url,
     key: process.env.LLM_GATEWAY_KEY || '',
-    model: process.env.LLM_MODEL || 'glm-5.2',
+    model: process.env.LLM_MODEL || 'gpt-5.5',
     transport,
   };
 }
@@ -72,7 +72,7 @@ function chatCompletionsUrl(url: string): string {
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 
-function openAiExtras(model: string): Record<string, unknown> {
+function openAiExtras(model: string, reasoningEffort?: 'none' | 'low' | 'medium' | 'high'): Record<string, unknown> {
   if (/^glm[-_.]/i.test(model)) {
     return {
       thinking: { type: 'disabled' },
@@ -80,7 +80,7 @@ function openAiExtras(model: string): Record<string, unknown> {
       reasoning_effort: 'none',
     };
   }
-  return {};
+  return reasoningEffort ? { reasoning_effort: reasoningEffort } : {};
 }
 
 function openAiContentPart(block: any): any | null {
@@ -112,14 +112,32 @@ function openAiMessages(system: string, messages: any[]): any[] {
   return out;
 }
 
+class EmptyGatewayTextError extends Error {
+  constructor(
+    message: string,
+    readonly finishReason: string,
+    readonly usage: unknown,
+  ) {
+    super(message);
+    this.name = 'EmptyGatewayTextError';
+  }
+}
+
 function emptyTextError(model: string, data: any): Error {
   const finish = data?.choices?.[0]?.finish_reason || data?.stop_reason || 'unknown';
   const reasoning = data?.choices?.[0]?.message?.reasoning_content || '';
   const usage = data?.usage ? ` usage=${JSON.stringify(data.usage)}` : '';
-  return new Error(`网关返回空正文 model=${model} finish=${finish}${reasoning ? ' reasoning_content_present=true' : ''}${usage}`);
+  return new EmptyGatewayTextError(`网关返回空正文 model=${model} finish=${finish}${reasoning ? ' reasoning_content_present=true' : ''}${usage}`, finish, data?.usage);
 }
 
-async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTokens: number; model?: string; signal?: AbortSignal }): Promise<{ text: string; thinking: string; data: any }> {
+async function callOpenAiGateway(opts: {
+  system: string;
+  messages: any[];
+  maxTokens: number;
+  model?: string;
+  signal?: AbortSignal;
+  reasoningEffort?: 'none' | 'low' | 'medium' | 'high';
+}): Promise<{ text: string; thinking: string; data: any }> {
   const { url, key } = cfg();
   const model = opts.model || cfg().model;
   if (!key) throw new Error('LLM_GATEWAY_KEY 未配置（在 annotation-loop-demo/.env 填网关 Key）');
@@ -127,7 +145,7 @@ async function callOpenAiGateway(opts: { system: string; messages: any[]; maxTok
     model,
     messages: openAiMessages(opts.system, opts.messages),
     max_tokens: opts.maxTokens,
-    ...openAiExtras(model),
+    ...openAiExtras(model, opts.reasoningEffort),
   };
   const requestId = `ai_${Date.now().toString(36)}_${++aiCallSeq}`;
   const t0 = Date.now();
@@ -389,15 +407,54 @@ function imageBlocks(images: ImgIn[]): any[] {
 }
 
 /** 单发：images 可为多图(带角色)数组，或单张已 strip 的 b64 字符串(旧调用方)。图在前、文字在后。 */
-async function gateway(system: string, user: string, maxTokens: number, image?: string | ImgIn[], model?: string, signal?: AbortSignal): Promise<string> {
+async function gateway(
+  system: string,
+  user: string,
+  maxTokens: number,
+  image?: string | ImgIn[],
+  model?: string,
+  options: {
+    signal?: AbortSignal;
+    reasoningEffort?: 'none' | 'low' | 'medium' | 'high';
+    retryEmptyLength?: boolean;
+  } = {},
+): Promise<string> {
   const blocks = Array.isArray(image)
     ? imageBlocks(image)
     : (image ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } }] : []);
   const content = blocks.length ? [...blocks, { type: 'text', text: user }] : user;
   if (isOpenAiTransport()) {
-    return (await callOpenAiGateway({ system, messages: [{ role: 'user', content }], maxTokens, model, signal })).text;
+    try {
+      return (await callOpenAiGateway({
+        system,
+        messages: [{ role: 'user', content }],
+        maxTokens,
+        model,
+        signal: options.signal,
+        reasoningEffort: options.reasoningEffort,
+      })).text;
+    } catch (error) {
+      if (!(error instanceof EmptyGatewayTextError) || error.finishReason !== 'length' || !options.retryEmptyLength) throw error;
+      const retryTokens = Math.min(24_000, Math.max(maxTokens + 4_000, maxTokens * 2));
+      if (retryTokens <= maxTokens) throw error;
+      console.warn(`[ai] meeting_postprocess_retry_empty_length model=${model || cfg().model} previous_max_tokens=${maxTokens} retry_max_tokens=${retryTokens}`);
+      return (await callOpenAiGateway({
+        system,
+        messages: [{ role: 'user', content }],
+        maxTokens: retryTokens,
+        model,
+        signal: options.signal,
+        reasoningEffort: options.reasoningEffort,
+      })).text;
+    }
   }
-  const text = textOf(await callGateway({ system, messages: [{ role: 'user', content }], maxTokens, model, signal }));
+  const text = textOf(await callGateway({
+    system,
+    messages: [{ role: 'user', content }],
+    maxTokens,
+    model,
+    signal: options.signal,
+  }));
   if (!text) throw emptyTextError(model || cfg().model, {});
   return text;
 }
@@ -414,6 +471,51 @@ function extractJson(text: string): any {
   const cm = b.match(/"content"\s*:\s*"([\s\S]*?)"\s*(?:,\s*"confidence"|\}\s*$)/);
   if (!cm && !rt) return { content: text };
   return { result_type: rt ? rt[1] : undefined, content: cm ? cm[1] : text, confidence: cf ? Number(cf[1]) : undefined };
+}
+
+/** Meeting postprocess V2 的窄 JSON 接缝。业务 schema、分块和 artifact 生命周期留在 meeting-postprocess。 */
+export async function runMeetingPostprocessJson(input: {
+  system: string;
+  user: string;
+  max_tokens: number;
+  model?: string;
+  signal?: AbortSignal;
+}): Promise<unknown> {
+  const maximumTokens = Number.isFinite(input.max_tokens)
+    ? Math.min(24_000, Math.max(256, Math.trunc(input.max_tokens)))
+    : 24_000;
+  const raw = await gateway(
+    input.system,
+    input.user,
+    maximumTokens,
+    undefined,
+    input.model,
+    {
+      signal: input.signal,
+      reasoningEffort: /^gpt-5(?:[._-]|$)/i.test(input.model || cfg().model)
+        ? 'low'
+        : undefined,
+      retryEmptyLength: false,
+    },
+  );
+  const match = raw.match(/\{[\s\S]*\}/) || raw.match(/\{[\s\S]*/);
+  if (!match) throw new Error('meeting_postprocess_json_missing');
+  try { return JSON.parse(match[0]); } catch {
+    let repaired = match[0].replace(/,\s*([}\]])/g, '$1');
+    const stack: string[] = [];
+    let inString = false; let escaped = false;
+    for (const char of repaired) {
+      if (escaped) { escaped = false; continue; }
+      if (char === '\\' && inString) { escaped = true; continue; }
+      if (char === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (char === '{') stack.push('}'); else if (char === '[') stack.push(']');
+      else if (char === '}' || char === ']') stack.pop();
+    }
+    if (inString) repaired += '"';
+    repaired = repaired.replace(/,\s*$/, '') + stack.reverse().join('');
+    try { return JSON.parse(repaired); } catch { throw new Error('meeting_postprocess_json_invalid'); }
+  }
 }
 
 // C5：AI 返回的声明式 schema（替代手写 String()/默认兜底，行为等价）。每字段 .catch 默认 = 缺/坏字段回退，
@@ -448,8 +550,7 @@ const meetingPanelSummarySchema = z.object({
   risks: cappedArray(meetingPanelTextSchema, 10),
   open_questions: cappedArray(meetingPanelTextSchema, 10),
   next_steps: cappedArray(meetingPanelTextSchema, 10),
-  // 访谈模式：完整研究报告 markdown 原文（可选·zod 默认会剥未知键，必须显式声明才能透传到设备）
-  report_markdown: z.string().optional(),
+  // 旧 report_markdown 不再声明或新写；Zod 会剥除模型意外返回的未知字段。
 });
 
 export type MeetingPanelSummary = z.infer<typeof meetingPanelSummarySchema>;
@@ -529,7 +630,7 @@ export async function runEducationStructured(payload: {
     practice: 'education_practice',
   } as const;
   if (!Array.isArray(payload.evidence) || payload.evidence.length === 0) throw new Error('education_evidence_required');
-  const raw = await gateway(SYSTEM_PROMPTS[roles[payload.kind]], JSON.stringify(educationStructuredEvidencePayload(payload)), 1_800, undefined, payload.model, payload.signal);
+  const raw = await gateway(SYSTEM_PROMPTS[roles[payload.kind]], JSON.stringify(educationStructuredEvidencePayload(payload)), 1_800, undefined, payload.model, { signal: payload.signal });
   if (raw.length > 128_000) throw new Error('education_response_too_large');
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('education_invalid_json');
@@ -540,7 +641,7 @@ export async function runEducationStructured(payload: {
 
 export async function runEducationLessonStructured(payload: { evidence: unknown[]; model?: string; signal?: AbortSignal }): Promise<EducationLessonGatewayResult> {
   if (!Array.isArray(payload.evidence) || payload.evidence.length < 3) throw new Error('education_evidence_required');
-  const raw = await gateway(SYSTEM_PROMPTS.education_lesson_graph, JSON.stringify(educationLessonEvidencePayload(payload.evidence)), 2_400, undefined, payload.model, payload.signal);
+  const raw = await gateway(SYSTEM_PROMPTS.education_lesson_graph, JSON.stringify(educationLessonEvidencePayload(payload.evidence)), 2_400, undefined, payload.model, { signal: payload.signal });
   if (raw.length > 128_000) throw new Error('education_response_too_large');
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('education_invalid_json');
@@ -551,13 +652,18 @@ export async function runEducationLessonStructured(payload: { evidence: unknown[
 
 export async function runEducationRecognitionStructured(payload: { evidence: unknown; eventIds: string[]; imageBase64?: string; model?: string; signal?: AbortSignal }): Promise<EducationRecognitionGatewayResult> {
   if (!Array.isArray(payload.eventIds) || payload.eventIds.length === 0) throw new Error('education_evidence_required');
-  const raw = await gateway(SYSTEM_PROMPTS.education_formula_recognition, JSON.stringify({ evidence: payload.evidence, allowed_event_ids: payload.eventIds }), 1_200, payload.imageBase64, payload.model, payload.signal);
+  const raw = await gateway(SYSTEM_PROMPTS.education_formula_recognition, JSON.stringify({ evidence: payload.evidence, allowed_event_ids: payload.eventIds }), 1_200, payload.imageBase64, payload.model, { signal: payload.signal });
   if (raw.length > 64_000) throw new Error('education_response_too_large');
   const match = raw.match(/\{[\s\S]*\}/); if (!match) throw new Error('education_invalid_json');
   let parsed: unknown; try { parsed = JSON.parse(match[0]); } catch { throw new Error('education_invalid_json'); }
   const result = educationRecognitionResultSchema.parse(parsed);
   if (new Set(result.event_ids).size !== payload.eventIds.length || result.event_ids.some((id) => !payload.eventIds.includes(id))) throw new Error('education_source_ref_invalid');
   return result;
+}
+
+/** 收口兼容摘要输出，并剥除历史完整报告等未声明字段。 */
+export function parseMeetingPanelSummaryOutput(value: unknown): MeetingPanelSummary {
+  return meetingPanelSummarySchema.parse(value);
 }
 
 
@@ -661,10 +767,10 @@ export async function runMeetingPanelSummary(payload: any): Promise<{ summary: M
     ...(smartNote ? { smart_note: smartNote } : {}),
     ...(handwritingSections ? { handwriting_sections: handwritingSections } : {}),
   });
-  // 长输出（访谈报告 20k tokens）非流式会撞网关 ~100s 空闲掐线（524）——走流式累积保活连接。
+  // 兼容端点只生成五要素摘要，不再为长文报告预留 32k token。
   let raw = '';
-  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 32000, model })) raw += delta; // 融合版双层文档（记录+分析）比单层长，20k 会截
-  const summary = meetingPanelSummarySchema.parse(extractJson(raw));
+  for await (const delta of gatewayTextStream({ system: prompt.system, messages: [{ role: 'user', content: prompt.user }], maxTokens: 3000, model })) raw += delta;
+  const summary = parseMeetingPanelSummaryOutput(extractJson(raw));
   if (!summary.conclusions.length) throw new Error('meeting_summary_missing_conclusions');
   return { summary, model };
 }

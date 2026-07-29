@@ -6,11 +6,11 @@
  * 全程用「附近/同时段」语义 + 明示校准状态（未校准/约对齐/已人工校准），绝不当精确。
  */
 import { esc } from '../core/escape';
-import { confirmSheet, infoSheet, pickOneSheet } from './sheet';
+import { confirmSheet, formSheet, infoSheet, pickOneSheet } from './sheet';
 import { getMeeting, mutateMeeting, updateMeeting, getFoldedMarks, getFoldedMarksByContext, getCachedMinute, putCachedMinute } from '../local/store';
-import { apiUrl, authFetch, getJson, postJson, postNdjson } from '../core/api';
+import { apiUrl, authFetch, getJson, postJson } from '../core/api';
 import { settings } from '../app/state';
-import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, resolveMeetingInstance, bindPanelMinute, getPanelMeetingSummary, generatePanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
+import { listRecentPanelMeetings, getMinuteTranscript, getMeetingNoteTranscript, resolveMeetingInstance, bindPanelMinute, getPanelMeetingSummary, type PanelFeishuMeeting, type PanelMeetingSummaryStatus } from '../integration/panel-feishu/client';
 import { parseSrtTranscript, type TranscriptCue } from '../integration/panel-feishu/align';
 import type { RecapSegment } from '../integration/panel-feishu/segment';
 import { buildEpaperMeetingTimeline, type EpaperMeetingTimeline } from '../integration/lark-meeting-timeline/epaper-timeline';
@@ -25,6 +25,8 @@ import { meetingMarkPhase } from './meeting-home-model';
 import { isBoardOcrInFlight, triggerBoardOcr } from '../capture/board-ocr';
 import { buildMeetingHandwritingSections, hasMeetingHandwritingSections, meetingHandwritingSectionLines } from '../features/meeting/meeting-summary-handwriting';
 import { aggregateProviderParticipants, providerParticipantLines } from '../features/meeting/provider-participants';
+import { appendProgressiveMeetingCard, deleteMeetingRawMedia, fetchMeetingPostprocessArtifacts, fetchMeetingPostprocessConfiguration, fetchMeetingRawMediaLifecycle, MEETING_POSTPROCESS_TEMPLATE_OPTIONS, meetingPostprocessTemplateLabel, postprocessProjection, resolveMeetingPostprocessOccurrenceId, submitMeetingPostprocessConfiguration, subscribeMeetingPostprocess, type MeetingPostprocessConfigurationState, type MeetingPostprocessTemplateId, type MeetingPostprocessUserGuidance, type MeetingRawMediaLifecycle } from '../features/meeting/meeting-postprocess-client';
+import { templateSummaryLayers } from '../features/meeting/template-summary-presentation';
 
 const SUMMARY_TRANSCRIPT_CAP = 48000; // 喂 AI 的转写字数软上限（16k 时一小时英文访谈只喂进前半场·后 132 句被砍——7-21 提到 48k；长转写分块留 P5）
 type ProviderMeetingSummaryResponse = { summary: PanelMeetingSummaryRecord['summary']; model: string };
@@ -58,6 +60,9 @@ function fmtDiff(deltaMs: number): string {
   if (a < 5400) return `${sign}${Math.round(a / 60)}min`;
   return `${sign}${(a / 3600).toFixed(1)}h`;
 }
+
+function guidanceLines(value?: string[]): string { return (value || []).join('\n'); }
+function splitGuidance(value: string): string[] { return value.split(/\n+/).map((line) => line.trim()).filter(Boolean).slice(0, 20); }
 
 /** detail 里「会后记录」卡的 HTML（含关联状态）。 */
 export function renderRecapCard(m: PersistedMeeting): string {
@@ -199,7 +204,6 @@ const TX_PAGE = 36;            // 文字记录每页句数（端侧避免一次�
 const FEISHU_AUTH_CHECK_TIMEOUT_MS = 5000;
 const RECAP_LOCAL_TIMEOUT_MS = 5000;
 const RECAP_REMOTE_BLOCK_TIMEOUT_MS = 65_000;
-const SUMMARY_STREAM_TIMEOUT_MS = 120_000;
 
 type RecapBlockStatus = 'loading' | 'ready' | 'missing' | 'failed' | 'auth_required';
 interface RecapBlockLoadState {
@@ -237,7 +241,6 @@ interface RecapV2 {
   feishuSummary: FeishuNoteSummaryRecord | null; // 飞书官方智能纪要，和转写/InkLoop 总结分开展示。
   panelSummary: PanelMeetingSummaryRecord | null; // L5：panel 五要素总结（独立整页·和时间脊互补）
   panelSummaryStatus: string;   // loading / ready / not_generated / generating / failed（missing_minute 仅兼容旧缓存）
-  psumReportOpen?: boolean;     // panel 页「完整报告」视图开关（仅当 summary.report_markdown 存在时可开）
   timeline: EpaperMeetingTimeline;
   marksById: Map<string, PersistedMark>; // 详情页需要完整 strokes；时间线只保留轻量 SegmentMark。
   markSourceMeeting: PersistedMeeting | null; // 手写可能来自同系列会议的本地手记，用于恢复未重新关联的笔迹。
@@ -246,12 +249,21 @@ interface RecapV2 {
   marksLoad: RecapBlockLoadState;
   panelSummaryError?: string;
   providerTimestampQuality?: ZoomTimestampQuality;
+  templateChangePending?: boolean;
+  templateChangeRunID?: string;
+  configurationStatus?: MeetingPostprocessConfigurationState;
+  rawMediaLifecycle?: MeetingRawMediaLifecycle | null;
+  rawMediaStatus?: 'loading' | 'ready' | 'not_found' | 'failed';
 }
+type DeleteMeetingFromRecap = (meeting: PersistedMeeting) => Promise<void>;
 let recapState: RecapV2 | null = null;
+let deleteMeetingFromRecap: DeleteMeetingFromRecap | null = null;
 const providerPanelSummaryInFlight = new Map<string, Promise<PanelMeetingSummaryRecord | null>>();
 // 防异步串会：打开 A 后快速返回/打开 B，A 的晚到结果（转写/AI 摘要）不能覆盖 B 的视图/状态。
 let recapLoadSeq = 0;
-export function resetRecapView(): void { recapLoadSeq++; recapState = null; delete document.body.dataset.recapView; updateExportButton(); updateRecapNav(); }
+let recapPostprocessSubscription: AbortController | null = null;
+export function resetRecapView(): void { recapLoadSeq++; recapPostprocessSubscription?.abort(); recapPostprocessSubscription = null; recapState = null; delete document.body.dataset.recapView; updateExportButton(); updateRecapNav(); }
+export function registerDeleteMeetingFromRecap(handler: DeleteMeetingFromRecap | null): void { deleteMeetingFromRecap = handler; }
 function recapAlive(seq: number, bodyEl: HTMLElement): boolean {
   // 含 data-mode：底部导航离开会议页后，晚到的异步 digest 不再更新隐藏 state/缓存（codex A#5）。
   return seq === recapLoadSeq && document.body.dataset.mode === 'meet' && document.body.dataset.mtg === 'recap' && document.body.contains(bodyEl);
@@ -618,6 +630,11 @@ async function loadTranscript(m: PersistedMeeting): Promise<LoadedTranscript | n
   }
 }
 
+/** 后台 ended adapter 的窄接口：复用 recap 已有 Provider/cache 策略，但不打开或渲染 recap。 */
+export async function loadMeetingTranscriptForPostprocess(m: PersistedMeeting): Promise<TranscriptCue[]> {
+  return (await loadTranscript(m))?.cues || [];
+}
+
 function isOAuthRecoveryError(message: string): boolean {
   return isFeishuReloginError(message);
 }
@@ -895,12 +912,12 @@ async function refreshTranscriptAfterInitialRender(seq: number, bodyEl: HTMLElem
         updateProviderNoteState(recapState);
         refreshRecapOverviewBlocks(bodyEl, ['#rc-feishu-block']);
         if (recapState.view === 'feishu') renderRecap(bodyEl);
-        if (recapState.cues.length && !recapState.panelSummary) void loadProviderPanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
+        // recap 只展示转写；V2 生成由 ended/provider worker 负责。
       } else if (platform === 'zoom') {
         updateProviderNoteState(recapState);
         refreshRecapOverviewBlocks(bodyEl, ['#rc-feishu-block']);
         if (recapState.view === 'feishu') renderRecap(bodyEl);
-        if (recapState.cues.length && !recapState.panelSummary) void loadProviderPanelSummary(seq, bodyEl, freshMeeting, recapState.cues);
+        // recap 只展示转写；V2 生成由 ended/provider worker 负责。
       } else if (platform === 'lark') {
         if (loaded?.sourceToken === freshMeeting.feishu_minute_token && freshMeeting.feishu_meeting_id) {
           try {
@@ -1019,6 +1036,7 @@ async function resolveRealMeetingId(m: PersistedMeeting): Promise<PersistedMeeti
 /** 进 recap 视图：拉转写 + 手写档案 → 分段 → 渲染概览（段级时间线为主体·左侧 #recap-nav 切到飞书纪要/思路总结/InkLoop总结整页）；
  *  并异步补 active 段 AI 摘要。 */
 export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titleEl: HTMLElement): Promise<void> {
+  recapPostprocessSubscription?.abort();
   const seq = ++recapLoadSeq;
   recapState = null;
   updateExportButton(); // 加载中先隐藏导出按钮/nav（还没有有效 recapState）
@@ -1033,6 +1051,11 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
   }
   if (!recapAlive(seq, bodyEl)) return;
   if (!m) { bodyEl.innerHTML = '<p class="rc-note">会议不存在。</p>'; return; }
+  const postprocessOccurrenceId = await resolveMeetingPostprocessOccurrenceId(m);
+  try {
+    const patch = postprocessProjection(m, await fetchMeetingPostprocessArtifacts(m.meeting_id, postprocessOccurrenceId), postprocessOccurrenceId);
+    if (patch) { await updateMeeting(m.meeting_id, patch); m = { ...m, ...patch }; }
+  } catch { /* Hub 离线时继续使用本地 projection。 */ }
   titleEl.textContent = `${m.title || '会议'} · 会后记录`;
   if (m.panel_summary_unread) void updateMeeting(m.meeting_id, { panel_summary_unread: false }); // 进 recap 即「已读」·清 home/detail 提醒
   const timeline = buildEpaperMeetingTimeline({
@@ -1074,8 +1097,88 @@ export async function loadRecapView(meetingId: string, bodyEl: HTMLElement, titl
       : sourceExpected
         ? { status: 'loading', message: '正在拉取官方纪要…' }
         : { status: 'missing', message: missingNoteMessage },
-    marksLoad: { status: 'loading', message: '正在读取本机手写档案…' } };
+    marksLoad: { status: 'loading', message: '正在读取本机手写档案…' },
+    rawMediaLifecycle: null,
+    rawMediaStatus: platform === 'google_meet' || platform === 'zoom' ? 'loading' : 'not_found',
+    configurationStatus: m.postprocess_configuration_status };
   renderRecap(bodyEl);
+  if (platform === 'google_meet' || platform === 'zoom') {
+    void fetchMeetingRawMediaLifecycle(m.meeting_id).then((result) => {
+      if (!recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+      recapState.rawMediaLifecycle = result.lifecycle;
+      recapState.rawMediaStatus = 'ready';
+      if (recapState.view === 'overview') renderRecapOverview(bodyEl);
+    }).catch((error) => {
+      if (!recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+      const message = String((error as Error)?.message || error);
+      recapState.rawMediaStatus = /404|not_found|session_not_found/i.test(message) ? 'not_found' : 'failed';
+      if (recapState.view === 'overview') renderRecapOverview(bodyEl);
+    });
+  }
+  void Promise.resolve(postprocessOccurrenceId).then(async (postprocessOccurrenceId) => {
+    const result = await fetchMeetingPostprocessConfiguration(meetingId, postprocessOccurrenceId);
+    if (!recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+    const configuration = result.configuration;
+    const patch: Partial<PersistedMeeting> = {
+      postprocess_occurrence_id: postprocessOccurrenceId,
+      postprocess_configuration_status: result.status,
+      ...(configuration ? { postprocess_template_id: configuration.template_id, postprocess_user_guidance: configuration.user_guidance } : {}),
+    };
+    recapState.configurationStatus = result.status;
+    recapState.meeting = { ...recapState.meeting, ...patch };
+    await updateMeeting(meetingId, patch);
+    renderRecap(bodyEl);
+    if (result.status === 'awaiting_configuration') void configureMeetingPostprocess(bodyEl, true);
+  }).catch(() => {
+    if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === meetingId && !recapState.meeting.postprocess_configuration_status) {
+      recapState.configurationStatus = 'awaiting_configuration';
+      renderRecap(bodyEl);
+    }
+  });
+  recapPostprocessSubscription = new AbortController();
+  void subscribeMeetingPostprocess({ meetingId, occurrenceId: postprocessOccurrenceId, signal: recapPostprocessSubscription.signal, onEvent: (event) => {
+    if (!recapAlive(seq, bodyEl) || !recapState) return;
+    if (event.type === 'run.failed'
+      && event.run_id
+      && event.run_id === recapState.templateChangeRunID) {
+      recapState.templateChangePending = false;
+      recapState.templateChangeRunID = undefined;
+      renderRecap(bodyEl);
+      void infoSheet({
+        title: '场景整理暂时失败',
+        message: '现有纪要没有被覆盖，可以直接重试或选择其他模板。',
+      });
+      return;
+    }
+    if (event.type === 'card.ready' && event.data.item && typeof event.data.item === 'object') {
+      if (recapState.templateChangePending) return; // 不把新模板的流式 item 混入上一版完整卡片。
+      const current = recapState.meeting.summary_cards_v2 || { schema_version: '2.0' as const, artifact_state: 'provisional' as const, theme: recapState.meeting.title, overview: '', key_points: [], decisions: [], action_items: [], highlights: [], risks: [], open_questions: [], personal_notes: [], coverage: { utterances: 'partial' as const, handwriting_ocr: 'partial' as const, started_at_ms: null, ended_at_ms: null } };
+      const next = appendProgressiveMeetingCard(
+        current,
+        event.data.section,
+        event.data.item,
+      );
+      if (!next) return;
+      recapState.meeting = {
+        ...recapState.meeting,
+        summary_finality: 'provisional',
+        summary_cards_v2: next,
+      };
+      renderRecap(bodyEl);
+      return;
+    }
+    if (event.type !== 'artifact.ready') return;
+    void fetchMeetingPostprocessArtifacts(meetingId, postprocessOccurrenceId).then(async (artifacts) => {
+      if (!recapState || recapState.meeting.meeting_id !== meetingId) return;
+      const patch = postprocessProjection(recapState.meeting, artifacts, postprocessOccurrenceId); if (!patch) return;
+      await updateMeeting(meetingId, patch); recapState.meeting = { ...recapState.meeting, ...patch };
+      if (patch.summary_cards_v2?.template_id === recapState.meeting.postprocess_template_id || (patch.interview_archive_html && recapState.meeting.postprocess_template_id === 'interview_archive')) {
+        recapState.templateChangePending = false;
+        recapState.templateChangeRunID = undefined;
+      }
+      renderRecap(bodyEl);
+    }).catch(() => {});
+  } }).catch(() => {});
   updateExportButton();
   wireRecapExportButton();
   updateRecapNav();
@@ -1169,8 +1272,7 @@ function pagerHtml(id: string, page: number, total: number): string {
 /** 页码钳到 [0, total-1]（防负/越界渲染空页·codex A#6）。 */
 const clampPage = (p: number, total: number): number => Math.max(0, Math.min(p, total - 1));
 
-// M2b·思路总结：本地 m.summary（summarizeMeeting 生成·手写档案 AI 综合）——左侧 #recap-nav「思路总结」入口整页，
-// 与 InkLoop 结构化总结（另一入口）分开（时间脊为主体这版布局：各入口互为平级页，时间脊只呈现"我何时写了什么"）。
+// 思路总结只读取 V2 artifact projection；生成由 ended/Provider worker 拥有，recap 不再保留重复 AI 主链。
 function meetingSummaryHtml(): string {
   if (!recapState) return '';
   const m = recapState.meeting;
@@ -1182,45 +1284,14 @@ function meetingSummaryHtml(): string {
     : meetingPlatformOf(m) === 'zoom' || meetingPlatformOf(m) === 'microsoft_teams' || meetingPlatformOf(m) === 'manual'
       ? `<div class="empty" id="rs-body">${sourceKey ? '还没生成思路总结。可基于已缓存转写和本场手写生成。' : '该来源暂无可用于生成思路总结的转写。'}</div>`
       : `<div class="empty" id="rs-body">${recapState.panelSummary ? '还没生成设备端思路总结；InkLoop 总结已同步。可点生成，把飞书转写和本场手写合在一起。' : (sourceKey ? '还没生成思路总结。可基于飞书会后转写和本场手写生成。' : '还没生成思路总结。先关联飞书会议后再生成。')}</div>`;
-  const label = m.summary ? '重新生成' : '生成思路总结';
-  const disabled = sourceKey ? '' : ' disabled style="opacity:.45"';
   return `<div class="rc-msum">`
-    + `<div class="rc-msum-h"><b>思路总结</b><button class="hbtn" id="rs-gen"${disabled}>${label}</button></div>`
+    + `<div class="rc-msum-h"><b>思路总结</b><span class="rc-note">${m.summary_finality === 'provisional' ? '初步结果·仍在补齐资料' : m.summary ? '最终结果' : '后台处理中'}</span></div>`
     + body + `</div>`;
-}
-async function generateMeetingSummary(seq: number, bodyEl: HTMLElement, meetingId: string): Promise<void> {
-  if (!recapState || !recapAlive(seq, bodyEl) || recapState.meeting.meeting_id !== meetingId) return;
-  const btn = bodyEl.querySelector<HTMLButtonElement>('#rs-gen');
-  if (btn?.dataset.busy) return;
-  if (btn) { btn.dataset.busy = '1'; btn.textContent = '生成中…'; btn.disabled = true; }
-  let lastPaint = 0;
-  try {
-    const out = await summarizeMeeting(meetingId, (full) => {
-      const now = Date.now();
-      if (now - lastPaint < 500) return; // 电纸屏 500ms 合并刷新·防残影
-      lastPaint = now;
-      if (!recapAlive(seq, bodyEl)) return;
-      const sumEl = bodyEl.querySelector<HTMLElement>('#rs-body');
-      if (sumEl) { sumEl.className = 'summary'; sumEl.textContent = full; }
-    });
-    if (!out || !recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== meetingId) return;
-    const fresh = await getMeeting(meetingId); // 刷新 recapState.meeting → renderRecap 重渲（不重 loadRecapView·免重拉转写/重算分段）
-    if (fresh && recapAlive(seq, bodyEl) && recapState && recapState.meeting.meeting_id === meetingId) recapState.meeting = fresh;
-  } finally {
-    if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
-  }
-}
-function wireMeetingSummaryButton(bodyEl: HTMLElement): void {
-  bodyEl.querySelector('#rs-gen')?.addEventListener('click', () => {
-    if (!recapState) return;
-    void generateMeetingSummary(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
-  });
 }
 /** 左侧 nav「思路总结」入口整页。 */
 function renderRecapSummaryPage(bodyEl: HTMLElement): void {
   if (!recapState) return;
   bodyEl.innerHTML = meetingSummaryHtml();
-  wireMeetingSummaryButton(bodyEl);
 }
 
 const FEISHU_IMAGE_REF = /^(?:meetgraph|images\/online)\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp)$/i;
@@ -1598,27 +1669,6 @@ async function loadPanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMe
   else refreshRecapOverviewBlocks(bodyEl, ['#rc-over-focus', '#rc-panel-block']);
 }
 
-/** L5：用户点「生成总结」→ POST 触发 panel 现总结（M3·几秒~十几秒·panel 侧 in-flight 去重）。 */
-async function generatePanelSummary(seq: number, bodyEl: HTMLElement, localMeetingId: string): Promise<void> {
-  const m = recapState?.meeting;
-  if (!m?.feishu_meeting_id || !recapAlive(seq, bodyEl) || m.meeting_id !== localMeetingId || !recapState) return;
-  const panelMeetingId = m.feishu_meeting_id;
-  recapState.panelSummaryStatus = 'generating';
-  renderRecap(bodyEl);
-  try {
-    const r = await generatePanelMeetingSummary(panelMeetingId);
-    // 串会守卫：生成期间快速切到别的会议 recap，晚到结果不能覆盖当前 state。
-    if (!recapAlive(seq, bodyEl) || !recapState || recapState.meeting.meeting_id !== localMeetingId) return;
-    recapState.panelSummary = r.summary ?? null;
-    recapState.panelSummaryStatus = r.summary ? 'ready' : r.status;
-    if (r.summary) await updateMeeting(localMeetingId, { panel_summary: r.summary, panel_summary_fetched_at: new Date().toISOString(), panel_summary_status: 'ready' });
-  } catch (e) {
-    if (recapAlive(seq, bodyEl) && recapState) recapState.panelSummaryStatus = 'failed';
-    await infoSheet({ title: '生成 InkLoop 总结失败', message: String((e as Error)?.message || e) });
-  }
-  if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
-}
-
 type CappedTranscript = { lines: string[]; truncated: boolean; usedCueCount: number };
 function cappedTranscriptLines(cues: TranscriptCue[]): CappedTranscript {
   const lines: string[] = [];
@@ -1790,31 +1840,6 @@ export async function requestProviderPanelSummary(
   }
 }
 
-async function loadProviderPanelSummary(seq: number, bodyEl: HTMLElement, m: PersistedMeeting, cues: TranscriptCue[]): Promise<void> {
-  if (m.panel_summary || !cues.length) return;
-  if (recapAlive(seq, bodyEl) && recapState?.meeting.meeting_id === m.meeting_id) {
-    recapState.panelSummaryStatus = 'generating';
-    renderRecap(bodyEl);
-  }
-  const result = await requestProviderPanelSummary(m, cues);
-  if (!result) return;
-  if (result.summary) {
-    if (!recapAlive(seq, bodyEl) || recapState?.meeting.meeting_id !== m.meeting_id) return;
-    recapState.panelSummary = result.summary;
-    recapState.meeting = { ...recapState.meeting, panel_summary: result.summary, panel_summary_status: 'ready' };
-    recapState.panelSummaryStatus = 'ready';
-  } else if (result.failurePersisted) {
-    if (recapAlive(seq, bodyEl)
-      && recapState?.meeting.meeting_id === m.meeting_id
-      && sameProviderSummaryOccurrence(recapState.meeting, result.platform, result.occurrenceToken)) {
-      recapState.panelSummaryStatus = 'failed';
-    }
-  } else {
-    return;
-  }
-  if (recapAlive(seq, bodyEl)) renderRecap(bodyEl);
-}
-
 function uniqText(items: string[], limit: number): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -1907,48 +1932,57 @@ function buildLocalPanelSummaryPreview(): PanelMeetingSummaryRecord | null {
   };
 }
 
-/** 极简 markdown → HTML（完整报告只读渲染：标题/加粗/列表/表格行等宽兜底；先转义防注入）。 */
-function reportMarkdownHtml(md: string): string {
-  const out: string[] = [];
-  let inList = false;
-  const closeList = (): void => { if (inList) { out.push('</ul>'); inList = false; } };
-  const inline = (t: string): string => esc(t).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
-  for (const raw of md.split('\n')) {
-    const line = raw.trimEnd();
-    if (/^#{1,6}\s/.test(line)) {
-      closeList();
-      const level = Math.min(4, (line.match(/^#+/) as RegExpMatchArray)[0].length);
-      out.push(`<div class="rc-rep-h${level}">${inline(line.replace(/^#+\s*/, ''))}</div>`);
-    } else if (/^\s*[-*]\s+/.test(line)) {
-      if (!inList) { out.push('<ul class="rc-rep-ul">'); inList = true; }
-      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
-    } else if (/^\s*\|/.test(line)) {
-      closeList();
-      out.push(`<div class="rc-rep-tr">${esc(line)}</div>`);
-    } else if (!line.trim()) {
-      closeList();
-      out.push('<div class="rc-rep-gap"></div>');
-    } else {
-      closeList();
-      out.push(`<div class="rc-rep-p">${inline(line)}</div>`);
-    }
-  }
-  closeList();
-  return out.join('');
+export function meetingSummaryProgress(cards: Pick<NonNullable<PersistedMeeting['summary_cards_v2']>, 'coverage'>, finality?: PersistedMeeting['summary_finality']): { label: string; partial: boolean } {
+  if (cards.coverage.utterances === 'partial') return { label: '实时转写追平中 · 当前为部分结果', partial: true };
+  return finality === 'provisional'
+    ? { label: '初步结果 · 仍在补齐资料', partial: false }
+    : { label: '最终结果', partial: false };
+}
+
+/** 纯渲染入口：历史 report 字段故意不读取，确保旧数据只能显示 Cards/短摘要。 */
+export function renderMeetingSummaryCardsHtml(meeting: PersistedMeeting, templateChangePending = false): string {
+  const v2 = meeting.summary_cards_v2;
+  if (!v2) return '';
+  const box = (inner: string): string => `<div class="rc-psum">${inner}</div>`;
+  const sections = `<div class="rc-summary-layers">${templateSummaryLayers(v2).map((layer) => `<section class="rc-summary-layer">`
+    + (layer.title ? `<h3 class="rc-summary-layer-title">${esc(layer.title)}</h3>` : '')
+    + `<div class="rc-summary-grid">${layer.blocks.map((block) => `<section class="rc-summary-card"><span class="rc-blk-h">${esc(block.title)}</span>`
+      + (block.paragraph ? `<span class="rc-summary-overview">${esc(block.paragraph)}</span>` : '')
+      + block.rows.map((row) => `<span class="rc-blk-li">${esc(row)}</span>`).join('')
+      + `</section>`).join('')}</div></section>`).join('')}</div>`;
+  const progress = meetingSummaryProgress(v2, meeting.summary_finality);
+  const state = `<span class="mdl${progress.partial ? ' rc-partial' : ''}">${progress.label}</span>`;
+  const selectedTemplate = meeting.postprocess_template_id || v2.template_id || 'meeting_expert';
+  const template = `<button class="hbtn rc-template-select" id="ps-template"${templateChangePending ? ' disabled' : ''}>场景：${esc(meetingPostprocessTemplateLabel(selectedTemplate))}</button>`;
+  const changing = templateChangePending ? '<span class="mdl">正在按新场景整理…</span>' : '';
+  return box(`<div class="rc-psum-h"><b>${esc(v2.theme || meeting.title)}</b>${template}${changing}${state}</div>${sections || '<div class="empty">未识别到决定、行动项或其它结构化要点。</div>'}`);
+}
+
+export function renderInterviewArchiveHtml(meeting: PersistedMeeting, templateChangePending = false): string {
+  const archive = meeting.interview_archive_html;
+  if (!archive) return '';
+  const srcdoc = esc(archive.html);
+  return `<div class="rc-psum"><div class="rc-psum-h"><b>用户访谈归档纪要（完整版）</b><button class="hbtn rc-template-select" id="ps-template"${templateChangePending ? ' disabled' : ''}>修改模板与研究者见解</button><button class="hbtn" id="ps-archive-download">下载 HTML</button><span class="mdl">${archive.finality === 'final' ? '最终结果' : '初步结果'}</span></div><iframe title="用户访谈归档纪要" sandbox="" srcdoc="${srcdoc}" style="width:100%;min-height:78vh;border:1px solid var(--line,#ddd);border-radius:10px;background:#f3efe5"></iframe></div>`;
 }
 
 /** L5：InkLoop 五要素总结块（左侧 nav「InkLoop」入口整页「会议讲了什么」·和时间脊「我何时写了什么」互补）。 */
 function panelSummaryHtml(): string {
   if (!recapState) return '';
+  const v2 = recapState.meeting.summary_cards_v2;
+  const archive = recapState.meeting.interview_archive_html;
+  const box = (inner: string): string => `<div class="rc-psum">${inner}</div>`;
+  const configurationStatus = recapState.configurationStatus || recapState.meeting.postprocess_configuration_status;
+  if (!v2 && !archive && configurationStatus === 'awaiting_configuration') {
+    return box(`<div class="rc-psum-h"><b>开始整理这场会议</b><button class="hbtn rc-template-select" id="ps-template">选择模板与关注方向</button></div><div class="rc-local-note">转写会继续在后台收敛。你可以先选择整理模板，并选填当场结论、最深感受和关注痛点；无需确认说话人。</div>`);
+  }
+  if (!v2 && !archive && configurationStatus === 'awaiting_transcript') {
+    return box(`<div class="rc-psum-h"><b>整理设置已保存</b><button class="hbtn rc-template-select" id="ps-template">修改设置</button></div><div class="rc-local-note">正式转写正在后台收敛，完成后会按「${esc(meetingPostprocessTemplateLabel(recapState.meeting.postprocess_template_id))}」自动生成纪要，无需停留在当前页面。</div>`);
+  }
+  if (archive) return renderInterviewArchiveHtml(recapState.meeting, recapState.templateChangePending);
+  if (v2) return renderMeetingSummaryCardsHtml(recapState.meeting, recapState.templateChangePending);
   const fallback = buildLocalPanelSummaryPreview();
   const rec = recapState.panelSummary ?? fallback;
   const status = recapState.panelSummaryStatus === 'missing_minute' ? 'not_generated' : recapState.panelSummaryStatus;
-  const box = (inner: string): string => `<div class="rc-psum">${inner}</div>`;
-  // 「完整报告」整页视图：五要素只是压缩摘要，长文报告在这里读。
-  if (recapState.psumReportOpen && rec?.summary?.report_markdown) {
-    return box(`<div class="rc-psum-h"><b>完整报告</b><button class="hbtn rc-psum-retry" id="ps-report-back">返回摘要</button></div>`
-      + `<div class="rc-report">${reportMarkdownHtml(rec.summary.report_markdown)}</div>`);
-  }
   if (rec?.summary) {
     const local = rec === fallback && !recapState.panelSummary;
     const s = rec.summary;
@@ -1957,8 +1991,7 @@ function panelSummaryHtml(): string {
     const ai = s.action_items.length
       ? `<div class="rc-blk"><span class="rc-blk-h">行动项</span>${s.action_items.map((a) => `<span class="rc-blk-li">${esc(a.task)}${a.owner && a.owner !== '未指定' ? `<span class="who">${esc(a.owner)}</span>` : ''}${a.due ? `<span class="who">${esc(a.due)}</span>` : ''}</span>`).join('')}</div>`
       : '';
-    const reportBtn = s.report_markdown ? '<button class="hbtn rc-psum-retry" id="ps-report">查看完整报告</button>' : '';
-    return box(`<div class="rc-psum-h"><b>${local ? 'InkLoop 后处理预览' : 'InkLoop AI 总结'} · 会议讲了什么</b>${rec.model ? `<span class="mdl">${esc(rec.model)}</span>` : ''}${reportBtn}</div>`
+    return box(`<div class="rc-psum-h"><b>${local ? 'InkLoop 后处理预览' : 'InkLoop AI 总结'} · 会议讲了什么</b>${rec.model ? `<span class="mdl">${esc(rec.model)}</span>` : ''}</div>`
       + (local ? '<div class="rc-local-note">Panel 后处理服务当前不可用，先基于飞书智能纪要与原始文字记录生成本地结构化预览；服务恢复后会替换为正式结果。</div>' : '')
       + blk('结论', s.conclusions) + ai + blk('风险', s.risks) + blk('待决', s.open_questions) + blk('后续', s.next_steps));
   }
@@ -1966,51 +1999,37 @@ function panelSummaryHtml(): string {
   if (platform === 'microsoft_teams' || platform === 'manual') {
     return box('该来源暂不支持远端总结生成。');
   }
-  if (status === 'transcript_not_ready') return box('用于生成总结的转写还在生成中（飞书会后文字记录或妙记还在生成）。就绪后会自动生成 InkLoop 总结，也可以稍后手动重试。<button class="hbtn rc-psum-retry" id="ps-gen">重试</button>');
+  if (status === 'transcript_not_ready') return box('用于生成总结的转写还在生成中；Provider worker 会在资料就绪后自动修订。');
   if (status === 'loading' || status === 'generating') return box(status === 'generating' ? '正在生成 InkLoop 总结…（读取完整转写，稍候）' : '正在拉取 InkLoop 总结…');
   if (status === 'failed') return box('拉取 InkLoop 总结失败（网络/服务波动）。<button class="hbtn rc-psum-retry" id="ps-refresh">刷新重试</button>');
   if (status === 'auth_required') return box('需要重新登录飞书后才能读取 InkLoop 总结。<button class="hbtn rc-psum-retry" id="ps-login">重新登录飞书</button><button class="hbtn rc-psum-retry" id="ps-refresh">重试</button>');
   if (status === 'not_found') return box('InkLoop 没找到这场会议（可能关联错了，可回上一页改关联）。<button class="hbtn rc-psum-retry" id="ps-refresh">刷新</button>');
-  // not_generated → 可主动触发生成
-  return box('InkLoop 还没生成这场会议的结构化总结。<button class="hbtn rc-psum-retry" id="ps-gen">生成总结</button>');
+  return box('InkLoop 正在后台整理这场会议；可离开页面，完成后会通过事件流更新。');
 }
 
-/** 绑定 panel 总结块的按钮（生成 / 刷新重试 / 完整报告开合）——正常态与空态共用。 */
+/** 绑定 panel 总结块的模板、登录与刷新按钮——正常态与空态共用。 */
 function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
-  bodyEl.querySelector('#ps-report')?.addEventListener('click', () => {
-    if (!recapState) return;
-    recapState.psumReportOpen = true;
-    renderRecap(bodyEl);
-  });
-  bodyEl.querySelector('#ps-report-back')?.addEventListener('click', () => {
-    if (!recapState) return;
-    recapState.psumReportOpen = false;
-    renderRecap(bodyEl);
+  bodyEl.querySelector('#ps-template')?.addEventListener('click', () => { void configureMeetingPostprocess(bodyEl); });
+  bodyEl.querySelector('#ps-archive-download')?.addEventListener('click', () => {
+    const archive = recapState?.meeting.interview_archive_html;
+    if (!archive) return;
+    const url = URL.createObjectURL(new Blob([archive.html], { type: 'text/html;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = archive.filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1_000);
   });
   bodyEl.querySelector('#ps-login')?.addEventListener('click', () => {
     void promptFeishuRelogin(recapState?.panelSummaryError || '当前飞书身份不可用。');
-  });
-  bodyEl.querySelector('#ps-gen')?.addEventListener('click', () => { // 生成总结（Google/Zoom 走 hub；飞书走 panel）
-    if (!recapState) return;
-    switch (meetingPlatformOf(recapState.meeting)) {
-      case 'google_meet':
-      case 'zoom':
-        void loadProviderPanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
-        break;
-      case 'lark':
-        void generatePanelSummary(recapLoadSeq, bodyEl, recapState.meeting.meeting_id);
-        break;
-      case 'microsoft_teams':
-      case 'manual':
-        break;
-    }
   });
   bodyEl.querySelector('#ps-refresh')?.addEventListener('click', () => { // 失败/未找到时重拉
     if (!recapState) return;
     switch (meetingPlatformOf(recapState.meeting)) {
       case 'google_meet':
       case 'zoom':
-        void loadProviderPanelSummary(recapLoadSeq, bodyEl, recapState.meeting, recapState.cues);
+        const occurrenceId = recapState.meeting.postprocess_occurrence_id;
+        if (!occurrenceId) break;
+        void fetchMeetingPostprocessArtifacts(recapState.meeting.meeting_id, occurrenceId).then(async (artifacts) => {
+          if (!recapState) return; const patch = postprocessProjection(recapState.meeting, artifacts, occurrenceId); if (!patch) return; await updateMeeting(recapState.meeting.meeting_id, patch); recapState.meeting = { ...recapState.meeting, ...patch }; renderRecap(bodyEl);
+        }).catch(() => {});
         break;
       case 'lark':
         recapState.panelSummaryStatus = 'loading';
@@ -2022,6 +2041,74 @@ function wirePanelSummaryButtons(bodyEl: HTMLElement): void {
         break;
     }
   });
+}
+
+async function configureMeetingPostprocess(bodyEl: HTMLElement, firstRun = false): Promise<void> {
+  if (!recapState || recapState.templateChangePending) return;
+  const meetingId = recapState.meeting.meeting_id;
+  const current = recapState.meeting.postprocess_template_id || recapState.meeting.summary_cards_v2?.template_id || 'meeting_expert';
+  const picked = await pickOneSheet({
+    title: '选择会议整理场景',
+    items: MEETING_POSTPROCESS_TEMPLATE_OPTIONS.map((item) => ({ id: item.id, label: item.label, sub: item.description })),
+    defaultId: current,
+    confirm: firstRun ? '下一步' : '继续配置',
+  });
+  if (!picked || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+  const templateId = picked as MeetingPostprocessTemplateId;
+  const priorGuidance = recapState.meeting.postprocess_user_guidance;
+  const values = await formSheet({
+    title: '补充本场关注方向（可选）',
+    fields: [
+      { key: 'conclusions', label: '当场结论', value: guidanceLines(priorGuidance?.conclusions), placeholder: '每行一条，例如：本周先验证课堂实时板书', multiline: true, rows: 3, hint: '用于提高相关内容优先级，不会自动当作会议已确认事实。' },
+      { key: 'deepest_impressions', label: '最深感受', value: guidanceLines(priorGuidance?.deepest_impressions), placeholder: '每行一条，例如：老师最担心操作负担', multiline: true, rows: 3 },
+      { key: 'pain_points', label: '关注的痛点', value: guidanceLines(priorGuidance?.pain_points), placeholder: '每行一条，例如：长会议纪要过密、生成慢', multiline: true, rows: 3 },
+    ],
+    confirm: '保存并开始整理',
+  });
+  if (!values || !recapState || recapState.meeting.meeting_id !== meetingId) return;
+  const userGuidance: MeetingPostprocessUserGuidance = { conclusions: splitGuidance(values.conclusions || ''), deepest_impressions: splitGuidance(values.deepest_impressions || ''), pain_points: splitGuidance(values.pain_points || '') };
+  const previous = recapState.meeting.postprocess_template_id;
+  const previousGuidance = recapState.meeting.postprocess_user_guidance;
+  const previousConfigurationStatus = recapState.configurationStatus;
+  recapState.templateChangePending = true;
+  recapState.meeting = { ...recapState.meeting, postprocess_template_id: templateId, postprocess_user_guidance: userGuidance, postprocess_configuration_status: 'awaiting_transcript' };
+  recapState.configurationStatus = 'awaiting_transcript';
+  renderRecap(bodyEl);
+  try {
+    const occurrenceId = await resolveMeetingPostprocessOccurrenceId(recapState.meeting);
+    await updateMeeting(meetingId, { postprocess_occurrence_id: occurrenceId, postprocess_template_id: templateId, postprocess_user_guidance: userGuidance, postprocess_configuration_status: 'awaiting_transcript' });
+    const requested = await submitMeetingPostprocessConfiguration({ meeting_id: meetingId, occurrence_id: occurrenceId, template_id: templateId, user_guidance: userGuidance });
+    if (!recapState || recapState.meeting.meeting_id !== meetingId) return;
+    recapState.configurationStatus = requested.status === 'queued' ? 'configured' : requested.status;
+    recapState.templateChangeRunID = requested.status === 'queued'
+      ? requested.run?.run_id
+      : undefined;
+    recapState.meeting = { ...recapState.meeting, postprocess_configuration_status: recapState.configurationStatus };
+    await updateMeeting(meetingId, { postprocess_configuration_status: recapState.configurationStatus });
+    if (requested.status === 'queued' && requested.run?.status === 'succeeded') {
+      const patch = postprocessProjection(recapState.meeting, await fetchMeetingPostprocessArtifacts(meetingId, occurrenceId), occurrenceId);
+      if (patch) {
+        await updateMeeting(meetingId, patch);
+        recapState.meeting = { ...recapState.meeting, ...patch };
+      }
+      recapState.templateChangePending = false;
+      recapState.templateChangeRunID = undefined;
+    } else if (requested.status !== 'queued') {
+      // 转写仍未收敛时不会有新 Artifact；保留旧内容但允许用户继续调整配置。
+      recapState.templateChangePending = false;
+      recapState.templateChangeRunID = undefined;
+    }
+    renderRecap(bodyEl);
+  } catch (error) {
+    if (!recapState || recapState.meeting.meeting_id !== meetingId) return;
+    recapState.templateChangePending = false;
+    recapState.templateChangeRunID = undefined;
+    recapState.configurationStatus = previousConfigurationStatus;
+    recapState.meeting = { ...recapState.meeting, postprocess_template_id: previous, postprocess_user_guidance: previousGuidance, postprocess_configuration_status: previousConfigurationStatus };
+    await updateMeeting(meetingId, { postprocess_template_id: previous, postprocess_user_guidance: previousGuidance, postprocess_configuration_status: previousConfigurationStatus }).catch(() => null);
+    renderRecap(bodyEl);
+    await infoSheet({ title: '场景切换失败', message: `现有纪要没有被覆盖，可以稍后重试。${String((error as Error)?.message || error)}` });
+  }
 }
 
 /** 左侧 nav「InkLoop」入口整页。 */
@@ -2148,6 +2235,24 @@ export function renderGoogleRecordingsHtml(meeting: Pick<PersistedMeeting, 'goog
     + `</div>`;
 }
 
+export function meetingRawMediaPresentation(
+  lifecycle: MeetingRawMediaLifecycle | null | undefined,
+  status: RecapV2['rawMediaStatus'] = 'ready',
+): { label: string; detail: string; canDelete: boolean; button: string } {
+  if (status === 'loading') return { label: '正在读取状态', detail: '正在确认云端临时媒体的删除状态。', canDelete: false, button: '读取中…' };
+  if (status === 'not_found') return { label: '尚未产生云端媒体', detail: '这场会议还没有对应的 InkLoop 双轨会话；本地会议内容不受影响。', canDelete: false, button: '暂无可删除媒体' };
+  if (status === 'failed') return { label: '状态读取失败', detail: '暂时无法确认云端媒体状态，可以刷新页面重试。', canDelete: true, button: '尝试删除云端临时音频' };
+  if (lifecycle?.status === 'deleted') return {
+    label: lifecycle.reason === 'user_requested' ? '已按你的要求删除' : '转写完成后已自动删除',
+    detail: '云端 Mic / Remote 临时分片已删除；Mac 原始音频与转写、手写、纪要仍保留。',
+    canDelete: false,
+    button: '云端临时音频已删除',
+  };
+  if (lifecycle?.status === 'deleting') return { label: '正在删除', detail: '服务端正在清理临时媒体，请稍后刷新。', canDelete: false, button: '正在删除…' };
+  if (lifecycle?.status === 'delete_failed') return { label: '上次删除失败', detail: '云端临时媒体仍可能保留，可立即重试；其它会议内容不会被删除。', canDelete: true, button: '重试删除云端临时音频' };
+  return { label: '自动清理已启用', detail: '云端临时 Mic / Remote 分片会在转写收敛后自动删除；也可以立即删除并停止未完成的云端转写重试。', canDelete: true, button: '立即删除云端临时音频' };
+}
+
 export function zoomTranscriptAlignmentLabel(timestampQuality?: ZoomTimestampQuality): string {
   if (timestampQuality === 'companion_offset_anchor') return 'Zoom AI Companion 场次时间对齐';
   return timestampQuality === 'approximate_pause_unknown'
@@ -2239,6 +2344,7 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
             : recapState.panelSummaryStatus === 'loading'
               ? '正在拉取 InkLoop 总结。'
               : '暂无 InkLoop 总结。';
+  const rawMedia = meetingRawMediaPresentation(recapState.rawMediaLifecycle, recapState.rawMediaStatus);
   bodyEl.innerHTML = `<div class="rc-overview">`
     + `<section class="rc-over-hero" id="rc-over-hero">`
     + `<div><span class="rc-kicker">会后概览</span><h2>${esc(title)}</h2><p>${esc(fmtClock(meetingT0(meeting)) || fmtClock(Date.parse(meeting.scheduled_at)) || '时间未知')} · ${esc(meetingDurationLabel(meeting, cues))} · ${esc(alignmentLabel)}</p></div>`
@@ -2258,6 +2364,14 @@ function renderRecapOverview(bodyEl: HTMLElement): void {
           : overviewCardHtml({ action: 'feishu', title: '官方纪要', meta: '暂不支持', body: note.message, disabled: true }))
     + overviewCardHtml({ action: 'handwriting', title: '手写记录', meta: marks.status === 'loading' ? '读取中' : inkCount ? `${inkCount} 处${markSource}` : '0 处', body: marks.status === 'ready' || marks.status === 'missing' ? inkBody : marks.message, disabled: inkPages.length === 0 && !marksActions, actions: marksActions })
     + overviewCardHtml({ action: 'panel', title: 'InkLoop 后处理', meta: `${panelSummaryLabel()} · ${exportState}`, body: panelBody })
+    + `</section>`
+    + ((google || zoom) ? `<section class="rc-privacy" aria-labelledby="rc-privacy-title">`
+      + `<div><b id="rc-privacy-title">隐私与临时媒体 · ${esc(rawMedia.label)}</b><span>${esc(rawMedia.detail)}</span></div>`
+      + `<button class="hbtn" type="button" data-rc-command="delete-raw-media"${rawMedia.canDelete ? '' : ' disabled aria-disabled="true"'}>${esc(rawMedia.button)}</button>`
+      + `</section>` : '')
+    + `<section class="rc-danger-zone" aria-labelledby="rc-delete-meeting-title">`
+    + `<div><b id="rc-delete-meeting-title">删除整场会议</b><span>删除会议卡、转写与纪要、本场手写/板书、Hub 派生产物、云端媒体及 Companion 本机原始音频。共享教学资料本身不会删除。</span></div>`
+    + `<button class="hbtn danger" type="button" data-rc-command="delete-meeting">删除整场会议</button>`
     + `</section>`
     + `</div>`;
   // 事件委托：一个 listener 挂在 .rc-overview 根上（局部块替换只换子块、不换根）。
@@ -2308,7 +2422,68 @@ function handleRecapBlockCommand(command: string, bodyEl: HTMLElement): void {
         void loadRecapView(meeting.meeting_id, bodyEl, document.getElementById('recap-title') as HTMLElement);
       }
     })();
+  } else if (command === 'delete-raw-media') {
+    const presentation = meetingRawMediaPresentation(recapState.rawMediaLifecycle, recapState.rawMediaStatus);
+    if (!presentation.canDelete) return;
+    const meetingId = recapState.meeting.meeting_id;
+    void (async () => {
+      const confirmed = await confirmSheet({
+        title: '立即删除云端临时音频？',
+        message: '将永久删除服务端为实时转写暂存的 Mic / Remote 分片，并停止尚未完成的云端转写重试。Mac 上的权威原始音频、已生成的转写、手写和会议纪要会保留。此操作无法撤销。',
+        confirm: '删除云端临时音频',
+      });
+      if (!confirmed) return;
+      commandElBusy(bodyEl, 'delete-raw-media', true);
+      try {
+        await deleteMeetingRawMedia(meetingId);
+        if (recapState?.meeting.meeting_id === meetingId) {
+          recapState.rawMediaStatus = 'ready';
+          recapState.rawMediaLifecycle = { status: 'deleted', reason: 'user_requested', updated_at_ms: Date.now() };
+          renderRecapOverview(bodyEl);
+        }
+        await infoSheet({ title: '云端临时音频已删除', message: '服务端 Mic / Remote 临时分片已删除；Mac 原始音频与已有转写、手写和会议纪要仍保留。' });
+      } catch (error) {
+        if (recapState?.meeting.meeting_id === meetingId) {
+          recapState.rawMediaStatus = 'ready';
+          recapState.rawMediaLifecycle = { status: 'delete_failed', reason: 'user_requested', updated_at_ms: Date.now(), error: String((error as Error)?.message || error) };
+          renderRecapOverview(bodyEl);
+        }
+        await infoSheet({ title: '删除失败', message: `云端临时音频仍可能保留，可以稍后重试。${String((error as Error)?.message || error)}` });
+      } finally {
+        commandElBusy(bodyEl, 'delete-raw-media', false);
+      }
+    })();
+  } else if (command === 'delete-meeting') {
+    if (!deleteMeetingFromRecap) return;
+    const meeting = recapState.meeting;
+    void (async () => {
+      const confirmed = await confirmSheet({
+        title: '永久删除整场会议？',
+        message: `这会永久删除《${meeting.title || '未命名会议'}》的会议卡、转写与纪要、本场手写和板书、Hub 派生产物、云端临时媒体，并通知录制这场会议的 Mac 删除权威原始音频。共享教学资料本身会保留，但其中属于本场会议的批注会删除。此操作无法撤销。`,
+        confirm: '永久删除整场会议',
+      });
+      if (!confirmed) return;
+      commandElBusy(bodyEl, 'delete-meeting', true);
+      try {
+        await deleteMeetingFromRecap?.(meeting);
+      } catch (error) {
+        await infoSheet({ title: '会议删除未完成', message: `会议仍保留，可以稍后重试。${String((error as Error)?.message || error)}` });
+        commandElBusy(bodyEl, 'delete-meeting', false);
+      }
+    })();
   }
+}
+
+function commandElBusy(bodyEl: HTMLElement, command: string, busy: boolean): void {
+  const button = bodyEl.querySelector<HTMLButtonElement>(`[data-rc-command="${command}"]`);
+  if (!button) return;
+  button.disabled = busy;
+  button.setAttribute('aria-busy', String(busy));
+  button.textContent = busy
+    ? '正在删除…'
+    : command === 'delete-meeting'
+      ? '删除整场会议'
+      : meetingRawMediaPresentation(recapState?.rawMediaLifecycle, recapState?.rawMediaStatus).button;
 }
 
 function refreshRecapOverviewBlocks(bodyEl: HTMLElement, selectors: string[]): void {
@@ -2519,71 +2694,4 @@ export function buildSummaryPrompt(m: PersistedMeeting, cues: TranscriptCue[], m
   lines.push(...(handwritingLines.length ? handwritingLines : ['（本场没有手写标注）']));
   lines.push('</手写标注>', '', '请按系统要求产出会后思路总结。');
   return { prompt: lines.join('\n'), truncated: capped.truncated, usedCueCount: capped.usedCueCount };
-}
-
-/** 会后思路总结：拉转写 + 手写档案 → 流式 /api/chat（meeting_summary role·不走 chatTurn 不污染书 buffer）→ 写 summary。 */
-export async function summarizeMeeting(meetingId: string, onDelta: (full: string) => void): Promise<string | null> {
-  const m = await getMeeting(meetingId);
-  if (!m) return null;
-  if (!transcriptSourceKey(m)) {
-    const lark = meetingPlatformOf(m) === 'lark';
-    await infoSheet({
-      title: lark ? '先关联飞书会议' : '暂无可用转写',
-      message: lark
-        ? '生成思路总结需要先在「会后记录」里关联这场会议的飞书会后转写。'
-        : '该来源暂无可用于生成思路总结的转写。',
-    });
-    return null;
-  }
-  let loaded: LoadedTranscript | null;
-  try { loaded = await loadTranscript(m); } catch (e) { await infoSheet({ title: '拉取转写失败', message: String((e as Error)?.message || e) }); return null; }
-  if (!loaded || !loaded.cues.length) { await infoSheet({ title: '转写为空', message: '没有可用于总结的转写内容。' }); return null; }
-  const marks = (await getFoldedMarksByContext('mtg_' + m.meeting_id)).filter((mk) => !mk.is_tombstone).sort((a, b) => markTime(a) - markTime(b));
-
-  const { prompt, truncated, usedCueCount } = buildSummaryPrompt(m, loaded.cues, marks);
-  let full = '';
-  let streamDone = false;
-  let streamError = '';
-  try {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), SUMMARY_STREAM_TIMEOUT_MS);
-    try {
-      await postNdjson<{ k?: string; d?: string }>(
-        '/api/chat',
-        { messages: [{ role: 'user', content: prompt }], role: 'meeting_summary', model: settings.inferModel, maxTokens: 1600 },
-        (frame) => {
-          if (frame.k === 'e') { streamError = frame.d || '生成中断'; return; }
-          if (frame.k === 'done') { streamDone = true; return; }
-          if (frame.k === 't' && frame.d) { full += frame.d; onDelta(full); } // 只收正文帧·丢思考帧 r
-        },
-        { signal: controller.signal },
-      );
-    } finally {
-      window.clearTimeout(timer);
-    }
-  } catch (e) { await infoSheet({ title: '生成失败', message: String((e as Error)?.message || e) }); return null; }
-  // 流没真完成（中途断/出错）→ 丢弃半截·不写库
-  if (streamError || !streamDone) { await infoSheet({ title: '生成失败', message: streamError || '连接中断，已丢弃未完成内容。' }); return null; }
-  let summary = full.trim();
-  if (!summary) return null;
-  // 截断时给 summary 顶一行透明告知（防"看起来是全文总结"误导·UI 直接可见）
-  if (truncated) summary = `〔注：本总结基于前 ${usedCueCount}/${loaded.cues.length} 句转写 + 全部手写生成，后半场转写过长未参与〕\n\n${summary}`;
-  const patch: Partial<PersistedMeeting> = {
-    summary,
-    summary_generated_at: new Date().toISOString(),
-    summary_source: { transcript_cache_token: loaded.sourceToken, align_offset_ms: m.align_offset_ms ?? 0, mark_count: marks.length, cue_count: loaded.cues.length, transcript_truncated: truncated, used_cue_count: usedCueCount },
-  };
-  if (meetingPlatformOf(m) === 'zoom') {
-    const occurrenceToken = providerOccurrenceToken(m.scheduled_at);
-    let occurrenceCurrent = false;
-    await mutateMeeting(m.meeting_id, (current) => {
-      if (!sameZoomOccurrence(current, occurrenceToken)) return null;
-      occurrenceCurrent = true;
-      return patch;
-    });
-    if (!occurrenceCurrent) return null;
-  } else {
-    await updateMeeting(m.meeting_id, patch);
-  }
-  return summary;
 }

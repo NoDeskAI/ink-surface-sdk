@@ -22,8 +22,23 @@ import { homedir } from 'node:os';
 import { assertNonEmptyVaultRelease, guardPanelVaultReqUrl, panelVaultGuardPayload, resolvePanelVaultGuardUser } from './panel-vault-guard';
 import {
   runReflow, runReflowAi, reflowAiStream, chatStream,
-  runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runReflowVlm,
+  runOcrVlm, runBoardOcrVlm, runExplainImage, runInterpret, runClassifyContext, runReadingNotePostprocess, runMeetingPanelSummary, runMeetingPostprocessJson, runReflowVlm,
 } from './infer';
+import { bootstrapMeetingPostprocess, bootstrapMeetingPostprocessConfigurationGates, createMeetingPostprocessService, enqueueEndedMeeting } from './meeting-postprocess/service';
+import { formalTranscriptUtterances } from './meeting-postprocess/evidence-snapshot';
+import {
+  createConfiguredFormalTranscriptConverger,
+  createConfiguredStreamingAsrProvider,
+  StreamingAsrProviderRouter,
+} from './meeting-media/provider';
+import { createMeetingMediaService, MeetingMediaStreamingIngress } from './meeting-media/streaming-ingress';
+import {
+  listProviderMeetingRegistrations,
+  providerOccurrenceReference,
+  registrationMatches,
+  resolveProviderMeetingOccurrence,
+} from './meeting-postprocess/provider-registry';
+import { enqueueRegisteredProviderEvidence } from './meeting-postprocess/provider-trigger';
 import { handleBoardOcrHttp } from './board-ocr';
 import { runOcrLayout } from './ocr-layout-dev.mjs';
 import { createRuntimeSyncDevHandler } from './runtime-sync-dev';
@@ -90,7 +105,7 @@ import {
   revokeMtlToken,
   type MtlReceiverIdentity,
 } from './mtl-receiver-auth';
-import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows, mtlZoomAttendanceWindows } from './mtl-receiver';
+import { handleMtlReceiver, listMtlMeetingWindows, mtlAttendanceWindows, mtlZoomAttendanceWindows, runMtlGoogleTranscriptCatchUp } from './mtl-receiver';
 import { fetchLarkDocxMedia, fetchLarkMeetingNoteTranscript } from './lark-meeting-notes';
 import { exportLarkDocxToPdf } from './lark-docx-export';
 import { matchLocalFeishuMaterialRoute } from './local-feishu-material-routes';
@@ -157,7 +172,7 @@ loadEnvFile(resolve(homedir(), '.hermes/.env'));
 if (!process.env.LLM_GATEWAY_KEY && process.env.NODESK_API_KEY) process.env.LLM_GATEWAY_KEY = process.env.NODESK_API_KEY;
 if (!process.env.LLM_GATEWAY_URL) process.env.LLM_GATEWAY_URL = 'https://llm-gateway-api.nodesk.tech/default/v1';
 if (!process.env.LLM_GATEWAY_TRANSPORT) process.env.LLM_GATEWAY_TRANSPORT = 'openai_chat_completions';
-if (!process.env.LLM_MODEL) process.env.LLM_MODEL = 'glm-5.2';
+if (!process.env.LLM_MODEL) process.env.LLM_MODEL = 'gpt-5.5';
 
 function feishuBotRuntimeEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return buildFeishuBotEnv(ROOT, baseEnv);
@@ -198,7 +213,10 @@ function isLanDevOrigin(req: IncomingMessage, origin: string): boolean {
 }
 function setCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  if (origin && (ALLOW_ORIGINS.has(origin) || isLanDevOrigin(req, origin))) {
+  const path = (req.url || '/').split('?')[0];
+  const meetingPath = path.startsWith('/api/meeting-media/')
+    || path.startsWith('/api/meeting-postprocess/');
+  if (origin && (ALLOW_ORIGINS.has(origin) || (!meetingPath && isLanDevOrigin(req, origin)))) {
     res.setHeader('access-control-allow-origin', origin);
     res.setHeader('vary', 'Origin');
   }
@@ -216,6 +234,18 @@ const INKLOOP_SHARED_SECRET = process.env.INKLOOP_SHARED_SECRET || '';
 const PANEL_AUTH_BASE = resolvePanelAuthBase(process.env);
 const LOCAL_DEVICE_AUTH = process.env.INKLOOP_LOCAL_DEVICE_AUTH === '1';
 const LOCAL_DEVICE_AUTH_AUTO_APPROVE = process.env.INKLOOP_LOCAL_DEVICE_AUTH_AUTO_APPROVE === '1';
+const LOCAL_DEVICE_AUTH_AUTO_APPROVE_TOKEN = String(
+  process.env.INKLOOP_LOCAL_DEVICE_AUTH_TOKEN || '',
+).trim();
+const LOCAL_BROWSER_AUTH_AUTO_APPROVE_TOKEN = String(
+  process.env.INKLOOP_LOCAL_BROWSER_AUTH_TOKEN || '',
+).trim();
+const LOCAL_DEVICE_AUTH_AUTO_APPROVE_DEVICE_ID = String(
+  process.env.INKLOOP_LOCAL_DEVICE_AUTH_DEVICE_ID || 'local-auto-approved-device',
+).trim();
+if (LOCAL_DEVICE_AUTH_AUTO_APPROVE && !LOCAL_DEVICE_AUTH_AUTO_APPROVE_TOKEN) {
+  throw new Error('INKLOOP_LOCAL_DEVICE_AUTH_TOKEN is required when local auto-approve is enabled');
+}
 const LOCAL_AUTH_STORE = process.env.INKLOOP_LOCAL_AUTH_STORE || resolve(ROOT, '.inkloop/auth-sessions.json');
 const LOCAL_LARK_OAUTH_PENDING_STORE = process.env.INKLOOP_LARK_OAUTH_PENDING_STORE || resolve(ROOT, '.inkloop/lark-auth/pending-device-oauth.json');
 const LOCAL_AUTH_TENANT_ID = process.env.INKLOOP_LOCAL_AUTH_TENANT_ID || process.env.INKLOOP_TENANT_ID || 'local';
@@ -408,8 +438,22 @@ function localSessionTokenFor(req: IncomingMessage): string {
   return bearerToken(req) || String(req.headers['x-inkloop-session'] || '').trim();
 }
 
+function matchesLocalAutoApproveToken(token: string): boolean {
+  if (!LOCAL_DEVICE_AUTH_AUTO_APPROVE || !token) {
+    return false;
+  }
+  const actual = Buffer.from(token);
+  return [
+    LOCAL_DEVICE_AUTH_AUTO_APPROVE_TOKEN,
+    LOCAL_BROWSER_AUTH_AUTO_APPROVE_TOKEN,
+  ].filter(Boolean).some((candidate) => {
+    const expected = Buffer.from(candidate);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  });
+}
+
 function updateLocalDeviceSession(token: string, patch: Partial<LocalDeviceSession>): LocalDeviceSession | null {
-  if (!LOCAL_DEVICE_AUTH || !token || token === 'local-demo-token') return null;
+  if (!LOCAL_DEVICE_AUTH || !token || matchesLocalAutoApproveToken(token)) return null;
   const store = readLocalAuthStore();
   const session = store.sessions[token];
   if (!session || session.expires_at <= Date.now()) return null;
@@ -540,14 +584,14 @@ function authorizeLocalFlow(store: LocalDeviceAuthStore, flow: LocalDeviceAuthFl
 
 function localDeviceSessionFromToken(token: string): InkLoopSessionContext | null {
   if (!LOCAL_DEVICE_AUTH || !token) return null;
-  if (LOCAL_DEVICE_AUTH_AUTO_APPROVE && token === 'local-demo-token') {
+  if (matchesLocalAutoApproveToken(token)) {
     return {
       active: true,
       session_id: 'local-demo-session',
       session_token: token,
       tenant_id: LOCAL_AUTH_TENANT_ID,
       user_id: LOCAL_AUTH_USER_ID,
-      device_id: 'local-demo-device',
+      device_id: LOCAL_DEVICE_AUTH_AUTO_APPROVE_DEVICE_ID,
       expires_at: Date.now() + LOCAL_AUTH_TTL_MS,
       feishu_open_id: null,
     };
@@ -688,6 +732,123 @@ async function optionalDeviceSession(req: IncomingMessage): Promise<InkLoopSessi
     return null;
   }
 }
+
+const meetingPostprocessWorkerOptions = {
+  root: process.env.INKLOOP_MEETING_POSTPROCESS_ROOT
+    || resolve(ROOT, '.inkloop/meeting-postprocess'),
+  generate: runMeetingPostprocessJson,
+  execution_timeout_ms: Number(
+    process.env.INKLOOP_MEETING_POSTPROCESS_EXECUTION_TIMEOUT_MS || 8 * 60_000,
+  ),
+};
+bootstrapMeetingPostprocess({ root: process.env.INKLOOP_MEETING_POSTPROCESS_ROOT || resolve(ROOT, '.inkloop/meeting-postprocess'), generate: runMeetingPostprocessJson });
+bootstrapMeetingPostprocessConfigurationGates(meetingPostprocessWorkerOptions);
+
+const meetingMediaIngress = new MeetingMediaStreamingIngress({
+  root: process.env.INKLOOP_MEETING_MEDIA_ROOT || resolve(ROOT, '.inkloop/meeting-media'),
+  providers: new StreamingAsrProviderRouter({}, createConfiguredStreamingAsrProvider(process.env)),
+  formal_converger: createConfiguredFormalTranscriptConverger(process.env),
+  realtime_provider_timeout_ms: Number(process.env.INKLOOP_MEETING_REALTIME_PROVIDER_TIMEOUT_MS || 5_000),
+  provider_max_attempts: Number(process.env.INKLOOP_MEETING_PROVIDER_MAX_ATTEMPTS || 5),
+  recorder_lease_required: process.env.INKLOOP_MEETING_RECORDER_LEASE_REQUIRED !== '0',
+  resolve_meeting_document_id(identity, input) {
+    const provider = input.platform === 'google_meet' ? 'google' : 'zoom';
+    const providerReference = input.meeting_ref.split(':').slice(1).join(':');
+    const registration = resolveProviderMeetingOccurrence(
+      listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root, provider),
+      {
+        tenant_id: identity.tenant_id,
+        user_id: identity.user_id,
+        provider,
+        logical_reference: providerReference,
+        started_at_ms: input.started_at_ms,
+      },
+    );
+    return registration ? {
+      meeting_document_id: `mtgdoc_${registration.meeting_id}`,
+      provider_occurrence_id: providerOccurrenceReference(registration),
+    } : null;
+  },
+});
+const meetingPostprocessService = createMeetingPostprocessService({
+  root: meetingPostprocessWorkerOptions.root,
+  generate: runMeetingPostprocessJson,
+  readBody,
+  resolveIdentity: async (req, res) => {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return null;
+    return {
+      tenant_id: session.tenant_id || LOCAL_AUTH_TENANT_ID,
+      user_id: session.user_id || LOCAL_AUTH_USER_ID,
+      device_id: session.device_id,
+    };
+  },
+  async deleteMeetingMedia(identity, meetingId) {
+    const registrations = listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root)
+      .filter((item) => item.tenant_id === identity.tenant_id && item.user_id === identity.user_id && item.meeting_id === meetingId);
+    const meetingRefs = registrations.flatMap((item) => {
+      if (item.provider === 'google' && item.meeting_code) return [`google_meet:${item.meeting_code}`];
+      if (item.provider === 'zoom' && (item.provider_meeting_id || item.provider_space_name)) return [`zoom:${item.provider_meeting_id || item.provider_space_name}`];
+      return [];
+    });
+    const startedAtMs = Math.min(...registrations.map((item) => Date.parse(item.started_at || item.scheduled_at)).filter(Number.isFinite));
+    const endedAtMs = Math.max(...registrations.map((item) => Date.parse(item.ended_at || item.scheduled_end_at || '')).filter(Number.isFinite));
+    const result = await meetingMediaIngress.deleteMeetingEvidence(identity, `mtgdoc_${meetingId}`, {
+      meeting_refs: meetingRefs,
+      ...(Number.isFinite(startedAtMs) ? { occurrence_started_at_ms: startedAtMs } : {}),
+      ...(Number.isFinite(endedAtMs) ? { occurrence_ended_at_ms: endedAtMs } : {}),
+    });
+    return {
+      command_id: result.command.command_id,
+      cloud_sessions_deleted: result.cloud_sessions_deleted,
+      pending_companion: result.pending_companion,
+    };
+  },
+  async deleteMeetingRuntime(identity, meetingId) {
+    const documentId = `mtgdoc_${meetingId}`;
+    const namespace = { tenant_id: identity.tenant_id, user_id: identity.user_id };
+    const [runtimeEvents, knowledge] = await Promise.all([
+      runtimeSyncEventStore.deleteDocument(namespace, documentId),
+      cloudKnowledgeStore.deleteDocument(namespace, documentId),
+    ]);
+    return {
+      runtime_events: runtimeEvents,
+      knowledge_records: knowledge.ai_turns + knowledge.knowledge_objects + knowledge.document_projections,
+    };
+  },
+});
+const meetingMediaService = createMeetingMediaService({
+  ingress: meetingMediaIngress,
+  readBody,
+  resolveIdentity: async (req, res) => {
+    const session = await requireDeviceSession(req, res);
+    if (!session) return null;
+    return { tenant_id: session.tenant_id || LOCAL_AUTH_TENANT_ID, user_id: session.user_id || LOCAL_AUTH_USER_ID, device_id: session.device_id };
+  },
+  onFormalTranscript: async ({ identity, artifact, request }) => {
+    return await enqueueEndedMeeting({
+      options: meetingPostprocessWorkerOptions,
+      identity,
+      meeting_id: request.meeting_id,
+      title: request.title?.trim() || '(未命名会议)',
+      platform: request.platform,
+      provider_meeting_id: request.provider_meeting_id || request.session_id,
+      started_at_ms: request.started_at_ms,
+      ended_at_ms: request.ended_at_ms,
+      source: 'local',
+      transcript_origin: 'inkloop_media',
+      transcript_final: artifact.finality === 'final',
+      transcript_converged: true,
+      transcript_missing_chunk_ids: artifact.missing_chunk_ids,
+      ocr_status: request.ocr_status || 'not_applicable',
+      utterances: formalTranscriptUtterances(artifact),
+      handwriting: Array.isArray(request.handwriting) ? request.handwriting as never[] : [],
+    });
+  },
+});
+void meetingMediaIngress.bootstrapPending().then((count) => {
+  if (count > 0) console.info(`[meeting-media] queued ${count} pending session(s) for provider retry`);
+}).catch((error) => console.warn('[meeting-media] bootstrap failed', String(error)));
 
 /** 阶段C：设备二维码登录 GET/POST 代理——create/status/ack 走 shared secret（前端不持有），scan 是纯 302 跳转。 */
 async function handleInkLoopAuth(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1946,6 +2107,7 @@ const localRuntimeSession = requireRuntimeSession ? undefined : {
 const cloudKnowledgeStore = new JsonCloudKnowledgeStore(process.env.INKLOOP_KNOWLEDGE_STORE || resolve(ROOT, '.inkloop/knowledge'));
 const cloudLibraryStore = new JsonCloudLibraryStore(process.env.INKLOOP_LIBRARY_STORE || resolve(ROOT, '.inkloop/library'));
 const cloudDeviceStore = new JsonCloudDeviceStore(process.env.INKLOOP_DEVICE_STORE || resolve(ROOT, '.inkloop/devices'));
+const runtimeSyncEventStore = new JsonlRuntimeSyncEventStore(process.env.INKLOOP_RUNTIME_SYNC_STORE || resolve(ROOT, '.inkloop/runtime-events.jsonl'));
 function knowledgePatchFromRuntimeEvent(event: RuntimeSyncEvent): CloudKnowledgeObjectPatch | null {
   if (event.operation !== 'knowledge.update') return null;
   const payload = event.payload || {};
@@ -2397,7 +2559,7 @@ async function applyRuntimeAnnotationPostprocess(event: RuntimeSyncEvent, namesp
       marked: quoteText || markText,
       view_narrative: `InkLoop Paper/Web runtime mark on ${docTitle}.`,
       conversation: [],
-      model: process.env.LLM_MODEL || 'glm-5.2',
+      model: process.env.LLM_MODEL || 'gpt-5.5',
     });
   } catch (error) {
     postprocessError = String((error as Error)?.message || error);
@@ -2415,7 +2577,7 @@ async function applyRuntimeAnnotationPostprocess(event: RuntimeSyncEvent, namesp
         quote: quoteText,
         user_note: userNote,
         context_text: contextText,
-        model: process.env.LLM_MODEL || 'glm-5.2',
+        model: process.env.LLM_MODEL || 'gpt-5.5',
       });
     }
   } catch (error) {
@@ -2503,7 +2665,7 @@ const runtimeSyncHandler = createRuntimeSyncDevHandler({
   token: process.env.INKLOOP_RUNTIME_SYNC_TOKEN || '',
   requireSession: requireRuntimeSession,
   defaultSession: localRuntimeSession,
-  store: new JsonlRuntimeSyncEventStore(process.env.INKLOOP_RUNTIME_SYNC_STORE || resolve(ROOT, '.inkloop/runtime-events.jsonl')),
+  store: runtimeSyncEventStore,
   resolveSession: requireRuntimeSession ? resolveDeviceSession : undefined,
   onAcceptedEvent: applyRuntimeAcceptedEvent,
   allowOrigins: (process.env.INKLOOP_RUNTIME_SYNC_ORIGINS || '')
@@ -2575,6 +2737,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   const url = (req.url || '/').split('?')[0];
   if (await classroomHandler(req, res)) return;
   if (classroomStatic(req, res)) return;
+  const origin = String(req.headers.origin || '');
+  if (LOCAL_DEVICE_AUTH_AUTO_APPROVE
+    && (url.startsWith('/api/meeting-media/') || url.startsWith('/api/meeting-postprocess/'))
+    && origin
+    && !ALLOW_ORIGINS.has(origin)) {
+    sendJson(res, 403, { error: { code: 'meeting_origin_forbidden' } });
+    return;
+  }
   setCors(req, res);
   if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
   if (req.method === 'GET' && url === '/healthz') {
@@ -2598,6 +2768,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     });
     return;
   }
+  if (url.startsWith('/api/meeting-postprocess/')) { await meetingPostprocessService(req, res); return; }
+  if (url.startsWith('/api/meeting-media/')) { await meetingMediaService(req, res); return; }
   // 妙记 token 收编：panel meeting sidecar 从 hub 取 user_access_token（loopback + shared secret 双门）。
   // 背景：sidecar 原有独立 v1 OAuth token 库已死（refresh_token 被 hub 侧重授权顶掉·2026-07-15），
   // 妙记取数的 token 真相源收编到 hub 这份 v2 OAuth state（resolveUserOAuthToken 自带懒刷新）。
@@ -2715,7 +2887,33 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // Zoom S2S 状态 + type=2 排期快照；所有子路由在 handler 内校验设备 session。
   if (url.startsWith('/api/zoom/')) { await handleZoomApi(req, res); return; }
   // MTL browser extension receiver uses a per-user secret path and includes GET /api/state.
-  if (url.startsWith('/api/mtl/')) { await handleMtlReceiver(req, res); return; }
+  if (url.startsWith('/api/mtl/')) {
+    await handleMtlReceiver(req, res, {
+      onMeetingEnded: async (identity, window) => {
+        const transcript = await runMtlGoogleTranscriptCatchUp(identity, window);
+        await enqueueEndedMeeting({
+          options: { root: process.env.INKLOOP_MEETING_POSTPROCESS_ROOT || resolve(ROOT, '.inkloop/meeting-postprocess'), generate: runMeetingPostprocessJson },
+          identity,
+          meeting_id: window.meeting_id,
+          title: window.title || '(未命名会议)',
+          platform: window.platform,
+          provider_meeting_id: window.external_meeting_id || window.meeting_code,
+          started_at_ms: window.started_at_ms,
+          ended_at_ms: window.ended_at_ms,
+          source: 'mtl',
+          transcript_final: transcript?.status === 'ready',
+          ocr_status: 'pending',
+          utterances: transcript?.transcript?.lines.map((line) => ({
+            speaker: line.speaker_name || line.speaker_id,
+            start_ms: Math.max(0, Date.parse(line.start_time) - window.started_at_ms),
+            end_ms: Math.max(0, Date.parse(line.end_time) - window.started_at_ms),
+            text: line.text,
+          })) || [],
+        });
+      },
+    });
+    return;
+  }
   // WS2-C：panel 飞书 GET 代理（在 POST-only 闸之前）
   if (url.startsWith('/api/panel-feishu')) { await handlePanelFeishu(req, res); return; }
   // 交付路线 Y：vault release GET/POST 代理（在 POST-only 闸之前·因含 GET latest/blob）
@@ -2817,9 +3015,20 @@ async function runLarkMeetingReconcile(reason: string): Promise<void> {
           } catch { return []; }
         },
         logger: (event, details) => console.log(`[inkloop proxy] ${event}`, JSON.stringify(details)),
+        onEnded: async (meeting) => {
+          const registrations = listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root, 'lark').filter((registration) => registrationMatches(registration, { provider_meeting_id: meeting.feishu_meeting_id, meeting_code: meeting.meeting_no, scheduled_at: meeting.scheduled_at }));
+          const transcript = meeting.feishu_meeting_id ? await fetchLarkMeetingNoteTranscript(meeting.feishu_meeting_id).catch(() => null) : null;
+          for (const registration of registrations) await enqueueRegisteredProviderEvidence({ options: meetingPostprocessWorkerOptions, registration, evidence: { status: transcript?.status === 'ready' ? 'ready' : 'pending', started_at: meeting.started_at, ended_at: meeting.ended_at, utterances: transcript?.transcript?.segments.map((segment) => ({ speaker: segment.speaker, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text })) } });
+        },
       });
       if (result.checked > 0 || result.errors.length > 0 || result.enriched > 0) {
         console.log(`[inkloop proxy] lark meeting reconcile reason=${reason} checked=${result.checked} ended=${result.ended} still_live=${result.still_live} skipped=${result.skipped} enriched=${result.enriched}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
+      }
+      // 妙记常晚于 ended 数分钟：每轮只对已注册场次探测，ready 后提交 evidence revision；相同 fingerprint 不重复推理。
+      for (const registration of listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root, 'lark').filter((item) => !!item.provider_meeting_id)) {
+        const transcript = await fetchLarkMeetingNoteTranscript(registration.provider_meeting_id!).catch(() => null);
+        if (transcript?.status !== 'ready' || !transcript.transcript?.segments.length) continue;
+        await enqueueRegisteredProviderEvidence({ options: meetingPostprocessWorkerOptions, registration, evidence: { status: 'ready', started_at: transcript.meeting?.start_time || registration.started_at, ended_at: transcript.meeting?.end_time || registration.ended_at, utterances: transcript.transcript.segments.map((segment) => ({ speaker: segment.speaker, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text })) } });
       }
     });
   } catch (e) {
@@ -2858,6 +3067,12 @@ async function runGoogleSmartNoteBackfill(reason: string): Promise<void> {
           grantedScopes: resolved.scopes,
           fetchImpl,
         });
+        for (const registration of listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root, 'google').filter((item) => item.tenant_id === identity.tenantId && item.user_id === identity.userId && (item.status === 'ended' || (!!item.scheduled_end_at && Date.parse(item.scheduled_end_at) <= Date.now())))) {
+          try {
+            const transcript = await fetchGoogleMeetingTranscript(resolved.token, { path: recordsPath }, { meetingCode: registration.meeting_code || '', scheduledAt: registration.scheduled_at }, { fetchImpl });
+            if (transcript.status !== 'pending') await enqueueRegisteredProviderEvidence({ options: meetingPostprocessWorkerOptions, registration, evidence: { status: transcript.status, started_at: transcript.record?.start_time, ended_at: transcript.record?.end_time, utterances: transcript.transcript?.lines.map((line) => ({ speaker: line.speaker_name || line.speaker_id, start_ms: Math.max(0, Date.parse(line.start_time) - Date.parse(transcript.record?.start_time || registration.scheduled_at)), end_ms: Math.max(0, Date.parse(line.end_time) - Date.parse(transcript.record?.start_time || registration.scheduled_at)), text: line.text })) } });
+          } catch (error) { console.warn(`[inkloop proxy] google postprocess trigger failed meeting=${registration.meeting_id}: ${String((error as Error)?.message || error)}`); }
+        }
         if (result.scanned > 0 || result.errors.length > 0) {
           console.log(`[inkloop proxy] google smart-note backfill reason=${reason} user=${identity.userId} scanned=${result.scanned} backfilled=${result.backfilled} completed=${result.completed}${result.errors.length ? ` errors=${result.errors.join('; ')}` : ''}`);
         }
@@ -2886,6 +3101,12 @@ async function runZoomRecordsBackfill(reason: string): Promise<void> {
         { path: zoomMeetingSyncPath(process.env) },
         { fetchImpl, signal },
       );
+      for (const registration of listProviderMeetingRegistrations(meetingPostprocessWorkerOptions.root, 'zoom').filter((item) => item.status === 'ended' || (!!item.scheduled_end_at && Date.parse(item.scheduled_end_at) <= Date.now()))) {
+        try {
+          const transcript = await (await import('./zoom-meeting-records')).fetchZoomMeetingTranscript(process.env, { path: zoomMeetingRecordsPath(process.env) }, { meetingId: registration.provider_space_name || registration.provider_meeting_id || '', scheduledAt: registration.scheduled_at }, { fetchImpl, signal });
+          if (transcript.status !== 'pending') await enqueueRegisteredProviderEvidence({ options: meetingPostprocessWorkerOptions, registration, evidence: { status: transcript.status, started_at: transcript.started_at || transcript.record?.start_time, ended_at: transcript.ended_at || transcript.record?.end_time, utterances: transcript.transcript?.lines.map((line) => ({ speaker: line.speaker.display_name, start_ms: Math.max(0, Date.parse(line.start_time) - Date.parse(transcript.started_at || transcript.record?.start_time || registration.scheduled_at)), end_ms: Math.max(0, Date.parse(line.end_time) - Date.parse(transcript.started_at || transcript.record?.start_time || registration.scheduled_at)), text: line.text })) } });
+        } catch (error) { console.warn(`[inkloop proxy] zoom postprocess trigger failed meeting=${registration.meeting_id}: ${String((error as Error)?.message || error)}`); }
+      }
       if (result.scanned > 0 || result.errors.length > 0) {
         console.log(`[inkloop proxy] provider_zoom_records_backfill provider_reason=${reason} provider_scanned=${result.scanned} provider_advanced=${result.advanced} provider_completed=${result.completed}${result.errors.length ? ` provider_errors=${result.errors.join('; ')}` : ''}`);
       }
@@ -2896,8 +3117,9 @@ async function runZoomRecordsBackfill(reason: string): Promise<void> {
 }
 
 const PORT = Number(process.env.PORT || 3000);
-server.listen(PORT, () => {
-  console.log(`[inkloop proxy] :${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
+const HOST = String(process.env.HOST || '').trim() || undefined;
+server.listen(PORT, HOST, () => {
+  console.log(`[inkloop proxy] ${HOST || '*'}:${PORT}  model=${process.env.LLM_MODEL || 'kimi-k2.6'}  key=${process.env.LLM_GATEWAY_KEY ? 'set' : 'MISSING'}`);
   const wsStatus = startLarkWsMeetingEvents(ROOT, feishuBotRuntimeEnv(process.env));
   console.log(`[inkloop proxy] Lark meeting WS ${wsStatus.enabled ? wsStatus.state : 'disabled'} events=${wsStatus.registered_event_types.length}`);
   if (LARK_MEETING_RECONCILE_MS > 0 && !FEISHU_SERVICE_BASE) {
@@ -2956,8 +3178,8 @@ if (HTTPS_PORT > 0 && HTTPS_KEY_PATH && HTTPS_CERT_PATH) {
       }
       console.warn(`[inkloop proxy] HTTPS disabled: ${String(error.message || error)}`);
     });
-    httpsServer.listen(HTTPS_PORT, () => {
-      console.log(`[inkloop proxy] https :${HTTPS_PORT}  cert=${HTTPS_CERT_PATH}`);
+    httpsServer.listen(HTTPS_PORT, HOST, () => {
+      console.log(`[inkloop proxy] https ${HOST || '*'}:${HTTPS_PORT}  cert=${HTTPS_CERT_PATH}`);
     });
   } catch (error) {
     console.warn(`[inkloop proxy] HTTPS disabled: ${String((error as Error)?.message || error)}`);

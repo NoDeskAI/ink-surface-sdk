@@ -354,6 +354,53 @@ describe('meeting transactional mutation', () => {
     expect(seen).toEqual(['provider_event']);
     expect(saved).toMatchObject({ status: 'ended', ended_at: '2026-07-18T02:00:00.000Z' });
   });
+
+  it('deletes a whole local meeting while preserving shared material documents', async () => {
+    const store = await import('./store');
+    const meeting = await store.createMeeting('ws_delete', { title: 'Delete', scheduled_at: '2026-07-18T01:00:00.000Z' });
+    const boardId = `mtgboard_${meeting.meeting_id}`;
+    await store.createDiaryDoc(boardId, 'Meeting board', 1);
+    await store.createDiaryDoc('shared_material', 'Shared material', 1);
+    for (const [index, documentId] of [boardId, 'shared_material'].entries()) {
+      const { entry_id: _entryId, seq: _seq, created_at: _createdAt, ...draft } = markRecord({
+        mark_id: `meeting-mark-${index}`,
+        document_id: documentId,
+        context_id: `mtg_${meeting.meeting_id}`,
+        seq: index + 1,
+        is_tombstone: false,
+      });
+      await store.appendMarkEntry(draft);
+    }
+    await store.putCachedMinute({ minute_token: 'minute-delete', meeting_id: meeting.meeting_id, srt: 'evidence', fetched_at: new Date().toISOString() });
+
+    const result = await store.deleteMeetingLocalData(meeting.meeting_id);
+
+    expect(result).toMatchObject({ meeting: true, meeting_board: true, context_marks: 2, cached_minutes: 1 });
+    expect(await store.getMeeting(meeting.meeting_id)).toBeNull();
+    expect(await store.getDoc(boardId)).toBeNull();
+    expect(await store.getDoc('shared_material')).not.toBeNull();
+    expect(await store.getFoldedMarksByContext(`mtg_${meeting.meeting_id}`)).toEqual([]);
+    expect(await store.getCachedMinute('minute-delete')).toBeNull();
+  });
+
+  it('keeps a provider occurrence tombstone after local meeting deletion', async () => {
+    const store = await import('./store');
+    const meeting = await store.createMeeting('ws_delete_provider', { title: 'Delete occurrence', scheduled_at: '2026-07-18T01:00:00.000Z' });
+    await store.updateMeeting(meeting.meeting_id, {
+      platform: 'zoom',
+      provider_space_name: '987654321',
+      provider_calendar_event_id: 'occ-week-1',
+    });
+
+    await store.deleteMeetingLocalData(meeting.meeting_id);
+
+    await expect(store.isMeetingProviderOccurrenceDeleted({
+      platform: 'zoom', provider_space_name: '987654321', provider_calendar_event_id: 'occ-week-1', scheduled_at: '2026-07-18T01:00:00.000Z',
+    })).resolves.toBe(true);
+    await expect(store.isMeetingProviderOccurrenceDeleted({
+      platform: 'zoom', provider_space_name: '987654321', provider_calendar_event_id: 'occ-week-2', scheduled_at: '2026-07-25T01:00:00.000Z',
+    })).resolves.toBe(false);
+  });
 });
 
 describe('library manifest pruning', () => {
