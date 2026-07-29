@@ -139,6 +139,17 @@ describe('lark meeting reconcile', () => {
     }
   });
 
+  it('notifies the Hub adapter when reconciliation discovers an ended meeting', async () => {
+    const root = seedRoot();
+    try {
+      seedLiveMeeting(root);
+      const onEnded = vi.fn(async (_meeting: import('./lark-realtime-meeting-store').LarkRealtimeMeetingRecord) => {});
+      await reconcileLarkLiveMeetings({ root, nowMs: NOW_MS, resolveUserToken: async () => 'token', fetchImpl: (async () => vcMeetingResponse(3, '1784299500')) as unknown as typeof fetch, onEnded });
+      expect(onEnded).toHaveBeenCalledOnce();
+      expect(onEnded.mock.calls[0][0]).toMatchObject({ status: 'ended', feishu_meeting_id: 'm_evening' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('enriches already-ended meetings missing participants in the second pass', async () => {
     const root = seedRoot();
     try {

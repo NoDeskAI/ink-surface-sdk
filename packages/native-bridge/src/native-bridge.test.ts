@@ -64,4 +64,43 @@ describe('native bridge contract', () => {
       error: { code: 'offline_asset_missing' },
     });
   });
+
+  it('validates meeting recording preference and manual stop requests', () => {
+    const preference: NativeBridgeRequest = {
+      protocol_version: NATIVE_BRIDGE_PROTOCOL_VERSION,
+      request_id: 'req_meeting_preference',
+      type: 'meeting.recording.preference.set',
+      automatically_record_supported_meetings: true,
+    };
+    const stop: NativeBridgeRequest = {
+      protocol_version: NATIVE_BRIDGE_PROTOCOL_VERSION,
+      request_id: 'req_meeting_stop',
+      type: 'meeting.recording.stop',
+      session_id: 'session_1',
+      reason: 'manual',
+    };
+
+    expect(validateNativeBridgeRequest(preference)).toEqual([]);
+    expect(validateNativeBridgeRequest(stop)).toEqual([]);
+  });
+
+  it('rejects malformed meeting recording requests', () => {
+    const preferenceIssues = validateNativeBridgeRequest({
+      protocol_version: NATIVE_BRIDGE_PROTOCOL_VERSION,
+      request_id: 'req_meeting_preference',
+      type: 'meeting.recording.preference.set',
+      automatically_record_supported_meetings: 'yes',
+    });
+    const stopIssues = validateNativeBridgeRequest({
+      protocol_version: NATIVE_BRIDGE_PROTOCOL_VERSION,
+      request_id: 'req_meeting_stop',
+      type: 'meeting.recording.stop',
+      session_id: '',
+      reason: 'meeting_end_confirmed',
+    });
+
+    expect(preferenceIssues.map((issue) => issue.path)).toContain('automatically_record_supported_meetings');
+    expect(stopIssues.map((issue) => issue.path)).toContain('session_id');
+    expect(stopIssues.map((issue) => issue.path)).toContain('reason');
+  });
 });

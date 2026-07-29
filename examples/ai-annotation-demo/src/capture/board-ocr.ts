@@ -129,11 +129,16 @@ export async function recognizeBoardMarks(input: BoardOcrInput, deps: BoardOcrEn
     byPage.set(key, group);
   }
 
-  for (const pagePending of byPage.values()) {
+  const concurrency = 2;
+  const pages = [...byPage.values()];
+  let nextPage = 0;
+  const processPage = async (): Promise<void> => {
+    while (nextPage < pages.length) {
+      const pagePending = pages[nextPage++];
     const page = pageForMark(pagePending[0], input.pages);
     const pageMarks = input.marks.filter((mark) => mark.page_id === page.page_id && drawablePageMark(mark));
     const image = deps.rasterize(page, pageMarks);
-    if (!image) { failed = true; break; }
+    if (!image) { failed = true; continue; }
     let response: { texts: Record<string, string> };
     try {
       response = await deps.request({
@@ -144,7 +149,7 @@ export async function recognizeBoardMarks(input: BoardOcrInput, deps: BoardOcrEn
       });
     } catch {
       failed = true;
-      break; // 网络/5xx 静默放弃本轮；未写指纹的页下次触发重试。
+      continue; // 单页失败不阻塞其它页；未写指纹的页下次触发重试。
     }
     for (const mark of pagePending) {
       if (!Object.prototype.hasOwnProperty.call(response.texts ?? {}, mark.mark_id)) continue;
@@ -163,7 +168,9 @@ export async function recognizeBoardMarks(input: BoardOcrInput, deps: BoardOcrEn
       if (text) ok += 1;
       else empty += 1;
     }
-  }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, pages.length) }, () => processPage()));
 
   const result: BoardOcrRunResult = {
     document_id: input.documentId,

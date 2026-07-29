@@ -8,6 +8,7 @@ export interface GoogleMeetingSyncDependencies {
   createMeeting: (workspaceId: string, input: { title: string; scheduled_at: string; status?: MeetingStatus }) => Promise<PersistedMeeting>;
   updateMeeting: (id: string, patch: Partial<PersistedMeeting>) => Promise<PersistedMeeting | null>;
   mutateMeeting: (id: string, mutator: (current: PersistedMeeting) => Partial<PersistedMeeting> | null) => Promise<PersistedMeeting | null>;
+  isProviderOccurrenceDeleted?: (identity: { platform: 'google_meet'; provider_calendar_event_id: string; meeting_code?: string; scheduled_at: string }) => Promise<boolean>;
   nowMs?: number;
 }
 
@@ -42,6 +43,7 @@ export function googleMeetingPatch(
   const endedAt = status === 'ended'
     ? source.scheduled_end_at || (source.status === 'cancelled' ? source.scheduled_at : undefined)
     : undefined;
+  const durationMinutes = (Date.parse(source.scheduled_end_at || '') - Date.parse(source.scheduled_at)) / 60_000;
   // 已结束/开过的场次被改期回 upcoming：必须清掉过时时间字段，否则 effectiveMeetingStatus 因旧 ended_at 恒判 ended。
   const rescheduled = status === 'upcoming' && !!existing
     && !!(existing.started_at || existing.ended_at || existing.vc_meeting_start_t0 || existing.t0_source || existing.align_state);
@@ -51,6 +53,7 @@ export function googleMeetingPatch(
     scheduled_at: source.scheduled_at,
     status,
     source_kind: 'calendar',
+    ...(Number.isFinite(durationMinutes) && durationMinutes > 0 ? { duration: durationMinutes } : {}),
     provider_calendar_event_id: source.calendar_event_id,
     ...(source.meeting_url ? { meeting_url: source.meeting_url } : {}),
     // Calendar meetingCode is an entry code, not a conferenceRecord instance id. P2 will fill provider_meeting_id.
@@ -102,6 +105,10 @@ export async function syncGoogleMeetingSources(
   const nowMs = dependencies.nowMs ?? Date.now();
 
   for (const source of sources.filter((item) => item.platform === 'google_meet' && item.calendar_event_id && item.scheduled_at)) {
+    if (await dependencies.isProviderOccurrenceDeleted?.({
+      platform: 'google_meet', provider_calendar_event_id: source.calendar_event_id,
+      meeting_code: source.meeting_code, scheduled_at: source.scheduled_at,
+    })) continue;
     const existing = findMeetingForProviderSource(meetings, {
       platform: 'google_meet',
       calendarEventId: source.calendar_event_id,

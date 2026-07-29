@@ -17,14 +17,14 @@ import { setRuntimeSyncHeld } from '../integration/inksurface/runtime-sync-host'
 import { createPager, mountPagerBar, type Pager, type PagerBar } from '../surface/virtual-pager';
 import {
   listWorkspaces, listAllMeetings, getWorkspace,
-  createMeeting, getMeeting, mutateMeeting, updateMeeting, deleteMeeting, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
+  createMeeting, getMeeting, mutateMeeting, updateMeeting, deleteMeeting, deleteMeetingLocalData, isMeetingProviderOccurrenceDeleted, addMeetingMaterialDocIds, addMeetingMaterialLinks, getFoldedMarks, getFoldedMarksByContext, listBooks, upsertFeishuWorkspace, startSimMeeting,
   createDiaryDoc, renameDiary, setActiveDoc, setLastReadPage, getDoc, upsertPanelWorkspace, upsertScheduleWorkspace,
   appendMarkEntry,
 } from '../local/store';
 import { esc } from '../core/escape';
 import QRCode from 'qrcode';
 import { confirmSheet, formSheet, infoSheet, mountSheet, pickSheet, pickOneSheet } from './sheet';
-import { loadRecapView, resetRecapView, recapHandleBack, refreshPanelSummaryCache } from './meeting-recap'; // summarizeMeeting 迁 recap 内调用(M2b)
+import { loadMeetingTranscriptForPostprocess, loadRecapView, registerDeleteMeetingFromRecap, resetRecapView, recapHandleBack } from './meeting-recap'; // summarizeMeeting 迁 recap 内调用(M2b)
 import type { MeetingStatus, PersistedMeeting, PersistedMeetingMaterialLink, PersistedWorkspace, PersistedDoc, PersistedMark } from '../core/store-format';
 import { pollPanelMeetingEvents, listActivePanelMeetings, type PanelFeishuMeeting, type PanelMeetingEvent } from '../integration/panel-feishu/client';
 import { listMeetingGroupMaterialFiles, listMeetingGroupDocxLinks, materialDocId, pdfSourceUrl, syncMeetingGroupMaterials, inCaptureWindow, type FeishuFileItem } from '../features/meeting/feishu-materials';
@@ -60,6 +60,7 @@ import { syncGoogleMeetingLiveState, syncGoogleMeetingSources } from './google-m
 import { fetchZoomMeetingLiveState, fetchZoomMeetingSources, fetchZoomStatus } from '../integration/zoom/client';
 import { syncZoomMeetingLiveState, syncZoomMeetingSources } from './zoom-meeting-sync';
 import { createMeetingHomeSync } from './meeting-home-sync';
+import { deleteMeetingPostprocess, deleteWholeMeeting, enqueueMeetingPostprocess, registerMeetingPostprocessProviders } from '../features/meeting/meeting-postprocess-client';
 
 // ── 飞书后端（feishu-service）+ 文档转换（convert-service）──
 // P0 安全止血后不再前端直连裸端口（两条服务之前零鉴权，见项目记忆盲区扫描发现）。设备浏览器发的请求一律走同源代理
@@ -271,6 +272,36 @@ async function triggerMeetingBoardOcr(mtgId: string): Promise<BoardOcrRunResult>
   return triggerBoardOcr(documentId);
 }
 
+/** 会议结束的统一设备侧接线：先尽力收尾 OCR，再把当前手写证据提交给 Hub。
+ * 转写可能尚未到达，因此这里允许生成 provisional；recap/provider backfill 拿到转写后会用新证据指纹生成 revision。 */
+async function triggerEndedMeetingPostprocess(mtgId: string): Promise<void> {
+  const ocr = await triggerMeetingBoardOcr(mtgId).catch(() => ({ failed: true } as BoardOcrRunResult));
+  const meeting = await getMeeting(mtgId);
+  if (!meeting || meeting.status !== 'ended') return;
+  const [boardMarks, contextMarks, cues] = await Promise.all([
+    getFoldedMarks(noteIdOf(mtgId)),
+    getFoldedMarksByContext(`mtg_${mtgId}`),
+    loadMeetingTranscriptForPostprocess(meeting).catch(() => []),
+  ]);
+  const marks = [...new Map([...boardMarks, ...contextMarks].map((mark) => [mark.mark_id, mark])).values()];
+  const handwriting = marks
+    .filter((mark) => !mark.is_tombstone && !!mark.marked_text.trim())
+    .map((mark) => ({
+      id: mark.mark_id,
+      text: mark.marked_text.trim(),
+      revision: Math.max(1, Number(mark.seq) || 1),
+      mark_ids: [mark.mark_id],
+    }));
+  const unresolved = marks.some((mark) => !mark.is_tombstone && (mark.feature_type === 'handwriting' || mark.feature_type === 'drawing') && (!mark.marked_text.trim() || /^手写\s+\d+\s*笔$/.test(mark.marked_text.trim())));
+  const ocrStatus = ocr.failed || unresolved ? 'failed' : handwriting.length ? 'ready' : 'not_applicable';
+  const queued = await enqueueMeetingPostprocess(meeting, cues, handwriting, ocrStatus);
+  const occurrenceId = queued.occurrence_id;
+  const postprocessStatus = queued.status === 'awaiting_configuration' || queued.status === 'awaiting_transcript'
+    ? queued.status
+    : 'configured';
+  if (occurrenceId) await updateMeeting(mtgId, { postprocess_occurrence_id: occurrenceId, postprocess_configuration_status: postprocessStatus });
+}
+
 function setMtg(view: 'home' | 'detail' | 'live' | 'recap'): void {
   document.body.dataset.mtg = view;
   document.body.classList.toggle('writable', view === 'live'); // 会中白板=可写（露工具格子）
@@ -390,6 +421,11 @@ async function upsertPanelMeetingInner(mt: PanelFeishuMeeting, type: PanelMeetin
   const realT0 = hasRealStart ? mt.start_time! : (type === 'started' && eventMs > 0 ? eventMs : existingT0);
   const endMs = typeof mt.end_time === 'number' && mt.end_time > 0 ? mt.end_time : (type === 'ended' ? eventMs : 0);
   const scheduledIso = realT0 ? new Date(realT0).toISOString() : (existing?.scheduled_at || existing?.started_at || new Date().toISOString());
+  if (!existing && await isMeetingProviderOccurrenceDeleted({
+    platform: 'lark', feishu_meeting_id: mt.meeting_id,
+    feishu_meeting_no: mt.meeting_no ? String(mt.meeting_no) : undefined,
+    scheduled_at: scheduledIso,
+  })) return;
   const ws = await resolveMeetingWorkspace(mt, existing, existingWs); // 归群「两条腿」（自动 group_ids / 认领映射 / 保持）
   const base = existing ?? await createMeeting(ws.workspace_id, { title: mt.topic || '飞书会议', scheduled_at: scheduledIso });
   // started/active 快照→live（除非本地已 ended·防 active 把已结束刷回 live）；ended→ended；metadata→保持既有 status。
@@ -435,7 +471,7 @@ async function upsertPanelMeetingInner(mt: PanelFeishuMeeting, type: PanelMeetin
     devEmit('meeting', () => ({ ev: 'live_toast_shown', meeting_id: saved.meeting_id, title: saved.title, source: type }));
   }
   if (nextStatus === 'ended') dismissMobileToast(`meeting-live:${base.meeting_id}`);
-  if (nextStatus === 'ended' && existing?.status !== 'ended') void triggerMeetingBoardOcr(base.meeting_id);
+  if (nextStatus === 'ended' && existing?.status !== 'ended') void triggerEndedMeetingPostprocess(base.meeting_id);
   // 正在这场记录工作台里 → 事件迟到时热更 status/t0/结束时长（不强制跳页·用户还在画板·只更状态条/脊）。
   if (liveMtg && liveMtg.id === base.meeting_id) {
     liveMtg.status = nextStatus;
@@ -460,12 +496,9 @@ async function applyPanelSummaryReady(mt: PanelFeishuMeeting): Promise<void> {
   await upsertPanelMeeting(mt, 'metadata'); // 写会议元数据·失败抛
   const local = await findLocalPanelMeeting(mt.meeting_id);
   if (!local) return;
-  const prevAt = local.panel_summary?.generated_at ?? 0;
-  try {
-    const r = await refreshPanelSummaryCache(local);
-    // 后台到达「更新的」总结 → 标未读（home/detail 提醒·进 recap 时清）。重放同一份 generated_at 不变 → 不重复标。
-    if (r.summary && r.summary.generated_at > prevAt) await updateMeeting(local.meeting_id, { panel_summary_unread: true });
-  } catch (e) { console.warn('[panel] summary_ready 拉总结失败（进 recap 时再拉）：', e); }
+  // summary_ready 只作为 Provider 资料可能收敛的信号：拉原始转写并创建 V2 evidence revision。
+  // 自动路径禁止继续写 legacy panel_summary；旧字段仅供迁移期读取和用户显式手动兼容入口。
+  void triggerEndedMeetingPostprocess(local.meeting_id);
 }
 
 /** 分发一条 panel 事件。未知类型忽略（向前兼容）。本地写失败冒泡 → syncPanelMeetings 中断 → 不推 cursor → 下次重放。 */
@@ -545,6 +578,11 @@ async function syncMeetingSources(): Promise<{ connected: boolean; imported: num
   let imported = 0;
   for (const source of sources) {
     const meetingNo0 = source.meeting_no || meetingNoFromUrl(source.meeting_url);
+    if (await isMeetingProviderOccurrenceDeleted({
+      platform: 'lark', feishu_meeting_id: source.feishu_meeting_id,
+      feishu_calendar_event_id: source.calendar_event_id,
+      feishu_meeting_no: meetingNo0, scheduled_at: source.scheduled_at,
+    })) continue;
     // 与 panel 事件路共锁 + 锁内重查：check-then-create 必须在同一把锁里原子，否则短会两路并发各建一张卡。
     const lockKey = providerMeetingLockKey('lark', String(source.feishu_meeting_id || source.calendar_event_id || meetingNo0 || source.source_id || source.meeting_url));
     await withMeetingKeyLock(lockKey, async () => {
@@ -624,6 +662,10 @@ async function syncCalendarMeetings(): Promise<{ connected: boolean; events: Fei
     const endIso = endMs > 0 ? new Date(endMs).toISOString() : undefined;
     const status = scheduledMeetingStatus(startIso, endIso);
     const meetingNo = meetingNoFromUrl(e.vchat?.meeting_url);
+    if (await isMeetingProviderOccurrenceDeleted({
+      platform: 'lark', feishu_calendar_event_id: e.event_id,
+      feishu_meeting_no: meetingNo, scheduled_at: startIso,
+    })) continue;
     const existing = byCalId.get(e.event_id);
     if (existing) {
       if (existing.source_kind === 'vc') continue;             // 已被 panel started 接管，日历不插手
@@ -838,6 +880,7 @@ async function syncGoogleCalendarMeetings(): Promise<void> {
     createMeeting,
     updateMeeting,
     mutateMeeting,
+    isProviderOccurrenceDeleted: isMeetingProviderOccurrenceDeleted,
   });
   if (!response.mtl_token_configured) return;
   const liveState = await getMeetingLiveState();
@@ -856,6 +899,7 @@ async function syncZoomMeetings(): Promise<void> {
     createMeeting,
     updateMeeting,
     mutateMeeting,
+    isProviderOccurrenceDeleted: isMeetingProviderOccurrenceDeleted,
   });
   const liveState = await fetchZoomMeetingLiveState();
   if (!liveState.connected) return;
@@ -902,7 +946,8 @@ async function healDuplicateLarkMeetings(): Promise<void> {
       if (extraDocs.length) await addMeetingMaterialDocIds(keeper.meeting_id, extraDocs);
     }
     if (Object.keys(patch).length) await updateMeeting(keeper.meeting_id, patch);
-    for (const loser of losers) await deleteMeeting(loser.meeting_id);
+    // 先删 Hub canonical state，再删本地 projection；Hub 失败则保留本地对象供下一轮重试，避免不可达的隐私残留。
+    for (const loser of losers) { await deleteMeetingPostprocess(loser.meeting_id); await deleteMeeting(loser.meeting_id); }
     devEmit('meeting', () => ({ ev: 'dup_heal_merged', fid, keeper: keeper.meeting_id, removed: losers.map((l) => l.meeting_id) }));
   }
 }
@@ -925,8 +970,10 @@ async function syncHomeDataRound(): Promise<void> {
   await syncGoogleCalendarMeetings().catch(() => {});
   await syncZoomMeetings().catch(() => {});
   await healDuplicateLarkMeetings().catch(() => {}); // 重复卡自愈（存量清理+锁的漏网兜底）·幂等
-  for (const meeting of await listAllMeetings()) {
-    if (meeting.status === 'ended' && statusBefore.get(meeting.meeting_id) !== 'ended') void triggerMeetingBoardOcr(meeting.meeting_id);
+  const currentMeetings = await listAllMeetings();
+  await registerMeetingPostprocessProviders(currentMeetings).catch(() => {}); // 后续 Provider worker 可在设备离线时推进已注册场次。
+  for (const meeting of currentMeetings) {
+    if (meeting.status === 'ended' && statusBefore.get(meeting.meeting_id) !== 'ended') void triggerEndedMeetingPostprocess(meeting.meeting_id);
   }
 }
 
@@ -1294,7 +1341,7 @@ async function syncActiveMeetingProviderLiveState(previousStatus: MeetingStatus 
     const endedMs = Date.parse(fresh.ended_at || '');
     active.frozenAt = Number.isFinite(endedMs) && endedMs > 0 ? endedMs : meetingNowMs();
     stopMeetingBedrock();
-    if (previousStatus !== 'ended') void triggerMeetingBoardOcr(fresh.meeting_id);
+    if (previousStatus !== 'ended') void triggerEndedMeetingPostprocess(fresh.meeting_id);
   } else if (fresh.status === 'live') {
     active.frozenAt = 0;
     startMeetingBedrock();
@@ -2106,6 +2153,23 @@ function wireBack(root: HTMLElement): void {
 /** 入口：mobile-main boot 时调一次。绑定会议 nav 进入 + live 静态控件 + 标注计数刷新。 */
 export function initMobileMeeting(opts: { readerCtx: SurfaceContext }): void {
   readerCtx = opts.readerCtx;
+  registerDeleteMeetingFromRecap(async (meeting) => {
+    // Cloud first: it persists the deletion tombstone before erasing media.
+    // If the Hub is unavailable, retain the local card so the user can retry
+    // and no offline Companion evidence can be orphaned or resurrected.
+    const cloud = await deleteWholeMeeting(meeting.meeting_id);
+    const local = await deleteMeetingLocalData(meeting.meeting_id);
+    resetRecapView();
+    mv = {};
+    setMtg('home');
+    await renderHome({ sync: false, keepPage: false });
+    await infoSheet({
+      title: cloud.pending_companion ? '会议已删除，等待 Mac 清理' : '会议已永久删除',
+      message: cloud.pending_companion
+        ? `会议卡、Hub 转写/纪要、云端媒体和本机 InkLoop 数据已删除。录制这场会议的 Mac 下次在线时会自动删除权威原始音频。清理命令：${cloud.command_id}`
+        : `会议卡、Hub 转写/纪要、云端媒体和本机 InkLoop 数据已删除。已移除 ${local.context_marks} 条本场书写记录。`,
+    });
+  });
 
   // 会议 rail 进入 → home（inline 已切 data-mode=meet + 高亮；这里补真数据）
   document.querySelector('.nav [data-mode="meet"]')?.addEventListener('click', () => {
@@ -2181,5 +2245,12 @@ export function initMobileMeeting(opts: { readerCtx: SurfaceContext }): void {
       if (el('mtg-spine').hidden) void refreshLiveMarkCounters();
       else void refreshSpine();
     }, 500);
+  });
+  // 会中增量 OCR：每次账本收敛后短去抖，仅扫描 fingerprint 变化的 mark；同文档 in-flight 自动去重。
+  let meetingOcrTimer = 0;
+  bus.on('mark:recorded', () => {
+    if (!liveMtg || liveMtg.status !== 'live' || liveMtg.frozenAt) return;
+    clearTimeout(meetingOcrTimer);
+    meetingOcrTimer = window.setTimeout(() => { void triggerMeetingBoardOcr(liveMtg!.id); }, 1200);
   });
 }

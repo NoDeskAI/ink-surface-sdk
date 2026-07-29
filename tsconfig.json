@@ -15,6 +15,7 @@
       "ink-surface-sdk/adapters/obsidian": ["packages/adapter-obsidian/src/index.ts"],
       "ink-surface-sdk/export-core": ["packages/export-core/src/index.ts"],
       "ink-surface-sdk/knowledge-schema": ["packages/knowledge-schema/src/index.ts"],
+      "ink-surface-sdk/meeting-media-core": ["packages/meeting-media-core/src/index.ts"],
       "ink-surface-sdk/native-bridge": ["packages/native-bridge/src/index.ts"],
       "ink-surface-sdk/offline-store": ["packages/offline-store/src/index.ts"],
       "ink-surface-sdk/offline-store/file-sidecar": ["packages/offline-store/src/file-sidecar-store.ts"],

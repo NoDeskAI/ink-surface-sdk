@@ -95,6 +95,19 @@ describe('board OCR writeback', () => {
     expect(request.mock.calls.map(([payload]) => payload.regions.map((region) => region.mark_id))).toEqual([['page_0'], ['page_1']]);
   });
 
+  it('continues other pages when one OCR request fails', async () => {
+    const first = mark({ mark_id: 'page_0' });
+    const second = mark({ mark_id: 'page_1', page_id: 'pg_diary_1_1', page_index: 1 });
+    const written: string[] = [];
+    const result = await recognizeBoardMarks({ documentId: 'diary_1', marks: [first, second], pages: [{ page_id: first.page_id, page_index: 0, width: 1000, height: 1320 }, { page_id: second.page_id, page_index: 1, width: 1000, height: 1320 }] }, {
+      rasterize: () => 'jpeg-base64',
+      request: async (payload) => { if (payload.regions[0].mark_id === 'page_0') throw new Error('timeout'); return { texts: { page_1: 'survived' } }; },
+      writeRevision: async (input) => { written.push(input.mark_id); return true; }, now: () => 1, emit: () => {},
+    });
+    expect(result).toMatchObject({ failed: true, ok: 1 });
+    expect(written).toEqual(['page_1']);
+  });
+
   it('响应漏掉的 mark 保持待识别，并在下一轮重新发送', async () => {
     const first = mark({ mark_id: 'answered' });
     const missing = mark({ mark_id: 'omitted' });

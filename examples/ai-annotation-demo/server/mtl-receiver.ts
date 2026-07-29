@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { googleCalendarSyncPath, googleMeetRecordsPath, resolveAnyUserGoogleToken, type GoogleOAuthEnv } from './google-oauth-state';
-import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload, type GoogleMeetAttendanceWindow } from './google-meet-records';
+import { fetchGoogleMeetingTranscript, googleMeetRecordsErrorPayload, type GoogleMeetAttendanceWindow, type GoogleMeetingTranscriptResult } from './google-meet-records';
 import { resolveMtlToken, type MtlReceiverAuthEnv, type MtlReceiverIdentity } from './mtl-receiver-auth';
 import { zoomMeetingIdFromUrl } from './zoom-meeting-sync';
 
@@ -525,16 +525,16 @@ export async function runMtlGoogleTranscriptCatchUp(
   identity: MtlReceiverIdentity,
   window: MtlLiveMeetingWindow,
   env: MtlReceiverEnv = process.env,
-): Promise<void> {
-  if (window.platform !== 'google_meet' || !window.meeting_code) return;
+): Promise<GoogleMeetingTranscriptResult | undefined> {
+  if (window.platform !== 'google_meet' || !window.meeting_code) return undefined;
   const userIdentity = { tenantId: identity.tenant_id, userId: identity.user_id };
   const resolved = await resolveAnyUserGoogleToken(env, userIdentity);
   if (!resolved.usable || !resolved.token) {
     console.info(`[mtl-receiver] transcript catch-up skipped: ${resolved.reason || 'google_token_unavailable'} tenant=${identity.tenant_id} user=${identity.user_id} meeting=${window.meeting_code}`);
-    return;
+    return undefined;
   }
   try {
-    await fetchGoogleMeetingTranscript(resolved.token, {
+    return await fetchGoogleMeetingTranscript(resolved.token, {
       path: googleMeetRecordsPath(env, userIdentity),
     }, {
       meetingCode: window.meeting_code,
@@ -550,6 +550,7 @@ export async function runMtlGoogleTranscriptCatchUp(
   } catch (error) {
     const failure = googleMeetRecordsErrorPayload(error);
     console.warn(`[mtl-receiver] transcript catch-up failed: ${failure.body.error.code} tenant=${identity.tenant_id} user=${identity.user_id} meeting=${window.meeting_code}`);
+    return undefined;
   }
 }
 

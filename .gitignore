@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.build/
+/tmp/
+examples/*/tmp/
 examples/*/dist/
 test-results/
 .inkloop/
@@ -30,8 +33,12 @@ examples/ai-annotation-demo/public/demo/education/textbooks/*.pdf
 
 # 外部参考仓库/SDK 本地副本。代码里通过适配层接入，目录本身不要混入主仓库。
 examples/ai-annotation-demo/Lark-Meeting-Timeline-main/
+examples/ai-annotation-demo/Lark-Meeting-Timeline-main
 examples/ai-annotation-demo/Lark-Meeting-Timeline-main.backup-*/
 examples/ai-annotation-demo/jsoncanvas-main/
 examples/ai-annotation-demo/obsidian-importer-master/
 examples/ai-annotation-demo/obsidian-maps-master/
 examples/ai-annotation-demo/obsidian-plugin/
+
+# 真实访谈原始转写只用于本地验收，不进入源码仓库。
+examples/ai-annotation-demo/fixtures/meeting-postprocess/interview-archive-*/

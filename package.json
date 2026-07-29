@@ -33,6 +33,11 @@
       "import": "./dist/packages/knowledge-schema/src/index.js",
       "default": "./dist/packages/knowledge-schema/src/index.js"
     },
+    "./meeting-media-core": {
+      "types": "./dist/packages/meeting-media-core/src/index.d.ts",
+      "import": "./dist/packages/meeting-media-core/src/index.js",
+      "default": "./dist/packages/meeting-media-core/src/index.js"
+    },
     "./native-bridge": {
       "types": "./dist/packages/native-bridge/src/index.d.ts",
       "import": "./dist/packages/native-bridge/src/index.js",
@@ -92,6 +97,9 @@
     "packages/knowledge-schema/package.json",
     "packages/knowledge-schema/src/index.ts",
     "packages/knowledge-schema/README.md",
+    "packages/meeting-media-core/package.json",
+    "packages/meeting-media-core/src/index.ts",
+    "packages/meeting-media-core/README.md",
     "packages/native-bridge/package.json",
     "packages/native-bridge/src/index.ts",
     "packages/native-bridge/src/webview-host.md",

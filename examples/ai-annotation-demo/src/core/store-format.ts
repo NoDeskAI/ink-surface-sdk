@@ -17,7 +17,7 @@ import type { ReflowBlock } from '../surface/reflow';
 import type { RawRef } from './bedrock';
 
 export const STORE_VERSION = '2'; // 1→2：strokes/overlays 出 docs 进 marks/ai_turns 账本（干净断裂，旧 docs 弃）
-export const DB_VERSION = 11;     // v10→v11：library_sync（Cloud Hub/本地 Library manifest 状态）。任何升级都自愈缺表。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
+export const DB_VERSION = 12;     // v11→v12：meeting_provider_deletions（已删外部会议场次墓碑，防日历同步复活）。任何升级都自愈缺表。升级走幂等基线 + 阶梯迁移（store.ts openDB），老数据不丢
 export type MarkEntrySchemaVersion = '3' | '4' | '5' | '6';
 export const MARK_ENTRY_SCHEMA_VERSION: MarkEntrySchemaVersion = '6'; // v6 持续允许 additive 可选字段：pen_down_at + 白板 OCR 标记；不 bump STORE_VERSION。
 
@@ -287,7 +287,7 @@ export interface PanelMeetingSummaryFive {
   risks: string[];
   open_questions: string[];
   next_steps: string[];
-  /** 完整长文报告（访谈研究报告等模式下由服务端一并返回；五要素只是它的压缩摘要）。 */
+  /** @deprecated Historical read compatibility only; no longer generated or displayed. */
   report_markdown?: string;
 }
 export interface PanelMeetingSummaryRecord {
@@ -356,6 +356,60 @@ export interface PersistedMeeting {
   material_doc_ids: string[];       // 可能有用的文件（指向 docs/pdf_blobs 的 document_id）
   material_links?: PersistedMeetingMaterialLink[]; // 链接型资料（妙记 docx 等·不强求可批注·见 PersistedMeetingMaterialLink）
   summary?: string;                 // 会后「思路总结」（AI 综合，先空）
+  summary_origin?: 'user' | 'legacy_ai' | 'postprocess_v2';
+  summary_artifact_id?: string;     // Hub canonical artifact 的 projection 引用
+  summary_artifact_revision?: number;
+  summary_finality?: 'provisional' | 'final';
+  postprocess_occurrence_id?: string;
+  postprocess_snapshot_id?: string;
+  postprocess_template_id?: 'university_notes' | 'interactive_classroom' | 'reasoning_summary' | 'interview_memo' | 'interview_archive' | 'meeting_expert';
+  postprocess_configuration_status?: 'awaiting_configuration' | 'awaiting_transcript' | 'configured';
+  postprocess_user_guidance?: {
+    conclusions: string[];
+    deepest_impressions: string[];
+    pain_points: string[];
+  };
+  summary_user_edited_at?: string;  // 存在时后台 projection 禁止盲覆盖
+  summary_cards_v2?: {
+    schema_version: '2.0';
+    template_id?: 'university_notes' | 'interactive_classroom' | 'reasoning_summary' | 'interview_memo' | 'interview_archive' | 'meeting_expert';
+    template_version?: string;
+    artifact_state: 'provisional' | 'final' | 'partial';
+    theme: string;
+    overview: string;
+    section_titles?: { background: string; discussion: string; next_steps: string };
+    meeting_metadata?: { started_at: string | null; duration_ms: number | null; participants: string[] };
+    key_points: Array<{ id: string; text: string; evidence_refs: string[] }>;
+    decisions: Array<{ id: string; text: string; status: 'confirmed' | 'tentative'; evidence_refs: string[] }>;
+    action_items: Array<{ id: string; task: string; owner: string | null; due_at: string | null; commitment: 'explicit' | 'proposed'; evidence_refs: string[] }>;
+    highlights: Array<{ id: string; text: string; evidence_refs: string[] }>;
+    risks: Array<{ id: string; text: string; mitigation: string | null; evidence_refs: string[] }>;
+    open_questions: Array<{ id: string; text: string; evidence_refs: string[] }>;
+    personal_notes: Array<{ id: string; text: string; kind: 'thought' | 'question' | 'todo' | 'emphasis'; mark_refs: string[]; supporting_utterance_refs: string[] }>;
+    /** Template-owned sections for v3+ templates. Absent on historical cards. */
+    template_sections?: Array<{
+      id: string;
+      title: string;
+      summary: string | null;
+      items: Array<{ id: string; text: string; label: string | null; speaker: string | null; evidence_refs: string[] }>;
+    }>;
+    coverage: { utterances: 'complete' | 'partial'; handwriting_ocr: 'complete' | 'partial' | 'failed'; started_at_ms: number | null; ended_at_ms: number | null };
+  };
+  mind_map_v1?: {
+    schema_version: '1.0';
+    source: 'meeting.summary_cards';
+    source_fingerprint: string;
+    nodes: Array<{
+      id: string;
+      parent_id: string | null;
+      kind: 'root' | 'section' | 'point' | 'decision' | 'action' | 'risk' | 'question' | 'note';
+      label: string;
+      evidence_refs: string[];
+    }>;
+  };
+  /** @deprecated Historical read compatibility only; no longer generated or displayed. */
+  full_report_v2?: { artifact_id: string; title: string; report_markdown: string; finality: 'provisional' | 'final'; source_fingerprint?: string; prompt_version?: string; generated_at?: string | null };
+  interview_archive_html?: { artifact_id: string; filename: string; html: string; finality: 'provisional' | 'final'; generated_at: string };
   // ── 多平台会议标识（optional·零迁移；缺省按存量飞书字段推断）──
   platform?: 'lark' | 'google_meet' | 'zoom' | 'microsoft_teams' | 'manual'; // 会议平台；存量飞书会议可不写
   provider_meeting_id?: string;        // 平台会议场次 ID；Google conferenceRecord.name，Teams attendanceReport.id

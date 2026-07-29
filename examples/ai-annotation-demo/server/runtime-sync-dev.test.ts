@@ -1,8 +1,8 @@
 import { createServer, request, type Server } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeSyncEvent } from 'ink-surface-sdk/runtime-schema';
 import { createRuntimeSyncDevHandler, type RuntimeSyncSessionContext } from './runtime-sync-dev';
 import { JsonlRuntimeSyncEventStore } from './runtime-sync-store';
@@ -188,6 +188,38 @@ describe('runtime sync dev handler', () => {
     expect(firstPull.next_cursor).toBe('1');
     expect(secondPull.events).toEqual([]);
     expect(secondPull.next_cursor).toBe('1');
+  });
+
+  it('can subscribe from the latest cursor without replaying historical meetings', async () => {
+    const base = await start();
+    const push = async (next: RuntimeSyncEvent): Promise<void> => {
+      const response = await fetch(`${base}/v1/runtime/events:push`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          schema_version: 'inkloop.runtime_sync_batch.v1',
+          device_id: 'inkloop-pen',
+          events: [next],
+        }),
+      });
+      expect(response.status).toBe(200);
+    };
+    await push({ ...event('evt_history'), doc_id: 'mtgdoc_old-meeting' });
+
+    const subscribed = await (await fetch(`${base}/v1/runtime/events:pull?device_id=live-board&cursor=latest`)).json() as {
+      events: RuntimeSyncEvent[];
+      next_cursor: string;
+      has_more: boolean;
+    };
+    expect(subscribed).toMatchObject({ events: [], next_cursor: '1', has_more: false });
+
+    await push({ ...event('evt_live'), doc_id: 'mtgdoc_current-meeting' });
+    const live = await (await fetch(`${base}/v1/runtime/events:pull?device_id=live-board&cursor=${subscribed.next_cursor}`)).json() as {
+      events: RuntimeSyncEvent[];
+      next_cursor: string;
+    };
+    expect(live.events.map((item) => item.event_id)).toEqual(['evt_live']);
+    expect(live.next_cursor).toBe('2');
   });
 
   it('dedupes equivalent runtime bootstrap snapshots even when volatile source hashes change', async () => {
@@ -588,6 +620,78 @@ describe('runtime sync dev handler', () => {
 
       expect(pulled.events.map((item) => item.event_id)).toEqual(['evt_persisted']);
       expect(pulled.next_cursor).toBe('1');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists a document deletion tombstone and drops offline events after restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'inkloop-runtime-sync-delete-'));
+    const file = join(dir, 'runtime-events.jsonl');
+    const meetingEvent = { ...event('evt_meeting_before_delete'), doc_id: 'mtgdoc_deleted_meeting' };
+    try {
+      const firstBase = await start({ store: new JsonlRuntimeSyncEventStore(file) });
+      await fetch(`${firstBase}/v1/runtime/events:push`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema_version: 'inkloop.runtime_sync_batch.v1', device_id: 'online-device', events: [meetingEvent] }),
+      });
+      const deleted = await fetch(`${firstBase}/v1/runtime/document?document_id=mtgdoc_deleted_meeting`, { method: 'DELETE' });
+      expect(deleted.status).toBe(200);
+      await new Promise<void>((resolve, reject) => server!.close((error) => error ? reject(error) : resolve()));
+      server = null;
+
+      const sideEffect = vi.fn();
+      const secondBase = await start({ store: new JsonlRuntimeSyncEventStore(file), onAcceptedEvent: sideEffect });
+      const lateEvent = { ...event('evt_meeting_offline_late'), doc_id: 'mtgdoc_deleted_meeting' };
+      const pushed = await fetch(`${secondBase}/v1/runtime/events:push`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema_version: 'inkloop.runtime_sync_batch.v1', device_id: 'offline-device', events: [lateEvent] }),
+      });
+      const body = await pushed.json() as { acks: Array<{ ok: boolean; dropped?: boolean; reason?: string }> };
+      const pulled = await (await fetch(`${secondBase}/v1/runtime/events:pull?device_id=offline-device&cursor=0`)).json() as { events: RuntimeSyncEvent[] };
+
+      expect(body.acks).toEqual([expect.objectContaining({ ok: true, dropped: true, reason: 'document_deleted' })]);
+      expect(pulled.events).toEqual([]);
+      expect(sideEffect).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers document deletion after a prior JSONL write failure', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'inkloop-runtime-sync-delete-retry-'));
+    const file = join(dir, 'runtime-events.jsonl');
+    try {
+      await mkdir(file);
+      const store = new JsonlRuntimeSyncEventStore(file);
+      await expect(store.append({ event: event('evt_failed_append') })).rejects.toBeTruthy();
+
+      await rm(file, { recursive: true, force: true });
+      await expect(store.deleteDocument({}, 'doc_runtime_dev')).resolves.toBe(0);
+      await expect(store.isDocumentDeleted({}, 'doc_runtime_dev')).resolves.toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes a JSONL deletion in memory only after its atomic rewrite succeeds', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'inkloop-runtime-sync-delete-atomic-'));
+    const file = join(dir, 'runtime-events.jsonl');
+    const stored = { sequence: 1, event: event('evt_delete_atomic') };
+    try {
+      await writeFile(file, `${JSON.stringify(stored)}\n`, 'utf8');
+      const store = new JsonlRuntimeSyncEventStore(file);
+      await expect(store.latestSequence()).resolves.toBe(1);
+      await rm(file);
+      await mkdir(file);
+
+      await expect(store.deleteDocument({}, 'doc_runtime_dev')).rejects.toBeTruthy();
+      await expect(store.isDocumentDeleted({}, 'doc_runtime_dev')).resolves.toBe(false);
+      await expect(store.eventsAfter({}, 0, 10)).resolves.toEqual([stored]);
+
+      await rm(file, { recursive: true, force: true });
+      await expect(store.deleteDocument({}, 'doc_runtime_dev')).resolves.toBe(1);
+      await expect(store.isDocumentDeleted({}, 'doc_runtime_dev')).resolves.toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

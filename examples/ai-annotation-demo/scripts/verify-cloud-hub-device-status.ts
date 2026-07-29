@@ -90,6 +90,7 @@ async function startCloudHub(rootDir: string): Promise<{ baseUrl: string; child:
       INKLOOP_HTTPS_PORT: '0',
       INKLOOP_LOCAL_DEVICE_AUTH: '1',
       INKLOOP_LOCAL_DEVICE_AUTH_AUTO_APPROVE: '1',
+      INKLOOP_LOCAL_DEVICE_AUTH_TOKEN: 'local-device-status-test-token',
       INKLOOP_LIBRARY_REQUIRE_SESSION: '1',
       INKLOOP_RUNTIME_SYNC_REQUIRE_SESSION: '1',
       INKLOOP_KNOWLEDGE_REQUIRE_SESSION: '1',
